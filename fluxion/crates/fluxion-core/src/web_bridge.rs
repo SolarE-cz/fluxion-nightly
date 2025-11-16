@@ -1,0 +1,725 @@
+// Copyright (c) 2025 SOLARE S.R.O.
+//
+// This file is part of FluxION.
+//
+// Licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+// (CC BY-NC-ND 4.0). You may use and share this file for non-commercial purposes only and you may not
+// create derivatives. See <https://creativecommons.org/licenses/by-nc-nd/4.0/>.
+//
+// This software is provided "AS IS", without warranty of any kind.
+//
+// For commercial licensing, please contact: info@solare.cz
+
+use bevy_ecs::prelude::*;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{debug, trace};
+
+use crate::{
+    components::*, config_events::ConfigUpdateEvent, debug::DebugModeConfig,
+    resources::SystemConfig,
+};
+
+/// Channel for web query requests
+#[derive(Resource)]
+pub struct WebQueryChannel {
+    pub receiver: mpsc::UnboundedReceiver<WebQueryRequest>,
+}
+
+/// Channel for config update events
+#[derive(Resource)]
+pub struct ConfigUpdateChannel {
+    pub receiver: mpsc::UnboundedReceiver<ConfigUpdateEvent>,
+}
+
+/// Clonable sender for web queries
+#[derive(Clone)]
+pub struct WebQuerySender {
+    sender: mpsc::UnboundedSender<WebQueryRequest>,
+}
+
+/// Clonable sender for config updates
+#[derive(Clone)]
+pub struct ConfigUpdateSender {
+    sender: mpsc::UnboundedSender<ConfigUpdateEvent>,
+}
+
+impl std::fmt::Debug for WebQuerySender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebQuerySender").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for ConfigUpdateSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigUpdateSender").finish_non_exhaustive()
+    }
+}
+
+impl WebQuerySender {
+    /// Create a new sender/receiver pair
+    pub fn new() -> (Self, WebQueryChannel) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self { sender }, WebQueryChannel { receiver })
+    }
+
+    /// Request dashboard data
+    pub async fn query_dashboard(&self) -> Result<WebQueryResponse, QueryError> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        self.sender
+            .send(WebQueryRequest {
+                query_type: QueryType::Dashboard,
+                response_tx,
+            })
+            .map_err(|_| QueryError::ChannelClosed)?;
+
+        response_rx.await.map_err(|_| QueryError::ResponseTimeout)
+    }
+
+    /// Request health check data
+    pub async fn query_health(&self) -> Result<SystemHealthData, QueryError> {
+        let response = self.query_dashboard().await?;
+        Ok(response.health)
+    }
+}
+
+impl ConfigUpdateSender {
+    /// Create a new sender/receiver pair
+    pub fn new() -> (Self, ConfigUpdateChannel) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self { sender }, ConfigUpdateChannel { receiver })
+    }
+
+    /// Send a config update event
+    pub fn send_update(&self, event: ConfigUpdateEvent) -> Result<(), ConfigUpdateError> {
+        self.sender
+            .send(event)
+            .map_err(|_| ConfigUpdateError::ChannelClosed)
+    }
+}
+
+/// Web query request from async web handlers to ECS
+pub struct WebQueryRequest {
+    pub query_type: QueryType,
+    pub response_tx: tokio::sync::oneshot::Sender<WebQueryResponse>,
+}
+
+/// Types of queries the web UI can make
+pub enum QueryType {
+    Dashboard,
+}
+
+/// Battery SOC history point for visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatterySocHistoryPoint {
+    pub timestamp: DateTime<Utc>,
+    pub soc: f32,
+}
+
+/// Battery SOC prediction point for visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatterySocPredictionPoint {
+    pub timestamp: DateTime<Utc>,
+    pub soc: f32,
+}
+
+/// PV generation history point for visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PvGenerationHistoryPoint {
+    pub timestamp: DateTime<Utc>,
+    pub power_w: f32,
+}
+
+/// Response containing ECS component data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebQueryResponse {
+    pub timestamp: DateTime<Utc>,
+    pub debug_mode: bool,
+    pub inverters: Vec<InverterData>,
+    pub schedule: Option<ScheduleData>,
+    pub prices: Option<PriceData>,
+    pub health: SystemHealthData,
+    pub timezone: Option<String>,
+    pub battery_soc_history: Option<Vec<BatterySocHistoryPoint>>,
+    pub battery_soc_prediction: Option<Vec<BatterySocPredictionPoint>>,
+    pub pv_generation_history: Option<Vec<PvGenerationHistoryPoint>>,
+}
+
+/// Inverter component data bundle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InverterData {
+    // Core identification
+    pub id: String,
+    pub topology: String,
+
+    // Current mode
+    pub mode: String,
+    pub mode_reason: String,
+
+    // Battery
+    pub battery_soc: f32,
+    pub battery_power_w: f32,
+    pub battery_voltage_v: f32,
+    pub battery_current_a: f32,
+    pub battery_temperature_c: f32,
+
+    // Grid
+    pub grid_power_w: f32,
+    pub grid_voltage_v: f32,
+    pub grid_frequency_hz: f32,
+
+    // PV Generation
+    pub pv_power_w: f32,
+    pub pv1_power_w: f32,
+    pub pv2_power_w: f32,
+    pub daily_energy_kwh: f32,
+    pub total_energy_kwh: f32,
+
+    // Status
+    pub online: bool,
+    pub run_mode: String,
+    pub error_code: u16,
+    pub inverter_temperature_c: f32,
+
+    // Extended data from RawInverterState
+    pub house_load_w: Option<f32>,
+    pub grid_import_w: Option<f32>,
+    pub grid_export_w: Option<f32>,
+    pub grid_import_today_kwh: Option<f32>,
+    pub grid_export_today_kwh: Option<f32>,
+    pub inverter_frequency_hz: Option<f32>,
+    pub inverter_voltage_v: Option<f32>,
+    pub inverter_current_a: Option<f32>,
+    pub inverter_power_w: Option<f32>,
+    pub battery_capacity_kwh: Option<f32>,
+    pub battery_input_energy_today_kwh: Option<f32>,
+    pub battery_output_energy_today_kwh: Option<f32>,
+    pub today_solar_energy_kwh: Option<f32>,
+    pub total_solar_energy_kwh: Option<f32>,
+}
+
+/// Schedule component data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleData {
+    pub current_mode: String,
+    pub current_reason: String,
+    pub current_strategy: Option<String>, // Strategy that chose this mode
+    pub expected_profit: Option<f32>,     // Expected profit for current block (CZK)
+    pub next_change: Option<DateTime<Utc>>,
+    pub blocks_today: usize,
+    pub target_soc_max: f32,                // Max battery SOC for charging
+    pub target_soc_min: f32,                // Min battery SOC for discharging
+    pub total_expected_profit: Option<f32>, // Total expected profit for all blocks (CZK)
+
+    // Schedule metadata for transparency
+    pub total_blocks_scheduled: usize, // Total blocks in schedule
+    pub schedule_hours: f32,           // Hours of schedule data
+    pub schedule_generated_at: DateTime<Utc>, // When schedule was created
+    pub schedule_ends_at: Option<DateTime<Utc>>, // When schedule data ends
+}
+
+/// Price component data with chart
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceData {
+    pub current_price: f32,
+    pub min_price: f32,
+    pub max_price: f32,
+    pub avg_price: f32,
+    pub blocks: Vec<PriceBlockData>,
+}
+
+/// Individual price block
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceBlockData {
+    pub timestamp: DateTime<Utc>,
+    pub price: f32,
+    pub block_type: String,           // "charge", "discharge", "self-use"
+    pub target_soc: Option<f32>,      // Target SOC for charge/discharge blocks
+    pub strategy: Option<String>,     // Strategy that chose this mode
+    pub expected_profit: Option<f32>, // Expected profit for this block (CZK)
+    pub reason: Option<String>,       // Detailed reason for the decision
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_info: Option<crate::strategy::BlockDebugInfo>, // Debug info (only when log_level=debug)
+    pub is_historical: bool, // True if block is in the past (shows regenerated schedule, not actual history)
+}
+
+/// System health data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemHealthData {
+    pub inverter_source: bool,
+    pub price_source: bool,
+    pub last_update: DateTime<Utc>,
+    pub errors: Vec<String>,
+}
+
+/// Query error types
+#[derive(Debug)]
+pub enum QueryError {
+    ChannelClosed,
+    ResponseTimeout,
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChannelClosed => write!(f, "Query channel closed"),
+            Self::ResponseTimeout => write!(f, "Response timeout"),
+        }
+    }
+}
+
+impl std::error::Error for QueryError {}
+
+/// Config update error types
+#[derive(Debug)]
+pub enum ConfigUpdateError {
+    ChannelClosed,
+}
+
+impl std::fmt::Display for ConfigUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChannelClosed => write!(f, "Config update channel closed"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigUpdateError {}
+
+type InverterQuery<'a> = (
+    &'a Inverter,
+    &'a CurrentMode,
+    Option<&'a BatteryStatus>,
+    Option<&'a GridPower>,
+    Option<&'a PowerGeneration>,
+    Option<&'a InverterStatus>,
+    Option<&'a RawInverterState>,
+);
+
+/// Extract strategy name and expected profit from reason string
+/// Format: "Strategy - reason (expected profit: X.XX CZK)"
+fn extract_strategy_info(reason: &str) -> (Option<String>, Option<f32>) {
+    // Try to extract strategy name (before first " - ")
+    let strategy = reason.split(" - ").next().map(|s| s.trim().to_string());
+
+    // Try to extract profit (in parentheses at end)
+    let profit = if let Some(start) = reason.rfind("expected profit: ") {
+        let profit_str = &reason[start + 17..]; // Skip "expected profit: "
+        if let Some(end) = profit_str.find(" CZK") {
+            profit_str[..end].trim().parse::<f32>().ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (strategy, profit)
+}
+
+/// ECS system that processes web query requests
+#[allow(clippy::too_many_arguments)]
+pub fn web_query_system(
+    debug_config: Res<DebugModeConfig>,
+    system_config: Res<SystemConfig>,
+    mut channel: ResMut<WebQueryChannel>,
+    inverters: Query<InverterQuery>,
+    schedule: Query<&OperationSchedule>,
+    price_data: Query<&SpotPriceData>,
+    price_analysis: Query<&PriceAnalysis>,
+    battery_history: Res<BatteryHistory>,
+    pv_history: Res<PvHistory>,
+) {
+    // Process all pending queries
+    while let Ok(request) = channel.receiver.try_recv() {
+        trace!(
+            "Processing web query: {:?}",
+            std::any::type_name_of_val(&request.query_type)
+        );
+
+        let response = match request.query_type {
+            QueryType::Dashboard => build_dashboard_response(
+                &debug_config,
+                &system_config,
+                &inverters,
+                &schedule,
+                &price_data,
+                &price_analysis,
+                &battery_history,
+                &pv_history,
+            ),
+        };
+
+        // Send response (ignore if receiver dropped)
+        let _ = request.response_tx.send(response);
+    }
+}
+
+///Build dashboard response from ECS queries
+#[allow(clippy::too_many_arguments)]
+fn build_dashboard_response(
+    debug_config: &DebugModeConfig,
+    system_config: &SystemConfig,
+    inverters: &Query<InverterQuery>,
+    schedule: &Query<&OperationSchedule>,
+    price_data: &Query<&SpotPriceData>,
+    price_analysis: &Query<&PriceAnalysis>,
+    battery_history: &BatteryHistory,
+    pv_history: &PvHistory,
+) -> WebQueryResponse {
+    let now = Utc::now();
+
+    // Query inverter data
+    let inverter_data: Vec<InverterData> = inverters
+        .iter()
+        .map(|(inv, mode, battery, grid, pv, status, raw_state)| {
+            InverterData {
+                // Core identification
+                id: inv.id.clone(),
+                topology: get_topology_string(&inv.id, system_config),
+
+                // Current mode
+                mode: format!("{}", mode.mode),
+                mode_reason: mode.reason.clone(),
+
+                // Battery
+                battery_soc: battery.map(|b| b.soc_percent as f32).unwrap_or(0.0),
+                battery_power_w: battery.map(|b| b.power_w as f32).unwrap_or(0.0),
+                battery_voltage_v: battery.map(|b| b.voltage_v).unwrap_or(0.0),
+                battery_current_a: battery.map(|b| b.current_a).unwrap_or(0.0),
+                battery_temperature_c: battery.map(|b| b.temperature_c).unwrap_or(0.0),
+
+                // Grid
+                grid_power_w: grid.map(|g| g.export_power_w as f32).unwrap_or(0.0),
+                grid_voltage_v: grid.map(|g| g.grid_voltage_v).unwrap_or(0.0),
+                grid_frequency_hz: grid.map(|g| g.grid_frequency_hz).unwrap_or(0.0),
+
+                // PV Generation
+                pv_power_w: pv.map(|p| p.current_power_w as f32).unwrap_or(0.0),
+                pv1_power_w: pv.map(|p| p.pv1_power_w as f32).unwrap_or(0.0),
+                pv2_power_w: pv.map(|p| p.pv2_power_w as f32).unwrap_or(0.0),
+                daily_energy_kwh: pv.map(|p| p.daily_energy_kwh).unwrap_or(0.0),
+                total_energy_kwh: pv.map(|p| p.total_energy_kwh).unwrap_or(0.0),
+
+                // Status
+                online: status.map(|s| s.connection_healthy).unwrap_or(false),
+                run_mode: status
+                    .map(|s| format!("{:?}", s.run_mode))
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                error_code: status.map(|s| s.error_code).unwrap_or(0),
+                inverter_temperature_c: status.map(|s| s.temperature_c).unwrap_or(0.0),
+
+                // Extended data from RawInverterState
+                house_load_w: raw_state.and_then(|r| r.state.house_load_w),
+                grid_import_w: raw_state.and_then(|r| r.state.grid_import_w),
+                grid_export_w: raw_state.and_then(|r| r.state.grid_export_w),
+                grid_import_today_kwh: raw_state.and_then(|r| r.state.grid_import_today_kwh),
+                grid_export_today_kwh: raw_state.and_then(|r| r.state.grid_export_today_kwh),
+                inverter_frequency_hz: raw_state.and_then(|r| r.state.inverter_frequency_hz),
+                inverter_voltage_v: raw_state.and_then(|r| r.state.inverter_voltage_v),
+                inverter_current_a: raw_state.and_then(|r| r.state.inverter_current_a),
+                inverter_power_w: raw_state.and_then(|r| r.state.inverter_power_w),
+                battery_capacity_kwh: raw_state.and_then(|r| r.state.battery_capacity_kwh),
+                battery_input_energy_today_kwh: raw_state
+                    .and_then(|r| r.state.battery_input_energy_today_kwh),
+                battery_output_energy_today_kwh: raw_state
+                    .and_then(|r| r.state.battery_output_energy_today_kwh),
+                today_solar_energy_kwh: raw_state.and_then(|r| r.state.today_solar_energy_kwh),
+                total_solar_energy_kwh: raw_state.and_then(|r| r.state.total_solar_energy_kwh),
+            }
+        })
+        .collect();
+
+    // Query schedule data
+    let schedule_data = schedule.single().ok().and_then(|sched| {
+        sched.get_current_mode(now).map(|current| {
+            // Find next change
+            let next_change = sched
+                .scheduled_blocks
+                .iter()
+                .find(|block| block.block_start > now)
+                .map(|block| block.block_start);
+
+            // Extract strategy and profit from reason string
+            // Format: "Strategy - reason (expected profit: X.XX CZK)"
+            let (strategy, profit) = extract_strategy_info(&current.reason);
+
+            // Calculate total expected profit from all blocks
+            let total_profit = sched
+                .scheduled_blocks
+                .iter()
+                .filter_map(|block| extract_strategy_info(&block.reason).1)
+                .sum::<f32>();
+
+            // Calculate schedule metadata
+            let total_blocks = sched.scheduled_blocks.len();
+            let schedule_hours = total_blocks as f32 / 4.0;
+            let schedule_ends_at = sched.scheduled_blocks.last().map(|b| b.block_start);
+
+            ScheduleData {
+                current_mode: format!("{}", current.mode),
+                current_reason: current.reason.clone(),
+                current_strategy: strategy,
+                expected_profit: profit,
+                next_change,
+                blocks_today: sched.scheduled_blocks.len(),
+                target_soc_max: system_config.control_config.max_battery_soc,
+                target_soc_min: system_config.control_config.min_battery_soc,
+                total_expected_profit: Some(total_profit),
+                total_blocks_scheduled: total_blocks,
+                schedule_hours,
+                schedule_generated_at: sched.generated_at,
+                schedule_ends_at,
+            }
+        })
+    });
+
+    // Query price data and enrich with schedule info
+    let price_data_result = price_data
+        .single()
+        .ok()
+        .zip(price_analysis.single().ok())
+        .map(|(prices, analysis)| {
+            // Get schedule for matching blocks with strategy info
+            let sched = schedule.single().ok();
+
+            // Build price blocks with classification
+            let blocks: Vec<PriceBlockData> = prices
+                .time_block_prices
+                .iter()
+                .enumerate()
+                .map(|(idx, block)| {
+                    // CRITICAL: Match schedule blocks by TIMESTAMP, not array index
+                    // This is essential because schedule may have filtered past blocks,
+                    // causing index misalignment with price data blocks.
+                    let (block_type, target_soc, strategy, profit, reason, debug_info) = sched
+                        .and_then(|s| {
+                            // Find the scheduled block that matches this price block's timestamp
+                            s.scheduled_blocks
+                                .iter()
+                                .find(|sb| sb.block_start == block.block_start)
+                        })
+                        .map(|sb| {
+                            let (strat, prof) = extract_strategy_info(&sb.reason);
+                            let block_type_str = match sb.mode {
+                                InverterOperationMode::ForceCharge => "charge",
+                                InverterOperationMode::ForceDischarge => "discharge",
+                                InverterOperationMode::SelfUse => "self-use",
+                                InverterOperationMode::BackUpMode => "backup",
+                            };
+                            let target_soc = match sb.mode {
+                                InverterOperationMode::ForceCharge => {
+                                    Some(system_config.control_config.max_battery_soc)
+                                }
+                                InverterOperationMode::ForceDischarge => {
+                                    Some(system_config.control_config.min_battery_soc)
+                                }
+                                InverterOperationMode::SelfUse
+                                | InverterOperationMode::BackUpMode => None,
+                            };
+                            (
+                                block_type_str.to_string(),
+                                target_soc,
+                                strat,
+                                prof,
+                                Some(sb.reason.clone()),
+                                sb.debug_info.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            // Fallback to analysis only if no matching schedule block found
+                            let (block_type, target_soc) = if analysis.charge_blocks.contains(&idx)
+                            {
+                                (
+                                    "charge".to_string(),
+                                    Some(system_config.control_config.max_battery_soc),
+                                )
+                            } else if analysis.discharge_blocks.contains(&idx) {
+                                (
+                                    "discharge".to_string(),
+                                    Some(system_config.control_config.min_battery_soc),
+                                )
+                            } else {
+                                ("self-use".to_string(), None)
+                            };
+                            (block_type, target_soc, None, None, None, None)
+                        });
+
+                    PriceBlockData {
+                        timestamp: block.block_start,
+                        price: block.price_czk_per_kwh,
+                        block_type,
+                        target_soc,
+                        strategy,
+                        expected_profit: profit,
+                        reason,
+                        debug_info,
+                        is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
+                    }
+                })
+                .collect();
+
+            // Find current price (closest to now)
+            let current_price = prices
+                .time_block_prices
+                .iter()
+                .min_by_key(|b| (b.block_start - now).num_seconds().abs())
+                .map(|b| b.price_czk_per_kwh)
+                .unwrap_or(0.0);
+
+            PriceData {
+                current_price,
+                min_price: analysis.price_range.min_czk_per_kwh,
+                max_price: analysis.price_range.max_czk_per_kwh,
+                avg_price: analysis.price_range.avg_czk_per_kwh,
+                blocks,
+            }
+        });
+
+    // Build health status
+    let has_inverter_data = !inverter_data.is_empty();
+    let has_price_data = price_data.single().is_ok();
+
+    let health = SystemHealthData {
+        inverter_source: has_inverter_data,
+        price_source: has_price_data,
+        last_update: now,
+        errors: vec![],
+    };
+
+    // Convert battery history to response format
+    let battery_soc_history = if !battery_history.is_empty() {
+        let history_points: Vec<BatterySocHistoryPoint> = battery_history
+            .points_chronological()
+            .iter()
+            .map(|point| BatterySocHistoryPoint {
+                timestamp: point.timestamp,
+                soc: point.soc,
+            })
+            .collect();
+
+        debug!(
+            "📊 Sending {} battery history points to web (oldest: {:.1}%, newest: {:.1}%)",
+            history_points.len(),
+            history_points.first().map(|p| p.soc).unwrap_or(0.0),
+            history_points.last().map(|p| p.soc).unwrap_or(0.0)
+        );
+
+        Some(history_points)
+    } else {
+        debug!("📊 No battery history available yet");
+        None
+    };
+
+    // Convert PV generation history to response format
+    let pv_generation_history = if !pv_history.is_empty() {
+        let pv_points: Vec<PvGenerationHistoryPoint> = pv_history
+            .points_chronological()
+            .iter()
+            .map(|point| PvGenerationHistoryPoint {
+                timestamp: point.timestamp,
+                power_w: point.power_w,
+            })
+            .collect();
+
+        debug!(
+            "☀️ Sending {} PV history points to web (oldest: {:.0}W, newest: {:.0}W)",
+            pv_points.len(),
+            pv_points.first().map(|p| p.power_w).unwrap_or(0.0),
+            pv_points.last().map(|p| p.power_w).unwrap_or(0.0)
+        );
+
+        Some(pv_points)
+    } else {
+        debug!("☀️ No PV generation history available yet");
+        None
+    };
+
+    trace!(
+        "Built dashboard response: {} inverters, schedule={}, prices={}, battery_history={}, pv_history={}",
+        inverter_data.len(),
+        schedule_data.is_some(),
+        price_data_result.is_some(),
+        battery_soc_history.is_some(),
+        pv_generation_history.is_some()
+    );
+
+    // Calculate battery SOC predictions based on schedule
+    let battery_soc_prediction = schedule.single().ok().and_then(|sched| {
+        // Get current battery SOC from first inverter
+        let current_soc = inverter_data
+            .first()
+            .map(|inv| inv.battery_soc)
+            .unwrap_or(50.0);
+
+        // Get current house load and PV power for accurate self-use predictions
+        let house_load_w = inverter_data.first().and_then(|inv| inv.house_load_w);
+        let pv_power_w = inverter_data.first().map(|inv| inv.pv_power_w);
+
+        // Generate prediction using configured charge/discharge rates
+        let prediction = crate::components::predict_battery_soc(
+            sched,
+            &system_config.control_config,
+            current_soc,
+            Some(system_config.control_config.max_battery_charge_rate_kw), // Use configured charge rate
+            Some(system_config.control_config.max_battery_charge_rate_kw), // Use same for discharge
+            house_load_w,
+            pv_power_w,
+        );
+
+        if prediction.is_empty() {
+            debug!("📈 No battery SOC predictions generated (empty schedule)");
+            None
+        } else {
+            let prediction_points: Vec<BatterySocPredictionPoint> = prediction
+                .points()
+                .iter()
+                .map(|point| BatterySocPredictionPoint {
+                    timestamp: point.timestamp,
+                    soc: point.soc_percent,
+                })
+                .collect();
+
+            debug!(
+                "📈 Generated {} battery SOC predictions (start: {:.1}%, end: {:.1}%)",
+                prediction_points.len(),
+                prediction_points.first().map(|p| p.soc).unwrap_or(0.0),
+                prediction_points.last().map(|p| p.soc).unwrap_or(0.0)
+            );
+
+            Some(prediction_points)
+        }
+    });
+
+    WebQueryResponse {
+        timestamp: now,
+        debug_mode: debug_config.is_enabled(),
+        inverters: inverter_data,
+        schedule: schedule_data,
+        prices: price_data_result,
+        health,
+        timezone: system_config.system_config.timezone.clone(),
+        battery_soc_history,
+        battery_soc_prediction,
+        pv_generation_history,
+    }
+}
+
+/// Helper to determine topology string from config
+fn get_topology_string(inverter_id: &str, config: &SystemConfig) -> String {
+    if let Some(inv_config) = config.inverters.iter().find(|i| i.id == inverter_id) {
+        match &inv_config.topology {
+            crate::resources::InverterTopology::Independent => "Independent".to_string(),
+            crate::resources::InverterTopology::Master { slave_ids } => {
+                format!("Master ({} slaves)", slave_ids.len())
+            }
+            crate::resources::InverterTopology::Slave { master_id } => {
+                format!("Slave of {}", master_id)
+            }
+        }
+    } else {
+        "Unknown".to_string()
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "fluxion-integration-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fluxion-core = { path = "../fluxion-core" }
+fluxion-ha = { path = "../fluxion-ha" }
+fluxion-solax = { path = "../fluxion-solax" }
+tokio = { workspace = true }
+
+[lib]
+# This is just a test crate, no library
+path = "src/lib.rs"
+
+[[test]]
+name = "ha_integration"
+path = "tests/ha_integration.rs"

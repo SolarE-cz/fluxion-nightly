@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="{{i18n.language().code()}}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{t("config-page-title")}} - FluxION</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            margin: 0 0 10px 0;
+            color: #333;
+        }
+        .subtitle {
+            color: #666;
+            margin: 0 0 30px 0;
+        }
+        .section {
+            margin: 30px 0;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .section-header {
+            background: #f8f8f8;
+            padding: 15px 20px;
+            cursor: pointer;
+            user-select: none;
+            border-bottom: 1px solid #ddd;
+        }
+        .section-header:hover {
+            background: #f0f0f0;
+        }
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 0 0 5px 0;
+        }
+        .section-desc {
+            font-size: 14px;
+            color: #666;
+            margin: 0;
+        }
+        .section-content {
+            padding: 20px;
+            display: none;
+        }
+        .section.expanded .section-content {
+            display: block;
+        }
+        .form-group {
+            margin: 20px 0;
+        }
+        .form-label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 5px;
+            color: #333;
+        }
+        .form-help {
+            display: block;
+            font-size: 13px;
+            color: #666;
+            margin-top: 3px;
+        }
+        .form-input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        .form-input:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 24px;
+        }
+        .toggle-input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 24px;
+        }
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+        .toggle-input:checked + .toggle-slider {
+            background-color: #4CAF50;
+        }
+        .toggle-input:checked + .toggle-slider:before {
+            transform: translateX(26px);
+        }
+        .button-group {
+            margin-top: 30px;
+            display: flex;
+            gap: 10px;
+        }
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .btn-primary {
+            background: #4CAF50;
+            color: white;
+        }
+        .btn-primary:hover {
+            background: #45a049;
+        }
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+        .notification {
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        .notification.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .notification.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{{t("config-page-title")}}</h1>
+        <p class="subtitle">{{t("config-page-subtitle")}}</p>
+
+        <div id="notification" class="notification"></div>
+
+        <form id="config-form">
+            <!-- System Section -->
+            <div class="section expanded">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">{{t("config-section-system")}}</div>
+                    <div class="section-desc">{{t("config-section-system-desc")}}</div>
+                </div>
+                <div class="section-content">
+                    <div class="form-group">
+                        <label class="form-label" for="debug_mode">
+                            {{t("config-system-debug-mode")}}
+                        </label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="debug_mode" class="toggle-input" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="form-help">{{t("config-system-debug-mode-help")}}</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="update_interval">
+                            {{t("config-system-update-interval")}}
+                        </label>
+                        <input type="number" id="update_interval" class="form-input" value="60" min="10" max="600">
+                        <span class="form-help">{{t("config-system-update-interval-help")}}</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="log_level">
+                            {{t("config-system-log-level")}}
+                        </label>
+                        <select id="log_level" class="form-input">
+                            <option value="error">Error</option>
+                            <option value="warn">Warn</option>
+                            <option value="info" selected>Info</option>
+                            <option value="debug">Debug</option>
+                            <option value="trace">Trace</option>
+                        </select>
+                        <span class="form-help">{{t("config-system-log-level-help")}}</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="display_currency">
+                            {{t("config-system-display-currency")}}
+                        </label>
+                        <select id="display_currency" class="form-input">
+                            <option value="EUR">EUR (€)</option>
+                            <option value="USD">USD ($)</option>
+                            <option value="CZK" selected>CZK (Kč)</option>
+                        </select>
+                        <span class="form-help">{{t("config-system-display-currency-help")}}</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="language">
+                            {{t("config-system-language")}}
+                        </label>
+                        <select id="language" class="form-input">
+                            <option value="english">English</option>
+                            <option value="czech">Čeština</option>
+                        </select>
+                        <span class="form-help">{{t("config-system-language-help")}}</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Additional sections would follow the same pattern -->
+            <div class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">{{t("config-section-inverters")}}</div>
+                    <div class="section-desc">{{t("config-section-inverters-desc")}}</div>
+                </div>
+                <div class="section-content">
+                    <p style="color: #666;">Inverter configuration UI - to be implemented</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">{{t("config-section-pricing")}}</div>
+                    <div class="section-desc">{{t("config-section-pricing-desc")}}</div>
+                </div>
+                <div class="section-content">
+                    <p style="color: #666;">Pricing configuration UI - to be implemented</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">{{t("config-section-control")}}</div>
+                    <div class="section-desc">{{t("config-section-control-desc")}}</div>
+                </div>
+                <div class="section-content">
+                    <p style="color: #666;">Control parameters UI - to be implemented</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header" onclick="toggleSection(this)">
+                    <div class="section-title">{{t("config-section-strategies")}}</div>
+                    <div class="section-desc">{{t("config-section-strategies-desc")}}</div>
+                </div>
+                <div class="section-content">
+                    <p style="color: #666;">Strategy configuration UI - to be implemented</p>
+                </div>
+            </div>
+
+            <div class="button-group">
+                <button type="submit" class="btn btn-primary">{{t("config-save-button")}}</button>
+                <button type="button" class="btn btn-secondary" onclick="window.location.href='/'">{{t("config-cancel-button")}}</button>
+                <button type="button" class="btn btn-secondary" onclick="exportConfig()">{{t("config-export-button")}}</button>
+            </div>
+        </form>
+    </div>
+
+    <script>
+        function toggleSection(header) {
+            const section = header.parentElement;
+            section.classList.toggle('expanded');
+        }
+
+        async function exportConfig() {
+            window.location.href = '/api/config/export';
+        }
+
+        document.getElementById('config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            // Collect form data (simplified)
+            const config = {
+                system: {
+                    debug_mode: document.getElementById('debug_mode').checked,
+                    update_interval_secs: parseInt(document.getElementById('update_interval').value),
+                    log_level: document.getElementById('log_level').value,
+                    display_currency: document.getElementById('display_currency').value,
+                    language: document.getElementById('language').value,
+                },
+                // Other sections would be collected here
+            };
+
+            try {
+                const response = await fetch('/api/config/update', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        config: config,
+                        create_backup: true,
+                    }),
+                });
+
+                const result = await response.json();
+                
+                const notification = document.getElementById('notification');
+                if (result.success) {
+                    notification.className = 'notification success';
+                    notification.textContent = '{{t("config-save-success")}}';
+                    notification.style.display = 'block';
+                } else {
+                    notification.className = 'notification error';
+                    notification.textContent = '{{t("config-save-error")}}';
+                    notification.style.display = 'block';
+                }
+
+                setTimeout(() => {
+                    notification.style.display = 'none';
+                }, 5000);
+            } catch (error) {
+                const notification = document.getElementById('notification');
+                notification.className = 'notification error';
+                notification.textContent = '{{t("config-save-error")}}';
+                notification.style.display = 'block';
+            }
+        });
+
+        // Load current config on page load
+        async function loadConfig() {
+            try {
+                const response = await fetch('/api/config');
+                const data = await response.json();
+                
+                // Populate form with current values (simplified)
+                if (data.config.system) {
+                    document.getElementById('debug_mode').checked = data.config.system.debug_mode || false;
+                    document.getElementById('update_interval').value = data.config.system.update_interval_secs || 60;
+                    document.getElementById('log_level').value = data.config.system.log_level || 'info';
+                    document.getElementById('display_currency').value = data.config.system.display_currency || 'CZK';
+                    document.getElementById('language').value = data.config.system.language || 'english';
+                }
+            } catch (error) {
+                console.error('Failed to load config:', error);
+            }
+        }
+
+        // Load config when page loads
+        loadConfig();
+    </script>
+</body>
+</html>

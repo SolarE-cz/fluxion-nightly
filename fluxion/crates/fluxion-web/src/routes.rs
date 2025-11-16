@@ -1,0 +1,447 @@
+// Copyright (c) 2025 SOLARE S.R.O.
+//
+// This file is part of FluxION.
+//
+// Licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+// (CC BY-NC-ND 4.0). You may use and share this file for non-commercial purposes only and you may not
+// create derivatives. See <https://creativecommons.org/licenses/by-nc-nd/4.0/>.
+//
+// This software is provided "AS IS", without warranty of any kind.
+//
+// For commercial licensing, please contact: info@solare.cz
+
+use askama::Template;
+use chrono::Timelike;
+use chrono_tz::Tz;
+use fluxion_core::{InverterData, ScheduleData, SystemHealthData, WebQueryResponse};
+use fluxion_i18n::I18n;
+use std::sync::Arc;
+
+/// Price data for Chart.js rendering
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PriceDataWithChart {
+    pub current_price: f32,
+    pub min_price: f32,
+    pub max_price: f32,
+    pub avg_price: f32,
+    pub chart_data: ChartData,
+}
+
+/// Battery SOC history point for Chart.js
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SocHistoryPoint {
+    pub label: String,
+    pub soc: f32,
+}
+
+/// Battery SOC prediction point for Chart.js
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SocPredictionPoint {
+    pub label: String,
+    pub soc: f32,
+}
+
+/// PV generation history point for Chart.js
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PvHistoryPoint {
+    pub label: String,
+    pub power_w: f32,
+}
+
+/// Chart data for Chart.js
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChartData {
+    pub labels: Vec<String>,
+    pub prices: Vec<f32>,
+    pub modes: Vec<String>,
+    pub target_socs: Vec<Option<f32>>,
+    pub strategies: Vec<Option<String>>,
+    pub profits: Vec<Option<f32>>,
+    pub current_time_label: Option<String>,
+    pub battery_soc_history: Vec<SocHistoryPoint>,
+    pub battery_soc_prediction: Vec<SocPredictionPoint>,
+    pub current_battery_soc: Option<f32>,
+    pub pv_generation_history: Vec<PvHistoryPoint>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub debug_info: Vec<Option<fluxion_core::strategy::BlockDebugInfo>>,
+    pub is_historical: Vec<bool>, // True for past blocks (shows regenerated schedule, not actual history)
+}
+
+/// Live data template (for SSE updates only)
+#[derive(Template)]
+#[template(path = "live_data.html", escape = "none")]
+pub struct LiveDataTemplate {
+    #[expect(
+        dead_code,
+        reason = "Header with debug badge moved outside SSE update area"
+    )]
+    pub debug_mode: bool,
+    pub inverters: Vec<InverterData>,
+    pub schedule: Option<ScheduleData>,
+    pub prices: Option<PriceDataWithChart>,
+    pub health: SystemHealthData,
+    pub i18n: Arc<I18n>,
+    pub last_update_formatted: String,
+    pub next_change_formatted: Option<String>,
+}
+
+impl LiveDataTemplate {
+    pub fn t(&self, key: &str) -> String {
+        self.i18n.get(key).unwrap_or_else(|_| key.to_owned())
+    }
+}
+
+/// Dashboard template
+#[derive(Template)]
+#[template(path = "index.html", escape = "none")]
+pub struct DashboardTemplate {
+    pub debug_mode: bool,
+    pub inverters: Vec<InverterData>,
+    pub schedule: Option<ScheduleData>,
+    pub prices: Option<PriceDataWithChart>,
+    pub chart_data_json: String,
+    pub health: SystemHealthData,
+    pub i18n: Arc<I18n>,
+    #[expect(dead_code, reason = "May be used in future template updates")]
+    pub timezone: Option<String>,
+    pub last_update_formatted: String,
+    pub next_change_formatted: Option<String>,
+    /// Ingress path prefix for HA Ingress support (e.g., "/hassio/ingress/641a79a3_fluxion")
+    /// Empty string when running standalone
+    pub ingress_path: String,
+}
+
+impl DashboardTemplate {
+    /// Helper method for translations in templates
+    pub fn t(&self, key: &str) -> String {
+        self.i18n.get(key).unwrap_or_else(|_| key.to_owned())
+    }
+
+    /// Create template from ECS query response
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Template construction requires processing multiple data sources"
+    )]
+    pub fn from_query_response(
+        response: WebQueryResponse,
+        i18n: Arc<I18n>,
+        ingress_path: String,
+    ) -> Self {
+        let timezone = response.timezone.clone();
+
+        // Format last update time in the correct timezone
+        let last_update_formatted = if let Some(tz_name) = &timezone {
+            if let Ok(tz) = tz_name.parse::<Tz>() {
+                response
+                    .health
+                    .last_update
+                    .with_timezone(&tz)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            } else {
+                response
+                    .health
+                    .last_update
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string()
+            }
+        } else {
+            response
+                .health
+                .last_update
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+
+        // Format next change time if available
+        let next_change_formatted = if let Some(ref schedule) = response.schedule {
+            schedule.next_change.map(|next| {
+                if let Some(tz_name) = &timezone
+                    && let Ok(tz) = tz_name.parse::<Tz>()
+                {
+                    return next.with_timezone(&tz).format("%H:%M:%S").to_string();
+                }
+                next.format("%H:%M:%S").to_string()
+            })
+        } else {
+            None
+        };
+
+        // Prepare chart data for Chart.js from price data if available
+        let prices = response.prices.map(|price_data| {
+            let mut labels = Vec::new();
+            let mut prices = Vec::new();
+            let mut modes = Vec::new();
+            let mut target_socs = Vec::new();
+            let mut strategies = Vec::new();
+            let mut profits = Vec::new();
+            let mut debug_info_vec = Vec::new();
+            let mut is_historical_vec = Vec::new();
+
+            // Get current time in the appropriate timezone for the "now" marker
+            // Round to nearest 15-minute block to match chart data
+            let now = chrono::Utc::now();
+            let minutes = now.minute();
+            #[expect(
+                clippy::integer_division,
+                reason = "Intentional integer division to round to 15-minute blocks"
+            )]
+            let rounded_minutes = (minutes / 15) * 15; // Round down to 15-min block
+            let rounded_time = now
+                .with_minute(rounded_minutes)
+                .and_then(|t| t.with_second(0))
+                .and_then(|t| t.with_nanosecond(0))
+                .unwrap_or(now);
+
+            let current_time_label = if let Some(tz_name) = &timezone {
+                if let Ok(tz) = tz_name.parse::<Tz>() {
+                    Some(
+                        rounded_time
+                            .with_timezone(&tz)
+                            .format("%m-%d %H:%M")
+                            .to_string(),
+                    )
+                } else {
+                    Some(rounded_time.format("%m-%d %H:%M").to_string())
+                }
+            } else {
+                Some(rounded_time.format("%m-%d %H:%M").to_string())
+            };
+
+            for block in &price_data.blocks {
+                // Format time label in the correct timezone
+                let label = if let Some(tz_name) = &timezone {
+                    if let Ok(tz) = tz_name.parse::<Tz>() {
+                        block
+                            .timestamp
+                            .with_timezone(&tz)
+                            .format("%m-%d %H:%M")
+                            .to_string()
+                    } else {
+                        block.timestamp.format("%m-%d %H:%M").to_string()
+                    }
+                } else {
+                    block.timestamp.format("%m-%d %H:%M").to_string()
+                };
+
+                labels.push(label);
+                prices.push(block.price);
+                target_socs.push(block.target_soc);
+                strategies.push(block.strategy.clone());
+                profits.push(block.expected_profit);
+                debug_info_vec.push(block.debug_info.clone());
+                is_historical_vec.push(block.is_historical); // Track if block is past (regenerated schedule)
+
+                // Map mode for display
+                let mode = match block.block_type.as_str() {
+                    "charge" => "Force Charge",
+                    "discharge" => "Force Discharge",
+                    _ => "Self-Use",
+                };
+                modes.push(mode.to_owned());
+            }
+
+            // Convert battery SOC history to chart format
+            let battery_soc_history = response.battery_soc_history.as_ref().map_or_else(
+                || {
+                    tracing::warn!("📊 [WEB ROUTES] No battery history from ECS, using empty vec");
+                    Vec::new()
+                },
+                |history| {
+                    tracing::debug!(
+                        "📊 [WEB ROUTES] Converting {} history points from ECS to chart format",
+                        history.len()
+                    );
+                    if !history.is_empty() {
+                        tracing::debug!(
+                            "📊 [WEB ROUTES] History range: {:.1}% ({}) -> {:.1}% ({})",
+                            history.first().map_or(0.0, |p| p.soc),
+                            history
+                                .first()
+                                .map(|p| p.timestamp.format("%H:%M").to_string())
+                                .unwrap_or_default(),
+                            history.last().map_or(0.0, |p| p.soc),
+                            history
+                                .last()
+                                .map(|p| p.timestamp.format("%H:%M").to_string())
+                                .unwrap_or_default()
+                        );
+                    }
+
+                    history
+                        .iter()
+                        .map(|point| {
+                            let label = if let Some(tz_name) = &timezone {
+                                if let Ok(tz) = tz_name.parse::<Tz>() {
+                                    point
+                                        .timestamp
+                                        .with_timezone(&tz)
+                                        .format("%m-%d %H:%M")
+                                        .to_string()
+                                } else {
+                                    point.timestamp.format("%m-%d %H:%M").to_string()
+                                }
+                            } else {
+                                point.timestamp.format("%m-%d %H:%M").to_string()
+                            };
+                            SocHistoryPoint {
+                                label,
+                                soc: point.soc,
+                            }
+                        })
+                        .collect()
+                },
+            );
+
+            // Convert battery SOC prediction to chart format
+            let battery_soc_prediction = response.battery_soc_prediction.as_ref().map_or_else(
+                || {
+                    tracing::debug!(
+                        "📈 [WEB ROUTES] No battery prediction from ECS, using empty vec"
+                    );
+                    Vec::new()
+                },
+                |prediction| {
+                    tracing::debug!(
+                        "📈 [WEB ROUTES] Converting {} prediction points from ECS to chart format",
+                        prediction.len()
+                    );
+                    if !prediction.is_empty() {
+                        tracing::debug!(
+                            "📈 [WEB ROUTES] Prediction range: {:.1}% ({}) -> {:.1}% ({})",
+                            prediction.first().map_or(0.0, |p| p.soc),
+                            prediction
+                                .first()
+                                .map(|p| p.timestamp.format("%H:%M").to_string())
+                                .unwrap_or_default(),
+                            prediction.last().map_or(0.0, |p| p.soc),
+                            prediction
+                                .last()
+                                .map(|p| p.timestamp.format("%H:%M").to_string())
+                                .unwrap_or_default()
+                        );
+                    }
+
+                    prediction
+                        .iter()
+                        .map(|point| {
+                            let label = if let Some(tz_name) = &timezone {
+                                if let Ok(tz) = tz_name.parse::<Tz>() {
+                                    point
+                                        .timestamp
+                                        .with_timezone(&tz)
+                                        .format("%m-%d %H:%M")
+                                        .to_string()
+                                } else {
+                                    point.timestamp.format("%m-%d %H:%M").to_string()
+                                }
+                            } else {
+                                point.timestamp.format("%m-%d %H:%M").to_string()
+                            };
+                            SocPredictionPoint {
+                                label,
+                                soc: point.soc,
+                            }
+                        })
+                        .collect()
+                },
+            );
+
+            let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
+
+            // Convert PV generation history to chart format
+            let pv_generation_history = response.pv_generation_history.as_ref().map_or_else(
+                || {
+                    tracing::debug!("☀️ [WEB ROUTES] No PV history from ECS, using empty vec");
+                    Vec::new()
+                },
+                |pv_history| {
+                    tracing::debug!(
+                        "☀️ [WEB ROUTES] Converting {} PV history points from ECS to chart format",
+                        pv_history.len()
+                    );
+                    if !pv_history.is_empty() {
+                        tracing::debug!(
+                            "☀️ [WEB ROUTES] PV range: {:.0}W ({}) -> {:.0}W ({})",
+                            pv_history.first().map_or(0.0, |p| p.power_w),
+                            pv_history
+                                .first()
+                                .map(|p| p.timestamp.format("%H:%M").to_string())
+                                .unwrap_or_default(),
+                            pv_history.last().map_or(0.0, |p| p.power_w),
+                            pv_history
+                                .last()
+                                .map(|p| p.timestamp.format("%H:%M").to_string())
+                                .unwrap_or_default()
+                        );
+                    }
+
+                    pv_history
+                        .iter()
+                        .map(|point| {
+                            let label = if let Some(tz_name) = &timezone {
+                                if let Ok(tz) = tz_name.parse::<Tz>() {
+                                    point
+                                        .timestamp
+                                        .with_timezone(&tz)
+                                        .format("%m-%d %H:%M")
+                                        .to_string()
+                                } else {
+                                    point.timestamp.format("%m-%d %H:%M").to_string()
+                                }
+                            } else {
+                                point.timestamp.format("%m-%d %H:%M").to_string()
+                            };
+                            PvHistoryPoint {
+                                label,
+                                power_w: point.power_w,
+                            }
+                        })
+                        .collect()
+                },
+            );
+
+            PriceDataWithChart {
+                current_price: price_data.current_price,
+                min_price: price_data.min_price,
+                max_price: price_data.max_price,
+                avg_price: price_data.avg_price,
+                chart_data: ChartData {
+                    labels,
+                    prices,
+                    modes,
+                    target_socs,
+                    strategies,
+                    profits,
+                    current_time_label,
+                    battery_soc_history,
+                    battery_soc_prediction,
+                    current_battery_soc,
+                    pv_generation_history,
+                    debug_info: debug_info_vec,
+                    is_historical: is_historical_vec,
+                },
+            }
+        });
+
+        // Serialize chart data to JSON for JavaScript
+        let chart_data_json = prices
+            .as_ref()
+            .and_then(|p| serde_json::to_string(&p.chart_data).ok())
+            .unwrap_or_else(|| "{\"labels\":[],\"prices\":[],\"modes\":[],\"target_socs\":[],\"strategies\":[],\"profits\":[]}".to_owned());
+
+        Self {
+            debug_mode: response.debug_mode,
+            inverters: response.inverters,
+            schedule: response.schedule,
+            prices,
+            chart_data_json,
+            health: response.health,
+            i18n,
+            timezone: response.timezone,
+            last_update_formatted,
+            next_change_formatted,
+            ingress_path,
+        }
+    }
+}
