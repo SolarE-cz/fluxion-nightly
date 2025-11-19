@@ -40,7 +40,11 @@ jobs:
 
       - name: Get version
         id: version
-        run: echo "version=$(grep 'version:' fluxion/fluxion/config.yaml | cut -d'"' -f2)" >> $GITHUB_OUTPUT
+        run: |
+          # Extract version from Cargo.toml
+          VERSION=$(grep -m1 '^version = ' fluxion/Cargo.toml | sed 's/version = "//;s/"//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
 
       - name: Map architecture
         id: arch
@@ -55,11 +59,11 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./fluxion/fluxion/Dockerfile
+          file: ./fluxion/Dockerfile
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:latest
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluxion-${{ matrix.arch }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
