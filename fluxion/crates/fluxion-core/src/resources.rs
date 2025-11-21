@@ -53,6 +53,37 @@ pub enum InverterTopology {
     Slave { master_id: String },
 }
 
+/// Schedule for fixed prices (flat or hourly)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PriceSchedule {
+    Flat(f32),
+    Hourly(Vec<f32>),
+}
+
+impl PriceSchedule {
+    /// Get price for a specific hour (0-23)
+    pub fn get_price(&self, hour: usize) -> f32 {
+        match self {
+            PriceSchedule::Flat(price) => *price,
+            PriceSchedule::Hourly(prices) => {
+                if prices.is_empty() {
+                    return 0.0;
+                }
+                // Handle wrapping or clamping if needed, but generally expect 24 items
+                // If less than 24, cycle or clamp? Let's cycle for safety.
+                prices[hour % prices.len()]
+            }
+        }
+    }
+}
+
+impl Default for PriceSchedule {
+    fn default() -> Self {
+        PriceSchedule::Flat(0.0)
+    }
+}
+
 /// Pricing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingConfig {
@@ -62,8 +93,16 @@ pub struct PricingConfig {
     pub tomorrow_price_entity: Option<String>,
     pub use_spot_prices_to_buy: bool,
     pub use_spot_prices_to_sell: bool,
-    pub fixed_buy_price_czk: f32,
-    pub fixed_sell_price_czk: f32,
+    pub fixed_buy_price_czk: PriceSchedule,
+    pub fixed_sell_price_czk: PriceSchedule,
+    
+    // Spot market fees
+    #[serde(default = "default_spot_buy_fee")]
+    pub spot_buy_fee_czk: f32,
+    #[serde(default = "default_spot_sell_fee")]
+    pub spot_sell_fee_czk: f32,
+    #[serde(default = "default_grid_distribution_fee")]
+    pub grid_distribution_fee_czk: f32,
 }
 
 /// Control configuration
@@ -135,6 +174,15 @@ fn default_min_consecutive_force_blocks() -> usize {
 }
 fn default_battery_operation_mode() -> InverterOperationMode {
     InverterOperationMode::SelfUse
+}
+fn default_spot_buy_fee() -> f32 {
+    0.5
+}
+fn default_spot_sell_fee() -> f32 {
+    0.5
+}
+fn default_grid_distribution_fee() -> f32 {
+    1.2
 }
 
 impl Default for ControlConfig {
@@ -304,5 +352,39 @@ impl I18nResource {
     #[must_use]
     pub fn inner(&self) -> &I18n {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_price_schedule_flat() {
+        let schedule = PriceSchedule::Flat(5.0);
+        assert_eq!(schedule.get_price(0), 5.0);
+        assert_eq!(schedule.get_price(12), 5.0);
+        assert_eq!(schedule.get_price(23), 5.0);
+    }
+
+    #[test]
+    fn test_price_schedule_hourly() {
+        let prices: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let schedule = PriceSchedule::Hourly(prices);
+        assert_eq!(schedule.get_price(0), 0.0);
+        assert_eq!(schedule.get_price(12), 12.0);
+        assert_eq!(schedule.get_price(23), 23.0);
+        
+        // Test wrapping
+        assert_eq!(schedule.get_price(24), 0.0);
+    }
+
+    #[test]
+    fn test_price_schedule_hourly_incomplete() {
+        let prices = vec![10.0, 20.0];
+        let schedule = PriceSchedule::Hourly(prices);
+        assert_eq!(schedule.get_price(0), 10.0);
+        assert_eq!(schedule.get_price(1), 20.0);
+        assert_eq!(schedule.get_price(2), 10.0); // Wraps
     }
 }

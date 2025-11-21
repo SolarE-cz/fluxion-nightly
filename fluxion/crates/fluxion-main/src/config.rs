@@ -89,6 +89,18 @@ pub struct PricingConfig {
     /// Fixed hourly sell prices (CZK/kWh) - fallback when spot disabled
     /// Can be 24 values (hourly) - will be expanded to 96 (15-min blocks)
     pub fixed_sell_prices: Vec<f32>,
+
+    /// Spot market buy fee (CZK/kWh)
+    #[serde(default = "default_spot_buy_fee")]
+    pub spot_buy_fee: f32,
+
+    /// Spot market sell fee (CZK/kWh)
+    #[serde(default = "default_spot_sell_fee")]
+    pub spot_sell_fee: f32,
+
+    /// Grid distribution fee (CZK/kWh) - added to import price
+    #[serde(default = "default_grid_distribution_fee")]
+    pub spot_grid_fee: f32,
 }
 
 /// Control configuration
@@ -192,6 +204,18 @@ fn default_min_consecutive_force_blocks() -> usize {
 
 fn default_battery_mode() -> String {
     "SelfUse".to_string() // Default to self-use mode for backward compatibility
+}
+
+fn default_spot_buy_fee() -> f32 {
+    0.5
+}
+
+fn default_spot_sell_fee() -> f32 {
+    0.5
+}
+
+fn default_grid_distribution_fee() -> f32 {
+    1.2
 }
 
 /// System configuration
@@ -329,6 +353,9 @@ impl Default for AppConfig {
                 use_spot_prices_to_sell: true,
                 fixed_buy_prices: vec![0.05; 24], // 24 hourly values
                 fixed_sell_prices: vec![0.08; 24],
+                spot_buy_fee: default_spot_buy_fee(),
+                spot_sell_fee: default_spot_sell_fee(),
+                spot_grid_fee: default_grid_distribution_fee(),
             },
             control: ControlConfig {
                 maximum_export_power_w: 5000,
@@ -844,18 +871,37 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 tomorrow_price_entity: app_config.pricing.tomorrow_price_entity,
                 use_spot_prices_to_buy: app_config.pricing.use_spot_prices_to_buy,
                 use_spot_prices_to_sell: app_config.pricing.use_spot_prices_to_sell,
-                fixed_buy_price_czk: app_config
-                    .pricing
-                    .fixed_buy_prices
-                    .first()
-                    .copied()
-                    .unwrap_or(0.05),
-                fixed_sell_price_czk: app_config
-                    .pricing
-                    .fixed_sell_prices
-                    .first()
-                    .copied()
-                    .unwrap_or(0.08),
+                fixed_buy_price_czk: if app_config.pricing.fixed_buy_prices.len() == 1 {
+                    fluxion_core::PriceSchedule::Flat(app_config.pricing.fixed_buy_prices[0])
+                } else if !app_config.pricing.fixed_buy_prices.is_empty() {
+                    // If we have 96 values, we should probably downsample or handle it, 
+                    // but for now let's just take the first 24 if it's > 24 to match hourly expectation
+                    // or just pass it all if PriceSchedule is robust.
+                    // Given PriceSchedule expects hourly for now, let's take every 4th if len == 96
+                    if app_config.pricing.fixed_buy_prices.len() == 96 {
+                        let hourly: Vec<f32> = app_config.pricing.fixed_buy_prices.iter().step_by(4).copied().collect();
+                        fluxion_core::PriceSchedule::Hourly(hourly)
+                    } else {
+                        fluxion_core::PriceSchedule::Hourly(app_config.pricing.fixed_buy_prices.clone())
+                    }
+                } else {
+                    fluxion_core::PriceSchedule::Flat(5.00)
+                },
+                fixed_sell_price_czk: if app_config.pricing.fixed_sell_prices.len() == 1 {
+                    fluxion_core::PriceSchedule::Flat(app_config.pricing.fixed_sell_prices[0])
+                } else if !app_config.pricing.fixed_sell_prices.is_empty() {
+                    if app_config.pricing.fixed_sell_prices.len() == 96 {
+                        let hourly: Vec<f32> = app_config.pricing.fixed_sell_prices.iter().step_by(4).copied().collect();
+                        fluxion_core::PriceSchedule::Hourly(hourly)
+                    } else {
+                        fluxion_core::PriceSchedule::Hourly(app_config.pricing.fixed_sell_prices.clone())
+                    }
+                } else {
+                    fluxion_core::PriceSchedule::Flat(2.00)
+                },
+                spot_buy_fee_czk: app_config.pricing.spot_buy_fee,
+                spot_sell_fee_czk: app_config.pricing.spot_sell_fee,
+                grid_distribution_fee_czk: app_config.pricing.spot_grid_fee,
             },
             control_config: fluxion_core::ControlConfig {
                 force_charge_hours: app_config.control.force_charge_hours,

@@ -14,6 +14,7 @@ pub mod async_runtime;
 pub mod async_systems;
 pub mod async_tasks;
 pub mod components;
+pub mod ote_market_data;
 pub mod config_events;
 pub mod continuous_systems;
 pub mod debug;
