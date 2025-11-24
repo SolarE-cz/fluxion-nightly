@@ -23,12 +23,9 @@
 
 use crate::components::{InverterOperationMode, TimeBlockPrice};
 use crate::strategy::seasonal_mode::SeasonalMode;
-use crate::strategy::{
-    Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext,
-};
+use crate::strategy::{Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext};
 
 use std::collections::HashSet;
-
 
 /// Discharge configuration for a specific season
 #[derive(Debug, Clone)]
@@ -110,7 +107,10 @@ impl SmartDischargeStrategy {
     }
 
     /// Get configuration for current season
-    fn _get_config_for_season(&self, date: chrono::DateTime<chrono::Utc>) -> &DischargeSeasonConfig {
+    fn _get_config_for_season(
+        &self,
+        date: chrono::DateTime<chrono::Utc>,
+    ) -> &DischargeSeasonConfig {
         match SeasonalMode::from_date(date) {
             SeasonalMode::Summer => &self._summer_config,
             SeasonalMode::Winter => &self._winter_config,
@@ -152,15 +152,14 @@ impl SmartDischargeStrategy {
         let fixed_import_fee = pricing_config.grid_distribution_fee_czk;
         let fixed_buy_fee = pricing_config.spot_buy_fee_czk;
         let total_import_adder = fixed_import_fee + fixed_buy_fee;
-        
-
 
         // 1. Group blocks by day to identify "today's" peaks
         // We assume the input `all_blocks` covers the relevant planning horizon (e.g. 48h)
         // We will process each day independently.
-        
-        let mut blocks_by_day: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
-        
+
+        let mut blocks_by_day: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+
         for (i, block) in all_blocks.iter().enumerate() {
             let day_key = block.block_start.format("%Y-%m-%d").to_string();
             blocks_by_day.entry(day_key).or_default().push(i);
@@ -175,15 +174,18 @@ impl SmartDischargeStrategy {
 
         for day in days {
             let indices = &blocks_by_day[&day];
-            
+
             // 2. Find Top 8 most expensive blocks for this day
-            let mut day_blocks: Vec<(usize, &TimeBlockPrice)> = indices.iter()
-                .map(|&i| (i, &all_blocks[i]))
-                .collect();
-            
+            let mut day_blocks: Vec<(usize, &TimeBlockPrice)> =
+                indices.iter().map(|&i| (i, &all_blocks[i])).collect();
+
             // Sort by price descending
-            day_blocks.sort_by(|a, b| b.1.price_czk_per_kwh.partial_cmp(&a.1.price_czk_per_kwh).unwrap());
-            
+            day_blocks.sort_by(|a, b| {
+                b.1.price_czk_per_kwh
+                    .partial_cmp(&a.1.price_czk_per_kwh)
+                    .unwrap()
+            });
+
             // Take top 8
             let top_8_peaks = day_blocks.iter().take(8);
 
@@ -195,9 +197,9 @@ impl SmartDischargeStrategy {
                 // 3. Find best charge opportunity for this peak
                 // Must be BEFORE the discharge block
                 // Must satisfy profitability condition
-                
+
                 let export_revenue = discharge_block.price_czk_per_kwh - fixed_sell_fee;
-                
+
                 let mut max_profit = 0.0;
                 let mut best_charge_idx: Option<usize> = None;
 
@@ -213,7 +215,8 @@ impl SmartDischargeStrategy {
                     let import_cost = charge_block.price_czk_per_kwh + total_import_adder;
 
                     // Profit = (Peak - SellFee) - (Charge + ImportFee + BuyFee) - Wear
-                    let profit = export_revenue - import_cost - control_config.battery_wear_cost_czk_per_kwh;
+                    let profit =
+                        export_revenue - import_cost - control_config.battery_wear_cost_czk_per_kwh;
 
                     if profit > 0.0 && profit > max_profit {
                         max_profit = profit;
@@ -225,17 +228,17 @@ impl SmartDischargeStrategy {
                 if let Some(charge_idx) = best_charge_idx {
                     used_charge_indices.insert(charge_idx);
                     used_discharge_indices.insert(*discharge_idx);
-                    
+
                     let charge_block = &all_blocks[charge_idx];
-                    
+
                     // Add to selected sets
-                     if let Ok(mut selected) = self.selected_charge_blocks.write() {
+                    if let Ok(mut selected) = self.selected_charge_blocks.write() {
                         selected.insert(charge_block.block_start);
                     }
                     if let Ok(mut selected) = self.selected_discharge_blocks.write() {
                         selected.insert(discharge_block.block_start);
                     }
-                    
+
                     tracing::debug!(
                         "ARBITRAGE PAIR: Charge @ {} ({:.2} CZK) -> Discharge @ {} ({:.2} CZK) | Profit: {:.2} CZK/kWh",
                         charge_block.block_start.format("%H:%M"),
@@ -278,12 +281,13 @@ impl EconomicStrategy for SmartDischargeStrategy {
         };
 
         // Check if this is a selected DISCHARGE block
-        let is_discharge_block = if let Ok(discharge_blocks) = self.selected_discharge_blocks.read() {
+        let is_discharge_block = if let Ok(discharge_blocks) = self.selected_discharge_blocks.read()
+        {
             discharge_blocks.contains(&context.price_block.block_start)
         } else {
             false
         };
-        
+
         // ARBITRAGE CHARGING: Pre-charge battery from grid during low-price blocks
         if is_charge_block {
             let mut eval = BlockEvaluation::new(
@@ -303,9 +307,11 @@ impl EconomicStrategy for SmartDischargeStrategy {
                 grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
             };
 
-            println!("DEBUG: ARBITRAGE CHARGE at {} - Price: {:.2} CZK",
+            println!(
+                "DEBUG: ARBITRAGE CHARGE at {} - Price: {:.2} CZK",
                 context.price_block.block_start.format("%H:%M"),
-                context.price_block.price_czk_per_kwh);
+                context.price_block.price_czk_per_kwh
+            );
 
             // Calculate charging
             let solar = context.solar_forecast_kwh;
@@ -317,12 +323,13 @@ impl EconomicStrategy for SmartDischargeStrategy {
             // Use solar for consumption first, then charge battery from grid
             let solar_to_load = solar.min(consumption);
             let remaining_solar = solar - solar_to_load;
-            
+
             // Charge from solar if available
             let solar_to_battery = remaining_solar.min(max_charge_kw * block_duration_hours);
-            
+
             // Additional grid charging to fill battery
-            let grid_charge_capacity = (max_charge_kw * block_duration_hours - solar_to_battery).max(0.0);
+            let grid_charge_capacity =
+                (max_charge_kw * block_duration_hours - solar_to_battery).max(0.0);
             let grid_to_battery = grid_charge_capacity; // Charge as much as possible from grid
 
             // Grid import for both load and charging
@@ -338,15 +345,18 @@ impl EconomicStrategy for SmartDischargeStrategy {
 
             // Calculate cost
             let import_cost = total_grid_import * context.price_block.price_czk_per_kwh;
-            let battery_wear = (solar_to_battery + grid_to_battery) * context.control_config.battery_wear_cost_czk_per_kwh;
-            
+            let battery_wear = (solar_to_battery + grid_to_battery)
+                * context.control_config.battery_wear_cost_czk_per_kwh;
+
             // Calculate avoided cost (revenue from self-use)
             let avoided_import_cost = solar_to_load * context.price_block.price_czk_per_kwh;
-            
+
             eval.net_profit_czk = avoided_import_cost - import_cost - battery_wear;
 
-            eval.reason = format!("ARBITRAGE: Charging {:.2} kWh from grid at {:.2} CZK/kWh",
-                grid_to_battery, context.price_block.price_czk_per_kwh);
+            eval.reason = format!(
+                "ARBITRAGE: Charging {:.2} kWh from grid at {:.2} CZK/kWh",
+                grid_to_battery, context.price_block.price_czk_per_kwh
+            );
 
             return eval;
         }
@@ -370,9 +380,11 @@ impl EconomicStrategy for SmartDischargeStrategy {
                 grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
             };
 
-            tracing::debug!("ARBITRAGE DISCHARGE at {} - Export Price: {:.2} CZK",
+            tracing::debug!(
+                "ARBITRAGE DISCHARGE at {} - Export Price: {:.2} CZK",
                 context.price_block.block_start.format("%H:%M"),
-                context.grid_export_price_czk_per_kwh);
+                context.grid_export_price_czk_per_kwh
+            );
 
             // AGGRESSIVE DISCHARGE during rare peak prices
             // Goal: Export maximum battery energy to grid, but NEVER import at peak prices!
@@ -383,30 +395,32 @@ impl EconomicStrategy for SmartDischargeStrategy {
 
             // Calculate maximum possible discharge
             let max_discharge_kwh = max_discharge_kw * block_duration_hours;
-            let available_battery_kwh = (context.current_battery_soc - context.control_config.min_battery_soc).max(0.0) 
-                * context.control_config.battery_capacity_kwh / 100.0;
+            let available_battery_kwh =
+                (context.current_battery_soc - context.control_config.min_battery_soc).max(0.0)
+                    * context.control_config.battery_capacity_kwh
+                    / 100.0;
             let actual_discharge_kwh = max_discharge_kwh.min(available_battery_kwh);
 
             // Energy flow priority (critical for avoiding peak price imports!):
             // 1. Solar → consumption
             // 2. Battery → remaining consumption (MUST NOT import at peak price!)
             // 3. Battery → grid export (maximize this for profit)
-            
+
             let solar_to_load = solar.min(consumption);
             let load_after_solar = (consumption - solar_to_load).max(0.0);
-            
+
             // Use battery for load FIRST (saves import cost at peak price)
             let battery_to_load = load_after_solar.min(actual_discharge_kwh);
-            
+
             // Remaining battery capacity goes to export
             let battery_to_grid = (actual_discharge_kwh - battery_to_load).max(0.0);
-            
+
             // Any surplus solar also exports
             let solar_surplus = (solar - consumption).max(0.0);
-            
+
             // If we still have load deficit after solar + battery, THEN import (but try to avoid this!)
             let grid_import = (load_after_solar - battery_to_load).max(0.0);
-            
+
             let total_export = solar_surplus + battery_to_grid;
             let total_discharge = battery_to_load + battery_to_grid;
 
@@ -418,23 +432,31 @@ impl EconomicStrategy for SmartDischargeStrategy {
 
             // Calculate profit
             let import_cost = grid_import * context.price_block.price_czk_per_kwh;
-            let export_revenue = (battery_to_grid + solar_surplus) * context.grid_export_price_czk_per_kwh;
-            let battery_wear = (battery_to_load + battery_to_grid) * context.control_config.battery_wear_cost_czk_per_kwh;
-            
+            let export_revenue =
+                (battery_to_grid + solar_surplus) * context.grid_export_price_czk_per_kwh;
+            let battery_wear = (battery_to_load + battery_to_grid)
+                * context.control_config.battery_wear_cost_czk_per_kwh;
+
             // Calculate avoided cost (revenue from self-use)
-            let avoided_import_cost = (solar_to_load + battery_to_load) * context.price_block.price_czk_per_kwh;
-            
+            let avoided_import_cost =
+                (solar_to_load + battery_to_load) * context.price_block.price_czk_per_kwh;
+
             eval.net_profit_czk = avoided_import_cost + export_revenue - import_cost - battery_wear;
 
-            eval.reason = format!("PEAK: Battery→Load: {:.2}, Battery→Grid: {:.2} kWh @ {:.2} CZK (Profit: {:.2})",
-                battery_to_load, battery_to_grid, context.grid_export_price_czk_per_kwh, eval.net_profit_czk);
+            eval.reason = format!(
+                "PEAK: Battery→Load: {:.2}, Battery→Grid: {:.2} kWh @ {:.2} CZK (Profit: {:.2})",
+                battery_to_load,
+                battery_to_grid,
+                context.grid_export_price_czk_per_kwh,
+                eval.net_profit_czk
+            );
 
             return eval;
         }
 
         // FALLBACK: Standard Self-Use Logic
         // If we are not in a planned charge/discharge block, we default to self-use.
-        
+
         let mut eval = BlockEvaluation::new(
             context.price_block.block_start,
             context.price_block.duration_minutes,
@@ -454,14 +476,14 @@ impl EconomicStrategy for SmartDischargeStrategy {
 
         // Standard self-use logic
         let (solar, consumption) = (context.solar_forecast_kwh, context.consumption_forecast_kwh);
-        
+
         if solar >= consumption {
             // Surplus solar
             let surplus = solar - consumption;
             eval.energy_flows.battery_charge_kwh = surplus;
             eval.energy_flows.grid_export_kwh = 0.0;
             eval.energy_flows.grid_import_kwh = 0.0;
-            
+
             // Calculate avoided cost (revenue from self-use)
             // solar used = consumption
             let avoided_import_cost = consumption * context.price_block.price_czk_per_kwh;
@@ -471,25 +493,32 @@ impl EconomicStrategy for SmartDischargeStrategy {
             let deficit = consumption - solar;
             let max_discharge_kw = context.control_config.max_battery_charge_rate_kw;
             let block_duration_hours = context.price_block.duration_minutes as f32 / 60.0;
-            
+
             // Use available battery capacity above min_soc
-            let available_battery_kwh = (context.current_battery_soc - context.control_config.min_battery_soc).max(0.0) 
-                * context.control_config.battery_capacity_kwh / 100.0;
-                
-            let battery_available = deficit.min(max_discharge_kw * block_duration_hours).min(available_battery_kwh);
-            
+            let available_battery_kwh =
+                (context.current_battery_soc - context.control_config.min_battery_soc).max(0.0)
+                    * context.control_config.battery_capacity_kwh
+                    / 100.0;
+
+            let battery_available = deficit
+                .min(max_discharge_kw * block_duration_hours)
+                .min(available_battery_kwh);
+
             eval.energy_flows.battery_discharge_kwh = battery_available;
             eval.energy_flows.grid_import_kwh = (deficit - battery_available).max(0.0);
             eval.energy_flows.grid_export_kwh = 0.0;
-            
-            let import_cost = eval.energy_flows.grid_import_kwh * context.price_block.price_czk_per_kwh;
-            let battery_wear = battery_available * context.control_config.battery_wear_cost_czk_per_kwh;
-            
+
+            let import_cost =
+                eval.energy_flows.grid_import_kwh * context.price_block.price_czk_per_kwh;
+            let battery_wear =
+                battery_available * context.control_config.battery_wear_cost_czk_per_kwh;
+
             // Calculate avoided cost (revenue from self-use)
             // solar used = solar (since solar < consumption)
             // battery used = battery_available
-            let avoided_import_cost = (solar + battery_available) * context.price_block.price_czk_per_kwh;
-            
+            let avoided_import_cost =
+                (solar + battery_available) * context.price_block.price_czk_per_kwh;
+
             eval.net_profit_czk = avoided_import_cost - import_cost - battery_wear;
         }
 

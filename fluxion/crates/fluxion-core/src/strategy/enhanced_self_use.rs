@@ -81,9 +81,7 @@ impl EnhancedSelfUseStrategy {
 
         let future_prices: Vec<f32> = all_blocks
             .iter()
-            .filter(|b| {
-                b.block_start > current_block_start && b.block_start <= lookahead_end
-            })
+            .filter(|b| b.block_start > current_block_start && b.block_start <= lookahead_end)
             .map(|b| b.price_czk_per_kwh)
             .collect();
 
@@ -162,7 +160,8 @@ impl EnhancedSelfUseStrategy {
                     / 100.0;
 
                 // Also constrain by maximum charge rate per block
-                let max_charge_this_block = context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS;
+                let max_charge_this_block =
+                    context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS;
 
                 let solar_to_store = remaining_solar
                     .min(battery_capacity_available)
@@ -268,10 +267,7 @@ impl EnhancedSelfUseStrategy {
 
                     eval.reason = format!(
                         "Exporting {:.2} kWh solar (immediate export {:.2} CZK > future value {:.2} CZK - wear {:.2} CZK)",
-                        remaining_solar,
-                        immediate_export_value,
-                        adjusted_future_value,
-                        wear_cost
+                        remaining_solar, immediate_export_value, adjusted_future_value, wear_cost
                     );
                 }
             } else {

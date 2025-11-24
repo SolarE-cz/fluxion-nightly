@@ -1,6 +1,18 @@
+// Copyright (c) 2025 SOLARE S.R.O.
+//
+// This file is part of FluxION.
+//
+// Licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+// (CC BY-NC-ND 4.0). You may use and share this file for non-commercial purposes only and you may not
+// create derivatives. See <https://creativecommons.org/licenses/by-nc-nd/4.0/>.
+//
+// This software is provided "AS IS", without warranty of any kind.
+//
+// For commercial licensing, please contact: info@solare.cz
+
 use anyhow::{Context, Result};
 use calamine::{Reader, Xlsx};
-use chrono::{NaiveDate, DateTime, Utc, Datelike};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use reqwest::blocking::Client;
 use std::io::Cursor;
 use tracing::{info, warn};
@@ -44,7 +56,8 @@ impl OteMarketData {
 
         info!("Downloading OTE data from: {}", url);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .context("Failed to send request to OTE")?;
@@ -60,8 +73,7 @@ impl OteMarketData {
     /// Parse Excel file and extract price records
     fn parse_excel(&self, bytes: &[u8], date: NaiveDate) -> Result<Vec<PriceRecord>> {
         let cursor = Cursor::new(bytes);
-        let mut workbook: Xlsx<_> = Xlsx::new(cursor)
-            .context("Failed to open Excel workbook")?;
+        let mut workbook: Xlsx<_> = Xlsx::new(cursor).context("Failed to open Excel workbook")?;
 
         let sheet_names = workbook.sheet_names().to_vec();
         if sheet_names.is_empty() {
@@ -77,7 +89,7 @@ impl OteMarketData {
         let mut hour_col_idx = None;
         let mut price_eur_col_idx = None;
         let mut price_czk_col_idx = None;
-        
+
         // Find the data table header (looks for "Period" and "15 min price")
         for (row_idx, row) in range.rows().enumerate() {
             if found_table_header {
@@ -90,29 +102,27 @@ impl OteMarketData {
                     }
                     continue;
                 }
-                
+
                 // Extract period number (1-96 for 15-min intervals)
                 let period = match hour_col_idx.and_then(|idx| row.get(idx)) {
-                    Some(val) => {
-                        match val {
-                            calamine::Data::Int(p) => *p as u32,
-                            calamine::Data::Float(p) => *p as u32,
-                            _ => continue,
-                        }
-                    }
+                    Some(val) => match val {
+                        calamine::Data::Int(p) => *p as u32,
+                        calamine::Data::Float(p) => *p as u32,
+                        _ => continue,
+                    },
                     _ => continue,
                 };
-                
+
                 if !(1..=96).contains(&period) {
                     continue; // Invalid period
                 }
-                
+
                 // Convert period (1-based) to hour and minute
                 // Period 1 = 00:00-00:15, Period 2 = 00:15-00:30, etc.
                 let total_minutes = (period - 1) * 15;
                 let hour = total_minutes / 60;
                 let minute = total_minutes % 60;
-                
+
                 // Extract 15-min price in EUR
                 let price_eur = match price_eur_col_idx.and_then(|idx| row.get(idx)) {
                     Some(val) => match val {
@@ -122,20 +132,19 @@ impl OteMarketData {
                     },
                     _ => continue,
                 };
-                
+
                 // For CZK, we would need EUR/CZK exchange rate
                 // For now, leave it at 0 or calculate using a fixed rate
                 let price_czk = price_eur * 24.0; // Approximate EUR/CZK rate
-                
+
                 let time = date.and_hms_opt(hour, minute, 0).context("Invalid time")?;
                 let datetime = time.and_utc();
-                
+
                 records.push(PriceRecord {
                     datetime,
                     price_eur,
                     price_czk,
                 });
-                
             } else {
                 // Look for table header
                 // We're looking for a row with "Period" and "15 min price"
@@ -151,11 +160,13 @@ impl OteMarketData {
                         }
                     }
                 }
-                
+
                 if hour_col_idx.is_some() && price_eur_col_idx.is_some() {
                     found_table_header = true;
-                    info!("Found price table header at row {}, period_col={:?}, eur_col={:?}, czk_col={:?}", 
-                        row_idx, hour_col_idx, price_eur_col_idx, price_czk_col_idx);
+                    info!(
+                        "Found price table header at row {}, period_col={:?}, eur_col={:?}, czk_col={:?}",
+                        row_idx, hour_col_idx, price_eur_col_idx, price_czk_col_idx
+                    );
                 }
             }
         }

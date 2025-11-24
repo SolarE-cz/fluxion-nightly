@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-i18n"
-version = "0.1.1"
+version = "0.1.10"
 dependencies = [
  "fluent",
  "fluent-bundle",

@@ -23,8 +23,8 @@ mod winter_peak_discharge;
 
 // New unified strategies
 mod enhanced_self_use;
-mod unified_smart_charge;
 mod smart_discharge;
+mod unified_smart_charge;
 
 pub use day_ahead_planning::DayAheadChargePlanningStrategy;
 pub use morning_precharge::MorningPreChargeStrategy;
@@ -38,8 +38,8 @@ pub use time_aware_charge::TimeAwareChargeStrategy;
 
 // Export new unified strategies
 pub use enhanced_self_use::EnhancedSelfUseStrategy;
-pub use unified_smart_charge::{UnifiedSmartChargeConfig, UnifiedSmartChargeStrategy};
 pub use smart_discharge::{DischargeSeasonConfig, SmartDischargeStrategy};
+pub use unified_smart_charge::{UnifiedSmartChargeConfig, UnifiedSmartChargeStrategy};
 
 use crate::components::{InverterOperationMode, TimeBlockPrice};
 use crate::resources::ControlConfig;

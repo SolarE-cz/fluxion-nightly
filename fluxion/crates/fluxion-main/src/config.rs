@@ -874,15 +874,23 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 fixed_buy_price_czk: if app_config.pricing.fixed_buy_prices.len() == 1 {
                     fluxion_core::PriceSchedule::Flat(app_config.pricing.fixed_buy_prices[0])
                 } else if !app_config.pricing.fixed_buy_prices.is_empty() {
-                    // If we have 96 values, we should probably downsample or handle it, 
+                    // If we have 96 values, we should probably downsample or handle it,
                     // but for now let's just take the first 24 if it's > 24 to match hourly expectation
                     // or just pass it all if PriceSchedule is robust.
                     // Given PriceSchedule expects hourly for now, let's take every 4th if len == 96
                     if app_config.pricing.fixed_buy_prices.len() == 96 {
-                        let hourly: Vec<f32> = app_config.pricing.fixed_buy_prices.iter().step_by(4).copied().collect();
+                        let hourly: Vec<f32> = app_config
+                            .pricing
+                            .fixed_buy_prices
+                            .iter()
+                            .step_by(4)
+                            .copied()
+                            .collect();
                         fluxion_core::PriceSchedule::Hourly(hourly)
                     } else {
-                        fluxion_core::PriceSchedule::Hourly(app_config.pricing.fixed_buy_prices.clone())
+                        fluxion_core::PriceSchedule::Hourly(
+                            app_config.pricing.fixed_buy_prices.clone(),
+                        )
                     }
                 } else {
                     fluxion_core::PriceSchedule::Flat(5.00)
@@ -891,10 +899,18 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     fluxion_core::PriceSchedule::Flat(app_config.pricing.fixed_sell_prices[0])
                 } else if !app_config.pricing.fixed_sell_prices.is_empty() {
                     if app_config.pricing.fixed_sell_prices.len() == 96 {
-                        let hourly: Vec<f32> = app_config.pricing.fixed_sell_prices.iter().step_by(4).copied().collect();
+                        let hourly: Vec<f32> = app_config
+                            .pricing
+                            .fixed_sell_prices
+                            .iter()
+                            .step_by(4)
+                            .copied()
+                            .collect();
                         fluxion_core::PriceSchedule::Hourly(hourly)
                     } else {
-                        fluxion_core::PriceSchedule::Hourly(app_config.pricing.fixed_sell_prices.clone())
+                        fluxion_core::PriceSchedule::Hourly(
+                            app_config.pricing.fixed_sell_prices.clone(),
+                        )
                     }
                 } else {
                     fluxion_core::PriceSchedule::Flat(2.00)

@@ -1,10 +1,21 @@
-use chrono::{DateTime, TimeZone, Utc, Timelike};
+// Copyright (c) 2025 SOLARE S.R.O.
+//
+// This file is part of FluxION.
+//
+// Licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+// (CC BY-NC-ND 4.0). You may use and share this file for non-commercial purposes only and you may not
+// create derivatives. See <https://creativecommons.org/licenses/by-nc-nd/4.0/>.
+//
+// This software is provided "AS IS", without warranty of any kind.
+//
+// For commercial licensing, please contact: info@solare.cz
+
+use chrono::{DateTime, TimeZone, Timelike, Utc};
 use fluxion_core::components::TimeBlockPrice;
-use fluxion_core::resources::{ControlConfig, PricingConfig, PriceSchedule};
+use fluxion_core::resources::{ControlConfig, PriceSchedule, PricingConfig};
 use fluxion_core::strategy::{
-    EconomicStrategy, EvaluationContext, EnhancedSelfUseStrategy, 
-    UnifiedSmartChargeStrategy, SmartDischargeStrategy,
-    UnifiedSmartChargeConfig, DischargeSeasonConfig
+    DischargeSeasonConfig, EconomicStrategy, EnhancedSelfUseStrategy, EvaluationContext,
+    SmartDischargeStrategy, UnifiedSmartChargeConfig, UnifiedSmartChargeStrategy,
 };
 use std::error::Error;
 use std::fs::File;
@@ -44,10 +55,14 @@ fn parse_csv<P: AsRef<Path>>(path: P) -> Result<Vec<InverterDataRow>, Box<dyn Er
 
     for line in lines {
         let line = line?;
-        if line.trim().is_empty() { continue; }
-        
+        if line.trim().is_empty() {
+            continue;
+        }
+
         let parts: Vec<&str> = line.split(';').collect();
-        if parts.len() < 17 { continue; }
+        if parts.len() < 17 {
+            continue;
+        }
 
         // Parse timestamp "2025-10-01 00:00:02"
         let time_str = parts[0];
@@ -73,17 +88,26 @@ fn parse_csv<P: AsRef<Path>>(path: P) -> Result<Vec<InverterDataRow>, Box<dyn Er
             battery_soc: soc,
         });
     }
-    
+
     // Sort by time just in case
     rows.sort_by_key(|r| r.timestamp);
     Ok(rows)
 }
 
 fn aggregate_to_blocks(rows: &[InverterDataRow]) -> Vec<AggregatedBlock> {
-    if rows.is_empty() { return Vec::new(); }
+    if rows.is_empty() {
+        return Vec::new();
+    }
 
     let mut blocks = Vec::new();
-    let mut current_block_start = rows[0].timestamp.with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let mut current_block_start = rows[0]
+        .timestamp
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
     // Align to 15 min
     let min = current_block_start.minute();
     let aligned_min = (min / 15) * 15;
@@ -98,7 +122,7 @@ fn aggregate_to_blocks(rows: &[InverterDataRow]) -> Vec<AggregatedBlock> {
                 blocks.push(block);
             }
             block_rows.clear();
-            
+
             // Advance block start
             while row.timestamp >= current_block_start + chrono::Duration::minutes(15) {
                 current_block_start += chrono::Duration::minutes(15);
@@ -106,7 +130,7 @@ fn aggregate_to_blocks(rows: &[InverterDataRow]) -> Vec<AggregatedBlock> {
         }
         block_rows.push(row);
     }
-    
+
     // Last block
     if let Some(block) = process_block(&block_rows, current_block_start) {
         blocks.push(block);
@@ -116,7 +140,9 @@ fn aggregate_to_blocks(rows: &[InverterDataRow]) -> Vec<AggregatedBlock> {
 }
 
 fn process_block(rows: &[&InverterDataRow], start_time: DateTime<Utc>) -> Option<AggregatedBlock> {
-    if rows.len() < 2 { return None; }
+    if rows.len() < 2 {
+        return None;
+    }
 
     let first = rows.first().unwrap();
     let last = rows.last().unwrap();
@@ -156,7 +182,9 @@ struct PriceData {
 use std::collections::HashMap;
 
 /// Load real OTE prices from CSV
-fn load_price_csv<P: AsRef<Path>>(path: P) -> Result<HashMap<DateTime<Utc>, PriceData>, Box<dyn Error>> {
+fn load_price_csv<P: AsRef<Path>>(
+    path: P,
+) -> Result<HashMap<DateTime<Utc>, PriceData>, Box<dyn Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut prices = HashMap::new();
@@ -167,10 +195,14 @@ fn load_price_csv<P: AsRef<Path>>(path: P) -> Result<HashMap<DateTime<Utc>, Pric
 
     for line in lines {
         let line = line?;
-        if line.trim().is_empty() { continue; }
-        
+        if line.trim().is_empty() {
+            continue;
+        }
+
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 3 { continue; }
+        if parts.len() < 3 {
+            continue;
+        }
 
         // Parse datetime "2025-10-01 00:00:00"
         let time_str = parts[0];
@@ -180,7 +212,14 @@ fn load_price_csv<P: AsRef<Path>>(path: P) -> Result<HashMap<DateTime<Utc>, Pric
         let price_eur = parts[1].parse::<f32>().unwrap_or(0.0);
         let price_czk = parts[2].parse::<f32>().unwrap_or(0.0);
 
-        prices.insert(timestamp, PriceData { _timestamp: timestamp, _price_eur: price_eur, price_czk });
+        prices.insert(
+            timestamp,
+            PriceData {
+                _timestamp: timestamp,
+                _price_eur: price_eur,
+                price_czk,
+            },
+        );
     }
 
     Ok(prices)
@@ -192,7 +231,7 @@ fn get_price_czk(time: DateTime<Utc>, prices: &HashMap<DateTime<Utc>, PriceData>
     if let Some(price) = prices.get(&time) {
         return price.price_czk / 1000.0; // Convert from CZK/MWh to CZK/kWh
     }
-    
+
     // Fallback: find nearest price within +/- 15 minutes
     for offset_minutes in [0, 15, -15, 30, -30] {
         let adjusted_time = time + chrono::Duration::minutes(offset_minutes);
@@ -200,7 +239,7 @@ fn get_price_czk(time: DateTime<Utc>, prices: &HashMap<DateTime<Utc>, PriceData>
             return price.price_czk / 1000.0;
         }
     }
-    
+
     // Final fallback: use average day/night price
     let hour = time.hour();
     if (8..20).contains(&hour) {
@@ -236,9 +275,15 @@ impl StrategySimState {
         }
     }
 
-    fn _update(&mut self, context: &EvaluationContext, _block_duration_hours: f32, battery_capacity: f32, battery_efficiency: f32) {
+    fn _update(
+        &mut self,
+        context: &EvaluationContext,
+        _block_duration_hours: f32,
+        battery_capacity: f32,
+        battery_efficiency: f32,
+    ) {
         let evaluation = self.strategy.evaluate(context);
-        
+
         // Update cumulative stats
         self.cumulative_profit_czk += evaluation.net_profit_czk;
         self.total_imported_kwh += evaluation.energy_flows.grid_import_kwh;
@@ -252,11 +297,11 @@ impl StrategySimState {
         // Net change at battery terminals:
         // Energy into battery = charge_kwh * efficiency
         // Energy out of battery = discharge_kwh / efficiency
-        
+
         let energy_in = evaluation.energy_flows.battery_charge_kwh * battery_efficiency;
         let energy_out = evaluation.energy_flows.battery_discharge_kwh / battery_efficiency;
         let net_energy_change = energy_in - energy_out;
-        
+
         let soc_change = (net_energy_change / battery_capacity) * 100.0;
         self.current_soc = (self.current_soc + soc_change).clamp(0.0, 100.0);
     }
@@ -264,18 +309,27 @@ impl StrategySimState {
 
 fn main() -> Result<(), Box<dyn Error>> {
     // 1. Load Data
-    let rows = parse_csv("/home/daniel/Repositories/solare/fluxion/fluxion/simulation_data/inverter_data.csv")?;
+    let rows = parse_csv(
+        "/home/daniel/Repositories/solare/fluxion/fluxion/simulation_data/inverter_data.csv",
+    )?;
     println!("Loaded {} rows of inverter data", rows.len());
 
     // 1.5. Load Real OTE Prices
     let price_csv_path = "/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-core/data/prices_2025_10.csv";
     let prices = match load_price_csv(price_csv_path) {
         Ok(p) => {
-            println!("Loaded {} real OTE price records from {}", p.len(), price_csv_path);
+            println!(
+                "Loaded {} real OTE price records from {}",
+                p.len(),
+                price_csv_path
+            );
             p
         }
         Err(e) => {
-            println!("Warning: Could not load real prices: {}. Using synthetic prices as fallback.", e);
+            println!(
+                "Warning: Could not load real prices: {}. Using synthetic prices as fallback.",
+                e
+            );
             HashMap::new() // Empty map will trigger fallback in get_price_czk
         }
     };
@@ -283,7 +337,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 2. Aggregate
     let blocks = aggregate_to_blocks(&rows);
     println!("Aggregated into {} 15-minute blocks", blocks.len());
-    
+
     if blocks.is_empty() {
         println!("No data blocks to simulate.");
         return Ok(());
@@ -291,18 +345,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // 3. Setup Strategies
     let _initial_soc = blocks[0].start_soc;
-    
+
     // 3. Setup Strategies
     let initial_soc = blocks[0].start_soc;
-    
+
     // 1. Baseline: Enhanced Self Use with optimization DISABLED (Pure Self-Use)
     let baseline_strategy = EnhancedSelfUseStrategy::new(
-        true, 
-        false, // Disable optimization -> Pure Self-Use
-        1.3, 
-        6
+        true, false, // Disable optimization -> Pure Self-Use
+        1.3, 6,
     );
-    
+
     // 2. Tuned Unified Smart Charge
     // - Stricter price difference (1.5 CZK) to avoid marginal trades
     // - Lower opportunity weight (0.3) to reduce speculation
@@ -313,7 +365,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..UnifiedSmartChargeConfig::default()
     };
     let tuned_unified_smart = UnifiedSmartChargeStrategy::new(true, tuned_unified_config);
-    
+
     // 3. Tuned Smart Discharge
     // - Median + 1.0 CZK threshold
     // - Lower start SOC (30%) to allow triggering with lower solar/self-use levels
@@ -322,22 +374,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         min_spread_czk: 1.0,
         min_arbitrage_profit_czk: 5.0, // High threshold to cover opportunity cost of self-use
         min_soc_to_start: 30.0,
-        solar_window_start_hour: 25, 
+        solar_window_start_hour: 25,
         ..DischargeSeasonConfig::winter()
     };
-    
-    let tuned_smart_discharge_controller = SmartDischargeStrategy::new(
-        true,
-        DischargeSeasonConfig::summer(), 
-        tuned_winter_config,
-    );
+
+    let tuned_smart_discharge_controller =
+        SmartDischargeStrategy::new(true, DischargeSeasonConfig::summer(), tuned_winter_config);
     let tuned_smart_discharge_strategy = tuned_smart_discharge_controller.clone();
 
     // Create simulation states
     let mut sim_states = vec![
-        StrategySimState::new("Baseline (Pure Self-Use)", Box::new(baseline_strategy), initial_soc),
-        StrategySimState::new("Tuned Unified Smart Charge", Box::new(tuned_unified_smart), initial_soc),
-        StrategySimState::new("Tuned Smart Discharge", Box::new(tuned_smart_discharge_strategy), initial_soc),
+        StrategySimState::new(
+            "Baseline (Pure Self-Use)",
+            Box::new(baseline_strategy),
+            initial_soc,
+        ),
+        StrategySimState::new(
+            "Tuned Unified Smart Charge",
+            Box::new(tuned_unified_smart),
+            initial_soc,
+        ),
+        StrategySimState::new(
+            "Tuned Smart Discharge",
+            Box::new(tuned_smart_discharge_strategy),
+            initial_soc,
+        ),
     ];
 
     let config = ControlConfig {
@@ -366,38 +427,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     let grid_fee_czk = pricing_config.grid_distribution_fee_czk;
 
     // Create price blocks for the whole period for lookahead
-    let all_price_blocks: Vec<TimeBlockPrice> = blocks.iter().map(|b| {
-        let spot_price = get_price_czk(b.start_time, &prices);
-        TimeBlockPrice {
-            block_start: b.start_time,
-            duration_minutes: 15,
-            price_czk_per_kwh: spot_price + grid_fee_czk, // Import price = Spot + Grid Fee
-        }
-    }).collect();
+    let all_price_blocks: Vec<TimeBlockPrice> = blocks
+        .iter()
+        .map(|b| {
+            let spot_price = get_price_czk(b.start_time, &prices);
+            TimeBlockPrice {
+                block_start: b.start_time,
+                duration_minutes: 15,
+                price_czk_per_kwh: spot_price + grid_fee_czk, // Import price = Spot + Grid Fee
+            }
+        })
+        .collect();
 
     println!("Starting simulation...");
 
     // 4. Run Simulation
     for (i, block) in blocks.iter().enumerate() {
         let price_block = &all_price_blocks[i];
-        
+
         // Perform daily planning for Smart Discharge
         if i == 0 || (block.start_time.hour() == 0 && block.start_time.minute() == 0) {
-             // We need the current SOC for the SmartDischarge strategy state
-             // Find the state for Smart Discharge
-             if let Some(state) = sim_states.iter().find(|s| s.name.contains("Smart Discharge")) {
-                 // Pass a 48-hour rolling window for planning (48 * 4 = 192 blocks)
-                 let end_idx = (i + 192).min(all_price_blocks.len());
-                 let planning_window = &all_price_blocks[i..end_idx];
-                 tuned_smart_discharge_controller.plan_discharge_blocks(planning_window, state.current_soc, &config, &pricing_config);
-             }
+            // We need the current SOC for the SmartDischarge strategy state
+            // Find the state for Smart Discharge
+            if let Some(state) = sim_states
+                .iter()
+                .find(|s| s.name.contains("Smart Discharge"))
+            {
+                // Pass a 48-hour rolling window for planning (48 * 4 = 192 blocks)
+                let end_idx = (i + 192).min(all_price_blocks.len());
+                let planning_window = &all_price_blocks[i..end_idx];
+                tuned_smart_discharge_controller.plan_discharge_blocks(
+                    planning_window,
+                    state.current_soc,
+                    &config,
+                    &pricing_config,
+                );
+            }
         }
 
         // For each strategy, we need a separate context because SOC is different
         for state in &mut sim_states {
             // Calculate spot price for export (no grid fee on export)
             let spot_price = get_price_czk(block.start_time, &prices);
-            
+
             let context = EvaluationContext {
                 price_block,
                 control_config: &config,
@@ -407,10 +479,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 grid_export_price_czk_per_kwh: spot_price, // Export at spot price (no grid fee)
                 all_price_blocks: Some(&all_price_blocks),
             };
-            
+
             // Special handling for SmartDischarge: Fallback to Baseline if it refuses to run (returns -inf)
             let mut evaluation = state.strategy.evaluate(&context);
-            
+
             if evaluation.net_profit_czk.is_infinite() && state.name.contains("Smart Discharge") {
                 // Fallback to Enhanced Self-Use (Baseline) logic for this block
                 // We need a temporary baseline strategy instance or just reuse logic
@@ -423,41 +495,49 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             // Update state with the valid evaluation
             // We need to manually update state fields based on evaluation
-            
+
             // Update cumulative stats
             state.cumulative_profit_czk += evaluation.net_profit_czk;
             state.total_imported_kwh += evaluation.energy_flows.grid_import_kwh;
             state.total_exported_kwh += evaluation.energy_flows.grid_export_kwh;
             state.total_charged_kwh += evaluation.energy_flows.battery_charge_kwh;
             state.total_discharged_kwh += evaluation.energy_flows.battery_discharge_kwh;
-            
+
             // Update SOC
             let energy_in = evaluation.energy_flows.battery_charge_kwh * config.battery_efficiency;
-            let energy_out = evaluation.energy_flows.battery_discharge_kwh / config.battery_efficiency;
+            let energy_out =
+                evaluation.energy_flows.battery_discharge_kwh / config.battery_efficiency;
             let net_energy_change = energy_in - energy_out;
-            
+
             let soc_change = (net_energy_change / config.battery_capacity_kwh) * 100.0;
             state.current_soc = (state.current_soc + soc_change).clamp(0.0, 100.0);
-            
+
             if state.cumulative_profit_czk.is_infinite() {
-                println!("WARNING: Infinite profit detected for {} at block {}", state.name, i);
+                println!(
+                    "WARNING: Infinite profit detected for {} at block {}",
+                    state.name, i
+                );
             }
         }
     }
-    
+
     // 5. Report
-    println!("\n{:<30} | {:<15} | {:<10} | {:<10} | {:<10} | {:<10}", 
-             "Strategy", "Profit (CZK)", "Imp (kWh)", "Exp (kWh)", "Disch(kWh)", "Final SOC");
+    println!(
+        "\n{:<30} | {:<15} | {:<10} | {:<10} | {:<10} | {:<10}",
+        "Strategy", "Profit (CZK)", "Imp (kWh)", "Exp (kWh)", "Disch(kWh)", "Final SOC"
+    );
     println!("{}", "-".repeat(100));
-    
+
     for state in sim_states {
-        println!("{:<30} | {:<15.2} | {:<10.2} | {:<10.2} | {:<10.2} | {:<5.1}%",
-                 state.name,
-                 state.cumulative_profit_czk,
-                 state.total_imported_kwh,
-                 state.total_exported_kwh,
-                 state.total_discharged_kwh,
-                 state.current_soc);
+        println!(
+            "{:<30} | {:<15.2} | {:<10.2} | {:<10.2} | {:<10.2} | {:<5.1}%",
+            state.name,
+            state.cumulative_profit_czk,
+            state.total_imported_kwh,
+            state.total_exported_kwh,
+            state.total_discharged_kwh,
+            state.current_soc
+        );
     }
 
     Ok(())

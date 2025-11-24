@@ -98,7 +98,7 @@ impl UnifiedSmartChargeStrategy {
     }
 
     /// METHOD A: Threshold-based block selection
-    /// Selects all blocks within threshold% of minimum price
+    /// Selects all upcoming blocks within threshold% of global minimum price
     fn method_a_threshold_blocks(
         &self,
         all_blocks: &[TimeBlockPrice],
@@ -114,9 +114,11 @@ impl UnifiedSmartChargeStrategy {
             return HashSet::new();
         }
 
-        let min_price = upcoming_blocks
+        // Use minimum price from ALL blocks (not just upcoming)
+        // This prevents treating expensive blocks as "cheap" just because they're the only upcoming ones
+        let min_price = all_blocks
             .iter()
-            .map(|(_, p)| *p)
+            .map(|b| b.price_czk_per_kwh)
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or(0.0);
 
@@ -131,6 +133,7 @@ impl UnifiedSmartChargeStrategy {
 
     /// METHOD B: Top-N block selection
     /// Selects N cheapest blocks where N is based on energy needed
+    /// Only selects blocks that are actually economically viable (within reasonable threshold)
     fn method_b_topn_blocks(
         &self,
         all_blocks: &[TimeBlockPrice],
@@ -150,7 +153,8 @@ impl UnifiedSmartChargeStrategy {
         }
 
         // Blocks needed
-        let blocks_needed = (energy_needed / (context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS))
+        let blocks_needed = (energy_needed
+            / (context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS))
             .ceil() as usize;
 
         // Get upcoming blocks sorted by price
@@ -160,11 +164,21 @@ impl UnifiedSmartChargeStrategy {
             .map(|b| (b.block_start, b.price_czk_per_kwh))
             .collect();
 
+        if upcoming_blocks.is_empty() {
+            return HashSet::new();
+        }
+
         upcoming_blocks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take top N cheapest
+        // Calculate threshold based on minimum price + threshold percentage
+        // This ensures we don't charge at expensive blocks just because they're the "cheapest" available
+        let min_price = upcoming_blocks[0].1;
+        let threshold = min_price * (1.0 + self.config.price_threshold_percentage);
+
+        // Take top N cheapest blocks, but only if they're within the threshold
         upcoming_blocks
             .into_iter()
+            .filter(|(_, price)| *price <= threshold)
             .take(blocks_needed)
             .map(|(time, _)| time)
             .collect()
@@ -251,7 +265,11 @@ impl UnifiedSmartChargeStrategy {
     }
 
     /// Check if significant solar is coming soon
-    fn solar_coming_soon(&self, context: &EvaluationContext, _all_blocks: &[TimeBlockPrice]) -> bool {
+    fn solar_coming_soon(
+        &self,
+        context: &EvaluationContext,
+        _all_blocks: &[TimeBlockPrice],
+    ) -> bool {
         // For now, use simple heuristic
         // Better implementation would sum solar forecast for next N hours
         let current_hour = context.price_block.block_start.hour();
@@ -437,44 +455,53 @@ impl EconomicStrategy for UnifiedSmartChargeStrategy {
                 // Solar covers all consumption
                 eval.energy_flows.grid_import_kwh = 0.0;
                 eval.energy_flows.grid_export_kwh = solar - consumption; // Excess solar exported
-                
+
                 // Revenue from export
                 eval.revenue_czk = economics::grid_export_revenue(
                     eval.energy_flows.grid_export_kwh,
-                    context.grid_export_price_czk_per_kwh
+                    context.grid_export_price_czk_per_kwh,
                 );
                 eval.cost_czk = 0.0;
             } else {
                 // Deficit needs to be covered by Battery or Grid
                 let deficit = consumption - solar;
-                
+
                 // Check battery availability
-                let battery_kwh_available = context.control_config.battery_capacity_kwh 
-                    * (context.current_battery_soc - context.control_config.min_battery_soc).max(0.0) 
+                let battery_kwh_available = context.control_config.battery_capacity_kwh
+                    * (context.current_battery_soc - context.control_config.min_battery_soc)
+                        .max(0.0)
                     / 100.0;
-                
+
                 // We can discharge to cover deficit, limited by max discharge rate
-                let max_discharge = context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS;
+                let max_discharge =
+                    context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS;
                 let discharge_kwh = deficit.min(battery_kwh_available).min(max_discharge);
-                
+
                 if discharge_kwh > 0.0 {
                     eval.energy_flows.battery_discharge_kwh = discharge_kwh;
-                    
+
                     // Remaining deficit covered by grid
                     let remaining_deficit = deficit - discharge_kwh;
                     eval.energy_flows.grid_import_kwh = remaining_deficit;
-                    
+
                     // Costs: Grid Import + Battery Wear
-                    let import_cost = economics::grid_import_cost(remaining_deficit, context.price_block.price_czk_per_kwh);
-                    let wear_cost = economics::battery_degradation_cost(discharge_kwh, context.control_config.battery_wear_cost_czk_per_kwh);
-                    
+                    let import_cost = economics::grid_import_cost(
+                        remaining_deficit,
+                        context.price_block.price_czk_per_kwh,
+                    );
+                    let wear_cost = economics::battery_degradation_cost(
+                        discharge_kwh,
+                        context.control_config.battery_wear_cost_czk_per_kwh,
+                    );
+
                     eval.cost_czk = import_cost + wear_cost;
                 } else {
                     // No battery available, full grid import
                     eval.energy_flows.grid_import_kwh = deficit;
-                    eval.cost_czk = economics::grid_import_cost(deficit, context.price_block.price_czk_per_kwh);
+                    eval.cost_czk =
+                        economics::grid_import_cost(deficit, context.price_block.price_czk_per_kwh);
                 }
-                
+
                 eval.revenue_czk = 0.0;
             }
 
@@ -486,7 +513,8 @@ impl EconomicStrategy for UnifiedSmartChargeStrategy {
         eval.mode = InverterOperationMode::ForceCharge;
 
         // Calculate charge amount
-        let max_charge_this_block = context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS;
+        let max_charge_this_block =
+            context.control_config.max_battery_charge_rate_kw * BLOCK_DURATION_HOURS;
         let energy_needed_to_target = context.control_config.battery_capacity_kwh
             * (target_soc - context.current_battery_soc)
             / 100.0;

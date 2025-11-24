@@ -95,7 +95,7 @@ pub struct PricingConfig {
     pub use_spot_prices_to_sell: bool,
     pub fixed_buy_price_czk: PriceSchedule,
     pub fixed_sell_price_czk: PriceSchedule,
-    
+
     // Spot market fees
     #[serde(default = "default_spot_buy_fee")]
     pub spot_buy_fee_czk: f32,
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(schedule.get_price(0), 0.0);
         assert_eq!(schedule.get_price(12), 12.0);
         assert_eq!(schedule.get_price(23), 23.0);
-        
+
         // Test wrapping
         assert_eq!(schedule.get_price(24), 0.0);
     }
