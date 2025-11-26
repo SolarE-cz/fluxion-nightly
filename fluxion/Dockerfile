@@ -37,7 +37,7 @@ RUN apk add --no-cache \
     && rm -rf /var/cache/apk/*
 
 # Copy binary from builder
-COPY --from=0 /build/target/release/fluxion-main /usr/local/bin/fluxion-main
+COPY --from=0 /build/target/release/fluxion /usr/local/bin/fluxion-main
 
 # Copy run script
 COPY run.sh /
