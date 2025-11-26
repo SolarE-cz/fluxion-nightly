@@ -13,6 +13,7 @@
 use super::day_ahead_planning::DayAheadChargePlanningStrategy;
 use super::morning_precharge::MorningPreChargeStrategy;
 use super::seasonal_mode::SeasonalMode;
+use super::winter_adaptive::{WinterAdaptiveConfig, WinterAdaptiveStrategy};
 use super::winter_peak_discharge::WinterPeakDischargeStrategy;
 use crate::strategy::{BlockEvaluation, EconomicStrategy, EvaluationContext};
 use crate::strategy::{
@@ -22,6 +23,18 @@ use crate::strategy::{
 /// Strategies configuration for optimizer construction
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeasonalStrategiesConfig {
+    pub winter_adaptive_enabled: bool,
+    pub winter_adaptive_ema_period_days: usize,
+    pub winter_adaptive_min_solar_percentage: f32,
+    pub winter_adaptive_target_battery_soc: f32,
+    pub winter_adaptive_critical_battery_soc: f32,
+    pub winter_adaptive_top_expensive_blocks: usize,
+    pub winter_adaptive_tomorrow_preservation_threshold: f32,
+    pub winter_adaptive_grid_export_price_threshold: f32,
+    pub winter_adaptive_min_soc_for_export: f32,
+    pub winter_adaptive_export_trigger_multiplier: f32,
+    pub winter_adaptive_negative_price_handling_enabled: bool,
+    pub winter_adaptive_charge_on_negative_even_if_full: bool,
     pub winter_peak_discharge_enabled: bool,
     pub winter_peak_min_spread_czk: f32,
     pub winter_peak_min_soc_to_start: f32,
@@ -45,7 +58,19 @@ pub struct SeasonalStrategiesConfig {
 impl Default for SeasonalStrategiesConfig {
     fn default() -> Self {
         Self {
-            winter_peak_discharge_enabled: true,
+            winter_adaptive_enabled: true,
+            winter_adaptive_ema_period_days: 7,
+            winter_adaptive_min_solar_percentage: 0.10,
+            winter_adaptive_target_battery_soc: 90.0,
+            winter_adaptive_critical_battery_soc: 40.0,
+            winter_adaptive_top_expensive_blocks: 12,
+            winter_adaptive_tomorrow_preservation_threshold: 1.2,
+            winter_adaptive_grid_export_price_threshold: 8.0,
+            winter_adaptive_min_soc_for_export: 50.0,
+            winter_adaptive_export_trigger_multiplier: 2.5,
+            winter_adaptive_negative_price_handling_enabled: true,
+            winter_adaptive_charge_on_negative_even_if_full: false,
+            winter_peak_discharge_enabled: false, // Disabled, replaced by winter_adaptive
             winter_peak_min_spread_czk: 3.0,
             winter_peak_min_soc_to_start: 70.0,
             winter_peak_min_soc_target: 50.0,
@@ -57,9 +82,9 @@ impl Default for SeasonalStrategiesConfig {
             solar_aware_solar_window_end: 14,
             solar_aware_midday_max_soc: 90.0,
             solar_aware_min_solar_forecast_kwh: 2.0,
-            morning_precharge_enabled: true,
-            day_ahead_planning_enabled: true,
-            time_aware_charge_enabled: true,
+            morning_precharge_enabled: false, // Disabled, replaced by winter_adaptive
+            day_ahead_planning_enabled: false, // Disabled, replaced by winter_adaptive
+            time_aware_charge_enabled: false, // Disabled, replaced by winter_adaptive
             price_arbitrage_enabled: true,
             solar_first_enabled: true,
             self_use_enabled: true,
@@ -70,6 +95,28 @@ impl Default for SeasonalStrategiesConfig {
 impl From<&crate::resources::StrategiesConfigCore> for SeasonalStrategiesConfig {
     fn from(config: &crate::resources::StrategiesConfigCore) -> Self {
         Self {
+            winter_adaptive_enabled: config.winter_adaptive.enabled,
+            winter_adaptive_ema_period_days: config.winter_adaptive.ema_period_days,
+            winter_adaptive_min_solar_percentage: config.winter_adaptive.min_solar_percentage,
+            winter_adaptive_target_battery_soc: config.winter_adaptive.target_battery_soc,
+            winter_adaptive_critical_battery_soc: config.winter_adaptive.critical_battery_soc,
+            winter_adaptive_top_expensive_blocks: config.winter_adaptive.top_expensive_blocks,
+            winter_adaptive_tomorrow_preservation_threshold: config
+                .winter_adaptive
+                .tomorrow_preservation_threshold,
+            winter_adaptive_grid_export_price_threshold: config
+                .winter_adaptive
+                .grid_export_price_threshold,
+            winter_adaptive_min_soc_for_export: config.winter_adaptive.min_soc_for_export,
+            winter_adaptive_export_trigger_multiplier: config
+                .winter_adaptive
+                .export_trigger_multiplier,
+            winter_adaptive_negative_price_handling_enabled: config
+                .winter_adaptive
+                .negative_price_handling_enabled,
+            winter_adaptive_charge_on_negative_even_if_full: config
+                .winter_adaptive
+                .charge_on_negative_even_if_full,
             winter_peak_discharge_enabled: config.winter_peak_discharge.enabled,
             winter_peak_min_spread_czk: config.winter_peak_discharge.min_spread_czk,
             winter_peak_min_soc_to_start: config.winter_peak_discharge.min_soc_to_start,
@@ -134,23 +181,53 @@ impl AdaptiveSeasonalOptimizer {
         ));
 
         let mut winter_strategies: Vec<Box<dyn EconomicStrategy>> = Vec::new();
-        // DISABLED: SolarAwareChargingStrategy
-        // This was overriding TimeAwareChargeStrategy with more lenient price thresholds (30% above min)
-        // causing charging before reaching the actual cheapest blocks.
-        // TimeAwareChargeStrategy now handles all charging with "upcoming cheapest blocks" logic.
 
-        if config.winter_peak_discharge_enabled {
-            winter_strategies.push(Box::new(winter_discharge.as_ref().clone()));
+        // PRIMARY WINTER STRATEGY: WinterAdaptiveStrategy
+        // This comprehensive strategy handles all winter optimization:
+        // - EMA-based consumption forecasting
+        // - Multi-horizon price analysis
+        // - Intelligent battery charge planning
+        // - Smart mode switching (Back Up Mode vs Self Use)
+        // - Battery protection (40% SOC threshold)
+        if config.winter_adaptive_enabled {
+            let winter_adaptive_config = WinterAdaptiveConfig {
+                enabled: true,
+                ema_period_days: config.winter_adaptive_ema_period_days,
+                min_solar_percentage: config.winter_adaptive_min_solar_percentage,
+                target_battery_soc: config.winter_adaptive_target_battery_soc,
+                critical_battery_soc: config.winter_adaptive_critical_battery_soc,
+                top_expensive_blocks: config.winter_adaptive_top_expensive_blocks,
+                tomorrow_preservation_threshold: config
+                    .winter_adaptive_tomorrow_preservation_threshold,
+                grid_export_price_threshold: config.winter_adaptive_grid_export_price_threshold,
+                min_soc_for_export: config.winter_adaptive_min_soc_for_export,
+                export_trigger_multiplier: config.winter_adaptive_export_trigger_multiplier,
+                negative_price_handling_enabled: config
+                    .winter_adaptive_negative_price_handling_enabled,
+                charge_on_negative_even_if_full: config
+                    .winter_adaptive_charge_on_negative_even_if_full,
+                ..Default::default()
+            };
+            winter_strategies.push(Box::new(WinterAdaptiveStrategy::new(
+                winter_adaptive_config,
+            )));
+        } else {
+            // Fallback to legacy strategies if winter adaptive is disabled
+            if config.winter_peak_discharge_enabled {
+                winter_strategies.push(Box::new(winter_discharge.as_ref().clone()));
+            }
+            if config.morning_precharge_enabled {
+                winter_strategies.push(Box::new(MorningPreChargeStrategy::default()));
+            }
+            if config.day_ahead_planning_enabled {
+                winter_strategies.push(Box::new(DayAheadChargePlanningStrategy::default()));
+            }
+            if config.time_aware_charge_enabled {
+                winter_strategies.push(Box::new(TimeAwareChargeStrategy::default()));
+            }
         }
-        if config.morning_precharge_enabled {
-            winter_strategies.push(Box::new(MorningPreChargeStrategy::default()));
-        }
-        if config.day_ahead_planning_enabled {
-            winter_strategies.push(Box::new(DayAheadChargePlanningStrategy::default()));
-        }
-        if config.time_aware_charge_enabled {
-            winter_strategies.push(Box::new(TimeAwareChargeStrategy::default()));
-        }
+
+        // Always include SelfUse as ultimate fallback
         if config.self_use_enabled {
             winter_strategies.push(Box::new(SelfUseStrategy::default()));
         }

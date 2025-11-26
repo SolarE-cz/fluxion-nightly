@@ -33,6 +33,8 @@ pub struct SystemConfig {
     pub system_config: SystemSettingsConfig,
     #[serde(default, rename = "strategies")]
     pub strategies_config: SeasonalStrategiesConfig,
+    #[serde(default, rename = "history")]
+    pub history: crate::components::ConsumptionHistoryConfig,
 }
 
 /// Configuration for a single inverter
@@ -224,6 +226,8 @@ pub struct SystemSettingsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StrategiesConfigCore {
     #[serde(default)]
+    pub winter_adaptive: WinterAdaptiveConfigCore,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfigCore,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfigCore,
@@ -295,6 +299,69 @@ pub struct StrategyEnabledConfigCore {
 impl Default for StrategyEnabledConfigCore {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveConfigCore {
+    pub enabled: bool,
+    pub ema_period_days: usize,
+    pub min_solar_percentage: f32,
+    pub target_battery_soc: f32,
+    pub critical_battery_soc: f32,
+    pub top_expensive_blocks: usize,
+    #[serde(default = "default_tomorrow_preservation_threshold")]
+    pub tomorrow_preservation_threshold: f32,
+    #[serde(default = "default_grid_export_price_threshold")]
+    pub grid_export_price_threshold: f32,
+    #[serde(default = "default_min_soc_for_export")]
+    pub min_soc_for_export: f32,
+    #[serde(default = "default_export_trigger_multiplier")]
+    pub export_trigger_multiplier: f32,
+    #[serde(default = "default_negative_price_handling_enabled")]
+    pub negative_price_handling_enabled: bool,
+    #[serde(default = "default_charge_on_negative_even_if_full")]
+    pub charge_on_negative_even_if_full: bool,
+    #[serde(skip)]
+    pub historical_daily_consumption: Vec<f32>,
+}
+
+fn default_tomorrow_preservation_threshold() -> f32 {
+    1.2
+}
+fn default_grid_export_price_threshold() -> f32 {
+    8.0
+}
+fn default_min_soc_for_export() -> f32 {
+    50.0
+}
+fn default_export_trigger_multiplier() -> f32 {
+    2.5
+}
+fn default_negative_price_handling_enabled() -> bool {
+    true
+}
+fn default_charge_on_negative_even_if_full() -> bool {
+    false
+}
+
+impl Default for WinterAdaptiveConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ema_period_days: 7,
+            min_solar_percentage: 0.10,
+            target_battery_soc: 90.0,
+            critical_battery_soc: 40.0,
+            top_expensive_blocks: 12,
+            tomorrow_preservation_threshold: 1.2,
+            grid_export_price_threshold: 8.0,
+            min_soc_for_export: 50.0,
+            export_trigger_multiplier: 2.5,
+            negative_price_handling_enabled: true,
+            charge_on_negative_even_if_full: false,
+            historical_daily_consumption: Vec::new(),
+        }
     }
 }
 
@@ -388,3 +455,9 @@ mod tests {
         assert_eq!(schedule.get_price(2), 10.0); // Wraps
     }
 }
+
+/// Wrapper resource for the consumption history data source
+#[derive(Resource)]
+pub struct ConsumptionHistoryDataSourceResource(
+    pub Arc<dyn crate::traits::ConsumptionHistoryDataSource>,
+);

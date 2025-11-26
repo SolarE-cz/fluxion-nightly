@@ -57,6 +57,7 @@ fn test_config_update_flow() {
             timezone: None,
         },
         strategies_config: Default::default(),
+        history: Default::default(),
     };
 
     // Create config update channel
@@ -154,6 +155,7 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
             timezone: None,
         },
         strategies_config: Default::default(),
+        history: Default::default(),
     };
 
     // Create config update channel

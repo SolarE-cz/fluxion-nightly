@@ -294,6 +294,14 @@ async fn export_handler(State(app_state): State<AppState>) -> impl IntoResponse 
                     "export_format_version": "1.0",
                     "description": "FluxION solar battery management system data export for analysis"
                 },
+                "consumption_stats": response.consumption_stats.as_ref().map(|stats| {
+                    serde_json::json!({
+                        "ema_kwh": stats.ema_kwh,
+                        "ema_days": stats.ema_days,
+                        "today_import_kwh": stats.today_import_kwh,
+                        "yesterday_import_kwh": stats.yesterday_import_kwh,
+                    })
+                }),
                 "system_health": {
                     "status": {
                         "inverter_connection": response.health.inverter_source,

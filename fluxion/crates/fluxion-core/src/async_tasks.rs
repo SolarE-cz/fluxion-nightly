@@ -94,3 +94,18 @@ pub struct BatteryHistoryFetcher {
 pub struct BatteryHistoryChannel {
     pub receiver: Receiver<(String, DateTime<Utc>)>,
 }
+
+// ============= Consumption History Fetcher =============
+
+/// Component marking this entity as the consumption history fetcher worker
+#[derive(Component)]
+pub struct ConsumptionHistoryFetcher {
+    pub source_name: String,
+    pub fetch_interval_hours: u64,
+}
+
+/// Component that holds a channel receiver for consumption history updates
+#[derive(Component)]
+pub struct ConsumptionHistoryChannel {
+    pub receiver: Receiver<Vec<crate::components::DailyEnergySummary>>,
+}

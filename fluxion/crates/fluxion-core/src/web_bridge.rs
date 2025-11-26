@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
+use crate::utils::calculate_ema;
 use crate::{
     components::*, config_events::ConfigUpdateEvent, debug::DebugModeConfig,
     resources::SystemConfig,
@@ -132,6 +133,19 @@ pub struct PvGenerationHistoryPoint {
     pub power_w: f32,
 }
 
+/// Aggregated consumption statistics used by strategies
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumptionStats {
+    /// Historical EMA of daily consumption (kWh/day), if available
+    pub ema_kwh: Option<f32>,
+    /// Number of days used for EMA calculation
+    pub ema_days: usize,
+    /// Total grid import today (kWh), if available
+    pub today_import_kwh: Option<f32>,
+    /// Total grid import yesterday (kWh), if available
+    pub yesterday_import_kwh: Option<f32>,
+}
+
 /// Response containing ECS component data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebQueryResponse {
@@ -145,6 +159,8 @@ pub struct WebQueryResponse {
     pub battery_soc_history: Option<Vec<BatterySocHistoryPoint>>,
     pub battery_soc_prediction: Option<Vec<BatterySocPredictionPoint>>,
     pub pv_generation_history: Option<Vec<PvGenerationHistoryPoint>>,
+    /// Aggregated consumption statistics (EMA, imports)
+    pub consumption_stats: Option<ConsumptionStats>,
 }
 
 /// Inverter component data bundle
@@ -198,6 +214,8 @@ pub struct InverterData {
     pub battery_output_energy_today_kwh: Option<f32>,
     pub today_solar_energy_kwh: Option<f32>,
     pub total_solar_energy_kwh: Option<f32>,
+    /// Grid import EMA (historical average consumption per day in kWh)
+    pub grid_import_ema_kwh: Option<f32>,
 }
 
 /// Schedule component data
@@ -228,6 +246,16 @@ pub struct PriceData {
     pub max_price: f32,
     pub avg_price: f32,
     pub blocks: Vec<PriceBlockData>,
+    // Today's price statistics
+    pub today_min_price: f32,
+    pub today_max_price: f32,
+    pub today_avg_price: f32,
+    pub today_median_price: f32,
+    // Tomorrow's price statistics (None if not yet available)
+    pub tomorrow_min_price: Option<f32>,
+    pub tomorrow_max_price: Option<f32>,
+    pub tomorrow_avg_price: Option<f32>,
+    pub tomorrow_median_price: Option<f32>,
 }
 
 /// Individual price block
@@ -331,6 +359,8 @@ pub fn web_query_system(
     price_analysis: Query<&PriceAnalysis>,
     battery_history: Res<BatteryHistory>,
     pv_history: Res<PvHistory>,
+    consumption_history: Option<Res<ConsumptionHistory>>,
+    consumption_history_config: Option<Res<ConsumptionHistoryConfig>>,
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -349,6 +379,8 @@ pub fn web_query_system(
                 &price_analysis,
                 &battery_history,
                 &pv_history,
+                consumption_history.as_deref(),
+                consumption_history_config.as_deref(),
             ),
         };
 
@@ -368,8 +400,62 @@ fn build_dashboard_response(
     price_analysis: &Query<&PriceAnalysis>,
     battery_history: &BatteryHistory,
     pv_history: &PvHistory,
+    consumption_history: Option<&ConsumptionHistory>,
+    consumption_history_config: Option<&ConsumptionHistoryConfig>,
 ) -> WebQueryResponse {
     let now = Utc::now();
+
+    // Compute consumption statistics (EMA and imports) early for use in inverter data
+    let consumption_stats = {
+        // Determine EMA window (days) from config if available, otherwise default to 7
+        let ema_days = consumption_history_config
+            .map(|cfg| cfg.ema_days)
+            .unwrap_or(7);
+
+        let mut ema_kwh: Option<f32> = None;
+        let mut today_import_kwh: Option<f32> = None;
+        let mut yesterday_import_kwh: Option<f32> = None;
+
+        if let Some(history) = consumption_history {
+            // EMA based on historical daily consumption values
+            let values = history.consumption_values();
+            if history.has_sufficient_data(ema_days) {
+                ema_kwh = calculate_ema(&values, ema_days);
+            }
+
+            // Today and yesterday imports from history summaries (newest first)
+            let today_date = now.date_naive();
+            let yesterday_date = today_date.pred_opt().unwrap_or(today_date);
+
+            for summary in history.summaries().iter() {
+                let date = summary.date.date_naive();
+                if date == today_date && today_import_kwh.is_none() {
+                    today_import_kwh = Some(summary.grid_import_kwh);
+                } else if date == yesterday_date && yesterday_import_kwh.is_none() {
+                    yesterday_import_kwh = Some(summary.grid_import_kwh);
+                }
+
+                if today_import_kwh.is_some() && yesterday_import_kwh.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // Only include stats if we have at least some meaningful data
+        if ema_kwh.is_some() || today_import_kwh.is_some() || yesterday_import_kwh.is_some() {
+            Some(ConsumptionStats {
+                ema_kwh,
+                ema_days,
+                today_import_kwh,
+                yesterday_import_kwh,
+            })
+        } else {
+            None
+        }
+    };
+
+    // Extract EMA for use in inverter data
+    let grid_import_ema = consumption_stats.as_ref().and_then(|stats| stats.ema_kwh);
 
     // Query inverter data
     let inverter_data: Vec<InverterData> = inverters
@@ -428,6 +514,7 @@ fn build_dashboard_response(
                     .and_then(|r| r.state.battery_output_energy_today_kwh),
                 today_solar_energy_kwh: raw_state.and_then(|r| r.state.today_solar_energy_kwh),
                 total_solar_energy_kwh: raw_state.and_then(|r| r.state.total_solar_energy_kwh),
+                grid_import_ema_kwh: grid_import_ema,
             }
         })
         .collect();
@@ -477,106 +564,199 @@ fn build_dashboard_response(
     });
 
     // Query price data and enrich with schedule info
-    let price_data_result = price_data
-        .single()
-        .ok()
-        .zip(price_analysis.single().ok())
-        .map(|(prices, analysis)| {
-            // Get schedule for matching blocks with strategy info
-            let sched = schedule.single().ok();
+    let price_data_result =
+        price_data
+            .single()
+            .ok()
+            .zip(price_analysis.single().ok())
+            .map(|(prices, analysis)| {
+                // Get schedule for matching blocks with strategy info
+                let sched = schedule.single().ok();
 
-            // Build price blocks with classification
-            let blocks: Vec<PriceBlockData> = prices
-                .time_block_prices
-                .iter()
-                .enumerate()
-                .map(|(idx, block)| {
-                    // CRITICAL: Match schedule blocks by TIMESTAMP, not array index
-                    // This is essential because schedule may have filtered past blocks,
-                    // causing index misalignment with price data blocks.
-                    let (block_type, target_soc, strategy, profit, reason, debug_info) = sched
-                        .and_then(|s| {
-                            // Find the scheduled block that matches this price block's timestamp
-                            s.scheduled_blocks
-                                .iter()
-                                .find(|sb| sb.block_start == block.block_start)
-                        })
-                        .map(|sb| {
-                            let (strat, prof) = extract_strategy_info(&sb.reason);
-                            let block_type_str = match sb.mode {
-                                InverterOperationMode::ForceCharge => "charge",
-                                InverterOperationMode::ForceDischarge => "discharge",
-                                InverterOperationMode::SelfUse => "self-use",
-                                InverterOperationMode::BackUpMode => "backup",
-                            };
-                            let target_soc = match sb.mode {
-                                InverterOperationMode::ForceCharge => {
-                                    Some(system_config.control_config.max_battery_soc)
-                                }
-                                InverterOperationMode::ForceDischarge => {
-                                    Some(system_config.control_config.min_battery_soc)
-                                }
-                                InverterOperationMode::SelfUse
-                                | InverterOperationMode::BackUpMode => None,
-                            };
-                            (
-                                block_type_str.to_string(),
-                                target_soc,
-                                strat,
-                                prof,
-                                Some(sb.reason.clone()),
-                                sb.debug_info.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            // Fallback to analysis only if no matching schedule block found
-                            let (block_type, target_soc) = if analysis.charge_blocks.contains(&idx)
-                            {
+                // Build price blocks with classification
+                let blocks: Vec<PriceBlockData> = prices
+                    .time_block_prices
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, block)| {
+                        // CRITICAL: Match schedule blocks by TIMESTAMP, not array index
+                        // This is essential because schedule may have filtered past blocks,
+                        // causing index misalignment with price data blocks.
+                        let (block_type, target_soc, strategy, profit, reason, debug_info) = sched
+                            .and_then(|s| {
+                                // Find the scheduled block that matches this price block's timestamp
+                                s.scheduled_blocks
+                                    .iter()
+                                    .find(|sb| sb.block_start == block.block_start)
+                            })
+                            .map(|sb| {
+                                let (strat, prof) = extract_strategy_info(&sb.reason);
+                                let block_type_str = match sb.mode {
+                                    InverterOperationMode::ForceCharge => "charge",
+                                    InverterOperationMode::ForceDischarge => "discharge",
+                                    InverterOperationMode::SelfUse => "self-use",
+                                    InverterOperationMode::BackUpMode => "backup",
+                                };
+                                let target_soc = match sb.mode {
+                                    InverterOperationMode::ForceCharge => {
+                                        Some(system_config.control_config.max_battery_soc)
+                                    }
+                                    InverterOperationMode::ForceDischarge => {
+                                        Some(system_config.control_config.min_battery_soc)
+                                    }
+                                    InverterOperationMode::SelfUse
+                                    | InverterOperationMode::BackUpMode => None,
+                                };
                                 (
-                                    "charge".to_string(),
-                                    Some(system_config.control_config.max_battery_soc),
+                                    block_type_str.to_string(),
+                                    target_soc,
+                                    strat,
+                                    prof,
+                                    Some(sb.reason.clone()),
+                                    sb.debug_info.clone(),
                                 )
-                            } else if analysis.discharge_blocks.contains(&idx) {
-                                (
-                                    "discharge".to_string(),
-                                    Some(system_config.control_config.min_battery_soc),
-                                )
-                            } else {
-                                ("self-use".to_string(), None)
-                            };
-                            (block_type, target_soc, None, None, None, None)
-                        });
+                            })
+                            .unwrap_or_else(|| {
+                                // Fallback: No matching schedule block found
+                                // Check if this is a charge/discharge block from analysis
+                                if analysis.charge_blocks.contains(&idx) {
+                                    (
+                                        "charge".to_string(),
+                                        Some(system_config.control_config.max_battery_soc),
+                                        Some("Time-Aware Charge".to_string()),
+                                        None,
+                                        Some(format!(
+                                            "Time-Aware Charge - Cheapest block ({:.3} CZK/kWh)",
+                                            block.price_czk_per_kwh
+                                        )),
+                                        None,
+                                    )
+                                } else if analysis.discharge_blocks.contains(&idx) {
+                                    (
+                                        "discharge".to_string(),
+                                        Some(system_config.control_config.min_battery_soc),
+                                        Some("Winter-Peak-Discharge".to_string()),
+                                        None,
+                                        Some(format!(
+                                            "Winter-Peak-Discharge - Peak price ({:.3} CZK/kWh)",
+                                            block.price_czk_per_kwh
+                                        )),
+                                        None,
+                                    )
+                                } else {
+                                    // Default to self-use with strategy name
+                                    (
+                                        "self-use".to_string(),
+                                        None,
+                                        Some("Self-Use".to_string()),
+                                        None,
+                                        Some(format!(
+                                            "Self-Use - Normal operation ({:.3} CZK/kWh)",
+                                            block.price_czk_per_kwh
+                                        )),
+                                        None,
+                                    )
+                                }
+                            });
 
-                    PriceBlockData {
-                        timestamp: block.block_start,
-                        price: block.price_czk_per_kwh,
-                        block_type,
-                        target_soc,
-                        strategy,
-                        expected_profit: profit,
-                        reason,
-                        debug_info,
-                        is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
-                    }
-                })
-                .collect();
+                        PriceBlockData {
+                            timestamp: block.block_start,
+                            price: block.price_czk_per_kwh,
+                            block_type,
+                            target_soc,
+                            strategy,
+                            expected_profit: profit,
+                            reason,
+                            debug_info,
+                            is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
+                        }
+                    })
+                    .collect();
 
-            // Find current price (closest to now)
-            let current_price = prices
-                .time_block_prices
-                .iter()
-                .min_by_key(|b| (b.block_start - now).num_seconds().abs())
-                .map(|b| b.price_czk_per_kwh)
-                .unwrap_or(0.0);
+                // Find current price (closest to now)
+                let current_price = prices
+                    .time_block_prices
+                    .iter()
+                    .min_by_key(|b| (b.block_start - now).num_seconds().abs())
+                    .map(|b| b.price_czk_per_kwh)
+                    .unwrap_or(0.0);
 
-            PriceData {
-                current_price,
-                min_price: analysis.price_range.min_czk_per_kwh,
-                max_price: analysis.price_range.max_czk_per_kwh,
-                avg_price: analysis.price_range.avg_czk_per_kwh,
-                blocks,
-            }
-        });
+                // Separate today and tomorrow prices based on dates
+                let today_date = now.date_naive();
+                let tomorrow_date = today_date + chrono::Duration::days(1);
+
+                let today_prices: Vec<f32> = prices
+                    .time_block_prices
+                    .iter()
+                    .filter(|b| b.block_start.date_naive() == today_date)
+                    .map(|b| b.price_czk_per_kwh)
+                    .collect();
+
+                let tomorrow_prices: Vec<f32> = prices
+                    .time_block_prices
+                    .iter()
+                    .filter(|b| b.block_start.date_naive() == tomorrow_date)
+                    .map(|b| b.price_czk_per_kwh)
+                    .collect();
+
+                // Calculate today's statistics
+                let today_min_price = today_prices
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(0.0);
+                let today_max_price = today_prices
+                    .iter()
+                    .copied()
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(0.0);
+                let today_avg_price = if !today_prices.is_empty() {
+                    today_prices.iter().sum::<f32>() / today_prices.len() as f32
+                } else {
+                    0.0
+                };
+                let today_median_price = calculate_median(&today_prices);
+
+                // Calculate tomorrow's statistics (may not be available yet)
+                let (
+                    tomorrow_min_price,
+                    tomorrow_max_price,
+                    tomorrow_avg_price,
+                    tomorrow_median_price,
+                ) = if !tomorrow_prices.is_empty() {
+                    let min = tomorrow_prices
+                        .iter()
+                        .copied()
+                        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(0.0);
+                    let max = tomorrow_prices
+                        .iter()
+                        .copied()
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(0.0);
+                    let avg = tomorrow_prices.iter().sum::<f32>() / tomorrow_prices.len() as f32;
+                    let median = calculate_median(&tomorrow_prices);
+                    (Some(min), Some(max), Some(avg), Some(median))
+                } else {
+                    (None, None, None, None)
+                };
+
+                PriceData {
+                    current_price,
+                    min_price: analysis.price_range.min_czk_per_kwh,
+                    max_price: analysis.price_range.max_czk_per_kwh,
+                    avg_price: analysis.price_range.avg_czk_per_kwh,
+                    blocks,
+                    today_min_price,
+                    today_max_price,
+                    today_avg_price,
+                    today_median_price,
+                    tomorrow_min_price,
+                    tomorrow_max_price,
+                    tomorrow_avg_price,
+                    tomorrow_median_price,
+                }
+            });
 
     // Build health status
     let has_inverter_data = !inverter_data.is_empty();
@@ -587,6 +767,22 @@ fn build_dashboard_response(
         price_source: has_price_data,
         last_update: now,
         errors: vec![],
+    };
+
+    // Fallback for today's import from live inverter data if history is missing
+    let consumption_stats = if let Some(mut stats) = consumption_stats {
+        if stats.today_import_kwh.is_none() {
+            let live_today_import: f32 = inverter_data
+                .iter()
+                .filter_map(|inv| inv.grid_import_today_kwh)
+                .sum();
+            if live_today_import > 0.0 {
+                stats.today_import_kwh = Some(live_today_import);
+            }
+        }
+        Some(stats)
+    } else {
+        None
     };
 
     // Convert battery history to response format
@@ -704,6 +900,22 @@ fn build_dashboard_response(
         battery_soc_history,
         battery_soc_prediction,
         pv_generation_history,
+        consumption_stats,
+    }
+}
+
+/// Calculate median of a slice of f32 values
+fn calculate_median(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
     }
 }
 

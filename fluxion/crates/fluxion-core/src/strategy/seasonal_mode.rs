@@ -11,9 +11,10 @@
 // For commercial licensing, please contact: info@solare.cz
 
 use chrono::{DateTime, Datelike, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Seasonal operating mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SeasonalMode {
     /// May-September
     Summer,

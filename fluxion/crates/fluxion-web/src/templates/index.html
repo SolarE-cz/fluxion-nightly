@@ -119,6 +119,12 @@
                 <span class="stat-value">{{ import_today }} {{ self.t("unit-kilowatt-hour") }}</span>
             </div>
             {% endif %}
+            {% if let Some(ema) = inverter.grid_import_ema_kwh %}
+            <div class="stat">
+                <span class="stat-label">Grid Import EMA (avg/day)</span>
+                <span class="stat-value">{{ ema }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
             {% if let Some(export_today) = inverter.grid_export_today_kwh %}
             <div class="stat">
                 <span class="stat-label">{{ self.t("grid-export-today") }}</span>
@@ -296,24 +302,118 @@
             <span class="stat-label">Current Price</span>
             <span class="stat-value">{{ prices.current_price }} CZK/kWh</span>
         </div>
+        <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📅 Today</h3>
         <div class="stat">
-            <span class="stat-label">Today's Minimum</span>
-            <span class="stat-value">{{ prices.min_price }} CZK/kWh</span>
+            <span class="stat-label">Minimum</span>
+            <span class="stat-value">{{ prices.today_min_price }} CZK/kWh</span>
         </div>
         <div class="stat">
-            <span class="stat-label">Today's Maximum</span>
-            <span class="stat-value">{{ prices.max_price }} CZK/kWh</span>
+            <span class="stat-label">Maximum</span>
+            <span class="stat-value">{{ prices.today_max_price }} CZK/kWh</span>
         </div>
         <div class="stat">
-            <span class="stat-label">Today's Average</span>
-            <span class="stat-value">{{ prices.avg_price }} CZK/kWh</span>
+            <span class="stat-label">Average</span>
+            <span class="stat-value">{{ prices.today_avg_price }} CZK/kWh</span>
         </div>
+        <div class="stat">
+            <span class="stat-label">Median</span>
+            <span class="stat-value">{{ prices.today_median_price }} CZK/kWh</span>
+        </div>
+        <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📆 Tomorrow</h3>
+        {% match prices.tomorrow_min_price %}
+        {% when Some with (min) %}
+        <div class="stat">
+            <span class="stat-label">Minimum</span>
+            <span class="stat-value">{{ min }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Minimum</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+        {% match prices.tomorrow_max_price %}
+        {% when Some with (max) %}
+        <div class="stat">
+            <span class="stat-label">Maximum</span>
+            <span class="stat-value">{{ max }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Maximum</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+        {% match prices.tomorrow_avg_price %}
+        {% when Some with (avg) %}
+        <div class="stat">
+            <span class="stat-label">Average</span>
+            <span class="stat-value">{{ avg }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Average</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+        {% match prices.tomorrow_median_price %}
+        {% when Some with (median) %}
+        <div class="stat">
+            <span class="stat-label">Median</span>
+            <span class="stat-value">{{ median }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Median</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
     </div>
     {% else %}
     <div class="card warning">
         <h2>💰 Prices</h2>
         <p>No price data available yet...</p>
         <div class="loading" style="margin-top: 10px;"></div>
+    </div>
+    {% endif %}
+
+    <!-- Consumption History / EMA -->
+    {% if let Some(stats) = consumption_stats %}
+    <div class="card">
+        <h2>📊 Consumption</h2>
+        <div class="stat">
+            <span class="stat-label">Historical EMA ({{ stats.ema_days }} days)</span>
+            <span class="stat-value">
+                {% match stats.ema_kwh %}
+                {% when Some with (ema) %}
+                {{ ema }} kWh/day
+                {% when None %}
+                <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+                {% endmatch %}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Grid import today</span>
+            <span class="stat-value">
+                {% match stats.today_import_kwh %}
+                {% when Some with (today) %}
+                {{ today }} kWh
+                {% when None %}
+                <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+                {% endmatch %}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Grid import yesterday</span>
+            <span class="stat-value">
+                {% match stats.yesterday_import_kwh %}
+                {% when Some with (yest) %}
+                {{ yest }} kWh
+                {% when None %}
+                <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+                {% endmatch %}
+            </span>
+        </div>
     </div>
     {% endif %}
     </div><!-- End of #live-data -->

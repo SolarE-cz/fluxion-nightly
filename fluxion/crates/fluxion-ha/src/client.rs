@@ -327,12 +327,16 @@ impl HomeAssistantClient {
         let end = end_time.unwrap_or_else(Utc::now);
 
         // HA history API expects ISO 8601 timestamps
+        // Format: /api/history/period/{start}?filter_entity_id={entity}&end_time={end}
         let start_str = start_time.to_rfc3339();
         let end_str = end.to_rfc3339();
 
+        // URL-encode the end_time parameter since it contains special characters
+        let end_encoded = urlencoding::encode(&end_str);
+
         let url = format!(
             "{}/api/history/period/{}?filter_entity_id={}&end_time={}",
-            self.base_url, start_str, entity_id, end_str
+            self.base_url, start_str, entity_id, end_encoded
         );
 
         debug!("📊 [HA HISTORY] Fetching history for: {}", entity_id);

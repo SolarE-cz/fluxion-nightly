@@ -191,6 +191,7 @@ pub fn generate_schedule_with_optimizer(
     // Initialize predicted SOC for actual scheduling pass
     let mut predicted_soc = current_battery_soc;
 
+    // SECOND PASS: Generate actual schedule decisions for current and future blocks
     for (local_idx, (original_idx, price_block)) in relevant_blocks.iter().enumerate() {
         // Get forecasts for this block (use defaults if not provided)
         let solar_kwh = solar_forecast
@@ -523,21 +524,13 @@ fn reduce_mode_switches(
     let high_soc_threshold = 90.0;
     let min_consecutive = config.min_consecutive_force_blocks;
 
-    // CRITICAL: If initial SOC is very low (<20%), skip consolidation entirely
-    // to allow all charge blocks through (prevents expensive morning peak imports)
-    let initial_soc = soc_predictions.first().copied().unwrap_or(50.0);
-    if initial_soc < 20.0 {
-        info!(
-            "Skipping mode switch reduction due to CRITICAL low SOC ({:.1}%) - allowing all charge blocks",
-            initial_soc
-        );
-        return;
-    }
+    // Initial SOC could be used for diagnostics in the future, but we
+    // intentionally don't branch on it now to keep behavior simple and
+    // predictable.
 
     let mut i = 0;
     while i < schedule.scheduled_blocks.len() {
-        let block = &schedule.scheduled_blocks[i];
-        let mode = block.mode;
+        let mode = schedule.scheduled_blocks[i].mode;
 
         // Only process force operations
         if mode != InverterOperationMode::ForceCharge
@@ -559,58 +552,127 @@ fn reduce_mode_switches(
         if consecutive < min_consecutive {
             let predicted_soc = soc_predictions.get(i).copied().unwrap_or(50.0);
 
-            // Determine if we should convert to self-use
-            let should_convert = if mode == InverterOperationMode::ForceCharge {
-                // Don't force-charge for short sequences if SOC > 90%
-                // The battery won't accept much energy anyway
-                if predicted_soc > high_soc_threshold {
-                    debug!(
-                        "Removing {}-block force-charge at {} (SOC: {:.1}% > {}%, min required: {})",
-                        consecutive,
-                        block.block_start.format("%H:%M"),
-                        predicted_soc,
-                        high_soc_threshold,
-                        min_consecutive
-                    );
-                    true
-                } else {
-                    // For lower SOC, still avoid short sequences
-                    debug!(
-                        "Removing isolated {}-block force-charge at {} (< {} blocks required for EEPROM protection)",
-                        consecutive,
-                        block.block_start.format("%H:%M"),
-                        min_consecutive
-                    );
-                    true
-                }
+            // STRATEGY: Prefer to *extend* short force sequences to reach
+            // min_consecutive_force_blocks instead of dropping them. This
+            // both respects inverter EEPROM limits (fewer switches) and
+            // preserves the optimizer's decision to charge/discharge.
+            let needed = min_consecutive - consecutive;
+            let mut extended = 0usize;
+
+            // Helper for logging mode name
+            let mode_name = if mode == InverterOperationMode::ForceCharge {
+                "Force-Charge"
             } else {
-                // ForceDischarge: short sequences rarely make sense
-                debug!(
-                    "Removing isolated {}-block force-discharge at {} (< {} blocks required for EEPROM protection)",
-                    consecutive,
-                    block.block_start.format("%H:%M"),
-                    min_consecutive
-                );
-                true
+                "Force-Discharge"
             };
 
-            if should_convert {
-                // Convert all blocks in this short sequence to default mode
-                for j in 0..consecutive {
-                    schedule.scheduled_blocks[i + j].mode = config.default_battery_mode;
-                    schedule.scheduled_blocks[i + j].reason = format!(
-                        "Converted from {} to Self-Use ({}-block sequence < {} min required, SOC: {:.1}%)",
-                        if mode == InverterOperationMode::ForceCharge {
-                            "Force-Charge"
-                        } else {
-                            "Force-Discharge"
-                        },
-                        consecutive,
-                        min_consecutive,
-                        predicted_soc
+            // For very high SOC and ForceCharge, we still avoid extending
+            // sequences: we don't want to push more charge when battery is
+            // effectively full.
+            let can_extend =
+                !(mode == InverterOperationMode::ForceCharge && predicted_soc > high_soc_threshold);
+
+            if can_extend {
+                // First, try to extend to the *right* into default-mode blocks
+                let mut j = i + consecutive;
+                while j < schedule.scheduled_blocks.len()
+                    && extended < needed
+                    && schedule.scheduled_blocks[j].mode == config.default_battery_mode
+                {
+                    schedule.scheduled_blocks[j].mode = mode;
+                    schedule.scheduled_blocks[j].reason = format!(
+                        "Extended {} sequence for EEPROM protection (min {} blocks)",
+                        mode_name, min_consecutive
                     );
+                    extended += 1;
+                    j += 1;
                 }
-                changes += consecutive;
+
+                // If still not enough, try to extend to the *left* into
+                // default-mode blocks directly before the sequence.
+                if extended < needed {
+                    let mut k = i;
+                    while k > 0
+                        && extended < needed
+                        && schedule.scheduled_blocks[k - 1].mode == config.default_battery_mode
+                    {
+                        schedule.scheduled_blocks[k - 1].mode = mode;
+                        schedule.scheduled_blocks[k - 1].reason = format!(
+                            "Extended {} sequence for EEPROM protection (min {} blocks)",
+                            mode_name, min_consecutive
+                        );
+                        extended += 1;
+                        k -= 1;
+                        // Also update i so outer loop doesn't skip the new start
+                        i = k;
+                    }
+                }
+            }
+
+            if extended >= needed {
+                let ts = schedule.scheduled_blocks[i].block_start;
+                debug!(
+                    "Extended {} sequence at {} from {} to {} blocks (SOC: {:.1}%, min required: {})",
+                    mode_name,
+                    ts.format("%H:%M"),
+                    consecutive,
+                    consecutive + extended,
+                    predicted_soc,
+                    min_consecutive
+                );
+                changes += extended;
+            } else {
+                // If we couldn't safely extend (e.g. high SOC or no adjacent
+                // default blocks), fall back to converting this short
+                // sequence to default mode to avoid rapid mode flips.
+                let should_convert = if mode == InverterOperationMode::ForceCharge {
+                    // Don't force-charge for short sequences if SOC > 90%
+                    // The battery won't accept much energy anyway
+                    if predicted_soc > high_soc_threshold {
+                        let ts = schedule.scheduled_blocks[i].block_start;
+                        debug!(
+                            "Removing {}-block force-charge at {} (SOC: {:.1}% > {}%, min required: {})",
+                            consecutive,
+                            ts.format("%H:%M"),
+                            predicted_soc,
+                            high_soc_threshold,
+                            min_consecutive
+                        );
+                        true
+                    } else {
+                        // For lower SOC, still avoid isolated short sequences
+                        let ts = schedule.scheduled_blocks[i].block_start;
+                        debug!(
+                            "Removing isolated {}-block force-charge at {} (< {} blocks required for EEPROM protection, no room to extend)",
+                            consecutive,
+                            ts.format("%H:%M"),
+                            min_consecutive
+                        );
+                        true
+                    }
+                } else {
+                    // ForceDischarge: short sequences rarely make sense
+                    let ts = schedule.scheduled_blocks[i].block_start;
+                    debug!(
+                        "Removing isolated {}-block force-discharge at {} (< {} blocks required for EEPROM protection, no room to extend)",
+                        consecutive,
+                        ts.format("%H:%M"),
+                        min_consecutive
+                    );
+                    true
+                };
+
+                if should_convert {
+                    // Convert all blocks in this short sequence to default mode
+                    for j in 0..consecutive {
+                        schedule.scheduled_blocks[i + j].mode = config.default_battery_mode;
+                        schedule.scheduled_blocks[i + j].reason = format!(
+                            "Converted from {} to Self-Use ({}-block sequence < {} min required, SOC: {:.1}%)",
+                            mode_name, consecutive, min_consecutive, predicted_soc
+                        );
+                    }
+                    changes += consecutive;
+                }
             }
         }
 

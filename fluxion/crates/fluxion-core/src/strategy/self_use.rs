@@ -183,7 +183,38 @@ impl EconomicStrategy for SelfUseStrategy {
             }
         }
 
+        // First, calculate local per-block economics (used as a fallback
+        // when we don't have a full price horizon available).
         eval.calculate_net_profit();
+
+        // If we have a price horizon, override economics to represent the
+        // "do nothing" baseline cost of serving expected consumption from
+        // the grid (zero solar) for all remaining blocks.
+        if let Some(all_blocks) = context.all_price_blocks {
+            let per_block_import_kwh = context.consumption_forecast_kwh;
+
+            if per_block_import_kwh > 0.0 && !all_blocks.is_empty() {
+                let baseline_future_cost: f32 = all_blocks
+                    .iter()
+                    .map(|b| per_block_import_kwh * b.price_czk_per_kwh)
+                    .sum();
+
+                // Baseline self-use has no explicit revenue; it's the
+                // estimated future grid cost if we do not actively
+                // optimize (no proactive charging, no solar benefit).
+                eval.revenue_czk = 0.0;
+                eval.cost_czk = baseline_future_cost;
+                eval.calculate_net_profit();
+
+                eval.reason = format!(
+                    "Baseline self-use: estimated future grid cost {:.2} CZK with {:.3} kWh/15min and no solar ({} remaining blocks)",
+                    baseline_future_cost,
+                    per_block_import_kwh,
+                    all_blocks.len()
+                );
+            }
+        }
+
         eval
     }
 }

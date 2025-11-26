@@ -55,6 +55,12 @@ jobs:
             armv7) echo "platform=linux/arm/v7" >> $GITHUB_OUTPUT ;;
           esac
 
+      - name: Downcase repo name
+        run: |
+          echo "REPO_NAME=${REPO,,}" >> ${GITHUB_ENV}
+        env:
+          REPO: '${{ github.repository }}'
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -63,7 +69,7 @@ jobs:
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/fluxion-${{ matrix.arch }}:latest
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}-${{ matrix.arch }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}-${{ matrix.arch }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -26,6 +26,9 @@ mod enhanced_self_use;
 mod smart_discharge;
 mod unified_smart_charge;
 
+// Winter adaptive strategy (primary strategy for winter)
+mod winter_adaptive;
+
 pub use day_ahead_planning::DayAheadChargePlanningStrategy;
 pub use morning_precharge::MorningPreChargeStrategy;
 pub use optimizer::EconomicOptimizer;
@@ -40,6 +43,11 @@ pub use time_aware_charge::TimeAwareChargeStrategy;
 pub use enhanced_self_use::EnhancedSelfUseStrategy;
 pub use smart_discharge::{DischargeSeasonConfig, SmartDischargeStrategy};
 pub use unified_smart_charge::{UnifiedSmartChargeConfig, UnifiedSmartChargeStrategy};
+
+// Export winter adaptive strategy
+pub use winter_adaptive::{
+    DayEnergyBalance, PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy,
+};
 
 use crate::components::{InverterOperationMode, TimeBlockPrice};
 use crate::resources::ControlConfig;

@@ -85,6 +85,12 @@
             <span class="stat-value">{{ import_today }} {{ self.t("unit-kilowatt-hour") }}</span>
         </div>
         {% endif %}
+        {% if let Some(ema) = inverter.grid_import_ema_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-trending-up"></i>Grid Import EMA (avg/day)</span>
+            <span class="stat-value">{{ ema }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
         {% if let Some(export_today) = inverter.grid_export_today_kwh %}
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-upload"></i>{{ self.t("grid-export-today") }}</span>
@@ -234,18 +240,72 @@
         <span class="stat-label"><i class="mdi mdi-cash"></i>Current Price</span>
         <span class="stat-value">{{ prices.current_price }} CZK/kWh</span>
     </div>
+    <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📅 Today</h3>
     <div class="stat">
-        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Today's Minimum</span>
-        <span class="stat-value">{{ prices.min_price }} CZK/kWh</span>
+        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Minimum</span>
+        <span class="stat-value">{{ prices.today_min_price }} CZK/kWh</span>
     </div>
     <div class="stat">
-        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Today's Maximum</span>
-        <span class="stat-value">{{ prices.max_price }} CZK/kWh</span>
+        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Maximum</span>
+        <span class="stat-value">{{ prices.today_max_price }} CZK/kWh</span>
     </div>
     <div class="stat">
-        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Today's Average</span>
-        <span class="stat-value">{{ prices.avg_price }} CZK/kWh</span>
+        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Average</span>
+        <span class="stat-value">{{ prices.today_avg_price }} CZK/kWh</span>
     </div>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-bell-curve"></i>Median</span>
+        <span class="stat-value">{{ prices.today_median_price }} CZK/kWh</span>
+    </div>
+    <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📆 Tomorrow</h3>
+    {% match prices.tomorrow_min_price %}
+    {% when Some with (min) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Minimum</span>
+        <span class="stat-value">{{ min }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Minimum</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+    {% match prices.tomorrow_max_price %}
+    {% when Some with (max) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Maximum</span>
+        <span class="stat-value">{{ max }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Maximum</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+    {% match prices.tomorrow_avg_price %}
+    {% when Some with (avg) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Average</span>
+        <span class="stat-value">{{ avg }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Average</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+    {% match prices.tomorrow_median_price %}
+    {% when Some with (median) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-bell-curve"></i>Median</span>
+        <span class="stat-value">{{ median }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-bell-curve"></i>Median</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
 </div>
 {% else %}
 <div class="card warning">

@@ -234,6 +234,15 @@ pub fn initialize_inverters_system(
 #[derive(Resource, Default)]
 pub struct BatteryHistoryInitialized(pub bool);
 
+// TODO: Implement system to sync ConsumptionHistory data to WinterAdaptiveStrategy config
+// The strategy config is boxed inside AdaptiveSeasonalOptimizer, making direct updates complex.
+// Possible approaches:
+// 1. Pass ConsumptionHistory as a parameter to strategy evaluation (requires trait changes)
+// 2. Store strategy configs in a separate ECS component that can be mutated
+// 3. Rebuild the optimizer when consumption history updates (expensive)
+//
+// For now, the strategy uses fallback consumption estimates (per-block × 96).
+
 /// System to fetch initial battery history from Home Assistant on startup
 /// This populates the BatteryHistory with the last 48 hours of data from HA
 pub fn fetch_initial_battery_history_system(
@@ -323,6 +332,8 @@ impl Plugin for ContinuousSystemsPlugin {
             .init_resource::<BatteryHistoryInitialized>()
             // Initialize PV generation history resources
             .init_resource::<PvHistory>()
+            // Initialize consumption history for winter adaptive strategy
+            .init_resource::<crate::components::ConsumptionHistory>()
             .add_systems(
                 Startup,
                 (
@@ -337,6 +348,7 @@ impl Plugin for ContinuousSystemsPlugin {
                 (
                     // New channel-based systems (non-blocking)
                     crate::async_systems::poll_price_channel,
+                    crate::async_systems::poll_consumption_history_channel,
                     crate::async_systems::config_event_handler,
                     crate::async_systems::poll_health_channels,
                     crate::async_systems::poll_command_results,

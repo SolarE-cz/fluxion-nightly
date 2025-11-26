@@ -630,3 +630,32 @@ pub trait VendorEntityMapper: Send + Sync {
         None
     }
 }
+
+// ============= History Data Traits =============
+
+/// Historical data point with timestamp and value
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryDataPoint {
+    /// Timestamp of the data point
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Numeric value
+    pub value: f32,
+}
+
+/// Trait for fetching historical consumption data
+#[async_trait]
+pub trait ConsumptionHistoryDataSource: Send + Sync {
+    /// Fetch history for a specific entity over a time range
+    async fn get_history(
+        &self,
+        entity_id: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<HistoryDataPoint>>;
+
+    /// Check if data source is available
+    async fn health_check(&self) -> Result<bool>;
+
+    /// Get data source name for logging
+    fn name(&self) -> &str;
+}

@@ -12,10 +12,14 @@
 
 pub mod battery_history;
 pub mod battery_predictor;
+pub mod consumption_history;
 pub mod pv_history;
 
 pub use battery_history::{BatteryHistory, BatteryHistoryPoint};
 pub use battery_predictor::{BatteryPrediction, BatteryPredictionPoint, predict_battery_soc};
+pub use consumption_history::{
+    ConsumptionHistory, ConsumptionHistoryConfig, DailyEnergySummary, aggregate_daily_consumption,
+};
 pub use pv_history::{PvHistory, PvHistoryPoint};
 
 use bevy_ecs::prelude::*;

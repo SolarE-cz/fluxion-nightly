@@ -122,17 +122,22 @@ fn initialize_and_run() -> Result<()> {
         if let Some(tomorrow_entity) = &config.pricing.tomorrow_price_entity {
             info!("💰 Using separate tomorrow sensor: {}", tomorrow_entity);
             Arc::new(CzSpotPriceAdapter::with_tomorrow_sensor(
-                ha_client,
+                ha_client.clone(),
                 config.pricing.spot_price_entity.clone(),
                 tomorrow_entity.clone(),
             ))
         } else {
             Arc::new(CzSpotPriceAdapter::new(
-                ha_client,
+                ha_client.clone(),
                 config.pricing.spot_price_entity.clone(),
             ))
         };
     info!("💰 Price data source: {}", price_source.name());
+
+    let history_source: Arc<dyn fluxion_core::traits::ConsumptionHistoryDataSource> = Arc::new(
+        fluxion_ha::HaConsumptionHistoryAdapter::new(ha_client.clone()),
+    );
+    info!("📊 History data source: {}", history_source.name());
 
     // Convert AppConfig to SystemConfig for ECS
     let system_config = SystemConfig::from(config.clone());
@@ -207,7 +212,10 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(query_channel)
         .insert_resource(config_update_channel)
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
-        .insert_resource(fluxion_core::PriceDataSourceResource(price_source));
+        .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
+        .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
+            history_source,
+        ));
 
     info!("✅ Starting main loop...");
 

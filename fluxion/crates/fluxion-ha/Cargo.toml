@@ -18,6 +18,7 @@ reqwest.workspace = true
 tokio.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
+urlencoding = "2.1"
 
 [dev-dependencies]
 mockito.workspace = true

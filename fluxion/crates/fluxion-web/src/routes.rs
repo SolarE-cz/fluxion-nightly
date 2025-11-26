@@ -25,6 +25,16 @@ pub struct PriceDataWithChart {
     pub max_price: f32,
     pub avg_price: f32,
     pub chart_data: ChartData,
+    // Today's price statistics
+    pub today_min_price: f32,
+    pub today_max_price: f32,
+    pub today_avg_price: f32,
+    pub today_median_price: f32,
+    // Tomorrow's price statistics (None if not yet available)
+    pub tomorrow_min_price: Option<f32>,
+    pub tomorrow_max_price: Option<f32>,
+    pub tomorrow_avg_price: Option<f32>,
+    pub tomorrow_median_price: Option<f32>,
 }
 
 /// Battery SOC history point for Chart.js
@@ -109,6 +119,8 @@ pub struct DashboardTemplate {
     /// Ingress path prefix for HA Ingress support (e.g., "/hassio/ingress/641a79a3_fluxion")
     /// Empty string when running standalone
     pub ingress_path: String,
+    /// Aggregated consumption statistics (EMA, imports)
+    pub consumption_stats: Option<fluxion_core::web_bridge::ConsumptionStats>,
 }
 
 impl DashboardTemplate {
@@ -406,6 +418,14 @@ impl DashboardTemplate {
                 min_price: price_data.min_price,
                 max_price: price_data.max_price,
                 avg_price: price_data.avg_price,
+                today_min_price: price_data.today_min_price,
+                today_max_price: price_data.today_max_price,
+                today_avg_price: price_data.today_avg_price,
+                today_median_price: price_data.today_median_price,
+                tomorrow_min_price: price_data.tomorrow_min_price,
+                tomorrow_max_price: price_data.tomorrow_max_price,
+                tomorrow_avg_price: price_data.tomorrow_avg_price,
+                tomorrow_median_price: price_data.tomorrow_median_price,
                 chart_data: ChartData {
                     labels,
                     prices,
@@ -442,6 +462,7 @@ impl DashboardTemplate {
             last_update_formatted,
             next_change_formatted,
             ingress_path,
+            consumption_stats: response.consumption_stats,
         }
     }
 }

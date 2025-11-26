@@ -491,6 +491,52 @@ impl CzSpotPriceAdapter {
     }
 }
 
+/// Adapter for fetching consumption history from Home Assistant
+pub struct HaConsumptionHistoryAdapter {
+    client: Arc<HomeAssistantClient>,
+}
+
+impl HaConsumptionHistoryAdapter {
+    pub fn new(client: Arc<HomeAssistantClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl fluxion_core::traits::ConsumptionHistoryDataSource for HaConsumptionHistoryAdapter {
+    async fn get_history(
+        &self,
+        entity_id: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<fluxion_core::traits::HistoryDataPoint>> {
+        let ha_history = self
+            .client
+            .get_history(entity_id, start_time, end_time)
+            .await
+            .context("Failed to fetch history from HA")?;
+
+        // Map HA history points to core history points
+        let core_history = ha_history
+            .into_iter()
+            .map(|p| fluxion_core::traits::HistoryDataPoint {
+                timestamp: p.timestamp,
+                value: p.value,
+            })
+            .collect();
+
+        Ok(core_history)
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        self.client.ping().await.map_err(|e| anyhow::anyhow!(e))
+    }
+
+    fn name(&self) -> &str {
+        "HaConsumptionHistory"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,27 +570,27 @@ mod tests {
         }
 
         fn get_work_mode_entity(&self, inverter_id: &str) -> String {
-            format!("select.{}_work_mode", inverter_id)
+            format!("select.{inverter_id}_work_mode")
         }
 
         fn get_battery_soc_entity(&self, inverter_id: &str) -> String {
-            format!("sensor.{}_battery_soc", inverter_id)
+            format!("sensor.{inverter_id}_battery_soc")
         }
 
         fn get_grid_power_entity(&self, inverter_id: &str) -> String {
-            format!("sensor.{}_grid_power", inverter_id)
+            format!("sensor.{inverter_id}_grid_power")
         }
 
         fn get_battery_power_entity(&self, inverter_id: &str) -> String {
-            format!("sensor.{}_battery_power_charge", inverter_id)
+            format!("sensor.{inverter_id}_battery_power_charge")
         }
 
         fn get_pv_power_entity(&self, inverter_id: &str) -> String {
-            format!("sensor.{}_pv_power", inverter_id)
+            format!("sensor.{inverter_id}_pv_power")
         }
 
         fn get_export_limit_entity(&self, inverter_id: &str) -> String {
-            format!("number.{}_export_limit", inverter_id)
+            format!("number.{inverter_id}_export_limit")
         }
 
         fn get_mode_change_request(

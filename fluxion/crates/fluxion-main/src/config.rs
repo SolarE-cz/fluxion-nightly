@@ -41,6 +41,10 @@ pub struct AppConfig {
     /// Strategies configuration (seasonal and specialized strategies)
     #[serde(default)]
     pub strategies: StrategiesConfig,
+
+    /// Consumption history configuration
+    #[serde(default)]
+    pub history: ConsumptionHistoryConfig,
 }
 
 /// Configuration for a single inverter
@@ -133,6 +137,13 @@ pub struct ControlConfig {
     #[serde(default = "default_battery_capacity")]
     pub battery_capacity_kwh: f32,
 
+    /// Maximum battery charge rate in kW used for planning how many
+    /// 15-minute charge blocks are required to reach the target SOC.
+    /// This should match the inverter's actual sustained charge power.
+    /// Typical values: 3-10 kW depending on system size.
+    #[serde(default = "default_max_battery_charge_rate_kw")]
+    pub max_battery_charge_rate_kw: f32,
+
     /// Battery wear cost per kWh cycled (CZK/kWh)
     /// This represents the cost of battery degradation
     /// Example: 23 kWh battery with 6000 cycles and 115,000 CZK cost
@@ -198,6 +209,10 @@ fn default_hardware_min_soc() -> f32 {
     10.0 // Typical hardware minimum SOC enforced by inverter firmware
 }
 
+fn default_max_battery_charge_rate_kw() -> f32 {
+    5.0 // Conservative default; should be set to actual inverter charge power
+}
+
 fn default_min_consecutive_force_blocks() -> usize {
     2 // Require at least 2 consecutive blocks (30 minutes) for force operations
 }
@@ -253,6 +268,8 @@ pub struct SystemConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StrategiesConfig {
     #[serde(default)]
+    pub winter_adaptive: WinterAdaptiveConfig,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfig,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfig,
@@ -270,6 +287,42 @@ pub struct StrategiesConfig {
     pub self_use: StrategyEnabledConfig,
     #[serde(default)]
     pub seasonal: SeasonalConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterAdaptiveConfig {
+    pub enabled: bool,
+    pub ema_period_days: usize,
+    pub min_solar_percentage: f32,
+    pub target_battery_soc: f32,
+    pub critical_battery_soc: f32,
+    pub top_expensive_blocks: usize,
+    pub tomorrow_preservation_threshold: f32,
+    pub grid_export_price_threshold: f32,
+    pub min_soc_for_export: f32,
+    pub export_trigger_multiplier: f32,
+    pub negative_price_handling_enabled: bool,
+    pub charge_on_negative_even_if_full: bool,
+}
+
+impl Default for WinterAdaptiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ema_period_days: 7,
+            min_solar_percentage: 0.10,
+            target_battery_soc: 90.0,
+            critical_battery_soc: 40.0,
+            top_expensive_blocks: 12,
+            tomorrow_preservation_threshold: 1.2,
+            grid_export_price_threshold: 8.0,
+            min_soc_for_export: 50.0,
+            export_trigger_multiplier: 2.5,
+            negative_price_handling_enabled: true,
+            charge_on_negative_even_if_full: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +382,52 @@ impl Default for StrategyEnabledConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumptionHistoryConfig {
+    /// Home Assistant entity ID for daily consumption (e.g., "sensor.solax_today_s_import_energy")
+    #[serde(default = "default_consumption_entity")]
+    pub consumption_entity: String,
+
+    /// Home Assistant entity ID for daily solar production (e.g., "sensor.energy_production_today")
+    #[serde(default = "default_solar_production_entity")]
+    pub solar_production_entity: String,
+
+    /// Number of days to track for EMA calculation
+    #[serde(default = "default_ema_days")]
+    pub ema_days: usize,
+
+    /// Number of days to track for seasonal mode detection
+    #[serde(default = "default_seasonal_detection_days")]
+    pub seasonal_detection_days: usize,
+}
+
+impl Default for ConsumptionHistoryConfig {
+    fn default() -> Self {
+        Self {
+            consumption_entity: default_consumption_entity(),
+            solar_production_entity: default_solar_production_entity(),
+            ema_days: default_ema_days(),
+            seasonal_detection_days: default_seasonal_detection_days(),
+        }
+    }
+}
+
+fn default_consumption_entity() -> String {
+    "sensor.solax_today_s_import_energy".to_string()
+}
+
+fn default_solar_production_entity() -> String {
+    "sensor.energy_production_today".to_string()
+}
+
+fn default_ema_days() -> usize {
+    7
+}
+
+fn default_seasonal_detection_days() -> usize {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeasonalConfig {
     pub force_season: Option<String>,
@@ -364,6 +463,7 @@ impl Default for AppConfig {
                 min_battery_soc: 10.0,
                 max_battery_soc: 100.0,
                 battery_capacity_kwh: default_battery_capacity(),
+                max_battery_charge_rate_kw: default_max_battery_charge_rate_kw(),
                 battery_wear_cost_czk_per_kwh: default_battery_wear_cost(),
                 battery_efficiency: default_battery_efficiency(),
                 min_mode_change_interval_secs: default_min_mode_change_interval(),
@@ -383,6 +483,7 @@ impl Default for AppConfig {
                 timezone: None, // Will be fetched from HA at runtime
             },
             strategies: StrategiesConfig::default(),
+            history: ConsumptionHistoryConfig::default(),
         }
     }
 }
@@ -710,6 +811,9 @@ impl AppConfig {
         if self.control.battery_capacity_kwh <= 0.0 {
             anyhow::bail!("battery_capacity_kwh must be positive");
         }
+        if self.control.max_battery_charge_rate_kw <= 0.0 {
+            anyhow::bail!("max_battery_charge_rate_kw must be positive");
+        }
         if self.control.battery_wear_cost_czk_per_kwh < 0.0 {
             anyhow::bail!("battery_wear_cost_czk_per_kwh must be non-negative");
         }
@@ -787,6 +891,48 @@ impl AppConfig {
 impl From<&AppConfig> for fluxion_core::SeasonalStrategiesConfig {
     fn from(app_config: &AppConfig) -> Self {
         Self {
+            winter_adaptive_enabled: app_config.strategies.winter_adaptive.enabled,
+            winter_adaptive_ema_period_days: app_config.strategies.winter_adaptive.ema_period_days,
+            winter_adaptive_min_solar_percentage: app_config
+                .strategies
+                .winter_adaptive
+                .min_solar_percentage,
+            winter_adaptive_target_battery_soc: app_config
+                .strategies
+                .winter_adaptive
+                .target_battery_soc,
+            winter_adaptive_critical_battery_soc: app_config
+                .strategies
+                .winter_adaptive
+                .critical_battery_soc,
+            winter_adaptive_top_expensive_blocks: app_config
+                .strategies
+                .winter_adaptive
+                .top_expensive_blocks,
+            winter_adaptive_tomorrow_preservation_threshold: app_config
+                .strategies
+                .winter_adaptive
+                .tomorrow_preservation_threshold,
+            winter_adaptive_grid_export_price_threshold: app_config
+                .strategies
+                .winter_adaptive
+                .grid_export_price_threshold,
+            winter_adaptive_min_soc_for_export: app_config
+                .strategies
+                .winter_adaptive
+                .min_soc_for_export,
+            winter_adaptive_export_trigger_multiplier: app_config
+                .strategies
+                .winter_adaptive
+                .export_trigger_multiplier,
+            winter_adaptive_negative_price_handling_enabled: app_config
+                .strategies
+                .winter_adaptive
+                .negative_price_handling_enabled,
+            winter_adaptive_charge_on_negative_even_if_full: app_config
+                .strategies
+                .winter_adaptive
+                .charge_on_negative_even_if_full,
             winter_peak_discharge_enabled: app_config.strategies.winter_peak_discharge.enabled,
             winter_peak_min_spread_czk: app_config.strategies.winter_peak_discharge.min_spread_czk,
             winter_peak_min_soc_to_start: app_config
@@ -931,9 +1077,9 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 min_mode_change_interval_secs: app_config.control.min_mode_change_interval_secs,
                 average_household_load_kw: app_config.control.average_household_load_kw,
                 hardware_min_battery_soc: app_config.control.hardware_min_battery_soc,
-                max_battery_charge_rate_kw: 10.0, // Default value
-                evening_target_soc: 90.0,         // Default value
-                evening_peak_start_hour: 17,      // Default value
+                max_battery_charge_rate_kw: app_config.control.max_battery_charge_rate_kw,
+                evening_target_soc: app_config.strategies.winter_adaptive.target_battery_soc,
+                evening_peak_start_hour: 17, // Default value
                 min_consecutive_force_blocks: app_config.control.min_consecutive_force_blocks,
                 default_battery_mode: match app_config
                     .control
@@ -955,6 +1101,51 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 timezone: app_config.system.timezone,
             },
             strategies_config: fluxion_core::strategy::SeasonalStrategiesConfig {
+                winter_adaptive_enabled: app_config.strategies.winter_adaptive.enabled,
+                winter_adaptive_ema_period_days: app_config
+                    .strategies
+                    .winter_adaptive
+                    .ema_period_days,
+                winter_adaptive_min_solar_percentage: app_config
+                    .strategies
+                    .winter_adaptive
+                    .min_solar_percentage,
+                winter_adaptive_target_battery_soc: app_config
+                    .strategies
+                    .winter_adaptive
+                    .target_battery_soc,
+                winter_adaptive_critical_battery_soc: app_config
+                    .strategies
+                    .winter_adaptive
+                    .critical_battery_soc,
+                winter_adaptive_top_expensive_blocks: app_config
+                    .strategies
+                    .winter_adaptive
+                    .top_expensive_blocks,
+                winter_adaptive_tomorrow_preservation_threshold: app_config
+                    .strategies
+                    .winter_adaptive
+                    .tomorrow_preservation_threshold,
+                winter_adaptive_grid_export_price_threshold: app_config
+                    .strategies
+                    .winter_adaptive
+                    .grid_export_price_threshold,
+                winter_adaptive_min_soc_for_export: app_config
+                    .strategies
+                    .winter_adaptive
+                    .min_soc_for_export,
+                winter_adaptive_export_trigger_multiplier: app_config
+                    .strategies
+                    .winter_adaptive
+                    .export_trigger_multiplier,
+                winter_adaptive_negative_price_handling_enabled: app_config
+                    .strategies
+                    .winter_adaptive
+                    .negative_price_handling_enabled,
+                winter_adaptive_charge_on_negative_even_if_full: app_config
+                    .strategies
+                    .winter_adaptive
+                    .charge_on_negative_even_if_full,
                 winter_peak_discharge_enabled: app_config.strategies.winter_peak_discharge.enabled,
                 winter_peak_min_spread_czk: app_config
                     .strategies
@@ -1003,6 +1194,12 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 price_arbitrage_enabled: app_config.strategies.price_arbitrage.enabled,
                 solar_first_enabled: app_config.strategies.solar_first.enabled,
                 self_use_enabled: app_config.strategies.self_use.enabled,
+            },
+            history: fluxion_core::components::ConsumptionHistoryConfig {
+                consumption_entity: app_config.history.consumption_entity,
+                solar_production_entity: app_config.history.solar_production_entity,
+                ema_days: app_config.history.ema_days,
+                seasonal_detection_days: app_config.history.seasonal_detection_days,
             },
         }
     }
