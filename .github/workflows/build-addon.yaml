@@ -65,7 +65,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./fluxion/Dockerfile
+          file: Dockerfile
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
           tags: |
