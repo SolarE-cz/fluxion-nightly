@@ -251,7 +251,10 @@
                     <div class="section-desc">{{t("config-section-inverters-desc")}}</div>
                 </div>
                 <div class="section-content">
-                    <p style="color: #666;">Inverter configuration UI - to be implemented</p>
+                    <div id="inverters_list"></div>
+                    <p style="color: #666; font-style: italic; margin-top: 10px;">
+                        Note: Inverter configuration changes (adding/removing) currently require editing config.json manually and restarting the addon.
+                    </p>
                 </div>
             </div>
 
@@ -261,7 +264,46 @@
                     <div class="section-desc">{{t("config-section-pricing-desc")}}</div>
                 </div>
                 <div class="section-content">
-                    <p style="color: #666;">Pricing configuration UI - to be implemented</p>
+                    <div class="form-group">
+                        <label class="form-label" for="pricing_spot_entity">{{t("config-pricing-spot-entity")}}</label>
+                        <input type="text" id="pricing_spot_entity" class="form-input" placeholder="sensor.spot_price">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="pricing_tomorrow_entity">{{t("config-pricing-tomorrow-entity")}}</label>
+                        <input type="text" id="pricing_tomorrow_entity" class="form-input" placeholder="sensor.current_spot_electricity_price_tomorrow">
+                    </div>
+                    
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div class="form-group">
+                            <label class="form-label" for="pricing_buy_fee">{{t("config-pricing-buy-fee")}}</label>
+                            <input type="number" id="pricing_buy_fee" class="form-input" step="0.01" min="0">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label" for="pricing_sell_fee">{{t("config-pricing-sell-fee")}}</label>
+                            <input type="number" id="pricing_sell_fee" class="form-input" step="0.01" min="0">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label class="form-label" for="pricing_dist_fee">{{t("config-pricing-dist-fee")}}</label>
+                        <input type="number" id="pricing_dist_fee" class="form-input" step="0.01" min="0">
+                    </div>
+
+                    <div class="form-group">
+                         <label class="toggle-switch" style="float: right;">
+                            <input type="checkbox" id="pricing_use_spot_buy" class="toggle-input">
+                            <span class="toggle-slider"></span>
+                        </label>
+                         <div style="font-weight: 600;">{{t("config-pricing-use-spot-buy")}}</div>
+                    </div>
+                    
+                    <div class="form-group">
+                         <label class="toggle-switch" style="float: right;">
+                            <input type="checkbox" id="pricing_use_spot_sell" class="toggle-input">
+                            <span class="toggle-slider"></span>
+                        </label>
+                         <div style="font-weight: 600;">{{t("config-pricing-use-spot-sell")}}</div>
+                    </div>
                 </div>
             </div>
 
@@ -271,7 +313,67 @@
                     <div class="section-desc">{{t("config-section-control-desc")}}</div>
                 </div>
                 <div class="section-content">
-                    <p style="color: #666;">Control parameters UI - to be implemented</p>
+                     <!-- Battery SOC Limits -->
+                    <div class="form-group">
+                        <label class="form-label" for="control_min_battery_soc">{{t("config-control-min-soc")}}</label>
+                        <input type="number" id="control_min_battery_soc" class="form-input" step="1" min="0" max="100">
+                        <span class="form-help">{{t("config-control-min-soc-help")}}</span>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="control_max_battery_soc">{{t("config-control-max-soc")}}</label>
+                        <input type="number" id="control_max_battery_soc" class="form-input" step="1" min="0" max="100">
+                        <span class="form-help">{{t("config-control-max-soc-help")}}</span>
+                    </div>
+
+                    <!-- Force Hours -->
+                    <div class="form-group">
+                        <label class="form-label" for="control_force_charge_hours">{{t("config-control-force-charge-hours")}}</label>
+                        <input type="number" id="control_force_charge_hours" class="form-input" step="1" min="0" max="24">
+                        <span class="form-help">{{t("config-control-force-charge-hours-help")}}</span>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="control_force_discharge_hours">{{t("config-control-force-discharge-hours")}}</label>
+                        <input type="number" id="control_force_discharge_hours" class="form-input" step="1" min="0" max="24">
+                        <span class="form-help">{{t("config-control-force-discharge-hours-help")}}</span>
+                    </div>
+
+                    <!-- Battery Params -->
+                     <div class="form-group">
+                        <label class="form-label" for="control_battery_capacity_kwh">{{t("config-control-battery-capacity")}}</label>
+                        <input type="number" id="control_battery_capacity_kwh" class="form-input" step="0.1" min="0.1">
+                        <span class="form-help">{{t("config-control-battery-capacity-help")}}</span>
+                    </div>
+                    
+                     <div class="form-group">
+                        <label class="form-label" for="control_max_export_power_w">{{t("config-control-max-export-power")}}</label>
+                        <input type="number" id="control_max_export_power_w" class="form-input" step="100" min="0">
+                        <span class="form-help">{{t("config-control-max-export-power-help")}}</span>
+                    </div>
+
+                    <!-- Peak Management -->
+                    <div class="form-group">
+                        <label class="form-label" for="control_evening_peak_start_hour">{{t("config-control-evening-peak-start")}}</label>
+                        <input type="number" id="control_evening_peak_start_hour" class="form-input" step="1" min="0" max="23">
+                        <span class="form-help">{{t("config-control-evening-peak-start-help")}}</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" for="control_evening_target_soc">{{t("config-control-evening-target-soc")}}</label>
+                        <input type="number" id="control_evening_target_soc" class="form-input" step="1" min="0" max="100">
+                        <span class="form-help">{{t("config-control-evening-target-soc-help")}}</span>
+                    </div>
+
+                    <!-- Default Mode -->
+                     <div class="form-group">
+                        <label class="form-label" for="control_default_battery_mode">{{t("config-control-default-mode")}}</label>
+                        <select id="control_default_battery_mode" class="form-input">
+                             <option value="SelfUse">Self Use</option>
+                             <option value="BackUpMode">Backup Mode</option>
+                             <option value="ForceCharge">Force Charge</option>
+                             <option value="ForceDischarge">Force Discharge</option>
+                        </select>
+                        <span class="form-help">{{t("config-control-default-mode-help")}}</span>
+                    </div>
                 </div>
             </div>
 
@@ -281,7 +383,90 @@
                     <div class="section-desc">{{t("config-section-strategies-desc")}}</div>
                 </div>
                 <div class="section-content">
-                    <p style="color: #666;">Strategy configuration UI - to be implemented</p>
+                    <h3>Winter Strategies</h3>
+                    
+                    <!-- Winter Adaptive -->
+                    <div class="strategy-card" style="border: 1px solid #eee; padding: 15px; margin-bottom: 15px; border-radius: 4px;">
+                        <div class="form-group" style="margin: 0;">
+                            <label class="toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_wa_enabled" class="toggle-input">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <div style="font-weight: 600;">{{t("config-strat-winter-adaptive")}}</div>
+                            <div style="font-size: 13px; color: #666;">{{t("config-strat-winter-adaptive-desc")}}</div>
+                        </div>
+                        <div id="strat_wa_params" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee;">
+                            <div class="form-group">
+                                <label class="form-label" for="strat_wa_ema">{{t("config-strat-wa-ema-days")}}</label>
+                                <input type="number" id="strat_wa_ema" class="form-input" step="1" min="1" max="30">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="strat_wa_target_soc">{{t("config-strat-wa-target-soc")}}</label>
+                                <input type="number" id="strat_wa_target_soc" class="form-input" step="1" min="0" max="100">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Winter Peak Discharge -->
+                    <div class="strategy-card" style="border: 1px solid #eee; padding: 15px; margin-bottom: 15px; border-radius: 4px;">
+                        <div class="form-group" style="margin: 0;">
+                            <label class="toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_wpd_enabled" class="toggle-input">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <div style="font-weight: 600;">{{t("config-strat-winter-peak-discharge")}}</div>
+                            <div style="font-size: 13px; color: #666;">{{t("config-strat-winter-peak-discharge-desc")}}</div>
+                        </div>
+                        <div id="strat_wpd_params" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #eee;">
+                            <div class="form-group">
+                                <label class="form-label" for="strat_wpd_min_spread">{{t("config-strat-wpd-min-spread")}}</label>
+                                <input type="number" id="strat_wpd_min_spread" class="form-input" step="0.1" min="0">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="strat_wpd_min_soc">{{t("config-strat-wpd-min-soc-start")}}</label>
+                                <input type="number" id="strat_wpd_min_soc" class="form-input" step="1" min="0" max="100">
+                            </div>
+                        </div>
+                    </div>
+
+                    <h3>General Strategies</h3>
+
+                    <!-- Solar Aware Charging -->
+                    <div class="strategy-card" style="border: 1px solid #eee; padding: 15px; margin-bottom: 15px; border-radius: 4px;">
+                        <div class="form-group" style="margin: 0;">
+                            <label class="toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_sac_enabled" class="toggle-input">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <div style="font-weight: 600;">{{t("config-strat-solar-aware")}}</div>
+                            <div style="font-size: 13px; color: #666;">{{t("config-strat-solar-aware-desc")}}</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Other Toggles -->
+                    <div class="form-group">
+                         <label class="toggle-switch" style="float: right;">
+                            <input type="checkbox" id="strat_mp_enabled" class="toggle-input">
+                            <span class="toggle-slider"></span>
+                        </label>
+                         <div style="font-weight: 600;">{{t("config-strat-morning-precharge")}}</div>
+                    </div>
+                    
+                    <div class="form-group">
+                         <label class="toggle-switch" style="float: right;">
+                            <input type="checkbox" id="strat_dap_enabled" class="toggle-input">
+                            <span class="toggle-slider"></span>
+                        </label>
+                         <div style="font-weight: 600;">{{t("config-strat-day-ahead")}}</div>
+                    </div>
+
+                    <div class="form-group">
+                         <label class="toggle-switch" style="float: right;">
+                            <input type="checkbox" id="strat_pa_enabled" class="toggle-input">
+                            <span class="toggle-slider"></span>
+                        </label>
+                         <div style="font-weight: 600;">{{t("config-strat-price-arbitrage")}}</div>
+                    </div>
                 </div>
             </div>
 
@@ -314,6 +499,48 @@
                     log_level: document.getElementById('log_level').value,
                     display_currency: document.getElementById('display_currency').value,
                     language: document.getElementById('language').value,
+                },
+                pricing: {
+                    spot_price_entity: document.getElementById('pricing_spot_entity').value,
+                    tomorrow_price_entity: document.getElementById('pricing_tomorrow_entity').value || null,
+                    spot_buy_fee_czk: parseFloat(document.getElementById('pricing_buy_fee').value),
+                    spot_sell_fee_czk: parseFloat(document.getElementById('pricing_sell_fee').value),
+                    grid_distribution_fee_czk: parseFloat(document.getElementById('pricing_dist_fee').value),
+                    use_spot_prices_to_buy: document.getElementById('pricing_use_spot_buy').checked,
+                    use_spot_prices_to_sell: document.getElementById('pricing_use_spot_sell').checked,
+                    // Default fixed prices (TODO: Add UI)
+                    fixed_buy_price_czk: 5.0,
+                    fixed_sell_price_czk: 0.1,
+                },
+                control: {
+                    min_battery_soc: parseFloat(document.getElementById('control_min_battery_soc').value),
+                    max_battery_soc: parseFloat(document.getElementById('control_max_battery_soc').value),
+                    force_charge_hours: parseInt(document.getElementById('control_force_charge_hours').value),
+                    force_discharge_hours: parseInt(document.getElementById('control_force_discharge_hours').value),
+                    battery_capacity_kwh: parseFloat(document.getElementById('control_battery_capacity_kwh').value),
+                    maximum_export_power_w: parseInt(document.getElementById('control_max_export_power_w').value),
+                    evening_peak_start_hour: parseInt(document.getElementById('control_evening_peak_start_hour').value),
+                    evening_target_soc: parseFloat(document.getElementById('control_evening_target_soc').value),
+                    default_battery_mode: document.getElementById('control_default_battery_mode').value,
+                },
+                strategies: {
+                    // Winter Adaptive
+                    winter_adaptive_enabled: document.getElementById('strat_wa_enabled').checked,
+                    winter_adaptive_ema_period_days: parseInt(document.getElementById('strat_wa_ema').value),
+                    winter_adaptive_target_battery_soc: parseFloat(document.getElementById('strat_wa_target_soc').value),
+                    
+                    // Winter Peak Discharge
+                    winter_peak_discharge_enabled: document.getElementById('strat_wpd_enabled').checked,
+                    winter_peak_min_spread_czk: parseFloat(document.getElementById('strat_wpd_min_spread').value),
+                    winter_peak_min_soc_to_start: parseFloat(document.getElementById('strat_wpd_min_soc').value),
+                    
+                    // Solar Aware
+                    solar_aware_charging_enabled: document.getElementById('strat_sac_enabled').checked,
+                    
+                    // Others
+                    morning_precharge_enabled: document.getElementById('strat_mp_enabled').checked,
+                    day_ahead_planning_enabled: document.getElementById('strat_dap_enabled').checked,
+                    price_arbitrage_enabled: document.getElementById('strat_pa_enabled').checked,
                 },
                 // Other sections would be collected here
             };
@@ -367,6 +594,67 @@
                     document.getElementById('log_level').value = data.config.system.log_level || 'info';
                     document.getElementById('display_currency').value = data.config.system.display_currency || 'CZK';
                     document.getElementById('language').value = data.config.system.language || 'english';
+                }
+                
+                if (data.config.inverters) {
+                     const container = document.getElementById('inverters_list');
+                     if (container) {
+                         container.innerHTML = '';
+                         data.config.inverters.forEach(inv => {
+                             const div = document.createElement('div');
+                             div.className = 'strategy-card';
+                             div.style = 'border: 1px solid #eee; padding: 15px; margin-bottom: 10px; border-radius: 4px; background: #f9f9f9;';
+                             div.innerHTML = `
+                                <div style="font-weight: 600;">${inv.id}</div>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 5px;">
+                                    <div style="font-size: 13px; color: #666;">Prefix: <code>${inv.entity_prefix}</code></div>
+                                    <div style="font-size: 13px; color: #666;">Type: ${inv.inverter_type}</div>
+                                </div>
+                             `;
+                             container.appendChild(div);
+                         });
+                     }
+                }
+
+                if (data.config.pricing) {
+                    document.getElementById('pricing_spot_entity').value = data.config.pricing.spot_price_entity || '';
+                    document.getElementById('pricing_tomorrow_entity').value = data.config.pricing.tomorrow_price_entity || '';
+                    document.getElementById('pricing_buy_fee').value = data.config.pricing.spot_buy_fee_czk || 0;
+                    document.getElementById('pricing_sell_fee').value = data.config.pricing.spot_sell_fee_czk || 0;
+                    document.getElementById('pricing_dist_fee').value = data.config.pricing.grid_distribution_fee_czk || 0;
+                    document.getElementById('pricing_use_spot_buy').checked = data.config.pricing.use_spot_prices_to_buy !== false;
+                    document.getElementById('pricing_use_spot_sell').checked = data.config.pricing.use_spot_prices_to_sell !== false;
+                }
+
+                if (data.config.control) {
+                    document.getElementById('control_min_battery_soc').value = data.config.control.min_battery_soc || 10;
+                    document.getElementById('control_max_battery_soc').value = data.config.control.max_battery_soc || 100;
+                    document.getElementById('control_force_charge_hours').value = data.config.control.force_charge_hours || 4;
+                    document.getElementById('control_force_discharge_hours').value = data.config.control.force_discharge_hours || 2;
+                    document.getElementById('control_battery_capacity_kwh').value = data.config.control.battery_capacity_kwh || 10.0;
+                    document.getElementById('control_max_export_power_w').value = data.config.control.maximum_export_power_w || 10000;
+                    document.getElementById('control_evening_peak_start_hour').value = data.config.control.evening_peak_start_hour || 17;
+                    document.getElementById('control_evening_target_soc').value = data.config.control.evening_target_soc || 90;
+                    document.getElementById('control_default_battery_mode').value = data.config.control.default_battery_mode || 'SelfUse';
+                }
+
+                if (data.config.strategies) {
+                    const s = data.config.strategies;
+                    // Winter Adaptive
+                    document.getElementById('strat_wa_enabled').checked = s.winter_adaptive_enabled !== false;
+                    document.getElementById('strat_wa_ema').value = s.winter_adaptive_ema_period_days || 7;
+                    document.getElementById('strat_wa_target_soc').value = s.winter_adaptive_target_battery_soc || 90;
+
+                    // Winter Peak Discharge
+                    document.getElementById('strat_wpd_enabled').checked = s.winter_peak_discharge_enabled !== false;
+                    document.getElementById('strat_wpd_min_spread').value = s.winter_peak_min_spread_czk || 3.0;
+                    document.getElementById('strat_wpd_min_soc').value = s.winter_peak_min_soc_to_start || 70;
+                    
+                    // Others
+                    document.getElementById('strat_sac_enabled').checked = s.solar_aware_charging_enabled !== false;
+                    document.getElementById('strat_mp_enabled').checked = s.morning_precharge_enabled !== false;
+                    document.getElementById('strat_dap_enabled').checked = s.day_ahead_planning_enabled !== false;
+                    document.getElementById('strat_pa_enabled').checked = s.price_arbitrage_enabled !== false;
                 }
             } catch (error) {
                 console.error('Failed to load config:', error);

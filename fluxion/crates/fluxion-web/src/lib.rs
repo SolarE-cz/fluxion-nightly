@@ -14,6 +14,7 @@ mod chart;
 mod config_api;
 mod config_ui;
 mod routes;
+mod validation;
 
 pub use chart::generate_price_chart_svg;
 pub use config_api::ConfigApiState;
@@ -110,7 +111,7 @@ pub async fn start_web_server(
         )
         .route(
             "/api/config/validate",
-            axum::routing::post(config_api::validate_config_handler),
+            axum::routing::post(config_api::validate_config_handler).with_state(config_state.clone()),
         )
         .route(
             "/api/config/update",

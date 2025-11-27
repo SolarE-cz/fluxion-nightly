@@ -10,6 +10,8 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+use crate::validation;
+use fluxion_core::resources::SystemConfig;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -185,25 +187,29 @@ pub async fn get_config_handler(
 
 /// POST /api/config/validate - Validate configuration without saving
 pub async fn validate_config_handler(
+    State(state): State<ConfigApiState>,
     Json(request): Json<ValidateRequest>,
 ) -> Json<ValidateResponse> {
-    // Parse as AppConfig and validate
-    let validation = match serde_json::from_value::<serde_json::Value>(request.config.clone()) {
-        Ok(_) => {
-            // For now, just do basic JSON validation
-            // In full implementation, deserialize to AppConfig and call validate_detailed()
+    // Merge partial config with current config
+    let mut config_to_validate = state.config.read().clone();
+    validation::merge_json(&mut config_to_validate, request.config);
+
+    // Parse as SystemConfig and validate
+    let validation = match serde_json::from_value::<SystemConfig>(config_to_validate) {
+        Ok(config) => {
+            let (errors, warnings) = validation::validate_config(&config);
             ValidateResponse {
-                valid: true,
-                errors: Vec::new(),
-                warnings: Vec::new(),
-                restart_required: false,
+                valid: errors.is_empty(),
+                errors,
+                warnings,
+                restart_required: false, // TODO: Check if restart needed based on changed fields
             }
         }
         Err(e) => ValidateResponse {
             valid: false,
             errors: vec![ValidationIssue {
                 field: "config".to_owned(),
-                message: format!("Invalid configuration format: {e}"),
+                message: format!("Invalid configuration structure: {e}"),
                 severity: "error".to_owned(),
             }],
             warnings: Vec::new(),
@@ -219,19 +225,26 @@ pub async fn update_config_handler(
     State(state): State<ConfigApiState>,
     Json(request): Json<UpdateConfigRequest>,
 ) -> Result<Json<UpdateConfigResponse>, StatusCode> {
+    // Merge partial config with current config
+    let mut config_to_validate = state.config.read().clone();
+    validation::merge_json(&mut config_to_validate, request.config.clone());
+
     // Validate the new configuration
-    let validation = match serde_json::from_value::<serde_json::Value>(request.config.clone()) {
-        Ok(_) => ValidateResponse {
-            valid: true,
-            errors: Vec::new(),
-            warnings: Vec::new(),
-            restart_required: false,
-        },
+    let validation = match serde_json::from_value::<SystemConfig>(config_to_validate) {
+        Ok(config) => {
+            let (errors, warnings) = validation::validate_config(&config);
+            ValidateResponse {
+                valid: errors.is_empty(),
+                errors,
+                warnings,
+                restart_required: false, // TODO: Check if restart needed
+            }
+        }
         Err(e) => ValidateResponse {
             valid: false,
             errors: vec![ValidationIssue {
                 field: "config".to_owned(),
-                message: format!("Invalid configuration format: {e}"),
+                message: format!("Invalid configuration structure: {e}"),
                 severity: "error".to_owned(),
             }],
             warnings: Vec::new(),
@@ -258,34 +271,13 @@ pub async fn update_config_handler(
         None
     };
 
-    // Merge the partial config update with the existing in-memory config
-    let mut current_config = state.config.read().clone();
-    if let (Some(current_obj), Some(new_obj)) =
-        (current_config.as_object_mut(), request.config.as_object())
-    {
-        // Deep merge: iterate over top-level keys
-        for (key, new_value) in new_obj {
-            if let (Some(current_nested), Some(new_nested)) = (
-                current_obj.get_mut(key).and_then(|v| v.as_object_mut()),
-                new_value.as_object(),
-            ) {
-                // If both are objects, merge their fields
-                for (nested_key, nested_value) in new_nested {
-                    current_nested.insert(nested_key.clone(), nested_value.clone());
-                }
-            } else {
-                // Otherwise, replace the entire value
-                current_obj.insert(key.clone(), new_value.clone());
-            }
-        }
-    }
-
     // Update in-memory config with merged result
-    *state.config.write() = current_config.clone();
-
+    let mut current_config = state.config.write();
+    validation::merge_json(&mut current_config, request.config);
+    
     // Save to persistent storage (optional when running outside HA)
     let persisted = serde_json::json!({
-        "config": current_config,
+        "config": *current_config,
         "metadata": {
             "last_modified": chrono::Utc::now().to_rfc3339(),
             "modified_by": "web_ui",
