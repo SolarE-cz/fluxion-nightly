@@ -1,6 +1,15 @@
 ARG TARGETARCH
-ARG BUILD_FROM=ghcr.io/home-assistant/${TARGETARCH}-base:3.18
-FROM ${BUILD_FROM}
+ARG TARGETPLATFORM
+# Map Docker's arch to Home Assistant's arch naming
+# Docker uses: amd64, arm64
+# Home Assistant uses: amd64, aarch64
+ARG BUILD_ARCH=${TARGETARCH}
+ARG BUILD_FROM=ghcr.io/home-assistant/${BUILD_ARCH}-base:3.18
+FROM ${BUILD_FROM} AS builder-amd64
+
+FROM ghcr.io/home-assistant/aarch64-base:3.18 AS builder-arm64
+
+FROM builder-${TARGETARCH} AS builder
 
 # Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -29,8 +38,12 @@ COPY crates/ ./crates/
 # Build release binary
 RUN cargo build --release --bin fluxion
 
-# Create final image
-FROM ${BUILD_FROM}
+# Create final image stages
+FROM ghcr.io/home-assistant/amd64-base:3.18 AS final-amd64
+
+FROM ghcr.io/home-assistant/aarch64-base:3.18 AS final-arm64
+
+FROM final-${TARGETARCH} AS final
 
 # Install runtime dependencies
 RUN apk add --no-cache \
@@ -38,7 +51,7 @@ RUN apk add --no-cache \
     && rm -rf /var/cache/apk/*
 
 # Copy binary from builder
-COPY --from=0 /build/target/release/fluxion /usr/local/bin/fluxion-main
+COPY --from=builder /build/target/release/fluxion /usr/local/bin/fluxion-main
 
 # Copy run script
 COPY run.sh /

@@ -205,6 +205,7 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxion_core::ConsumptionHistoryConfig;
     use fluxion_core::resources::{
         ControlConfig, PricingConfig, SystemConfig, SystemSettingsConfig,
     };
@@ -233,7 +234,7 @@ mod tests {
                 timezone: None,
             },
             strategies_config: SeasonalStrategiesConfig::default(),
-            history: Default::default(),
+            history: ConsumptionHistoryConfig::default(),
         }
     }
 
