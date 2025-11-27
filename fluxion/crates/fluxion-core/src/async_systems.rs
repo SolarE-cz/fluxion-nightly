@@ -22,6 +22,7 @@ use crate::{
     async_tasks::*,
     components::*,
     config_events::ConfigSection,
+    debug::DebugModeConfig,
     pricing::analyze_prices,
     resources::SystemConfig,
     scheduling::{ScheduleConfig, generate_schedule_with_optimizer},
@@ -549,6 +550,7 @@ pub fn poll_price_channel(
 pub fn config_event_handler(
     mut config_channel: ResMut<ConfigUpdateChannel>,
     mut system_config: ResMut<SystemConfig>,
+    mut debug_config: ResMut<DebugModeConfig>,
     mut schedule_query: Query<&mut OperationSchedule>,
     price_data_query: Query<&SpotPriceData>,
     battery_query: Query<&BatteryStatus>,
@@ -602,6 +604,17 @@ pub fn config_event_handler(
         // Store old config for comparison logging
         let old_config = system_config.clone();
         *system_config = new_config;
+
+        // Sync DebugModeConfig resource with SystemConfig.system_config.debug_mode
+        if old_config.system_config.debug_mode != system_config.system_config.debug_mode {
+            debug_config.enabled = system_config.system_config.debug_mode;
+            if system_config.system_config.debug_mode {
+                info!("🔍 Debug mode ENABLED - system will log actions but not execute them");
+            } else {
+                info!("⚠️ Debug mode DISABLED - system will execute REAL commands!");
+                DebugModeConfig::warn_production_mode();
+            }
+        }
 
         info!("✅ SystemConfig updated from web UI");
 

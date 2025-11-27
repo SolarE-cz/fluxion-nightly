@@ -91,15 +91,16 @@ pub async fn start_web_server(
     config_json: serde_json::Value,
     config_update_sender: Option<ConfigUpdateSender>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app_state = AppState { query_sender, i18n };
+    let app_state = AppState {
+        query_sender,
+        i18n: i18n.clone(),
+    };
     let config_state =
         config_api::ConfigApiState::new(config_json, "/data/config.json", config_update_sender);
 
-    let config_ui_handler = config_ui_handler(app_state.i18n.clone());
-
     let app = Router::new()
         .route("/", get(index_handler))
-        .route("/config", get(config_ui_handler))
+        .route("/config", get(config_ui_handler).with_state(i18n))
         .route("/stream", get(stream_handler))
         .route("/chart-data", get(chart_data_handler))
         .route("/export", get(export_handler))
@@ -479,12 +480,14 @@ async fn health_handler(State(app_state): State<AppState>) -> impl IntoResponse 
 }
 
 /// Config UI page handler
-fn config_ui_handler(i18n: Arc<I18n>) -> impl Fn() -> std::future::Ready<Html<String>> + Clone {
-    move || {
-        let template = config_ui::ConfigTemplate { i18n: i18n.clone() };
-        let html = template
-            .render()
-            .unwrap_or_else(|e| format!("<h1>Template error</h1><p>{e}</p>"));
-        std::future::ready(Html(html))
-    }
+async fn config_ui_handler(
+    headers: axum::http::HeaderMap,
+    State(i18n): State<Arc<I18n>>,
+) -> impl IntoResponse {
+    let ingress_path = extract_ingress_path(&headers);
+    let template = config_ui::ConfigTemplate { i18n, ingress_path };
+    let html = template
+        .render()
+        .unwrap_or_else(|e| format!("<h1>Template error</h1><p>{e}</p>"));
+    Html(html)
 }

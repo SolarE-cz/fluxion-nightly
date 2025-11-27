@@ -17,8 +17,8 @@
 use bevy_app::App;
 use bevy_ecs::system::RunSystemOnce;
 use fluxion_core::{
-    ConfigSection, ConfigUpdateEvent, ConfigUpdateSender, OperationSchedule, SpotPriceData,
-    SystemConfig, TimeBlockPrice,
+    ConfigSection, ConfigUpdateEvent, ConfigUpdateSender, DebugModeConfig, OperationSchedule,
+    SpotPriceData, SystemConfig, TimeBlockPrice,
 };
 use fluxion_i18n::Language;
 use std::collections::HashSet;
@@ -66,6 +66,7 @@ fn test_config_update_flow() {
     // Insert resources
     app.insert_resource(initial_config.clone());
     app.insert_resource(config_channel);
+    app.insert_resource(DebugModeConfig::default());
 
     // Create some dummy price data
     let price_data = SpotPriceData {
@@ -164,6 +165,7 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
     // Insert resources
     app.insert_resource(initial_config.clone());
     app.insert_resource(config_channel);
+    app.insert_resource(DebugModeConfig::default());
 
     // Modify only system settings (not Control/Pricing/Strategies)
     initial_config.system_config.debug_mode = false;
