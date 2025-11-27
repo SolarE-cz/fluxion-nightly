@@ -1,0 +1,160 @@
+name: FluxION ECS (Nightly)
+version: 0.1.17
+slug: fluxion-nightly
+description: Solar plant automation based on electricity spot prices
+url: https://github.com/SolarE-cz/fluxion
+arch:
+- aarch64
+- amd64
+startup: application
+boot: auto
+init: false
+host_network: false
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:solar-power
+options:
+  inverters:
+  - id: solax
+    vendor: solax
+    entity_prefix: solax
+    topology: independent
+  pricing:
+    spot_price_entity: sensor.current_spot_electricity_price_15min
+    use_spot_prices_to_buy: true
+    use_spot_prices_to_sell: true
+    fixed_buy_prices: []
+    fixed_sell_prices: []
+  control:
+    maximum_export_power_w: 10000
+    force_charge_hours: 4
+    force_discharge_hours: 2
+    min_battery_soc: 10
+    max_battery_soc: 100
+    battery_capacity_kwh: 23.0
+    max_battery_charge_rate_kw: 5.0
+    average_household_load_kw: 0.5
+  system:
+    debug_mode: true
+    log_level: info
+    update_interval_secs: 60
+  strategies:
+    winter_adaptive:
+      enabled: true
+      ema_period_days: 7
+      min_solar_percentage: 0.1
+      target_battery_soc: 90.0
+      critical_battery_soc: 40.0
+      top_expensive_blocks: 12
+      tomorrow_preservation_threshold: 1.2
+      grid_export_price_threshold: 8.0
+      min_soc_for_export: 50.0
+      export_trigger_multiplier: 2.5
+      negative_price_handling_enabled: true
+      charge_on_negative_even_if_full: false
+    winter_peak_discharge:
+      enabled: true
+      min_spread_czk: 3.0
+      min_soc_to_start: 70.0
+      min_soc_target: 50.0
+      solar_window_start_hour: 10
+      solar_window_end_hour: 14
+      min_hours_to_solar: 4
+    solar_aware_charging:
+      enabled: true
+      solar_window_start_hour: 10
+      solar_window_end_hour: 14
+      midday_max_soc: 90.0
+      min_solar_forecast_kwh: 2.0
+    morning_precharge:
+      enabled: true
+    day_ahead_planning:
+      enabled: true
+    time_aware_charge:
+      enabled: true
+    price_arbitrage:
+      enabled: true
+    solar_first:
+      enabled: true
+    self_use:
+      enabled: true
+schema:
+  inverters:
+  - id: str
+    vendor: list(solax)?
+    entity_prefix: str
+    topology: list(independent|master|slave)?
+    master_id: str?
+    slave_ids:
+    - str?
+  pricing:
+    spot_price_entity: str?
+    use_spot_prices_to_buy: bool?
+    use_spot_prices_to_sell: bool?
+    fixed_buy_prices:
+    - float?
+    fixed_sell_prices:
+    - float?
+  control:
+    maximum_export_power_w: int(0,)?
+    force_charge_hours: int(0,24)?
+    force_discharge_hours: int(0,24)?
+    min_battery_soc: float(0,100)?
+    max_battery_soc: float(0,100)?
+    battery_capacity_kwh: float(0,)?
+    max_battery_charge_rate_kw: float(0,)?
+    average_household_load_kw: float(0,)?
+  system:
+    debug_mode: bool?
+    log_level: list(trace|debug|info|warning|error)?
+    update_interval_secs: int(10,3600)?
+  strategies:
+    winter_adaptive:
+      enabled: bool?
+      ema_period_days: int(1,30)?
+      min_solar_percentage: float(0,1)?
+      target_battery_soc: float(0,100)?
+      critical_battery_soc: float(0,100)?
+      top_expensive_blocks: int(0,96)?
+      tomorrow_preservation_threshold: float?
+      grid_export_price_threshold: float?
+      min_soc_for_export: float(0,100)?
+      export_trigger_multiplier: float?
+      negative_price_handling_enabled: bool?
+      charge_on_negative_even_if_full: bool?
+    winter_peak_discharge:
+      enabled: bool?
+      min_spread_czk: float?
+      min_soc_to_start: float(0,100)?
+      min_soc_target: float(0,100)?
+      solar_window_start_hour: int(0,23)?
+      solar_window_end_hour: int(0,23)?
+      min_hours_to_solar: int(0,24)?
+    solar_aware_charging:
+      enabled: bool?
+      solar_window_start_hour: int(0,23)?
+      solar_window_end_hour: int(0,23)?
+      midday_max_soc: float(0,100)?
+      min_solar_forecast_kwh: float?
+    morning_precharge:
+      enabled: bool?
+    day_ahead_planning:
+      enabled: bool?
+    time_aware_charge:
+      enabled: bool?
+    price_arbitrage:
+      enabled: bool?
+    solar_first:
+      enabled: bool?
+    self_use:
+      enabled: bool?
+image: ghcr.io/solare-cz/fluxion-nightly-{arch}
+labels:
+  org.opencontainers.image.title: FluxION ECS
+  org.opencontainers.image.description: Solar plant automation based on electricity
+    spot prices
+  org.opencontainers.image.source: https://github.com/SolarE-cz/fluxion
+  org.opencontainers.image.licenses: CC-BY-NC-ND-4.0
