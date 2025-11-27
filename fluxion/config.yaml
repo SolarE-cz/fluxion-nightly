@@ -1,0 +1,75 @@
+name: FluxION ECS (Nightly)
+version: 0.1.0
+slug: fluxion-nightly
+description: PV plant automation based on electricity spot prices
+url: https://gitlab.com/your-org/fluxion
+arch:
+- aarch64
+- amd64
+- armv7
+startup: application
+boot: auto
+init: false
+host_network: false
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+ingress: true
+ingress_port: 8099
+ingress_stream: false
+panel_icon: mdi:solar-power
+panel_title: FluxION
+options:
+  debug_mode: true
+  log_level: info
+  inverters:
+  - id: solax
+    inverter_type: solax
+    entity_prefix: solax
+    topology: independent
+    min_battery_soc: 10
+    max_battery_soc: 100
+  pricing:
+    spot_price_entity: sensor.current_spot_electricity_prices
+    use_spot_to_buy: true
+    use_spot_to_sell: true
+    force_charge_hours: 4
+    force_discharge_hours: 2
+    fixed_buy_prices: []
+    fixed_sell_prices: []
+  control:
+    max_export_power_w: 10000
+    update_interval_secs: 60
+schema:
+  debug_mode: bool
+  log_level: list(trace|debug|info|warn|error)?
+  inverters:
+  - id: str
+    inverter_type: list(solax|solax-ultra)?
+    entity_prefix: str
+    topology: list(independent|master|slave)?
+    master_id: str?
+    slave_ids:
+    - str?
+    min_battery_soc: float(0,100)?
+    max_battery_soc: float(0,100)?
+  pricing:
+    spot_price_entity: str?
+    use_spot_to_buy: bool?
+    use_spot_to_sell: bool?
+    force_charge_hours: int(0,24)?
+    force_discharge_hours: int(0,24)?
+    fixed_buy_prices:
+    - float?
+    fixed_sell_prices:
+    - float?
+  control:
+    max_export_power_w: int(0,)?
+    update_interval_secs: int(10,3600)?
+image: ghcr.io/solare-cz/fluxion-nightly-{arch}
+labels:
+  org.opencontainers.image.title: FluxION ECS
+  org.opencontainers.image.description: PV plant automation based on electricity spot
+    prices
+  org.opencontainers.image.source: https://gitlab.com/your-org/fluxion
+  org.opencontainers.image.licenses: MIT
