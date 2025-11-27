@@ -164,6 +164,24 @@
         packages.default = buildFluxionFor system system;
         packages.fluxion = buildFluxionFor system system;
 
+        # Version binary (single source of truth for versioning)
+        packages.fluxion-version =
+          let
+            rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./fluxion/rust-toolchain.toml;
+            rustPlatform = pkgs.makeRustPlatform {
+              cargo = rustToolchain;
+              rustc = rustToolchain;
+            };
+          in
+          rustPlatform.buildRustPackage {
+            pname = "fluxion-version";
+            version = "0.1.0";
+            src = ./fluxion;
+            cargoLock.lockFile = ./fluxion/Cargo.lock;
+            cargoBuildFlags = [ "--bin" "fluxion-version" ];
+            doCheck = false;
+          };
+
         # Docker images for different architectures
         packages.dockerImage-amd64 = buildDockerImageFor system "x86_64-linux";
         packages.dockerImage-aarch64 = buildDockerImageFor system "aarch64-linux";
@@ -300,6 +318,15 @@
                           echo "⚠️  systemd-nspawn not available, running directly:"
                           RUST_LOG=debug $FLUXION/bin/fluxion-main
                         fi
+          '');
+        };
+
+        # Version app - outputs the workspace version from Cargo.toml
+        # This is the single source of truth for versioning
+        apps.version = {
+          type = "app";
+          program = toString (pkgs.writeShellScript "fluxion-version" ''
+            ${self.packages.${system}.fluxion-version}/bin/fluxion-version
           '');
         };
 

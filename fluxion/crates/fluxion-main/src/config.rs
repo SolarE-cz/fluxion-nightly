@@ -54,6 +54,8 @@ pub struct InverterConfig {
     pub id: String,
 
     /// Inverter type (enum defining supported inverter models)
+    /// Accepts both "inverter_type" (config.toml) and "vendor" (HA addon options.json)
+    #[serde(alias = "vendor")]
     pub inverter_type: fluxion_core::InverterType,
 
     /// Entity prefix in HA (e.g., "solax", "solax_<ip>")
@@ -63,10 +65,13 @@ pub struct InverterConfig {
     pub topology: String,
 
     /// Slave inverter IDs (if topology = master)
-    #[serde(default)]
+    /// Accepts both "slaves" (config.toml) and "slave_ids" (HA addon options.json)
+    #[serde(default, alias = "slave_ids")]
     pub slaves: Option<Vec<String>>,
 
     /// Master inverter ID (if topology = slave)
+    /// Accepts both "master" (config.toml) and "master_id" (HA addon options.json)
+    #[serde(alias = "master_id")]
     pub master: Option<String>,
 }
 
@@ -1416,5 +1421,185 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
+    }
+
+    /// Test that the HA addon options.json format can be correctly parsed into AppConfig.
+    /// This test validates that the field names used in fluxion/config.yaml match our Rust structs.
+    /// The HA addon uses slightly different field names (e.g., "vendor" instead of "inverter_type"),
+    /// so we rely on serde aliases for compatibility.
+    #[test]
+    fn test_ha_addon_options_format() {
+        // This JSON matches the structure of /data/options.json as defined in fluxion/config.yaml
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "solax",
+                    "vendor": "solax",
+                    "entity_prefix": "solax",
+                    "topology": "independent"
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            },
+            "control": {
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            },
+            "strategies": {
+                "winter_adaptive": {
+                    "enabled": true,
+                    "ema_period_days": 7,
+                    "min_solar_percentage": 0.10,
+                    "target_battery_soc": 90.0,
+                    "critical_battery_soc": 40.0,
+                    "top_expensive_blocks": 12,
+                    "tomorrow_preservation_threshold": 1.2,
+                    "grid_export_price_threshold": 8.0,
+                    "min_soc_for_export": 50.0,
+                    "export_trigger_multiplier": 2.5,
+                    "negative_price_handling_enabled": true,
+                    "charge_on_negative_even_if_full": false
+                },
+                "winter_peak_discharge": {
+                    "enabled": true,
+                    "min_spread_czk": 3.0,
+                    "min_soc_to_start": 70.0,
+                    "min_soc_target": 50.0,
+                    "solar_window_start_hour": 10,
+                    "solar_window_end_hour": 14,
+                    "min_hours_to_solar": 4
+                },
+                "solar_aware_charging": {
+                    "enabled": true,
+                    "solar_window_start_hour": 10,
+                    "solar_window_end_hour": 14,
+                    "midday_max_soc": 90.0,
+                    "min_solar_forecast_kwh": 2.0
+                },
+                "morning_precharge": { "enabled": true },
+                "day_ahead_planning": { "enabled": true },
+                "time_aware_charge": { "enabled": true },
+                "price_arbitrage": { "enabled": true },
+                "solar_first": { "enabled": true },
+                "self_use": { "enabled": true }
+            }
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(ha_addon_json)
+            .expect("Failed to parse HA addon options format - check field name compatibility!");
+
+        // Verify critical fields were correctly parsed
+        assert_eq!(config.inverters.len(), 1);
+        assert_eq!(config.inverters[0].id, "solax");
+        assert_eq!(
+            config.inverters[0].inverter_type,
+            fluxion_core::InverterType::Solax,
+            "vendor field should map to inverter_type via serde alias"
+        );
+        assert_eq!(config.inverters[0].topology, "independent");
+
+        // Verify pricing
+        assert!(config.pricing.use_spot_prices_to_buy);
+        assert!(config.pricing.use_spot_prices_to_sell);
+
+        // Verify control
+        assert_eq!(config.control.force_charge_hours, 4);
+        assert_eq!(config.control.force_discharge_hours, 2);
+
+        // Verify system
+        assert!(config.system.debug_mode);
+
+        // Verify strategies
+        assert!(config.strategies.winter_adaptive.enabled);
+        assert!(config.strategies.winter_peak_discharge.enabled);
+
+        // Configuration should be valid
+        assert!(
+            config.validate().is_ok(),
+            "HA addon options format should produce valid config"
+        );
+    }
+
+    /// Test that master/slave topology works with HA addon field names (master_id, slave_ids)
+    #[test]
+    fn test_ha_addon_master_slave_topology() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "master_inv",
+                    "vendor": "solax",
+                    "entity_prefix": "solax_1",
+                    "topology": "master",
+                    "slave_ids": ["slave_inv"]
+                },
+                {
+                    "id": "slave_inv",
+                    "vendor": "solax",
+                    "entity_prefix": "solax_2",
+                    "topology": "slave",
+                    "master_id": "master_inv"
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.price",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            },
+            "control": {
+                "maximum_export_power_w": 5000,
+                "force_charge_hours": 2,
+                "force_discharge_hours": 1,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            }
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(ha_addon_json)
+            .expect("Failed to parse HA addon master/slave config");
+
+        // Verify master configuration
+        assert_eq!(config.inverters[0].topology, "master");
+        assert_eq!(
+            config.inverters[0].slaves,
+            Some(vec!["slave_inv".to_string()]),
+            "slave_ids should map to slaves via serde alias"
+        );
+
+        // Verify slave configuration
+        assert_eq!(config.inverters[1].topology, "slave");
+        assert_eq!(
+            config.inverters[1].master,
+            Some("master_inv".to_string()),
+            "master_id should map to master via serde alias"
+        );
+
+        // Configuration should be valid
+        assert!(
+            config.validate().is_ok(),
+            "HA addon master/slave config should be valid"
+        );
     }
 }
