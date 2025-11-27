@@ -19,6 +19,7 @@ use std::sync::Arc;
 #[template(path = "config.html", escape = "none")]
 pub struct ConfigTemplate {
     pub i18n: Arc<I18n>,
+    pub ingress_path: String,
 }
 
 impl ConfigTemplate {
@@ -30,7 +31,10 @@ impl ConfigTemplate {
 /// Router for config UI (currently unused, but kept for potential future use)
 #[expect(dead_code, reason = "Config UI not yet enabled, kept for future use")]
 pub fn router(i18n: Arc<I18n>) -> Router {
-    let template = ConfigTemplate { i18n };
+    let template = ConfigTemplate {
+        i18n,
+        ingress_path: String::new(),
+    };
     Router::new().route(
         "/config",
         get(move || {
