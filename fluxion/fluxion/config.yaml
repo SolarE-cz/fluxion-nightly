@@ -1,5 +1,5 @@
 name: FluxION ECS (Nightly)
-version: 0.1.24
+version: 0.1.26
 slug: fluxion-nightly
 description: Solar plant automation based on electricity spot prices
 url: https://github.com/SolarE-cz/fluxion
