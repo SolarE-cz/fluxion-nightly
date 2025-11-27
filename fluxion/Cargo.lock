@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-core"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-ha"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-i18n"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "fluent",
  "fluent-bundle",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-integration-tests"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "fluxion-core",
  "fluxion-ha",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-main"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "bevy_app",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-solax"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "fluxion-core",
  "serde",
@@ -1027,11 +1027,11 @@ dependencies = [
 
 [[package]]
 name = "fluxion-version"
-version = "0.1.23"
+version = "0.1.24"
 
 [[package]]
 name = "fluxion-web"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "askama",
  "axum",
