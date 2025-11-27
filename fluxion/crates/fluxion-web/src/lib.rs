@@ -111,7 +111,8 @@ pub async fn start_web_server(
         )
         .route(
             "/api/config/validate",
-            axum::routing::post(config_api::validate_config_handler).with_state(config_state.clone()),
+            axum::routing::post(config_api::validate_config_handler)
+                .with_state(config_state.clone()),
         )
         .route(
             "/api/config/update",

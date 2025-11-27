@@ -87,7 +87,7 @@ The `.gitlab-ci.yml` file is already configured. To enable:
 
    - **Build**: Runs on `main` and tags
 
-     - Builds Docker images for amd64, aarch64, armv7
+     - Builds Docker images for amd64, aarch64
      - Pushes to container registry
 
    - **Release**: Runs on tags only

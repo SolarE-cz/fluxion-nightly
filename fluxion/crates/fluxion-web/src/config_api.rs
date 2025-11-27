@@ -11,8 +11,8 @@
 // For commercial licensing, please contact: info@solare.cz
 
 use crate::validation;
-use fluxion_core::resources::SystemConfig;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use fluxion_core::resources::SystemConfig;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -274,7 +274,7 @@ pub async fn update_config_handler(
     // Update in-memory config with merged result
     let mut current_config = state.config.write();
     validation::merge_json(&mut current_config, request.config);
-    
+
     // Save to persistent storage (optional when running outside HA)
     let persisted = serde_json::json!({
         "config": *current_config,

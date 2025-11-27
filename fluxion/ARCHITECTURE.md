@@ -1928,7 +1928,6 @@ description: Intelligent battery automation based on electricity spot prices
 arch:
   - aarch64
   - amd64
-  - armv7
 startup: application
 boot: auto
 hassio_api: true
@@ -2417,7 +2416,7 @@ LABEL \
     io.hass.description="PV Plant Automation based on Spot Prices" \
     io.hass.version="0.1.0" \
     io.hass.type="addon" \
-    io.hass.arch="aarch64|amd64|armv7"
+    io.hass.arch="aarch64|amd64"
 
 CMD ["/run.sh"]
 ```

@@ -52,7 +52,6 @@ jobs:
           case ${{ matrix.arch }} in
             aarch64) echo "platform=linux/arm64" >> $GITHUB_OUTPUT ;;
             amd64) echo "platform=linux/amd64" >> $GITHUB_OUTPUT ;;
-            armv7) echo "platform=linux/arm/v7" >> $GITHUB_OUTPUT ;;
           esac
 
       - name: Downcase repo name

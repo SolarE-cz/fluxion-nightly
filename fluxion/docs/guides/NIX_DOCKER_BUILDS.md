@@ -76,9 +76,7 @@ docker images | grep fluxion-ha
 
 | Architecture | Nix System | Docker Platform | Status |
 |--------------|------------|-----------------|--------| | x86_64 (amd64) | `x86_64-linux` |
-`linux/amd64` | ✅ Native build | | ARM64 (aarch64) | `aarch64-linux` | `linux/arm64` | ✅
-Cross-compilation | | ARMv7 (armv7) | `armv7l-linux` | `linux/arm/v7` | ⚠️ Requires additional setup
-|
+`linux/amd64` | ✅ Native build | | ARM64 (aarch64) | `aarch64-linux` | `linux/arm64` | ✅ |
 
 ## CI/CD Integration
 
@@ -164,5 +162,4 @@ The current implementation uses a minimal base. If you need to reduce size furth
 ## Next Steps
 
 - Update `.gitlab-ci.yml` to use Nix builds instead of Docker builds
-- Add armv7 support with proper cross-compilation setup
 - Implement multi-arch manifest creation in Nix

@@ -19,7 +19,6 @@
       haBaseImages = {
         "x86_64-linux" = "ghcr.io/home-assistant/amd64-base:3.18";
         "aarch64-linux" = "ghcr.io/home-assistant/aarch64-base:3.18";
-        "armv7l-linux" = "ghcr.io/home-assistant/armv7-base:3.18";
       };
 
       # Build fluxion for a specific target system
@@ -66,7 +65,6 @@
           arch =
             if targetSystem == "x86_64-linux" then "amd64"
             else if targetSystem == "aarch64-linux" then "aarch64"
-            else if targetSystem == "armv7l-linux" then "armv7"
             else throw "Unsupported architecture: ${targetSystem}";
         in
         pkgs.dockerTools.buildImage {
@@ -169,8 +167,6 @@
         # Docker images for different architectures
         packages.dockerImage-amd64 = buildDockerImageFor system "x86_64-linux";
         packages.dockerImage-aarch64 = buildDockerImageFor system "aarch64-linux";
-        # Note: armv7 cross-compilation from x86_64 requires additional setup
-        # packages.dockerImage-armv7 = buildDockerImageFor system "armv7l-linux";
 
         # Convenience apps to build and load images into Docker
         apps.load-amd64 = {
