@@ -116,7 +116,7 @@
         };
 
         # Import the treefmt-based formatter with addlicense
-        formatter = import ./formatter.nix pkgs;
+        formatter = import ./formatter.nix { inherit pkgs rustToolchain; };
 
       in
       {

@@ -223,7 +223,7 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
 
                 if mode_change.entity_changes.is_empty() {
                     warn!(
-                        "No entity changes defined for mode {:?} by {}",
+                        "No entity changes defined for mode {:?} by {:?}",
                         mode,
                         self.mapper.vendor_name()
                     );
@@ -546,8 +546,8 @@ mod tests {
     struct MockMapper;
 
     impl VendorEntityMapper for MockMapper {
-        fn vendor_name(&self) -> &str {
-            "Mock"
+        fn vendor_name(&self) -> fluxion_core::InverterType {
+            fluxion_core::InverterType::Solax
         }
 
         fn map_mode_to_vendor(&self, mode: InverterOperationMode) -> i32 {

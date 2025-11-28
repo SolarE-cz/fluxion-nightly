@@ -31,8 +31,8 @@ impl Default for SolaxEntityMapper {
 }
 
 impl VendorEntityMapper for SolaxEntityMapper {
-    fn vendor_name(&self) -> &str {
-        "Solax"
+    fn vendor_name(&self) -> fluxion_core::InverterType {
+        fluxion_core::InverterType::Solax
     }
 
     fn map_mode_to_vendor(&self, mode: InverterOperationMode) -> i32 {
@@ -375,8 +375,8 @@ impl Default for SolaxUltraEntityMapper {
 }
 
 impl VendorEntityMapper for SolaxUltraEntityMapper {
-    fn vendor_name(&self) -> &str {
-        "Solax Ultra"
+    fn vendor_name(&self) -> fluxion_core::InverterType {
+        fluxion_core::InverterType::SolaxUltra
     }
 
     // Inherit all mode mapping and entity methods from standard Solax
@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn test_solax_mapper_vendor_name() {
         let mapper = SolaxEntityMapper::new();
-        assert_eq!(mapper.vendor_name(), "Solax");
+        assert_eq!(mapper.vendor_name(), fluxion_core::InverterType::Solax);
     }
 
     #[test]

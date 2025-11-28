@@ -297,8 +297,8 @@ pub trait PriceDataSource: Send + Sync {
 /// All methods return Option<String> for entity IDs to indicate if a sensor is supported.
 /// Methods return None if the vendor doesn't have that particular sensor.
 pub trait VendorEntityMapper: Send + Sync {
-    /// Get the vendor name (e.g., "Solax", "Fronius")
-    fn vendor_name(&self) -> &str;
+    /// Get the inverter type
+    fn vendor_name(&self) -> InverterType;
 
     // ============= Mode Control (Required) =============
 

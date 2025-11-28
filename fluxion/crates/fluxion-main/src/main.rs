@@ -111,7 +111,10 @@ fn initialize_and_run() -> Result<()> {
         .map(|inv| inv.inverter_type)
         .expect("No inverters configured");
     let mapper = fluxion_solax::create_entity_mapper(inverter_type);
-    info!("📦 Using {} entity mapper", mapper.vendor_name());
+    info!(
+        "📦 Using {} entity mapper",
+        mapper.vendor_name().display_name()
+    );
 
     // Create data sources
     let inverter_source: Arc<dyn fluxion_core::InverterDataSource> =
