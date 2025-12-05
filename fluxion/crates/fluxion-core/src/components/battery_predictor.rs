@@ -16,6 +16,25 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+/// Calculate SOC percentage change from energy in kWh
+///
+/// This is the single source of truth for battery SOC calculations.
+/// Formula: SOC_change = (energy_kwh / battery_capacity_kwh) * 100
+///
+/// # Arguments
+/// * `energy_kwh` - Energy in kWh (positive for charge, negative for discharge)
+/// * `battery_capacity_kwh` - Total battery capacity in kWh
+///
+/// # Returns
+/// SOC change in percentage points
+#[inline]
+pub fn calculate_soc_change(energy_kwh: f32, battery_capacity_kwh: f32) -> f32 {
+    if battery_capacity_kwh <= 0.0 {
+        return 0.0;
+    }
+    (energy_kwh / battery_capacity_kwh) * 100.0
+}
+
 /// A single predicted battery SOC point
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatteryPredictionPoint {
@@ -103,7 +122,6 @@ pub fn predict_battery_soc(
     let discharge_rate = max_discharge_rate_kw.unwrap_or(3.5); // kW
 
     let battery_capacity = control_config.battery_capacity_kwh;
-    let efficiency = control_config.battery_efficiency;
     let max_soc = control_config.max_battery_soc;
     let hardware_min_soc = control_config.hardware_min_battery_soc;
 
@@ -117,17 +135,15 @@ pub fn predict_battery_soc(
 
         match block.mode {
             InverterOperationMode::ForceCharge => {
-                // Energy added to battery (accounting for efficiency)
-                // Use correct formula: charge_rate_kw / battery_capacity_kwh * 100 / 4 (for 15-min blocks)
-                // This accounts for the actual charge capability per block
-                let soc_increase_per_hour = (charge_rate / battery_capacity) * 100.0 * efficiency;
-                let soc_increase = soc_increase_per_hour * duration_hours;
+                // Energy charged in this block
+                let energy_kwh = charge_rate * duration_hours;
+                let soc_increase = calculate_soc_change(energy_kwh, battery_capacity);
                 soc = (soc + soc_increase).min(max_soc);
             }
             InverterOperationMode::ForceDischarge => {
-                // Energy removed from battery
-                let energy_out = discharge_rate * duration_hours;
-                let soc_decrease = (energy_out / battery_capacity) * 100.0;
+                // Energy discharged from battery
+                let energy_kwh = discharge_rate * duration_hours;
+                let soc_decrease = calculate_soc_change(energy_kwh, battery_capacity);
                 // Use hardware minimum SOC enforced by inverter firmware
                 soc = (soc - soc_decrease).max(hardware_min_soc);
             }
@@ -148,13 +164,13 @@ pub fn predict_battery_soc(
 
                 if net_power_kw > 0.0 {
                     // Excess solar - battery charges from surplus
-                    let energy_in = net_power_kw * duration_hours;
-                    let soc_increase = (energy_in / battery_capacity) * 100.0 * efficiency;
+                    let energy_kwh = net_power_kw * duration_hours;
+                    let soc_increase = calculate_soc_change(energy_kwh, battery_capacity);
                     soc = (soc + soc_increase).min(max_soc);
                 } else if net_power_kw < 0.0 {
                     // Power deficit - battery discharges to cover household load
-                    let energy_out = net_power_kw.abs() * duration_hours;
-                    let soc_decrease = (energy_out / battery_capacity) * 100.0;
+                    let energy_kwh = net_power_kw.abs() * duration_hours;
+                    let soc_decrease = calculate_soc_change(energy_kwh, battery_capacity);
                     // Use hardware minimum SOC enforced by inverter firmware
                     soc = (soc - soc_decrease).max(hardware_min_soc);
                 }

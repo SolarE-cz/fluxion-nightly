@@ -30,7 +30,7 @@ use axum::{
     },
     routing::get,
 };
-use fluxion_core::{ConfigUpdateSender, WebQuerySender};
+use fluxion_core::{ConfigUpdateSender, WebQueryResponse, WebQuerySender};
 use fluxion_i18n::I18n;
 use serde::Serialize;
 use std::convert::Infallible;
@@ -273,12 +273,8 @@ async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoRespo
     }
 }
 
-/// Export data endpoint - returns comprehensive JSON for analysis
-/// Format optimized for Claude Sonnet 4.5 with clear hierarchy and descriptive fields
-#[expect(
-    clippy::too_many_lines,
-    reason = "Comprehensive export structure requires building detailed JSON"
-)]
+/// Export data endpoint - returns compact JSON for analysis
+/// Optimized format with abbreviated field names, Unix timestamps, and encoded decision reasons
 async fn export_handler(State(app_state): State<AppState>) -> impl IntoResponse {
     match app_state.query_sender.query_dashboard().await {
         Ok(response) => {
@@ -288,156 +284,13 @@ async fn export_handler(State(app_state): State<AppState>) -> impl IntoResponse 
                 response.timestamp.format("%Y%m%d_%H%M%S")
             );
 
-            // Create comprehensive export structure optimized for Claude analysis
-            let export_data = serde_json::json!({
-                "metadata": {
-                    "export_timestamp": response.timestamp,
-                    "timezone": response.timezone,
-                    "debug_mode": response.debug_mode,
-                    "export_format_version": "1.0",
-                    "description": "FluxION solar battery management system data export for analysis"
-                },
-                "consumption_stats": response.consumption_stats.as_ref().map(|stats| {
-                    serde_json::json!({
-                        "ema_kwh": stats.ema_kwh,
-                        "ema_days": stats.ema_days,
-                        "today_import_kwh": stats.today_import_kwh,
-                        "yesterday_import_kwh": stats.yesterday_import_kwh,
-                    })
-                }),
-                "system_health": {
-                    "status": {
-                        "inverter_connection": response.health.inverter_source,
-                        "price_data_source": response.health.price_source,
-                        "last_update": response.health.last_update,
-                    },
-                    "errors": response.health.errors,
-                },
-                "inverters": response.inverters.iter().map(|inv| {
-                    serde_json::json!({
-                        "identification": {
-                            "id": inv.id,
-                            "topology": inv.topology,
-                            "online": inv.online,
-                        },
-                        "current_operation": {
-                            "mode": inv.mode,
-                            "mode_reason": inv.mode_reason,
-                            "run_mode": inv.run_mode,
-                            "error_code": inv.error_code,
-                        },
-                        "battery": {
-                            "state_of_charge_percent": inv.battery_soc,
-                            "power_watts": inv.battery_power_w,
-                            "voltage_volts": inv.battery_voltage_v,
-                            "current_amperes": inv.battery_current_a,
-                            "temperature_celsius": inv.battery_temperature_c,
-                            "capacity_kwh": inv.battery_capacity_kwh,
-                            "energy_input_today_kwh": inv.battery_input_energy_today_kwh,
-                            "energy_output_today_kwh": inv.battery_output_energy_today_kwh,
-                        },
-                        "grid": {
-                            "power_watts": inv.grid_power_w,
-                            "voltage_volts": inv.grid_voltage_v,
-                            "frequency_hz": inv.grid_frequency_hz,
-                            "import_power_watts": inv.grid_import_w,
-                            "export_power_watts": inv.grid_export_w,
-                            "import_today_kwh": inv.grid_import_today_kwh,
-                            "export_today_kwh": inv.grid_export_today_kwh,
-                        },
-                        "solar_generation": {
-                            "total_power_watts": inv.pv_power_w,
-                            "pv1_power_watts": inv.pv1_power_w,
-                            "pv2_power_watts": inv.pv2_power_w,
-                            "energy_today_kwh": inv.daily_energy_kwh,
-                            "energy_total_kwh": inv.total_energy_kwh,
-                            "today_solar_energy_kwh": inv.today_solar_energy_kwh,
-                            "total_solar_energy_kwh": inv.total_solar_energy_kwh,
-                        },
-                        "house_load": {
-                            "load_watts": inv.house_load_w,
-                        },
-                        "inverter_internals": {
-                            "temperature_celsius": inv.inverter_temperature_c,
-                            "voltage_volts": inv.inverter_voltage_v,
-                            "current_amperes": inv.inverter_current_a,
-                            "power_watts": inv.inverter_power_w,
-                            "frequency_hz": inv.inverter_frequency_hz,
-                        },
-                    })
-                }).collect::<Vec<_>>(),
-                "operation_schedule": response.schedule.as_ref().map(|sched| {
-                    serde_json::json!({
-                        "current_block": {
-                            "mode": sched.current_mode,
-                            "reason": sched.current_reason,
-                            "strategy": sched.current_strategy,
-                            "expected_profit_czk": sched.expected_profit,
-                        },
-                        "schedule_summary": {
-                            "next_mode_change": sched.next_change,
-                            "total_blocks_today": sched.blocks_today,
-                            "target_soc_max_percent": sched.target_soc_max,
-                            "target_soc_min_percent": sched.target_soc_min,
-                            "total_expected_profit_czk": sched.total_expected_profit,
-                        },
-                    })
-                }),
-                "electricity_prices": response.prices.as_ref().map(|prices| {
-                    serde_json::json!({
-                        "current_price_czk_per_kwh": prices.current_price,
-                        "price_statistics": {
-                            "minimum_czk_per_kwh": prices.min_price,
-                            "maximum_czk_per_kwh": prices.max_price,
-                            "average_czk_per_kwh": prices.avg_price,
-                        },
-                        "price_blocks": prices.blocks.iter().map(|block| {
-                            serde_json::json!({
-                                "timestamp": block.timestamp,
-                                "price_czk_per_kwh": block.price,
-                                "operation_type": block.block_type,
-                                "target_soc_percent": block.target_soc,
-                                "strategy_name": block.strategy,
-                                "expected_profit_czk": block.expected_profit,
-                                "decision_reason": block.reason,
-                            })
-                        }).collect::<Vec<_>>(),
-                    })
-                }),
-                "battery_history": {
-                    "state_of_charge": response.battery_soc_history.as_ref().map(|history| {
-                        history.iter().map(|point| {
-                            serde_json::json!({
-                                "timestamp": point.timestamp,
-                                "soc_percent": point.soc,
-                            })
-                        }).collect::<Vec<_>>()
-                    }),
-                },
-                "battery_predictions": {
-                    "state_of_charge": response.battery_soc_prediction.as_ref().map(|prediction| {
-                        prediction.iter().map(|point| {
-                            serde_json::json!({
-                                "timestamp": point.timestamp,
-                                "predicted_soc_percent": point.soc,
-                            })
-                        }).collect::<Vec<_>>()
-                    }),
-                },
-                "pv_generation_history": response.pv_generation_history.as_ref().map(|pv_history| {
-                    pv_history.iter().map(|point| {
-                        serde_json::json!({
-                            "timestamp": point.timestamp,
-                            "power_watts": point.power_w,
-                        })
-                    }).collect::<Vec<_>>()
-                }),
-            });
+            // Create compact JSON structure with space optimizations
+            let export_data = create_compact_export(&response);
 
             let json_string = match serde_json::to_string_pretty(&export_data) {
                 Ok(json) => json,
                 Err(e) => {
-                    error!("Failed to serialize export data: {}", e);
+                    error!("Failed to serialize compact export data: {}", e);
                     return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "").into_response();
                 }
             };
@@ -490,4 +343,193 @@ async fn config_ui_handler(
         .render()
         .unwrap_or_else(|e| format!("<h1>Template error</h1><p>{e}</p>"));
     Html(html)
+}
+
+/// Create compact export data with space optimizations
+#[expect(clippy::too_many_lines)]
+fn create_compact_export(response: &WebQueryResponse) -> serde_json::Value {
+    serde_json::json!({
+        // Metadata with abbreviated keys
+        "meta": {
+            "ts": response.timestamp.timestamp(),
+            "tz": response.timezone,
+            "dbg": response.debug_mode,
+            "ver": "2.0",
+            "desc": "FluxION compact export"
+        },
+
+        // System health (abbreviated)
+        "health": {
+            "inv": response.health.inverter_source,
+            "price": response.health.price_source,
+            "upd": response.health.last_update.timestamp(),
+            "errs": response.health.errors
+        },
+
+        // Compact inverter data
+        "inv": response.inverters.iter().map(|inv| {
+            serde_json::json!({
+                "id": inv.id,
+                "topo": inv.topology,
+                "mode": inv.mode,
+                "reason": inv.mode_reason,
+                "online": inv.online,
+                "err": inv.error_code,
+
+                // Battery (rounded values)
+                "soc": round_2_decimals(inv.battery_soc),
+                "bat_pwr": round_nearest(inv.battery_power_w),
+                "bat_v": round_1_decimal(inv.battery_voltage_v),
+                "bat_a": round_1_decimal(inv.battery_current_a),
+                "bat_temp": round_nearest(inv.battery_temperature_c),
+
+                // Grid (rounded values)
+                "grid_pwr": round_nearest(inv.grid_power_w),
+                "grid_v": round_1_decimal(inv.grid_voltage_v),
+                "grid_hz": round_2_decimals(inv.grid_frequency_hz),
+
+                // Solar (rounded values)
+                "pv_pwr": round_nearest(inv.pv_power_w),
+                "pv1_pwr": round_nearest(inv.pv1_power_w),
+                "pv2_pwr": round_nearest(inv.pv2_power_w),
+                "daily_kwh": round_1_decimal(inv.daily_energy_kwh),
+                "total_kwh": round_nearest(inv.total_energy_kwh),
+
+                // Optional fields (only if present)
+                "house_w": inv.house_load_w.map(round_nearest),
+                "grid_in": inv.grid_import_w.map(round_nearest),
+                "grid_out": inv.grid_export_w.map(round_nearest),
+                "bat_cap": inv.battery_capacity_kwh.map(round_1_decimal),
+            })
+        }).collect::<Vec<_>>(),
+
+        // Operation schedule (keep existing field names - already compact enough)
+        "sched": response.schedule.as_ref().map(|sched| {
+            serde_json::json!({
+                "mode": sched.current_mode,
+                "reason": sched.current_reason,
+                "strategy": sched.current_strategy,
+                "profit": sched.expected_profit.map(round_2_decimals),
+                "next": sched.next_change.map(|dt| dt.timestamp()),
+                "blocks": sched.blocks_today,
+                "soc_min": round_1_decimal(sched.target_soc_min),
+                "soc_max": round_1_decimal(sched.target_soc_max),
+                "total_profit": sched.total_expected_profit.map(round_2_decimals),
+            })
+        }),
+
+        // Compact price data
+        "prices": response.prices.as_ref().map(|prices| {
+            serde_json::json!({
+                "cur": round_2_decimals(prices.current_price),
+                "min": round_2_decimals(prices.min_price),
+                "max": round_2_decimals(prices.max_price),
+                "avg": round_2_decimals(prices.avg_price),
+
+                // Compact price blocks
+                "blocks": prices.blocks.iter().map(|block| {
+                    serde_json::json!({
+                        "ts": block.timestamp.timestamp(),
+                        "p": round_2_decimals(block.price),
+                        "op": abbreviate_operation(&block.block_type),
+                        "soc": block.target_soc.map(round_1_decimal),
+                        "st": block.strategy.as_ref().map(|s| abbreviate_strategy(s)),
+                        "pr": block.expected_profit.map(round_2_decimals),
+                        "r": block.reason.as_ref().map(|r| abbreviate_reason(r)),
+                        "h": block.is_historical
+                    })
+                }).collect::<Vec<_>>(),
+
+                // Today stats
+                "today_min": round_2_decimals(prices.today_min_price),
+                "today_max": round_2_decimals(prices.today_max_price),
+                "today_avg": round_2_decimals(prices.today_avg_price),
+                "today_med": round_2_decimals(prices.today_median_price),
+
+                // Tomorrow stats (if available)
+                "tom_min": prices.tomorrow_min_price.map(round_2_decimals),
+                "tom_max": prices.tomorrow_max_price.map(round_2_decimals),
+                "tom_avg": prices.tomorrow_avg_price.map(round_2_decimals),
+                "tom_med": prices.tomorrow_median_price.map(round_2_decimals),
+            })
+        }),
+
+        // Compact battery history
+        "bat_hist": response.battery_soc_history.as_ref().map(|hist| {
+            hist.iter().map(|p| serde_json::json!({
+                "ts": p.timestamp.timestamp(),
+                "soc": round_1_decimal(p.soc)
+            })).collect::<Vec<_>>()
+        }),
+
+        // Compact battery predictions
+        "bat_pred": response.battery_soc_prediction.as_ref().map(|pred| {
+            pred.iter().map(|p| serde_json::json!({
+                "ts": p.timestamp.timestamp(),
+                "soc": round_1_decimal(p.soc)
+            })).collect::<Vec<_>>()
+        }),
+
+        // Compact PV history
+        "pv_hist": response.pv_generation_history.as_ref().map(|hist| {
+            hist.iter().map(|p| serde_json::json!({
+                "ts": p.timestamp.timestamp(),
+                "pwr": round_nearest(p.power_w)
+            })).collect::<Vec<_>>()
+        }),
+
+        // Consumption stats
+        "consumption": response.consumption_stats.as_ref().map(|stats| {
+            serde_json::json!({
+                "ema_kwh": stats.ema_kwh.map(round_2_decimals),
+                "ema_days": stats.ema_days,
+                "today_kwh": stats.today_import_kwh.map(round_2_decimals),
+                "yesterday_kwh": stats.yesterday_import_kwh.map(round_2_decimals),
+            })
+        })
+    })
+}
+
+// Helper functions for rounding
+fn round_nearest(value: f32) -> f32 {
+    value.round()
+}
+
+fn round_1_decimal(value: f32) -> f32 {
+    (value * 10.0).round() / 10.0
+}
+
+fn round_2_decimals(value: f32) -> f32 {
+    (value * 100.0).round() / 100.0
+}
+
+// Helper functions for abbreviation
+fn abbreviate_operation(op: &str) -> &str {
+    match op {
+        "charge" => "c",
+        "discharge" => "d",
+        "self-use" => "s",
+        _ => "u", // unknown
+    }
+}
+
+fn abbreviate_strategy(strategy: &str) -> String {
+    match strategy {
+        "Winter-Adaptive" => "WA".to_owned(),
+        "Self-Use" => "SU".to_owned(),
+        "Time-Aware Charge" => "TAC".to_owned(),
+        "Winter-Peak-Discharge" => "WPD".to_owned(),
+        "Price-Arbitrage" => "PA".to_owned(),
+        other => other.chars().filter(|c| c.is_uppercase()).take(3).collect(),
+    }
+}
+
+fn abbreviate_reason(reason: &str) -> String {
+    // For now, just truncate long reasons to save space
+    // Later we could implement the full DecisionReason enum parsing
+    if reason.len() > 50 {
+        format!("{}...", reason.get(..50).unwrap_or_default())
+    } else {
+        reason.to_owned()
+    }
 }

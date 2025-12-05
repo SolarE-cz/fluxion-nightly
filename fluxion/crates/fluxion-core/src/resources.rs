@@ -12,382 +12,88 @@
 
 use anyhow::Result;
 use bevy_ecs::prelude::*;
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use fluxion_i18n::{I18n, I18nError, Language};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::components::InverterOperationMode;
-use crate::strategy::SeasonalStrategiesConfig;
+// ============= System Configuration (Imported from fluxion-types) =============
+pub use fluxion_types::config::{
+    ControlConfig, Currency, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
+    SolarAwareChargingConfigCore, StrategiesConfigCore, StrategyEnabledConfigCore, SystemConfig,
+    SystemSettingsConfig, WinterAdaptiveConfigCore, WinterPeakDischargeConfigCore,
+};
+pub use fluxion_types::history::ConsumptionHistoryConfig;
 
-// ============= System Configuration =============
+// ============= Timezone Configuration =============
 
-/// Central configuration resource for the FluxION system
-#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
-pub struct SystemConfig {
-    pub inverters: Vec<InverterConfig>,
-    #[serde(rename = "pricing")]
-    pub pricing_config: PricingConfig,
-    #[serde(rename = "control")]
-    pub control_config: ControlConfig,
-    #[serde(rename = "system")]
-    pub system_config: SystemSettingsConfig,
-    #[serde(default, rename = "strategies")]
-    pub strategies_config: SeasonalStrategiesConfig,
-    #[serde(default, rename = "history")]
-    pub history: crate::components::ConsumptionHistoryConfig,
+/// Resource for Home Assistant timezone configuration
+/// This is synchronized periodically with Home Assistant to detect timezone changes
+#[derive(Resource, Debug, Clone)]
+pub struct TimezoneConfig {
+    /// Current timezone string from Home Assistant (e.g., "Europe/Prague", "America/New_York")
+    pub timezone: Option<String>,
+
+    /// Parsed timezone for efficient time conversions
+    /// Cached to avoid re-parsing on every use
+    pub tz: Option<Tz>,
+
+    /// Last time we checked HA for timezone updates
+    pub last_check: DateTime<Utc>,
+
+    /// How often to check HA for timezone changes (default: 5 minutes)
+    pub check_interval: Duration,
 }
 
-/// Configuration for a single inverter
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InverterConfig {
-    pub id: String,
-    pub inverter_type: crate::InverterType,
-    pub entity_prefix: String,
-    pub topology: InverterTopology,
-}
-
-/// Inverter topology for multi-inverter setups
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum InverterTopology {
-    Independent,
-    Master { slave_ids: Vec<String> },
-    Slave { master_id: String },
-}
-
-/// Schedule for fixed prices (flat or hourly)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum PriceSchedule {
-    Flat(f32),
-    Hourly(Vec<f32>),
-}
-
-impl PriceSchedule {
-    /// Get price for a specific hour (0-23)
-    pub fn get_price(&self, hour: usize) -> f32 {
-        match self {
-            PriceSchedule::Flat(price) => *price,
-            PriceSchedule::Hourly(prices) => {
-                if prices.is_empty() {
-                    return 0.0;
-                }
-                // Handle wrapping or clamping if needed, but generally expect 24 items
-                // If less than 24, cycle or clamp? Let's cycle for safety.
-                prices[hour % prices.len()]
-            }
-        }
-    }
-}
-
-impl Default for PriceSchedule {
-    fn default() -> Self {
-        PriceSchedule::Flat(0.0)
-    }
-}
-
-/// Pricing configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PricingConfig {
-    pub spot_price_entity: String,
-    /// Optional separate sensor for tomorrow's prices
-    #[serde(default)]
-    pub tomorrow_price_entity: Option<String>,
-    pub use_spot_prices_to_buy: bool,
-    pub use_spot_prices_to_sell: bool,
-    pub fixed_buy_price_czk: PriceSchedule,
-    pub fixed_sell_price_czk: PriceSchedule,
-
-    // Spot market fees
-    #[serde(default = "default_spot_buy_fee")]
-    pub spot_buy_fee_czk: f32,
-    #[serde(default = "default_spot_sell_fee")]
-    pub spot_sell_fee_czk: f32,
-    #[serde(default = "default_grid_distribution_fee")]
-    pub grid_distribution_fee_czk: f32,
-}
-
-/// Control configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ControlConfig {
-    pub force_charge_hours: usize,
-    pub force_discharge_hours: usize,
-    pub min_battery_soc: f32,
-    pub max_battery_soc: f32,
-    pub maximum_export_power_w: u32,
-    pub battery_capacity_kwh: f32,
-    pub battery_wear_cost_czk_per_kwh: f32,
-    pub battery_efficiency: f32,
-    pub min_mode_change_interval_secs: u64,
-    /// Average household consumption (kW) used for battery SOC predictions
-    /// This is used as a fallback when actual load data is not available
-    pub average_household_load_kw: f32,
-    /// Hardware minimum battery SOC enforced by inverter firmware
-    /// This is the absolute floor that predictions should use
-    #[serde(default = "default_hardware_min_soc")]
-    pub hardware_min_battery_soc: f32,
-
-    // ============= Charge Time Planning Parameters =============
-    /// Maximum battery charge rate in kW (determines minimum charge time)
-    /// Typical values: 5-15 kW depending on battery/inverter specifications
-    /// Default: 10.0 kW
-    #[serde(default = "default_charge_rate")]
-    pub max_battery_charge_rate_kw: f32,
-
-    /// Target SOC (%) to reach before evening peak
-    /// Scheduler will reserve enough cheap blocks to reach this SOC
-    /// Default: 90% (leaves 10% room for solar top-up)
-    #[serde(default = "default_evening_target_soc")]
-    pub evening_target_soc: f32,
-
-    /// Evening peak start hour (24h format, 0-23)
-    /// Scheduler ensures battery is charged before this hour
-    /// Default: 17 (5:00 PM)
-    #[serde(default = "default_evening_peak_hour")]
-    pub evening_peak_start_hour: u32,
-
-    /// Minimum number of consecutive 15-minute blocks required for force-charge/discharge operations
-    /// Single-block force operations can cause excessive inverter EEPROM writes.
-    /// Default: 2 blocks (30 minutes minimum duration)
-    #[serde(default = "default_min_consecutive_force_blocks")]
-    pub min_consecutive_force_blocks: usize,
-
-    /// Default battery operation mode when not force charging/discharging
-    /// Default: SelfUse (normal self-consumption mode)
-    #[serde(default = "default_battery_operation_mode")]
-    pub default_battery_mode: InverterOperationMode,
-}
-
-// Default value functions for serde
-fn default_charge_rate() -> f32 {
-    10.0
-}
-fn default_evening_target_soc() -> f32 {
-    90.0
-}
-fn default_evening_peak_hour() -> u32 {
-    17
-}
-fn default_hardware_min_soc() -> f32 {
-    10.0
-}
-fn default_min_consecutive_force_blocks() -> usize {
-    2
-}
-fn default_battery_operation_mode() -> InverterOperationMode {
-    InverterOperationMode::SelfUse
-}
-fn default_spot_buy_fee() -> f32 {
-    0.5
-}
-fn default_spot_sell_fee() -> f32 {
-    0.5
-}
-fn default_grid_distribution_fee() -> f32 {
-    1.2
-}
-
-impl Default for ControlConfig {
+impl Default for TimezoneConfig {
     fn default() -> Self {
         Self {
-            force_charge_hours: 4,
-            force_discharge_hours: 2,
-            min_battery_soc: 10.0,
-            max_battery_soc: 100.0,
-            maximum_export_power_w: 10000,
-            battery_capacity_kwh: 20.0,
-            battery_wear_cost_czk_per_kwh: 0.125,
-            battery_efficiency: 0.95,
-            min_mode_change_interval_secs: 300,
-            average_household_load_kw: 1.0,
-            hardware_min_battery_soc: 10.0,
-            max_battery_charge_rate_kw: 10.0,
-            evening_target_soc: 90.0,
-            evening_peak_start_hour: 17,
-            min_consecutive_force_blocks: 2,
-            default_battery_mode: InverterOperationMode::SelfUse,
+            timezone: None,
+            tz: None,
+            last_check: Utc::now(),
+            check_interval: Duration::from_secs(300), // 5 minutes
         }
     }
 }
 
-/// System settings configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemSettingsConfig {
-    pub update_interval_secs: u64,
-    pub debug_mode: bool,
-    pub display_currency: Currency,
-    #[serde(default)]
-    pub language: Language,
-    #[serde(skip)]
-    pub timezone: Option<String>, // Home Assistant timezone (fetched at runtime)
-}
-
-/// Strategies configuration for core module
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct StrategiesConfigCore {
-    #[serde(default)]
-    pub winter_adaptive: WinterAdaptiveConfigCore,
-    #[serde(default)]
-    pub winter_peak_discharge: WinterPeakDischargeConfigCore,
-    #[serde(default)]
-    pub solar_aware_charging: SolarAwareChargingConfigCore,
-    #[serde(default)]
-    pub morning_precharge: StrategyEnabledConfigCore,
-    #[serde(default)]
-    pub day_ahead_planning: StrategyEnabledConfigCore,
-    #[serde(default)]
-    pub time_aware_charge: StrategyEnabledConfigCore,
-    #[serde(default)]
-    pub price_arbitrage: StrategyEnabledConfigCore,
-    #[serde(default)]
-    pub solar_first: StrategyEnabledConfigCore,
-    #[serde(default)]
-    pub self_use: StrategyEnabledConfigCore,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WinterPeakDischargeConfigCore {
-    pub enabled: bool,
-    pub min_spread_czk: f32,
-    pub min_soc_to_start: f32,
-    pub min_soc_target: f32,
-    pub solar_window_start_hour: u32,
-    pub solar_window_end_hour: u32,
-    pub min_hours_to_solar: u32,
-}
-
-impl Default for WinterPeakDischargeConfigCore {
-    fn default() -> Self {
+impl TimezoneConfig {
+    /// Create a new `TimezoneConfig` with a specific timezone
+    #[must_use]
+    pub fn new(timezone: Option<String>) -> Self {
+        let tz = timezone
+            .as_ref()
+            .and_then(|tz_str| tz_str.parse::<Tz>().ok());
         Self {
-            enabled: true,
-            min_spread_czk: 3.0,
-            min_soc_to_start: 70.0,
-            min_soc_target: 50.0,
-            solar_window_start_hour: 10,
-            solar_window_end_hour: 14,
-            min_hours_to_solar: 4,
+            timezone,
+            tz,
+            last_check: Utc::now(),
+            check_interval: Duration::from_secs(300),
         }
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SolarAwareChargingConfigCore {
-    pub enabled: bool,
-    pub solar_window_start_hour: u32,
-    pub solar_window_end_hour: u32,
-    pub midday_max_soc: f32,
-    pub min_solar_forecast_kwh: f32,
-}
-
-impl Default for SolarAwareChargingConfigCore {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            solar_window_start_hour: 10,
-            solar_window_end_hour: 14,
-            midday_max_soc: 90.0,
-            min_solar_forecast_kwh: 2.0,
+    /// Update the timezone (re-parses the timezone string)
+    pub fn update_timezone(&mut self, timezone: Option<String>) {
+        if self.timezone != timezone {
+            tracing::info!("🌍 Timezone changed: {:?} -> {:?}", self.timezone, timezone);
+            self.tz = timezone
+                .as_ref()
+                .and_then(|tz_str| tz_str.parse::<Tz>().ok());
+            self.timezone = timezone;
         }
+        self.last_check = Utc::now();
+    }
+
+    /// Check if it's time to sync timezone with HA
+    #[must_use]
+    pub fn should_check(&self) -> bool {
+        Utc::now()
+            .signed_duration_since(self.last_check)
+            .to_std()
+            .unwrap_or_default()
+            >= self.check_interval
     }
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyEnabledConfigCore {
-    pub enabled: bool,
-}
-
-impl Default for StrategyEnabledConfigCore {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WinterAdaptiveConfigCore {
-    pub enabled: bool,
-    pub ema_period_days: usize,
-    pub min_solar_percentage: f32,
-    pub target_battery_soc: f32,
-    pub critical_battery_soc: f32,
-    pub top_expensive_blocks: usize,
-    #[serde(default = "default_tomorrow_preservation_threshold")]
-    pub tomorrow_preservation_threshold: f32,
-    #[serde(default = "default_grid_export_price_threshold")]
-    pub grid_export_price_threshold: f32,
-    #[serde(default = "default_min_soc_for_export")]
-    pub min_soc_for_export: f32,
-    #[serde(default = "default_export_trigger_multiplier")]
-    pub export_trigger_multiplier: f32,
-    #[serde(default = "default_negative_price_handling_enabled")]
-    pub negative_price_handling_enabled: bool,
-    #[serde(default = "default_charge_on_negative_even_if_full")]
-    pub charge_on_negative_even_if_full: bool,
-    #[serde(skip)]
-    pub historical_daily_consumption: Vec<f32>,
-}
-
-fn default_tomorrow_preservation_threshold() -> f32 {
-    1.2
-}
-fn default_grid_export_price_threshold() -> f32 {
-    8.0
-}
-fn default_min_soc_for_export() -> f32 {
-    50.0
-}
-fn default_export_trigger_multiplier() -> f32 {
-    2.5
-}
-fn default_negative_price_handling_enabled() -> bool {
-    true
-}
-fn default_charge_on_negative_even_if_full() -> bool {
-    false
-}
-
-impl Default for WinterAdaptiveConfigCore {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            ema_period_days: 7,
-            min_solar_percentage: 0.10,
-            target_battery_soc: 90.0,
-            critical_battery_soc: 40.0,
-            top_expensive_blocks: 12,
-            tomorrow_preservation_threshold: 1.2,
-            grid_export_price_threshold: 8.0,
-            min_soc_for_export: 50.0,
-            export_trigger_multiplier: 2.5,
-            negative_price_handling_enabled: true,
-            charge_on_negative_even_if_full: false,
-            historical_daily_consumption: Vec::new(),
-        }
-    }
-}
-
-/// Currency display option
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum Currency {
-    #[serde(rename = "EUR")]
-    #[default]
-    EUR,
-    #[serde(rename = "USD")]
-    USD,
-    #[serde(rename = "CZK")]
-    CZK,
-}
-
-impl Currency {
-    pub fn symbol(&self) -> &'static str {
-        match self {
-            Currency::EUR => "€",
-            Currency::USD => "$",
-            Currency::CZK => "Kč",
-        }
-    }
-}
-
-// Implementation moved to fluxion-main config module to avoid circular dependency
 
 // ============= Internationalization =============
 
@@ -461,3 +167,282 @@ mod tests {
 pub struct ConsumptionHistoryDataSourceResource(
     pub Arc<dyn crate::traits::ConsumptionHistoryDataSource>,
 );
+
+// ============= Async Cache Resources =============
+
+/// Cached price data source that fetches prices on demand
+/// Replaces channel-based async price fetcher with direct async calls
+#[derive(Resource)]
+pub struct PriceCache {
+    data: parking_lot::Mutex<Option<crate::components::SpotPriceData>>,
+    last_fetch: parking_lot::Mutex<std::time::Instant>,
+    last_error: parking_lot::Mutex<Option<String>>,
+    source: Arc<dyn crate::traits::PriceDataSource>,
+    fetch_interval: Duration,
+}
+
+impl PriceCache {
+    /// Create a new price cache with the specified fetch interval
+    pub fn new(source: Arc<dyn crate::traits::PriceDataSource>, interval_secs: u64) -> Self {
+        Self {
+            data: parking_lot::Mutex::new(None),
+            last_fetch: parking_lot::Mutex::new(
+                std::time::Instant::now() - Duration::from_secs(1000),
+            ),
+            last_error: parking_lot::Mutex::new(None),
+            source,
+            fetch_interval: Duration::from_secs(interval_secs),
+        }
+    }
+
+    /// Get cached data or fetch fresh data if stale
+    /// This is the main replacement for channel-based price updates
+    pub fn get_or_fetch(&self) -> Result<crate::components::SpotPriceData> {
+        // Check if we have fresh data
+        let last = *self.last_fetch.lock();
+        if last.elapsed() < self.fetch_interval
+            && let Some(data) = self.data.lock().clone()
+        {
+            return Ok(data);
+        }
+
+        // Fetch fresh data using tokio runtime handle
+        let handle = tokio::runtime::Handle::current();
+        let prices = handle.block_on(async { self.source.read_prices().await })?;
+
+        // Update cache
+        *self.data.lock() = Some(prices.clone());
+        *self.last_fetch.lock() = std::time::Instant::now();
+        *self.last_error.lock() = None;
+
+        Ok(prices)
+    }
+
+    /// Check if cached data is stale and needs refreshing
+    pub fn is_stale(&self) -> bool {
+        self.last_fetch.lock().elapsed() > self.fetch_interval
+    }
+
+    /// Get the last error that occurred during fetching
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.lock().clone()
+    }
+
+    /// Get cached data without fetching (returns None if no cache or stale)
+    pub fn get_cached(&self) -> Option<crate::components::SpotPriceData> {
+        let last = *self.last_fetch.lock();
+        if last.elapsed() < self.fetch_interval {
+            self.data.lock().clone()
+        } else {
+            None
+        }
+    }
+}
+
+/// Direct async inverter writer that replaces channel-based command execution
+/// Provides both synchronous and fire-and-forget async command writing
+#[derive(Resource)]
+pub struct AsyncInverterWriter {
+    source: Arc<dyn crate::traits::InverterDataSource>,
+}
+
+impl AsyncInverterWriter {
+    /// Create a new async inverter writer
+    pub fn new(source: Arc<dyn crate::traits::InverterDataSource>) -> Self {
+        Self { source }
+    }
+
+    /// Write a command synchronously (blocks until completion)
+    /// Use this when you need immediate confirmation of success/failure
+    pub fn write_command(
+        &self,
+        inverter_id: &str,
+        command: &crate::components::InverterCommand,
+    ) -> Result<()> {
+        let source = self.source.clone();
+        let inverter_id = inverter_id.to_string();
+        let command = command.clone();
+
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move { source.write_command(&inverter_id, &command).await })
+    }
+
+    /// Write a command asynchronously (fire-and-forget)
+    /// Use this for mode changes where you don't need immediate confirmation
+    pub fn write_command_async(
+        &self,
+        inverter_id: String,
+        command: crate::components::InverterCommand,
+    ) {
+        let source = self.source.clone();
+
+        tokio::spawn(async move {
+            match source.write_command(&inverter_id, &command).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "✅ Async command succeeded for {}: {:?}",
+                        inverter_id,
+                        command
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "❌ Async command failed for {}: {:?} - {}",
+                        inverter_id,
+                        command,
+                        e
+                    );
+                }
+            }
+        });
+    }
+}
+
+/// On-demand health checker that replaces channel-based periodic checks
+/// Provides cached health status with configurable check intervals
+#[derive(Resource)]
+pub struct HealthChecker {
+    inverter_source: Option<Arc<dyn crate::traits::InverterDataSource>>,
+    price_source: Option<Arc<dyn crate::traits::PriceDataSource>>,
+    last_check: parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, bool)>>,
+    check_interval: Duration,
+}
+
+impl HealthChecker {
+    /// Create a new health checker with the specified sources and interval
+    pub fn new(
+        inverter_source: Arc<dyn crate::traits::InverterDataSource>,
+        price_source: Arc<dyn crate::traits::PriceDataSource>,
+        check_interval_secs: u64,
+    ) -> Self {
+        Self {
+            inverter_source: Some(inverter_source),
+            price_source: Some(price_source),
+            last_check: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            check_interval: Duration::from_secs(check_interval_secs),
+        }
+    }
+
+    /// Check all sources and return their health status
+    /// Uses caching to avoid excessive health checks
+    pub fn check_all(&self) -> std::collections::HashMap<String, bool> {
+        let mut results = std::collections::HashMap::new();
+        let now = std::time::Instant::now();
+
+        // Check cached results first
+        let mut cache = self.last_check.lock();
+
+        // Check inverter source
+        if let Some(ref source) = self.inverter_source {
+            let name = "inverter_source";
+            let needs_check = cache
+                .get(name)
+                .is_none_or(|(last_time, _)| last_time.elapsed() >= self.check_interval);
+
+            if needs_check {
+                let handle = tokio::runtime::Handle::current();
+                let is_healthy = handle.block_on(source.health_check()).unwrap_or(false);
+
+                results.insert(name.to_string(), is_healthy);
+                cache.insert(name.to_string(), (now, is_healthy));
+            } else if let Some((_, cached_result)) = cache.get(name) {
+                results.insert(name.to_string(), *cached_result);
+            }
+        }
+
+        // Check price source
+        if let Some(ref source) = self.price_source {
+            let name = "price_source";
+            let needs_check = cache
+                .get(name)
+                .is_none_or(|(last_time, _)| last_time.elapsed() >= self.check_interval);
+
+            if needs_check {
+                let handle = tokio::runtime::Handle::current();
+                let is_healthy = handle.block_on(source.health_check()).unwrap_or(false);
+
+                results.insert(name.to_string(), is_healthy);
+                cache.insert(name.to_string(), (now, is_healthy));
+            } else if let Some((_, cached_result)) = cache.get(name) {
+                results.insert(name.to_string(), *cached_result);
+            }
+        }
+
+        results
+    }
+
+    /// Check if any cached results are stale and need refreshing
+    pub fn should_check(&self) -> bool {
+        let cache = self.last_check.lock();
+        cache
+            .values()
+            .any(|(time, _)| time.elapsed() >= self.check_interval)
+            || cache.is_empty()
+    }
+
+    /// Get cached health status without performing fresh checks
+    pub fn get_cached_status(&self) -> std::collections::HashMap<String, bool> {
+        let cache = self.last_check.lock();
+        let mut results = std::collections::HashMap::new();
+
+        for (name, (time, healthy)) in cache.iter() {
+            if time.elapsed() < self.check_interval {
+                results.insert(name.clone(), *healthy);
+            }
+        }
+
+        results
+    }
+}
+
+/// Direct inverter state reader that replaces channel-based state polling
+/// Provides on-demand state reading with timer-based control
+#[derive(Resource)]
+pub struct InverterStateReader {
+    source: Arc<dyn crate::traits::InverterDataSource>,
+}
+
+impl InverterStateReader {
+    /// Create a new inverter state reader
+    pub fn new(source: Arc<dyn crate::traits::InverterDataSource>) -> Self {
+        Self { source }
+    }
+
+    /// Read state for a specific inverter
+    pub fn read_state(&self, inverter_id: &str) -> Result<crate::GenericInverterState> {
+        let source = self.source.clone();
+        let inverter_id = inverter_id.to_string();
+
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move { source.read_state(&inverter_id).await })
+    }
+}
+
+/// Timer resource for controlling state read frequency
+#[derive(Resource)]
+pub struct StateReadTimer {
+    last_read: parking_lot::Mutex<std::time::Instant>,
+    read_interval: Duration,
+}
+
+impl StateReadTimer {
+    /// Create a new state read timer with the specified interval
+    pub fn new(interval_secs: u64) -> Self {
+        Self {
+            last_read: parking_lot::Mutex::new(
+                std::time::Instant::now() - Duration::from_secs(interval_secs),
+            ),
+            read_interval: Duration::from_secs(interval_secs),
+        }
+    }
+
+    /// Check if it's time to read states
+    pub fn should_read(&self) -> bool {
+        self.last_read.lock().elapsed() >= self.read_interval
+    }
+
+    /// Mark that a read has been performed
+    pub fn mark_read(&self) {
+        *self.last_read.lock() = std::time::Instant::now();
+    }
+}

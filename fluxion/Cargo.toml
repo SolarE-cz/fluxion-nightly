@@ -1,18 +1,18 @@
 [workspace]
 members = [
+    "crates/fluxion-adapters",
     "crates/fluxion-core",
-    "crates/fluxion-ha",
     "crates/fluxion-i18n",
     "crates/fluxion-integration-tests",
     "crates/fluxion-main",
-    "crates/fluxion-solax",
-    "crates/fluxion-version",
+    "crates/fluxion-types",
     "crates/fluxion-web",
+    "crates/solax-csv-importer",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.28"
+version = "0.2.0"
 edition = "2024"
 license = "CC-BY-NC-ND-4.0"
 repository = "https://github.com/SolarE-cz/fluxion-nightly"
@@ -150,4 +150,11 @@ features = [
     "svg_backend",
     "chrono",
     "line_series",
+]
+
+[workspace.dependencies.rusqlite]
+version = "0.33.0"
+features = [
+    "bundled",
+    "chrono",
 ]

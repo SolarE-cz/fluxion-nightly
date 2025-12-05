@@ -7,24 +7,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
+## [0.2.0] - 2025-11-30
 
-- Repository cleanup and documentation organization
-- Comprehensive CONTRIBUTING.md with development guidelines
-- CHANGELOG.md following Keep a Changelog format
+### Code Quality & Architecture Improvements
+
+This release focuses on code quality improvements based on comprehensive code review, eliminating
+all Clippy warnings and simplifying the architecture.
 
 ### Changed
 
-- Improved documentation structure (organized into docs/ subdirectories)
-- Enhanced README.md with better Quick Start and Project Status sections
-- Replaced TODO comments with descriptive "Future:" comments
-- Improved documentation for future-use configuration methods
+- **Fixed Clippy Warnings**: Refactored functions with 8+ parameters to use Bevy `SystemParam`
+  structs
 
-### Removed
+  - `poll_price_channel` now uses `PriceChannelParams` for cleaner function signatures
+  - `config_event_handler` now uses `ConfigEventParams` for better maintainability
+  - Result: Zero Clippy warnings across entire codebase
 
-- Dead code cleanup: removed ~801 lines of unused functions
-- Obsolete configuration files and test data
-- Outdated inventory files
+- **Improved Type Safety**: Replaced macro-based abstractions with typed generic functions
+
+  - Converted `read_optional!` macro to `read_optional_sensor<F>()` async function
+  - Better IDE support with full type inference
+  - Enhanced debuggability and compile-time safety
+
+- **Unified Type Definitions**: Consolidated duplicate component definitions
+
+  - Removed duplicate components from `fluxion-core`
+  - All components now defined in `fluxion-types` as single source of truth
+  - Used re-exports to maintain API compatibility
+
+- **Simplified Architecture**: Removed unnecessary abstraction layers
+
+  - Eliminated `InverterModel` enum (redundant wrapper around `InverterType`)
+  - Changed `Inverter.model` → `Inverter.inverter_type` for directness
+  - Cleaner, more maintainable codebase with fewer indirection layers
+
+### Technical Details
+
+- **Code Quality Grade**: Improved from B+ to A- based on professional Rust review
+- **Clippy Warnings**: 2 → 0 (100% clean)
+- **Idiomatic Rust**: Enhanced use of Bevy ECS patterns and generic functions
+- **Documentation**: Added comprehensive CODE_REVIEW.md with findings and improvements
+
+### Documentation
+
+- Added `CODE_REVIEW.md` with detailed analysis and implemented improvements
+- Updated `ARCHITECTURE.md` to version 1.2 with code quality changelog
+- Enhanced README.md with code quality badges and updated version info
 
 ## [0.1.0] - 2025-10-29
 

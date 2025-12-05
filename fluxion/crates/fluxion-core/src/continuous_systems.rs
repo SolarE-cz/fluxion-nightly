@@ -14,7 +14,7 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use chrono::Utc;
 use std::sync::Arc;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     components::*,
@@ -56,7 +56,7 @@ impl Default for BatteryHistoryFetchTimer {
 /// This would prevent mode changes when battery status is unavailable or out-of-date.
 pub fn schedule_execution_system(
     schedule_query: Query<&OperationSchedule>,
-    command_channel_query: Query<&crate::async_tasks::InverterCommandChannel>,
+    async_writer: Res<crate::resources::AsyncInverterWriter>,
     mut current_mode_query: Query<(&mut CurrentMode, &Inverter, Option<&BatteryStatus>)>,
     config: Res<ExecutionConfig>,
     debug: Res<DebugModeConfig>,
@@ -166,29 +166,21 @@ pub fn schedule_execution_system(
                         current_mode.set_at = now;
                         current_mode.reason = scheduled_mode.reason.clone();
                     } else {
-                        // Send command through channel (non-blocking)
-                        if let Ok(cmd_channel) = command_channel_query.single() {
-                            let command = InverterCommand::SetMode(scheduled_mode.mode);
+                        // Send command using direct async writer (fire-and-forget)
+                        let command = InverterCommand::SetMode(scheduled_mode.mode);
 
-                            match cmd_channel.sender.send((inverter.id.clone(), command)) {
-                                Ok(_) => {
-                                    info!(
-                                        "📤 Sent command to change {} to {:?}: {}",
-                                        inverter.id, scheduled_mode.mode, scheduled_mode.reason
-                                    );
-                                    // Update current mode immediately (optimistic)
-                                    // The result will be confirmed via poll_command_results
-                                    current_mode.mode = scheduled_mode.mode;
-                                    current_mode.set_at = now;
-                                    current_mode.reason = scheduled_mode.reason.clone();
-                                }
-                                Err(e) => {
-                                    error!("❌ Failed to send command for {}: {}", inverter.id, e);
-                                }
-                            }
-                        } else {
-                            warn!("No command channel available - command writer not initialized");
-                        }
+                        info!(
+                            "📤 Sending command to change {} to {:?}: {}",
+                            inverter.id, scheduled_mode.mode, scheduled_mode.reason
+                        );
+
+                        // Use async fire-and-forget for mode changes (don't block the ECS system)
+                        async_writer.write_command_async(inverter.id.clone(), command);
+
+                        // Update current mode immediately (optimistic)
+                        current_mode.mode = scheduled_mode.mode;
+                        current_mode.set_at = now;
+                        current_mode.reason = scheduled_mode.reason.clone();
                     }
                 }
             }
@@ -218,7 +210,7 @@ pub fn initialize_inverters_system(
         commands.spawn((
             Inverter {
                 id: inv_config.id.clone(),
-                model: InverterModel::from_inverter_type(inv_config.inverter_type),
+                inverter_type: inv_config.inverter_type,
             },
             CurrentMode::default(),
             // Add other required components
@@ -247,7 +239,6 @@ pub struct BatteryHistoryInitialized(pub bool);
 /// This populates the BatteryHistory with the last 48 hours of data from HA
 pub fn fetch_initial_battery_history_system(
     mut initialized: ResMut<BatteryHistoryInitialized>,
-    _runtime: Res<crate::async_runtime::AsyncRuntime>,
     system_config: Res<crate::resources::SystemConfig>,
     _battery_history: Res<BatteryHistory>,
 ) {
@@ -343,17 +334,15 @@ impl Plugin for ContinuousSystemsPlugin {
                 )
                     .chain(), // Ensure inverters are created before async workers
             )
+            .add_systems(Startup, crate::async_systems::setup_price_cache)
             .add_systems(
                 Update,
                 (
-                    // New channel-based systems (non-blocking)
-                    crate::async_systems::poll_price_channel,
                     crate::async_systems::poll_consumption_history_channel,
                     crate::async_systems::config_event_handler,
-                    crate::async_systems::poll_health_channels,
-                    crate::async_systems::poll_command_results,
-                    crate::async_systems::spawn_inverter_state_polls,
-                    crate::async_systems::poll_inverter_state_results,
+                    crate::async_systems::check_health_system,
+                    // poll_command_results removed - using direct AsyncInverterWriter
+                    crate::async_systems::read_inverter_states_system,
                     // Decompose RawInverterState into individual components
                     crate::async_systems::decompose_inverter_state,
                     // Keep schedule execution but update to use channels
@@ -362,6 +351,8 @@ impl Plugin for ContinuousSystemsPlugin {
                     trigger_battery_history_fetch_system,
                     // Process web queries via message passing (ECS -> Web)
                     crate::web_bridge::web_query_system,
+                    // New channel-based systems (non-blocking)
+                    crate::async_systems::update_prices_system,
                 ),
             );
     }

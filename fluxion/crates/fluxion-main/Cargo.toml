@@ -15,8 +15,7 @@ default = []
 # Local dependencies
 fluxion-core = { path = "../fluxion-core" }
 fluxion-i18n = { path = "../fluxion-i18n" }
-fluxion-solax = { path = "../fluxion-solax" }
-fluxion-ha = { path = "../fluxion-ha" }
+fluxion-adapters = { path = "../fluxion-adapters" }
 fluxion-web = { path = "../fluxion-web" }
 
 # Workspace dependencies

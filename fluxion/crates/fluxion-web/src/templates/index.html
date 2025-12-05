@@ -234,65 +234,6 @@
         <div class="loading" style="margin-top: 10px;"></div>
     </div>
     {% endif %}
-    
-    <!-- Full Upcoming Schedule -->
-    {% if let Some(prices) = prices %}
-    <div class="card">
-        <h2>📋 Upcoming Schedule (48h)</h2>
-        <div class="schedule-table-container">
-            <table class="schedule-table">
-                <thead>
-                    <tr>
-                        <th>Time</th>
-                        <th>Mode</th>
-                        <th>Price</th>
-                        <th>Strategy</th>
-                        <th>Target SOC</th>
-                        <th>Expected Profit</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for i in 0..prices.chart_data.labels.len() %}
-                    <tr{% match prices.chart_data.current_time_label %}{% when Some with (current) %}{% if current == prices.chart_data.labels[i] %} class="current-block"{% endif %}{% when None %}{% endmatch %}>
-                        <td class="time-col">
-                            {% match prices.chart_data.current_time_label %}{% when Some with (current) %}{% if current == prices.chart_data.labels[i] %}➡️ {% endif %}{% when None %}{% endmatch %}{{ prices.chart_data.labels[i] }}
-                        </td>
-                        <td>
-                            <span class="mode-badge mode-{{ prices.chart_data.modes[i].to_lowercase().replace(" ", "-") }}">
-                                {{ prices.chart_data.modes[i] }}
-                            </span>
-                        </td>
-                        <td class="price-col">{{ prices.chart_data.prices[i] }} Kč</td>
-                        <td>
-                            {% match prices.chart_data.strategies[i] %}
-                            {% when Some with (strat) %}
-                            <span class="strategy-badge">{{ strat }}</span>
-                            {% when None %}
-                            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
-                            {% endmatch %}
-                        </td>
-                        <td style="text-align: center;">
-                            {% if let Some(soc) = prices.chart_data.target_socs[i] %}
-                            {{ soc }}%
-                            {% else %}
-                            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
-                            {% endif %}
-                        </td>
-                        <td class="profit-col {% match prices.chart_data.profits[i] %}{% when Some with (p) %}{% if p >= &0.0 %}profit-positive{% else %}profit-negative{% endif %}{% when None %}{% endmatch %}">
-                            {% match prices.chart_data.profits[i] %}
-                            {% when Some with (p) %}
-                            {% if p >= &0.0 %}+{% endif %}{{ p }} Kč
-                            {% when None %}
-                            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
-                            {% endmatch %}
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-    {% endif %}
 
     <!-- Price Information -->
     {% if let Some(prices) = prices %}
@@ -427,6 +368,7 @@
             <div class="price-legend">
                 <span><div class="legend-box charge"></div> Force Charge</span>
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
+                <span><div class="legend-box backup"></div> Back Up Mode</span>
                 <span><div class="legend-box self-use"></div> Self-Use</span>
                 {% if let Some(inv) = inverters.first() %}
                 <span><div class="legend-box battery-soc"></div> Battery SOC ({{ inv.battery_soc }}%)</span>
@@ -456,7 +398,8 @@
                     const opacity = isHistorical ? 0.4 : 0.8; // Dimmed for past blocks
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                    return `rgba(33, 150, 243, ${opacity})`;
+                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
                 
                 const borderColors = chartData.modes.map((mode, idx) => {
@@ -464,7 +407,8 @@
                     const opacity = isHistorical ? 0.5 : 1.0;
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                    return `rgba(33, 150, 243, ${opacity})`;
+                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
                 
                 // Prepare datasets
@@ -937,34 +881,21 @@
         if (!chartData.labels || chartData.labels.length === 0) return;
         
         // Find the current time block (or closest future block)
-        const now = new Date();
+        // chartData.current_time_label is already in the correct timezone
+        const currentTimeLabel = chartData.current_time_label;
         let startIndex = 0;
         
-        // Find the block that matches current time or is in the future
-        for (let i = 0; i < chartData.labels.length; i++) {
-            const label = chartData.labels[i];
-            // Parse label format: "MM-DD HH:MM"
-            const parts = label.split(' ');
-            if (parts.length === 2) {
-                const [monthDay, time] = parts;
-                const [month, day] = monthDay.split('-').map(Number);
-                const [hour, minute] = time.split(':').map(Number);
-                
-                const blockTime = new Date();
-                blockTime.setMonth(month - 1);
-                blockTime.setDate(day);
-                blockTime.setHours(hour);
-                blockTime.setMinutes(minute);
-                blockTime.setSeconds(0);
-                
-                if (blockTime >= now) {
+        // Find the block that matches or is after the current time
+        if (currentTimeLabel) {
+            for (let i = 0; i < chartData.labels.length; i++) {
+                if (chartData.labels[i] >= currentTimeLabel) {
                     startIndex = i;
                     break;
                 }
             }
         }
         
-        // Group consecutive Self-Use blocks
+        // Group consecutive blocks with the same mode
         const groups = [];
         let i = startIndex;
         const maxBlocks = Math.min(startIndex + 96, chartData.labels.length); // Next 6 hours (24 blocks)
@@ -972,43 +903,29 @@
         while (i < maxBlocks) {
             const mode = chartData.modes[i];
             
-            if (mode === 'Self-Use') {
-                // Start a Self-Use group
-                const group = {
-                    startLabel: chartData.labels[i],
-                    endLabel: chartData.labels[i],
-                    prices: [chartData.prices[i]],
-                    mode: mode,
-                    strategies: [chartData.strategies[i]],
-                    profits: [chartData.profits[i]],
-                    blockCount: 1
-                };
-                
-                // Collect consecutive Self-Use blocks
-                i++;
-                while (i < maxBlocks && chartData.modes[i] === 'Self-Use') {
-                    group.endLabel = chartData.labels[i];
-                    group.prices.push(chartData.prices[i]);
-                    group.strategies.push(chartData.strategies[i]);
-                    group.profits.push(chartData.profits[i]);
-                    group.blockCount++;
-                    i++;
-                }
-                
-                groups.push(group);
-            } else {
-                // Non-Self-Use blocks are not grouped
-                groups.push({
-                    startLabel: chartData.labels[i],
-                    endLabel: chartData.labels[i],
-                    prices: [chartData.prices[i]],
-                    mode: mode,
-                    strategies: [chartData.strategies[i]],
-                    profits: [chartData.profits[i]],
-                    blockCount: 1
-                });
+            // Start a new group for this mode
+            const group = {
+                startLabel: chartData.labels[i],
+                endLabel: chartData.labels[i],
+                prices: [chartData.prices[i]],
+                mode: mode,
+                strategies: [chartData.strategies[i]],
+                profits: [chartData.profits[i]],
+                blockCount: 1
+            };
+            
+            // Collect consecutive blocks with the same mode
+            i++;
+            while (i < maxBlocks && chartData.modes[i] === mode) {
+                group.endLabel = chartData.labels[i];
+                group.prices.push(chartData.prices[i]);
+                group.strategies.push(chartData.strategies[i]);
+                group.profits.push(chartData.profits[i]);
+                group.blockCount++;
                 i++;
             }
+            
+            groups.push(group);
         }
         
         // Render groups

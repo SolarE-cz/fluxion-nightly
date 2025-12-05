@@ -14,72 +14,9 @@ use crate::components::*;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::str::FromStr;
 
-/// Supported inverter types in FluxION
-/// This enum defines all inverter vendors and models that FluxION can control
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum InverterType {
-    /// Standard Solax inverters (uses battery_capacity sensor)
-    Solax,
-    /// Solax Ultra inverters (uses battery_total_capacity_charge sensor)
-    SolaxUltra,
-    // Future inverter types can be added here:
-    // Fronius,
-    // Sma,
-    // Huawei,
-}
-
-impl InverterType {
-    /// Get human-readable name for the inverter type
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Solax => "Solax",
-            Self::SolaxUltra => "Solax Ultra",
-        }
-    }
-
-    /// Get config string value (kebab-case)
-    pub fn to_config_value(&self) -> &'static str {
-        match self {
-            Self::Solax => "solax",
-            Self::SolaxUltra => "solax-ultra",
-        }
-    }
-
-    /// List all supported inverter types
-    pub fn all() -> &'static [InverterType] {
-        &[Self::Solax, Self::SolaxUltra]
-    }
-}
-
-impl fmt::Display for InverterType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.display_name())
-    }
-}
-
-impl FromStr for InverterType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "solax" => Ok(Self::Solax),
-            "solax-ultra" => Ok(Self::SolaxUltra),
-            _ => Err(anyhow::anyhow!(
-                "Unknown inverter type: '{}'. Supported types: {}",
-                s,
-                Self::all()
-                    .iter()
-                    .map(|t| t.to_config_value())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        }
-    }
-}
+// Import InverterType from fluxion-types
+pub use fluxion_types::inverter::InverterType;
 
 /// Represents a single entity change in Home Assistant
 #[derive(Debug, Clone, PartialEq, Eq)]

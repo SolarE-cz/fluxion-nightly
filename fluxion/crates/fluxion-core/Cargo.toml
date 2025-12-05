@@ -10,6 +10,7 @@ default = []
 [dependencies]
 # Local dependencies
 fluxion-i18n = { path = "../fluxion-i18n" }
+fluxion-types = { path = "../fluxion-types" }
 
 # Core dependencies only - no inverter-specific or runtime dependencies
 bevy_ecs.workspace = true
@@ -20,9 +21,11 @@ bevy_tasks.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 async-trait.workspace = true
 crossbeam-channel.workspace = true
 ringbuffer.workspace = true
@@ -32,12 +35,9 @@ tower-http.workspace = true
 parking_lot.workspace = true
 futures-timer.workspace = true
 fluent.workspace = true
-reqwest = { version = "0.11", default-features = false, features = [
-  "blocking",
-  "json",
-  "rustls-tls",
-] }
-calamine = "0.24"
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+calamine.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

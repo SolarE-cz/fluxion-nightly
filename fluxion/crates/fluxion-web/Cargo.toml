@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 fluxion-core = { path = "../fluxion-core" }
 fluxion-i18n = { path = "../fluxion-i18n" }
+fluxion-types = { path = "../fluxion-types" }
 axum.workspace = true
 askama.workspace = true
 tokio.workspace = true

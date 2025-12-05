@@ -11,6 +11,7 @@
 // For commercial licensing, please contact: info@solare.cz
 
 mod config;
+mod version;
 
 use anyhow::Result;
 use bevy_app::{ScheduleRunnerPlugin, TaskPoolPlugin, prelude::*};
@@ -18,11 +19,42 @@ use std::{sync::Arc, time::Duration};
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use fluxion_core::{ConfigUpdateSender, FluxionCorePlugin, SystemConfig, WebQuerySender};
-use fluxion_ha::{CzSpotPriceAdapter, HaPlugin, HomeAssistantClient, HomeAssistantInverterAdapter};
+use fluxion_adapters::{
+    CzSpotPriceAdapter, HaClientResource, HaPlugin, HomeAssistantClient,
+    HomeAssistantInverterAdapter,
+};
+use fluxion_core::{
+    ConfigUpdateSender, FluxionCorePlugin, SystemConfig, TimezoneConfig, WebQuerySender,
+};
 use fluxion_i18n::I18n;
 
 fn main() -> Result<()> {
+    // Handle command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--help" | "-h" => {
+                println!("FluxION - PV Plant Automation (MVP)");
+                println!("Version: {}", version::VERSION);
+                println!();
+                println!("Usage: fluxion [OPTIONS]");
+                println!();
+                println!("Options:");
+                println!("  -h, --help    Print this help message");
+                println!("  -v, --version Print version");
+                return Ok(());
+            }
+            "--version" | "-v" => {
+                println!("{}", version::VERSION);
+                return Ok(());
+            }
+            _ => {
+                // Continue to normal execution for other args or no args
+                // If we want to be strict about unknown args, we could handle that here
+            }
+        }
+    }
+
     // Create tokio runtime for async HTTP operations
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -93,15 +125,18 @@ fn initialize_and_run() -> Result<()> {
         )?)
     };
 
-    // Fetch timezone from Home Assistant
+    // Fetch timezone from Home Assistant and create TimezoneConfig
     let mut config = config;
     let runtime_handle = tokio::runtime::Handle::current();
-    if let Ok(timezone) = runtime_handle.block_on(async { ha_client.get_timezone().await }) {
-        config.system.timezone = Some(timezone.clone());
-        info!("🌍 Using Home Assistant timezone: {}", timezone);
-    } else {
-        warn!("⚠️ Failed to fetch timezone from HA, times will be displayed in UTC");
-    }
+    let timezone_config =
+        if let Ok(timezone) = runtime_handle.block_on(async { ha_client.get_timezone().await }) {
+            config.system.timezone = Some(timezone.clone());
+            info!("🌍 Using Home Assistant timezone: {}", timezone);
+            TimezoneConfig::new(Some(timezone))
+        } else {
+            warn!("⚠️ Failed to fetch timezone from HA, times will be displayed in UTC");
+            TimezoneConfig::default()
+        };
 
     // Create vendor-specific entity mapper based on config
     // Use inverter type from first inverter (for multi-inverter setups, all should use same type)
@@ -110,7 +145,7 @@ fn initialize_and_run() -> Result<()> {
         .first()
         .map(|inv| inv.inverter_type)
         .expect("No inverters configured");
-    let mapper = fluxion_solax::create_entity_mapper(inverter_type);
+    let mapper = fluxion_adapters::create_entity_mapper(inverter_type);
     info!(
         "📦 Using {} entity mapper",
         mapper.vendor_name().display_name()
@@ -138,7 +173,7 @@ fn initialize_and_run() -> Result<()> {
     info!("💰 Price data source: {}", price_source.name());
 
     let history_source: Arc<dyn fluxion_core::traits::ConsumptionHistoryDataSource> = Arc::new(
-        fluxion_ha::HaConsumptionHistoryAdapter::new(ha_client.clone()),
+        fluxion_adapters::HaConsumptionHistoryAdapter::new(ha_client.clone()),
     );
     info!("📊 History data source: {}", history_source.name());
 
@@ -197,9 +232,6 @@ fn initialize_and_run() -> Result<()> {
     // Create Bevy app with full configuration
     info!("🎮 Starting ECS application...");
 
-    // Create AsyncRuntime resource (uses Bevy's AsyncComputeTaskPool)
-    let async_runtime = fluxion_core::AsyncRuntime::new();
-
     let mut app = App::new();
     app
         // Add TaskPoolPlugin to initialize async task pools
@@ -211,14 +243,16 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(system_config)
         .insert_resource(debug_config)
         .insert_resource(execution_config)
-        .insert_resource(async_runtime)
         .insert_resource(query_channel)
         .insert_resource(config_update_channel)
+        .insert_resource(timezone_config)
+        .insert_resource(HaClientResource(ha_client))
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
         .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
         .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
             history_source,
-        ));
+        ))
+        .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>();
 
     info!("✅ Starting main loop...");
 

@@ -248,6 +248,7 @@ impl DashboardTemplate {
                 let mode = match block.block_type.as_str() {
                     "charge" => "Force Charge",
                     "discharge" => "Force Discharge",
+                    "backup" => "Back Up Mode",
                     _ => "Self-Use",
                 };
                 modes.push(mode.to_owned());

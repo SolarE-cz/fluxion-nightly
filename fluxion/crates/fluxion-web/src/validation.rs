@@ -172,18 +172,20 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
     let strategies = &config.strategies_config;
 
     // Winter Peak Discharge
-    if strategies.winter_peak_discharge_enabled {
-        if strategies.winter_peak_min_spread_czk < 0.0 {
+    if strategies.winter_peak_discharge.enabled {
+        if strategies.winter_peak_discharge.min_spread_czk < 0.0 {
             errors.push(ValidationIssue {
-                field: "strategies.winter_peak_min_spread_czk".to_owned(),
+                field: "strategies.winter_peak_discharge.min_spread_czk".to_owned(),
                 message: "Minimum spread cannot be negative".to_owned(),
                 severity: "error".to_owned(),
             });
         }
 
-        if strategies.winter_peak_solar_window_start >= strategies.winter_peak_solar_window_end {
+        if strategies.winter_peak_discharge.solar_window_start_hour
+            >= strategies.winter_peak_discharge.solar_window_end_hour
+        {
             errors.push(ValidationIssue {
-                field: "strategies.winter_peak_solar_window_start".to_owned(),
+                field: "strategies.winter_peak_discharge.solar_window_start_hour".to_owned(),
                 message: "Solar window start must be before end".to_owned(),
                 severity: "error".to_owned(),
             });
@@ -191,9 +193,9 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
     }
 
     // Winter Adaptive
-    if strategies.winter_adaptive_enabled && strategies.winter_adaptive_ema_period_days < 1 {
+    if strategies.winter_adaptive.enabled && strategies.winter_adaptive.ema_period_days < 1 {
         errors.push(ValidationIssue {
-            field: "strategies.winter_adaptive_ema_period_days".to_owned(),
+            field: "strategies.winter_adaptive.ema_period_days".to_owned(),
             message: "EMA period must be at least 1 day".to_owned(),
             severity: "error".to_owned(),
         });
@@ -205,11 +207,10 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxion_core::ConsumptionHistoryConfig;
     use fluxion_core::resources::{
-        ControlConfig, PricingConfig, SystemConfig, SystemSettingsConfig,
+        ConsumptionHistoryConfig, ControlConfig, PricingConfig, StrategiesConfigCore, SystemConfig,
+        SystemSettingsConfig,
     };
-    use fluxion_core::strategy::SeasonalStrategiesConfig;
 
     fn default_config() -> SystemConfig {
         SystemConfig {
@@ -233,7 +234,7 @@ mod tests {
                 language: fluxion_i18n::Language::English,
                 timezone: None,
             },
-            strategies_config: SeasonalStrategiesConfig::default(),
+            strategies_config: StrategiesConfigCore::default(),
             history: ConsumptionHistoryConfig::default(),
         }
     }
@@ -304,14 +305,17 @@ mod tests {
     #[test]
     fn test_strategy_validation() {
         let mut config = default_config();
-        config.strategies_config.winter_peak_discharge_enabled = true;
-        config.strategies_config.winter_peak_min_spread_czk = -5.0;
+        config.strategies_config.winter_peak_discharge.enabled = true;
+        config
+            .strategies_config
+            .winter_peak_discharge
+            .min_spread_czk = -5.0;
 
         let (errors, _) = validate_config(&config);
         assert!(
             errors
                 .iter()
-                .any(|e| e.field == "strategies.winter_peak_min_spread_czk")
+                .any(|e| e.field == "strategies.winter_peak_discharge.min_spread_czk")
         );
     }
 }

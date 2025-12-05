@@ -1,5 +1,5 @@
 name: FluxION ECS (Nightly)
-version: 0.1.28
+version: 0.2.0
 slug: fluxion-nightly
 description: Solar plant automation based on electricity spot prices
 url: https://github.com/SolarE-cz/fluxion
@@ -29,7 +29,6 @@ options:
     fixed_buy_prices: []
     fixed_sell_prices: []
   control:
-    maximum_export_power_w: 10000
     force_charge_hours: 4
     force_discharge_hours: 2
     min_battery_soc: 10
@@ -47,7 +46,6 @@ options:
       ema_period_days: 7
       min_solar_percentage: 0.1
       target_battery_soc: 90.0
-      critical_battery_soc: 40.0
       top_expensive_blocks: 12
       tomorrow_preservation_threshold: 1.2
       grid_export_price_threshold: 8.0
@@ -56,7 +54,7 @@ options:
       negative_price_handling_enabled: true
       charge_on_negative_even_if_full: false
     winter_peak_discharge:
-      enabled: true
+      enabled: false
       min_spread_czk: 3.0
       min_soc_to_start: 70.0
       min_soc_target: 50.0
@@ -64,23 +62,23 @@ options:
       solar_window_end_hour: 14
       min_hours_to_solar: 4
     solar_aware_charging:
-      enabled: true
+      enabled: false
       solar_window_start_hour: 10
       solar_window_end_hour: 14
       midday_max_soc: 90.0
       min_solar_forecast_kwh: 2.0
     morning_precharge:
-      enabled: true
+      enabled: false
     day_ahead_planning:
-      enabled: true
+      enabled: false
     time_aware_charge:
-      enabled: true
+      enabled: false
     price_arbitrage:
-      enabled: true
+      enabled: false
     solar_first:
-      enabled: true
+      enabled: false
     self_use:
-      enabled: true
+      enabled: false
 schema:
   inverters:
   - id: str
@@ -99,7 +97,7 @@ schema:
     fixed_sell_prices:
     - float?
   control:
-    maximum_export_power_w: int(0,)?
+    maximum_export_power_w: int(0,)
     force_charge_hours: int(0,24)?
     force_discharge_hours: int(0,24)?
     min_battery_soc: float(0,100)?
@@ -117,7 +115,6 @@ schema:
       ema_period_days: int(1,30)?
       min_solar_percentage: float(0,1)?
       target_battery_soc: float(0,100)?
-      critical_battery_soc: float(0,100)?
       top_expensive_blocks: int(0,96)?
       tomorrow_preservation_threshold: float?
       grid_export_price_threshold: float?

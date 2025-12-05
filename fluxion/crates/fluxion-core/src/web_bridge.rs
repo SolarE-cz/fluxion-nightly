@@ -18,8 +18,10 @@ use tracing::{debug, trace};
 
 use crate::utils::calculate_ema;
 use crate::{
-    components::*, config_events::ConfigUpdateEvent, debug::DebugModeConfig,
-    resources::SystemConfig,
+    components::*,
+    config_events::ConfigUpdateEvent,
+    debug::DebugModeConfig,
+    resources::{SystemConfig, TimezoneConfig},
 };
 
 /// Channel for web query requests
@@ -352,6 +354,7 @@ fn extract_strategy_info(reason: &str) -> (Option<String>, Option<f32>) {
 pub fn web_query_system(
     debug_config: Res<DebugModeConfig>,
     system_config: Res<SystemConfig>,
+    timezone_config: Option<Res<TimezoneConfig>>,
     mut channel: ResMut<WebQueryChannel>,
     inverters: Query<InverterQuery>,
     schedule: Query<&OperationSchedule>,
@@ -373,6 +376,7 @@ pub fn web_query_system(
             QueryType::Dashboard => build_dashboard_response(
                 &debug_config,
                 &system_config,
+                timezone_config.as_deref(),
                 &inverters,
                 &schedule,
                 &price_data,
@@ -394,6 +398,7 @@ pub fn web_query_system(
 fn build_dashboard_response(
     debug_config: &DebugModeConfig,
     system_config: &SystemConfig,
+    timezone_config: Option<&TimezoneConfig>,
     inverters: &Query<InverterQuery>,
     schedule: &Query<&OperationSchedule>,
     price_data: &Query<&SpotPriceData>,
@@ -896,7 +901,9 @@ fn build_dashboard_response(
         schedule: schedule_data,
         prices: price_data_result,
         health,
-        timezone: system_config.system_config.timezone.clone(),
+        timezone: timezone_config
+            .and_then(|tz| tz.timezone.clone())
+            .or_else(|| system_config.system_config.timezone.clone()),
         battery_soc_history,
         battery_soc_prediction,
         pv_generation_history,

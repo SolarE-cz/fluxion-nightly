@@ -15,32 +15,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-/// Configuration for consumption history tracking
-#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
-pub struct ConsumptionHistoryConfig {
-    /// Home Assistant entity ID for daily consumption (e.g., "sensor.solax_today_s_import_energy")
-    pub consumption_entity: String,
-
-    /// Home Assistant entity ID for daily solar production (e.g., "sensor.energy_production_today")
-    pub solar_production_entity: String,
-
-    /// Number of days to track for EMA calculation
-    pub ema_days: usize,
-
-    /// Number of days to track for seasonal mode detection
-    pub seasonal_detection_days: usize,
-}
-
-impl Default for ConsumptionHistoryConfig {
-    fn default() -> Self {
-        Self {
-            consumption_entity: "sensor.solax_today_s_import_energy".to_string(),
-            solar_production_entity: "sensor.energy_production_today".to_string(),
-            ema_days: 7,
-            seasonal_detection_days: 3,
-        }
-    }
-}
+// Import ConsumptionHistoryConfig from fluxion-types
+pub use fluxion_types::history::ConsumptionHistoryConfig;
 
 /// Daily energy summary for a specific date
 #[derive(Debug, Clone, Serialize, Deserialize)]

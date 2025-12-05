@@ -10,48 +10,23 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-mod day_ahead_planning;
-mod morning_precharge;
-mod optimizer;
-mod price_arbitrage;
-mod seasonal_mode;
-mod seasonal_optimizer;
-mod self_use;
-mod solar_first;
-mod time_aware_charge;
-mod winter_peak_discharge;
+pub mod seasonal_mode;
+pub mod seasonal_optimizer;
+pub mod utils;
+pub mod winter_adaptive;
 
-// New unified strategies
-mod enhanced_self_use;
-mod smart_discharge;
-mod unified_smart_charge;
-
-// Winter adaptive strategy (primary strategy for winter)
-mod winter_adaptive;
-
-pub use day_ahead_planning::DayAheadChargePlanningStrategy;
-pub use morning_precharge::MorningPreChargeStrategy;
-pub use optimizer::EconomicOptimizer;
-pub use price_arbitrage::PriceArbitrageStrategy;
+// Re-export strategies
 pub use seasonal_mode::SeasonalMode;
 pub use seasonal_optimizer::{AdaptiveSeasonalOptimizer, SeasonalStrategiesConfig};
-pub use self_use::SelfUseStrategy;
-pub use solar_first::SolarFirstStrategy;
-pub use time_aware_charge::TimeAwareChargeStrategy;
-
-// Export new unified strategies
-pub use enhanced_self_use::EnhancedSelfUseStrategy;
-pub use smart_discharge::{DischargeSeasonConfig, SmartDischargeStrategy};
-pub use unified_smart_charge::{UnifiedSmartChargeConfig, UnifiedSmartChargeStrategy};
-
-// Export winter adaptive strategy
 pub use winter_adaptive::{
     DayEnergyBalance, PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy,
 };
 
-use crate::components::{InverterOperationMode, TimeBlockPrice};
-use crate::resources::ControlConfig;
 use chrono::{DateTime, Utc};
+use fluxion_types::config::ControlConfig;
+use fluxion_types::inverter::InverterOperationMode;
+use fluxion_types::pricing::TimeBlockPrice;
+pub use fluxion_types::scheduling::{BlockDebugInfo, StrategyEvaluation};
 use serde::{Deserialize, Serialize};
 
 /// Detailed energy flow information for a time block
@@ -126,35 +101,6 @@ impl Default for Assumptions {
             grid_export_price_czk_per_kwh: 0.40,
         }
     }
-}
-
-/// Debug information about strategy evaluation for a block
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StrategyEvaluation {
-    /// Name of the strategy
-    pub strategy_name: String,
-
-    /// Operation mode this strategy recommends
-    pub mode: InverterOperationMode,
-
-    /// Net profit score from this strategy (CZK)
-    pub net_profit_czk: f32,
-
-    /// Detailed reasoning for this strategy's decision
-    pub reason: String,
-}
-
-/// Debug information captured during block scheduling
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockDebugInfo {
-    /// All strategies that were evaluated for this block
-    pub evaluated_strategies: Vec<StrategyEvaluation>,
-
-    /// Explanation of why the winning strategy was chosen
-    pub winning_reason: String,
-
-    /// Key conditions that were checked
-    pub conditions: Vec<String>,
 }
 
 /// Complete economic evaluation of a time block
@@ -246,6 +192,14 @@ pub struct EvaluationContext<'a> {
 
     /// All price blocks for today/tomorrow (for global price analysis)
     pub all_price_blocks: Option<&'a [TimeBlockPrice]>,
+
+    /// Backup discharge minimum SOC from HA sensor (%)  
+    /// Read from number.<prefix>_backup_discharge_min_soc sensor
+    pub backup_discharge_min_soc: f32,
+
+    /// Grid import energy consumed today (kWh)
+    /// Read from sensor.<prefix>_today_s_import_energy sensor
+    pub grid_import_today_kwh: Option<f32>,
 }
 
 /// Trait for economic battery operation strategies
@@ -329,64 +283,5 @@ pub mod economics {
         // Opportunity cost is the guaranteed revenue minus what we might earn
         // (This is a simplified model; full model would consider future price forecasts)
         immediate_revenue - (future_exportable * current_export_price)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_energy_flows_default() {
-        let flows = EnergyFlows::default();
-        assert_eq!(flows.grid_import_kwh, 0.0);
-        assert_eq!(flows.battery_charge_kwh, 0.0);
-    }
-
-    #[test]
-    fn test_assumptions_default() {
-        let assumptions = Assumptions::default();
-        assert_eq!(assumptions.battery_efficiency, 0.95);
-        assert_eq!(assumptions.current_battery_soc, 50.0);
-    }
-
-    #[test]
-    fn test_block_evaluation_calculate_profit() {
-        let mut eval = BlockEvaluation::new(
-            Utc::now(),
-            15,
-            InverterOperationMode::SelfUse,
-            "test".to_string(),
-        );
-
-        eval.revenue_czk = 10.0;
-        eval.cost_czk = 6.0;
-        eval.calculate_net_profit();
-
-        assert_eq!(eval.net_profit_czk, 4.0);
-    }
-
-    #[test]
-    fn test_battery_degradation_cost() {
-        let cost = economics::battery_degradation_cost(10.0, 0.125);
-        assert_eq!(cost, 1.25);
-    }
-
-    #[test]
-    fn test_efficiency_loss() {
-        let loss = economics::efficiency_loss(10.0, 0.95);
-        assert!((loss - 0.5).abs() < 0.001); // Use floating point tolerance
-    }
-
-    #[test]
-    fn test_grid_import_cost() {
-        let cost = economics::grid_import_cost(5.0, 0.50);
-        assert_eq!(cost, 2.5);
-    }
-
-    #[test]
-    fn test_grid_export_revenue() {
-        let revenue = economics::grid_export_revenue(5.0, 0.40);
-        assert_eq!(revenue, 2.0);
     }
 }

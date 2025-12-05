@@ -301,7 +301,6 @@ pub struct WinterAdaptiveConfig {
     pub ema_period_days: usize,
     pub min_solar_percentage: f32,
     pub target_battery_soc: f32,
-    pub critical_battery_soc: f32,
     pub top_expensive_blocks: usize,
     pub tomorrow_preservation_threshold: f32,
     pub grid_export_price_threshold: f32,
@@ -318,7 +317,6 @@ impl Default for WinterAdaptiveConfig {
             ema_period_days: 7,
             min_solar_percentage: 0.10,
             target_battery_soc: 90.0,
-            critical_battery_soc: 40.0,
             top_expensive_blocks: 12,
             tomorrow_preservation_threshold: 1.2,
             grid_export_price_threshold: 8.0,
@@ -656,6 +654,14 @@ impl AppConfig {
         }
 
         // Validate control parameters
+        // CRITICAL: maximum_export_power_w must be set correctly to avoid grid penalties
+        if self.control.maximum_export_power_w == 0 {
+            result.add_error(
+                "control.maximum_export_power_w",
+                "CRITICAL: Maximum export power must be configured! Using wrong value can result in heavy penalties for exceeding your allowed grid export limit. Set this to your contracted maximum export power in watts.",
+            );
+        }
+
         if self.control.min_battery_soc < 0.0 || self.control.min_battery_soc > 100.0 {
             result.add_error("control.min_battery_soc", "Must be between 0 and 100");
         }
@@ -802,6 +808,19 @@ impl AppConfig {
         }
 
         // Validate control parameters
+        // CRITICAL: maximum_export_power_w must be set correctly to avoid grid penalties
+        if self.control.maximum_export_power_w == 0 {
+            anyhow::bail!(
+                "\n\n🚨 CRITICAL CONFIGURATION ERROR 🚨\n\n\
+                maximum_export_power_w is not configured!\n\n\
+                You MUST set this value to your contracted maximum grid export power (in watts).\n\
+                Using an incorrect value can result in HEAVY FINANCIAL PENALTIES for exceeding\n\
+                your allowed export limit.\n\n\
+                Example: If your contract allows 10 kW export, set maximum_export_power_w: 10000\n\n\
+                Please configure this value in the Home Assistant addon options and restart.\n"
+            );
+        }
+
         if self.control.min_battery_soc < 0.0 || self.control.min_battery_soc > 100.0 {
             anyhow::bail!("min_battery_soc must be between 0 and 100");
         }
@@ -889,95 +908,6 @@ impl AppConfig {
     #[allow(dead_code)]
     pub fn is_debug_mode(&self) -> bool {
         self.system.debug_mode
-    }
-}
-
-/// Convert AppConfig strategies to fluxion_core::SeasonalStrategiesConfig
-impl From<&AppConfig> for fluxion_core::SeasonalStrategiesConfig {
-    fn from(app_config: &AppConfig) -> Self {
-        Self {
-            winter_adaptive_enabled: app_config.strategies.winter_adaptive.enabled,
-            winter_adaptive_ema_period_days: app_config.strategies.winter_adaptive.ema_period_days,
-            winter_adaptive_min_solar_percentage: app_config
-                .strategies
-                .winter_adaptive
-                .min_solar_percentage,
-            winter_adaptive_target_battery_soc: app_config
-                .strategies
-                .winter_adaptive
-                .target_battery_soc,
-            winter_adaptive_critical_battery_soc: app_config
-                .strategies
-                .winter_adaptive
-                .critical_battery_soc,
-            winter_adaptive_top_expensive_blocks: app_config
-                .strategies
-                .winter_adaptive
-                .top_expensive_blocks,
-            winter_adaptive_tomorrow_preservation_threshold: app_config
-                .strategies
-                .winter_adaptive
-                .tomorrow_preservation_threshold,
-            winter_adaptive_grid_export_price_threshold: app_config
-                .strategies
-                .winter_adaptive
-                .grid_export_price_threshold,
-            winter_adaptive_min_soc_for_export: app_config
-                .strategies
-                .winter_adaptive
-                .min_soc_for_export,
-            winter_adaptive_export_trigger_multiplier: app_config
-                .strategies
-                .winter_adaptive
-                .export_trigger_multiplier,
-            winter_adaptive_negative_price_handling_enabled: app_config
-                .strategies
-                .winter_adaptive
-                .negative_price_handling_enabled,
-            winter_adaptive_charge_on_negative_even_if_full: app_config
-                .strategies
-                .winter_adaptive
-                .charge_on_negative_even_if_full,
-            winter_peak_discharge_enabled: app_config.strategies.winter_peak_discharge.enabled,
-            winter_peak_min_spread_czk: app_config.strategies.winter_peak_discharge.min_spread_czk,
-            winter_peak_min_soc_to_start: app_config
-                .strategies
-                .winter_peak_discharge
-                .min_soc_to_start,
-            winter_peak_min_soc_target: app_config.strategies.winter_peak_discharge.min_soc_target,
-            winter_peak_min_hours_to_solar: app_config
-                .strategies
-                .winter_peak_discharge
-                .min_hours_to_solar,
-            winter_peak_solar_window_start: app_config
-                .strategies
-                .winter_peak_discharge
-                .solar_window_start_hour,
-            winter_peak_solar_window_end: app_config
-                .strategies
-                .winter_peak_discharge
-                .solar_window_end_hour,
-            solar_aware_charging_enabled: app_config.strategies.solar_aware_charging.enabled,
-            solar_aware_solar_window_start: app_config
-                .strategies
-                .solar_aware_charging
-                .solar_window_start_hour,
-            solar_aware_solar_window_end: app_config
-                .strategies
-                .solar_aware_charging
-                .solar_window_end_hour,
-            solar_aware_midday_max_soc: app_config.strategies.solar_aware_charging.midday_max_soc,
-            solar_aware_min_solar_forecast_kwh: app_config
-                .strategies
-                .solar_aware_charging
-                .min_solar_forecast_kwh,
-            morning_precharge_enabled: app_config.strategies.morning_precharge.enabled,
-            day_ahead_planning_enabled: app_config.strategies.day_ahead_planning.enabled,
-            time_aware_charge_enabled: app_config.strategies.time_aware_charge.enabled,
-            price_arbitrage_enabled: app_config.strategies.price_arbitrage.enabled,
-            solar_first_enabled: app_config.strategies.solar_first.enabled,
-            self_use_enabled: app_config.strategies.self_use.enabled,
-        }
     }
 }
 
@@ -1082,6 +1012,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 min_mode_change_interval_secs: app_config.control.min_mode_change_interval_secs,
                 average_household_load_kw: app_config.control.average_household_load_kw,
                 hardware_min_battery_soc: app_config.control.hardware_min_battery_soc,
+                grid_export_fee_czk_per_kwh: 0.5, // Fixed export fee (TODO: make configurable)
                 max_battery_charge_rate_kw: app_config.control.max_battery_charge_rate_kw,
                 evening_target_soc: app_config.strategies.winter_adaptive.target_battery_soc,
                 evening_peak_start_hour: 17, // Default value
@@ -1105,102 +1036,96 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 language: app_config.system.language,
                 timezone: app_config.system.timezone,
             },
-            strategies_config: fluxion_core::strategy::SeasonalStrategiesConfig {
-                winter_adaptive_enabled: app_config.strategies.winter_adaptive.enabled,
-                winter_adaptive_ema_period_days: app_config
-                    .strategies
-                    .winter_adaptive
-                    .ema_period_days,
-                winter_adaptive_min_solar_percentage: app_config
-                    .strategies
-                    .winter_adaptive
-                    .min_solar_percentage,
-                winter_adaptive_target_battery_soc: app_config
-                    .strategies
-                    .winter_adaptive
-                    .target_battery_soc,
-                winter_adaptive_critical_battery_soc: app_config
-                    .strategies
-                    .winter_adaptive
-                    .critical_battery_soc,
-                winter_adaptive_top_expensive_blocks: app_config
-                    .strategies
-                    .winter_adaptive
-                    .top_expensive_blocks,
-                winter_adaptive_tomorrow_preservation_threshold: app_config
-                    .strategies
-                    .winter_adaptive
-                    .tomorrow_preservation_threshold,
-                winter_adaptive_grid_export_price_threshold: app_config
-                    .strategies
-                    .winter_adaptive
-                    .grid_export_price_threshold,
-                winter_adaptive_min_soc_for_export: app_config
-                    .strategies
-                    .winter_adaptive
-                    .min_soc_for_export,
-                winter_adaptive_export_trigger_multiplier: app_config
-                    .strategies
-                    .winter_adaptive
-                    .export_trigger_multiplier,
-                winter_adaptive_negative_price_handling_enabled: app_config
-                    .strategies
-                    .winter_adaptive
-                    .negative_price_handling_enabled,
-                winter_adaptive_charge_on_negative_even_if_full: app_config
-                    .strategies
-                    .winter_adaptive
-                    .charge_on_negative_even_if_full,
-                winter_peak_discharge_enabled: app_config.strategies.winter_peak_discharge.enabled,
-                winter_peak_min_spread_czk: app_config
-                    .strategies
-                    .winter_peak_discharge
-                    .min_spread_czk,
-                winter_peak_min_soc_to_start: app_config
-                    .strategies
-                    .winter_peak_discharge
-                    .min_soc_to_start,
-                winter_peak_min_soc_target: app_config
-                    .strategies
-                    .winter_peak_discharge
-                    .min_soc_target,
-                winter_peak_min_hours_to_solar: app_config
-                    .strategies
-                    .winter_peak_discharge
-                    .min_hours_to_solar,
-                winter_peak_solar_window_start: app_config
-                    .strategies
-                    .winter_peak_discharge
-                    .solar_window_start_hour,
-                winter_peak_solar_window_end: app_config
-                    .strategies
-                    .winter_peak_discharge
-                    .solar_window_end_hour,
-                solar_aware_charging_enabled: app_config.strategies.solar_aware_charging.enabled,
-                solar_aware_solar_window_start: app_config
-                    .strategies
-                    .solar_aware_charging
-                    .solar_window_start_hour,
-                solar_aware_solar_window_end: app_config
-                    .strategies
-                    .solar_aware_charging
-                    .solar_window_end_hour,
-                solar_aware_midday_max_soc: app_config
-                    .strategies
-                    .solar_aware_charging
-                    .midday_max_soc,
-                solar_aware_min_solar_forecast_kwh: app_config
-                    .strategies
-                    .solar_aware_charging
-                    .min_solar_forecast_kwh,
-                morning_precharge_enabled: app_config.strategies.morning_precharge.enabled,
-                day_ahead_planning_enabled: app_config.strategies.day_ahead_planning.enabled,
-                time_aware_charge_enabled: app_config.strategies.time_aware_charge.enabled,
-                price_arbitrage_enabled: app_config.strategies.price_arbitrage.enabled,
-                solar_first_enabled: app_config.strategies.solar_first.enabled,
-                self_use_enabled: app_config.strategies.self_use.enabled,
+            strategies_config: fluxion_core::StrategiesConfigCore {
+                winter_adaptive: fluxion_core::WinterAdaptiveConfigCore {
+                    enabled: app_config.strategies.winter_adaptive.enabled,
+                    ema_period_days: app_config.strategies.winter_adaptive.ema_period_days,
+                    min_solar_percentage: app_config
+                        .strategies
+                        .winter_adaptive
+                        .min_solar_percentage,
+                    target_battery_soc: app_config.strategies.winter_adaptive.target_battery_soc,
+                    top_expensive_blocks: app_config
+                        .strategies
+                        .winter_adaptive
+                        .top_expensive_blocks,
+                    tomorrow_preservation_threshold: app_config
+                        .strategies
+                        .winter_adaptive
+                        .tomorrow_preservation_threshold,
+                    grid_export_price_threshold: app_config
+                        .strategies
+                        .winter_adaptive
+                        .grid_export_price_threshold,
+                    min_soc_for_export: app_config.strategies.winter_adaptive.min_soc_for_export,
+                    export_trigger_multiplier: app_config
+                        .strategies
+                        .winter_adaptive
+                        .export_trigger_multiplier,
+                    negative_price_handling_enabled: app_config
+                        .strategies
+                        .winter_adaptive
+                        .negative_price_handling_enabled,
+                    charge_on_negative_even_if_full: app_config
+                        .strategies
+                        .winter_adaptive
+                        .charge_on_negative_even_if_full,
+                    historical_daily_consumption: Vec::new(),
+                },
+                winter_peak_discharge: fluxion_core::WinterPeakDischargeConfigCore {
+                    enabled: app_config.strategies.winter_peak_discharge.enabled,
+                    min_spread_czk: app_config.strategies.winter_peak_discharge.min_spread_czk,
+                    min_soc_to_start: app_config.strategies.winter_peak_discharge.min_soc_to_start,
+                    min_soc_target: app_config.strategies.winter_peak_discharge.min_soc_target,
+                    solar_window_start_hour: app_config
+                        .strategies
+                        .winter_peak_discharge
+                        .solar_window_start_hour,
+                    solar_window_end_hour: app_config
+                        .strategies
+                        .winter_peak_discharge
+                        .solar_window_end_hour,
+                    min_hours_to_solar: app_config
+                        .strategies
+                        .winter_peak_discharge
+                        .min_hours_to_solar,
+                },
+                solar_aware_charging: fluxion_core::SolarAwareChargingConfigCore {
+                    enabled: app_config.strategies.solar_aware_charging.enabled,
+                    solar_window_start_hour: app_config
+                        .strategies
+                        .solar_aware_charging
+                        .solar_window_start_hour,
+                    solar_window_end_hour: app_config
+                        .strategies
+                        .solar_aware_charging
+                        .solar_window_end_hour,
+                    midday_max_soc: app_config.strategies.solar_aware_charging.midday_max_soc,
+                    min_solar_forecast_kwh: app_config
+                        .strategies
+                        .solar_aware_charging
+                        .min_solar_forecast_kwh,
+                },
+                morning_precharge: fluxion_core::StrategyEnabledConfigCore {
+                    enabled: app_config.strategies.morning_precharge.enabled,
+                },
+                day_ahead_planning: fluxion_core::StrategyEnabledConfigCore {
+                    enabled: app_config.strategies.day_ahead_planning.enabled,
+                },
+                time_aware_charge: fluxion_core::StrategyEnabledConfigCore {
+                    enabled: app_config.strategies.time_aware_charge.enabled,
+                },
+                price_arbitrage: fluxion_core::StrategyEnabledConfigCore {
+                    enabled: app_config.strategies.price_arbitrage.enabled,
+                },
+                solar_first: fluxion_core::StrategyEnabledConfigCore {
+                    enabled: app_config.strategies.solar_first.enabled,
+                },
+                self_use: fluxion_core::StrategyEnabledConfigCore {
+                    enabled: app_config.strategies.self_use.enabled,
+                },
             },
-            history: fluxion_core::components::ConsumptionHistoryConfig {
+            history: fluxion_core::ConsumptionHistoryConfig {
                 consumption_entity: app_config.history.consumption_entity,
                 solar_production_entity: app_config.history.solar_production_entity,
                 ema_days: app_config.history.ema_days,
@@ -1467,7 +1392,6 @@ mod tests {
                     "ema_period_days": 7,
                     "min_solar_percentage": 0.10,
                     "target_battery_soc": 90.0,
-                    "critical_battery_soc": 40.0,
                     "top_expensive_blocks": 12,
                     "tomorrow_preservation_threshold": 1.2,
                     "grid_export_price_threshold": 8.0,

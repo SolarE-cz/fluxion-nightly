@@ -25,6 +25,8 @@ efficient, reliable control of your solar installation through Home Assistant in
 - **Multi-language Support**: Fully translated UI (English, Czech)
 - **Comprehensive Monitoring**: 30+ sensor types including PV strings, battery metrics, grid data
 - **Web UI**: Built-in monitoring dashboard with real-time charts
+- **Compact Data Export**: AI-optimized JSON export (60-70% smaller) for analysis with Claude Code
+- **Code Quality**: Zero Clippy warnings, idiomatic Rust throughout
 
 ## Internationalization
 
@@ -48,9 +50,10 @@ See [docs/guides/I18N.md](docs/guides/I18N.md) for detailed documentation on:
 
 ## System Requirements
 
-- Rust 1.75+
+- Rust 1.75+ (edition 2024)
 - Tokio runtime for async operations
-- Network access to Solax inverter (Modbus TCP port 502)
+- Home Assistant with inverter integration
+- (Optional) Network access to Solax inverter (Modbus TCP port 502)
 
 ## Quick Start
 
@@ -146,6 +149,84 @@ FluxION includes a built-in web UI accessible at `http://localhost:3000` (config
 - Manual mode control
 - Multi-language support (English, Czech)
 
+## Data Export API
+
+FluxION provides a compact JSON export endpoint optimized for analysis with AI tools like Claude
+Code:
+
+### Export Endpoint
+
+**GET** `/export` - Downloads comprehensive system data as JSON file
+
+### Compact Format Features
+
+- **60-70% size reduction** compared to verbose JSON
+- **Abbreviated field names**: `"timestamp"` → `"ts"`, `"battery_power_w"` → `"bat_pwr"`
+- **Unix timestamps** instead of ISO 8601 strings (50%+ shorter)
+- **Rounded precision**: Prices to 2 decimals, SOC to 1 decimal, power to nearest watt
+- **Encoded decision reasons** using structured enums instead of verbose strings
+- **Strategy abbreviations**: `"Winter-Adaptive"` → `"WA"`, `"Self-Use"` → `"SU"`
+
+### Export Data Structure
+
+```json
+{
+  "meta": {
+    "ts": 1733251337,           // Unix timestamp
+    "tz": "Europe/Prague",
+    "dbg": true,
+    "ver": "2.0"
+  },
+  "inv": [{                     // Inverter data
+    "soc": 30.1,                // Battery SOC (1 decimal)
+    "bat_pwr": 1235,            // Battery power (nearest watt)
+    "grid_pwr": -890,           // Grid power (negative = export)
+    "pv_pwr": 2100              // PV generation
+  }],
+  "prices": {
+    "cur": 3.02,                // Current price (2 decimals)
+    "blocks": [{
+      "ts": 1733251800,         // Unix timestamp
+      "p": 2.53,                // Price CZK/kWh
+      "op": "s",                // Operation: c=charge, d=discharge, s=self-use
+      "st": "SU",               // Strategy code
+      "r": "SU - Normal operation" // Decision reason (abbreviated)
+    }]
+  },
+  "bat_pred": [{               // Battery SOC predictions
+    "ts": 1733252400,
+    "soc": 28.5
+  }]
+}
+```
+
+### Key Benefits
+
+- **AI-Optimized**: Fits comfortably within Claude Code's 25K token limit
+- **No Data Loss**: All essential information preserved for analysis
+- **Human Readable**: Still pretty-printed JSON for debugging
+- **Type Safe**: Structured data with proper validation
+- **Backward Compatible**: Can convert back to verbose format if needed
+
+### Usage Examples
+
+```bash
+# Download current system state
+curl -o fluxion_export.json http://localhost:3000/export
+
+# Import for analysis with Claude Code
+# File will be ~25-30KB instead of ~85KB, fitting comfortably in token limits
+```
+
+The export includes:
+
+- **Real-time inverter data** (SOC, power flows, temperatures)
+- **Operation schedule** (current mode, next changes, strategy)
+- **Price data** (current block + 192 future price blocks)
+- **Battery predictions** (SOC forecast for upcoming schedule)
+- **Historical data** (recent SOC, PV generation)
+- **System health** (connection status, errors)
+
 ## Supported Inverters
 
 Currently tested with:
@@ -154,6 +235,37 @@ Currently tested with:
 
 The vendor-agnostic architecture makes it easy to add support for other brands. See
 [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) for implementation details.
+
+## Development Tools
+
+### Solax CSV Importer
+
+A utility tool for importing historical Solax inverter data from CSV exports into a SQLite database
+for analysis.
+
+**Features:**
+
+- Parses Solax export CSV files (converted from Excel format)
+- Creates SQLite database with 57 data columns (PV yield, battery stats, grid power, MPPT data,
+  etc.)
+- Handles missing/empty values gracefully
+- Prevents duplicate imports with timestamp-based uniqueness
+- Creates indexed database for efficient time-series queries
+
+**Usage:**
+
+```bash
+# Convert Excel export to CSV
+libreoffice --headless --convert-to csv H34A10I2293069-2025-11-01-2025-11-30.xlsx --outdir /tmp
+
+# Import to SQLite
+cargo run --release --bin solax-csv-importer -- \
+  --csv /tmp/H34A10I2293069-2025-11-01-2025-11-30.csv \
+  --database solax_data.db
+```
+
+See [crates/solax-csv-importer/README.md](crates/solax-csv-importer/README.md) for detailed
+documentation and example queries.
 
 ## Troubleshooting
 
@@ -167,7 +279,7 @@ For detailed troubleshooting, see [docs/guides/DEPLOYMENT.md](docs/guides/DEPLOY
 
 ## Project Status
 
-**Current Version:** MVP Complete (v0.1.0)
+**Current Version:** v0.2.0
 
 **Status:**
 
@@ -177,6 +289,8 @@ For detailed troubleshooting, see [docs/guides/DEPLOYMENT.md](docs/guides/DEPLOY
 - ✅ Web UI with real-time monitoring
 - ✅ Multi-language support (EN, CZ)
 - ✅ Comprehensive sensor support (30+ types)
+- ✅ Compact data export API (AI-optimized JSON)
+- ✅ Zero Clippy warnings (clean, idiomatic code)
 - 🔄 Additional inverter brand support (planned)
 - 🔄 Advanced forecasting integration (planned)
 

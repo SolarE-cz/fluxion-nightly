@@ -10,9 +10,9 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+use fluxion_adapters::SolaxEntityMapper;
+use fluxion_adapters::{CzSpotPriceAdapter, HomeAssistantClient, HomeAssistantInverterAdapter};
 use fluxion_core::{InverterDataSource, PriceDataSource, VendorEntityMapper};
-use fluxion_ha::{CzSpotPriceAdapter, HomeAssistantClient, HomeAssistantInverterAdapter};
-use fluxion_solax::SolaxEntityMapper;
 use std::sync::Arc;
 
 /// Load HA token from .token.txt file (in workspace root)
@@ -334,7 +334,7 @@ async fn test_end_to_end_data_flow() {
         );
 
         println!("\n📋 Step 3: Analyze prices");
-        let analysis = fluxion_core::analyze_prices(
+        let analysis = fluxion_core::pricing::analyze_prices(
             &spot_prices.time_block_prices,
             4,    // 4 hours charge
             2,    // 2 hours discharge
@@ -356,15 +356,15 @@ async fn test_end_to_end_data_flow() {
         );
 
         println!("\n📋 Step 4: Generate schedule");
-        let schedule_config = fluxion_core::ScheduleConfig {
+        let schedule_config = fluxion_core::scheduling::ScheduleConfig {
             min_battery_soc: 10.0,
             max_battery_soc: 100.0,
             target_inverters: Vec::new(), // Empty = all inverters
-            display_currency: fluxion_core::Currency::EUR,
+            display_currency: fluxion_types::config::Currency::EUR,
             default_battery_mode: Default::default(),
         };
 
-        let schedule = fluxion_core::generate_schedule(
+        let schedule = fluxion_core::scheduling::generate_schedule(
             &spot_prices.time_block_prices,
             &analysis,
             &schedule_config,

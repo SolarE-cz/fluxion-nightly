@@ -14,8 +14,7 @@ use chrono::{DateTime, TimeZone, Timelike, Utc};
 use fluxion_core::components::TimeBlockPrice;
 use fluxion_core::resources::{ControlConfig, PriceSchedule, PricingConfig};
 use fluxion_core::strategy::{
-    DischargeSeasonConfig, EconomicStrategy, EnhancedSelfUseStrategy, EvaluationContext,
-    SmartDischargeStrategy, UnifiedSmartChargeConfig, UnifiedSmartChargeStrategy,
+    EconomicStrategy, EvaluationContext, WinterAdaptiveConfig, WinterAdaptiveStrategy,
 };
 use std::error::Error;
 use std::fs::File;
@@ -252,7 +251,7 @@ fn get_price_czk(time: DateTime<Utc>, prices: &HashMap<DateTime<Utc>, PriceData>
 /// State for a single strategy simulation
 struct StrategySimState {
     name: String,
-    strategy: Box<dyn EconomicStrategy>,
+    strategy: WinterAdaptiveStrategy,
     current_soc: f32,
     cumulative_profit_czk: f32,
     total_imported_kwh: f32,
@@ -262,7 +261,7 @@ struct StrategySimState {
 }
 
 impl StrategySimState {
-    fn new(name: &str, strategy: Box<dyn EconomicStrategy>, initial_soc: f32) -> Self {
+    fn new(name: &str, strategy: WinterAdaptiveStrategy, initial_soc: f32) -> Self {
         Self {
             name: name.to_string(),
             strategy,
@@ -274,64 +273,49 @@ impl StrategySimState {
             total_discharged_kwh: 0.0,
         }
     }
-
-    fn _update(
-        &mut self,
-        context: &EvaluationContext,
-        _block_duration_hours: f32,
-        battery_capacity: f32,
-        battery_efficiency: f32,
-    ) {
-        let evaluation = self.strategy.evaluate(context);
-
-        // Update cumulative stats
-        self.cumulative_profit_czk += evaluation.net_profit_czk;
-        self.total_imported_kwh += evaluation.energy_flows.grid_import_kwh;
-        self.total_exported_kwh += evaluation.energy_flows.grid_export_kwh;
-        self.total_charged_kwh += evaluation.energy_flows.battery_charge_kwh;
-        self.total_discharged_kwh += evaluation.energy_flows.battery_discharge_kwh;
-
-        // Update SOC
-        // Charge efficiency applies to charging (grid -> bat, solar -> bat)
-        // Discharge efficiency applies to discharging (bat -> load, bat -> grid)
-        // Net change at battery terminals:
-        // Energy into battery = charge_kwh * efficiency
-        // Energy out of battery = discharge_kwh / efficiency
-
-        let energy_in = evaluation.energy_flows.battery_charge_kwh * battery_efficiency;
-        let energy_out = evaluation.energy_flows.battery_discharge_kwh / battery_efficiency;
-        let net_energy_change = energy_in - energy_out;
-
-        let soc_change = (net_energy_change / battery_capacity) * 100.0;
-        self.current_soc = (self.current_soc + soc_change).clamp(0.0, 100.0);
-    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     // 1. Load Data
-    let rows = parse_csv(
-        "/home/daniel/Repositories/solare/fluxion/fluxion/simulation_data/inverter_data.csv",
-    )?;
+    // Note: Paths are hardcoded for the example, might need adjustment or env vars
+    let data_path = Path::new("simulation_data/inverter_data.csv");
+    if !data_path.exists() {
+        println!(
+            "Simulation data not found at {:?}. Skipping simulation.",
+            data_path
+        );
+        return Ok(());
+    }
+
+    let rows = parse_csv(data_path)?;
     println!("Loaded {} rows of inverter data", rows.len());
 
     // 1.5. Load Real OTE Prices
-    let price_csv_path = "/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-core/data/prices_2025_10.csv";
-    let prices = match load_price_csv(price_csv_path) {
-        Ok(p) => {
-            println!(
-                "Loaded {} real OTE price records from {}",
-                p.len(),
-                price_csv_path
-            );
-            p
+    let price_csv_path = Path::new("crates/fluxion-core/data/prices_2025_10.csv");
+    let prices = if price_csv_path.exists() {
+        match load_price_csv(price_csv_path) {
+            Ok(p) => {
+                println!(
+                    "Loaded {} real OTE price records from {:?}",
+                    p.len(),
+                    price_csv_path
+                );
+                p
+            }
+            Err(e) => {
+                println!(
+                    "Warning: Could not load real prices: {}. Using synthetic prices as fallback.",
+                    e
+                );
+                HashMap::new()
+            }
         }
-        Err(e) => {
-            println!(
-                "Warning: Could not load real prices: {}. Using synthetic prices as fallback.",
-                e
-            );
-            HashMap::new() // Empty map will trigger fallback in get_price_czk
-        }
+    } else {
+        println!(
+            "Price data not found at {:?}. Using synthetic prices.",
+            price_csv_path
+        );
+        HashMap::new()
     };
 
     // 2. Aggregate
@@ -344,59 +328,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // 3. Setup Strategies
-    let _initial_soc = blocks[0].start_soc;
-
-    // 3. Setup Strategies
     let initial_soc = blocks[0].start_soc;
 
-    // 1. Baseline: Enhanced Self Use with optimization DISABLED (Pure Self-Use)
-    let baseline_strategy = EnhancedSelfUseStrategy::new(
-        true, false, // Disable optimization -> Pure Self-Use
-        1.3, 6,
-    );
+    // Strategy 1: Default Winter Adaptive
+    let default_config = WinterAdaptiveConfig::default();
+    let default_strategy = WinterAdaptiveStrategy::new(default_config);
 
-    // 2. Tuned Unified Smart Charge
-    // - Stricter price difference (1.5 CZK) to avoid marginal trades
-    // - Lower opportunity weight (0.3) to reduce speculation
-    // - Stricter price threshold (2%)
-    let tuned_unified_config = UnifiedSmartChargeConfig {
-        min_price_difference_czk: 1.5,
-        price_threshold_percentage: 0.02,
-        ..UnifiedSmartChargeConfig::default()
+    // Strategy 2: Aggressive Winter Adaptive (more expensive blocks avoided)
+    let aggressive_config = WinterAdaptiveConfig {
+        top_expensive_blocks: 16, // Avoid top 16 blocks instead of 12
+        ..WinterAdaptiveConfig::default()
     };
-    let tuned_unified_smart = UnifiedSmartChargeStrategy::new(true, tuned_unified_config);
-
-    // 3. Tuned Smart Discharge
-    // - Median + 1.0 CZK threshold
-    // - Lower start SOC (30%) to allow triggering with lower solar/self-use levels
-    // - Disable solar window check (start=25)
-    let tuned_winter_config = DischargeSeasonConfig {
-        min_spread_czk: 1.0,
-        min_arbitrage_profit_czk: 5.0, // High threshold to cover opportunity cost of self-use
-        min_soc_to_start: 30.0,
-        solar_window_start_hour: 25,
-        ..DischargeSeasonConfig::winter()
-    };
-
-    let tuned_smart_discharge_controller =
-        SmartDischargeStrategy::new(true, DischargeSeasonConfig::summer(), tuned_winter_config);
-    let tuned_smart_discharge_strategy = tuned_smart_discharge_controller.clone();
+    let aggressive_strategy = WinterAdaptiveStrategy::new(aggressive_config);
 
     // Create simulation states
     let mut sim_states = vec![
+        StrategySimState::new("Default Winter Adaptive", default_strategy, initial_soc),
         StrategySimState::new(
-            "Baseline (Pure Self-Use)",
-            Box::new(baseline_strategy),
-            initial_soc,
-        ),
-        StrategySimState::new(
-            "Tuned Unified Smart Charge",
-            Box::new(tuned_unified_smart),
-            initial_soc,
-        ),
-        StrategySimState::new(
-            "Tuned Smart Discharge",
-            Box::new(tuned_smart_discharge_strategy),
+            "Aggressive Winter Adaptive",
+            aggressive_strategy,
             initial_soc,
         ),
     ];
@@ -445,26 +395,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (i, block) in blocks.iter().enumerate() {
         let price_block = &all_price_blocks[i];
 
-        // Perform daily planning for Smart Discharge
-        if i == 0 || (block.start_time.hour() == 0 && block.start_time.minute() == 0) {
-            // We need the current SOC for the SmartDischarge strategy state
-            // Find the state for Smart Discharge
-            if let Some(state) = sim_states
-                .iter()
-                .find(|s| s.name.contains("Smart Discharge"))
-            {
-                // Pass a 48-hour rolling window for planning (48 * 4 = 192 blocks)
-                let end_idx = (i + 192).min(all_price_blocks.len());
-                let planning_window = &all_price_blocks[i..end_idx];
-                tuned_smart_discharge_controller.plan_discharge_blocks(
-                    planning_window,
-                    state.current_soc,
-                    &config,
-                    &pricing_config,
-                );
-            }
-        }
-
         // For each strategy, we need a separate context because SOC is different
         for state in &mut sim_states {
             // Calculate spot price for export (no grid fee on export)
@@ -478,23 +408,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 consumption_forecast_kwh: block.consumption_kwh,
                 grid_export_price_czk_per_kwh: spot_price, // Export at spot price (no grid fee)
                 all_price_blocks: Some(&all_price_blocks),
+                backup_discharge_min_soc: config.hardware_min_battery_soc,
+                grid_import_today_kwh: None, // Not tracked in simulation
             };
 
-            // Special handling for SmartDischarge: Fallback to Baseline if it refuses to run (returns -inf)
-            let mut evaluation = state.strategy.evaluate(&context);
-
-            if evaluation.net_profit_czk.is_infinite() && state.name.contains("Smart Discharge") {
-                // Fallback to Enhanced Self-Use (Baseline) logic for this block
-                // We need a temporary baseline strategy instance or just reuse logic
-                // Since we have `baseline_strategy` available in main scope, we can use it if we didn't move it.
-                // But we moved `baseline_strategy` into `sim_states`.
-                // Let's create a new default one for fallback.
-                let fallback = EnhancedSelfUseStrategy::default();
-                evaluation = fallback.evaluate(&context);
-            }
-
-            // Update state with the valid evaluation
-            // We need to manually update state fields based on evaluation
+            let evaluation = state.strategy.evaluate(&context);
 
             // Update cumulative stats
             state.cumulative_profit_czk += evaluation.net_profit_czk;
