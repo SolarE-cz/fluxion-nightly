@@ -410,6 +410,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 all_price_blocks: Some(&all_price_blocks),
                 backup_discharge_min_soc: config.hardware_min_battery_soc,
                 grid_import_today_kwh: None, // Not tracked in simulation
+                consumption_today_kwh: None, // Not tracked in simulation
             };
 
             let evaluation = state.strategy.evaluate(&context);

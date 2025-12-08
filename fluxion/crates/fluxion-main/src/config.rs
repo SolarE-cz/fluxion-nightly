@@ -300,7 +300,8 @@ pub struct WinterAdaptiveConfig {
     pub enabled: bool,
     pub ema_period_days: usize,
     pub min_solar_percentage: f32,
-    pub target_battery_soc: f32,
+    pub daily_charging_target_soc: f32,
+    pub conservation_threshold_soc: f32,
     pub top_expensive_blocks: usize,
     pub tomorrow_preservation_threshold: f32,
     pub grid_export_price_threshold: f32,
@@ -316,7 +317,8 @@ impl Default for WinterAdaptiveConfig {
             enabled: true,
             ema_period_days: 7,
             min_solar_percentage: 0.10,
-            target_battery_soc: 90.0,
+            daily_charging_target_soc: 90.0,
+            conservation_threshold_soc: 75.0,
             top_expensive_blocks: 12,
             tomorrow_preservation_threshold: 1.2,
             grid_export_price_threshold: 8.0,
@@ -1014,7 +1016,10 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 hardware_min_battery_soc: app_config.control.hardware_min_battery_soc,
                 grid_export_fee_czk_per_kwh: 0.5, // Fixed export fee (TODO: make configurable)
                 max_battery_charge_rate_kw: app_config.control.max_battery_charge_rate_kw,
-                evening_target_soc: app_config.strategies.winter_adaptive.target_battery_soc,
+                evening_target_soc: app_config
+                    .strategies
+                    .winter_adaptive
+                    .daily_charging_target_soc,
                 evening_peak_start_hour: 17, // Default value
                 min_consecutive_force_blocks: app_config.control.min_consecutive_force_blocks,
                 default_battery_mode: match app_config
@@ -1044,7 +1049,14 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .strategies
                         .winter_adaptive
                         .min_solar_percentage,
-                    target_battery_soc: app_config.strategies.winter_adaptive.target_battery_soc,
+                    daily_charging_target_soc: app_config
+                        .strategies
+                        .winter_adaptive
+                        .daily_charging_target_soc,
+                    conservation_threshold_soc: app_config
+                        .strategies
+                        .winter_adaptive
+                        .conservation_threshold_soc,
                     top_expensive_blocks: app_config
                         .strategies
                         .winter_adaptive
@@ -1391,7 +1403,8 @@ mod tests {
                     "enabled": true,
                     "ema_period_days": 7,
                     "min_solar_percentage": 0.10,
-                    "target_battery_soc": 90.0,
+                    "daily_charging_target_soc": 90.0,
+                    "conservation_threshold_soc": 75.0,
                     "top_expensive_blocks": 12,
                     "tomorrow_preservation_threshold": 1.2,
                     "grid_export_price_threshold": 8.0,

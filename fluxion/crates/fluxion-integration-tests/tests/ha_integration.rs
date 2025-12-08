@@ -340,6 +340,7 @@ async fn test_end_to_end_data_flow() {
             2,    // 2 hours discharge
             true, // use spot for buy
             true, // use spot for sell
+            2,    // min consecutive blocks
         );
 
         println!(

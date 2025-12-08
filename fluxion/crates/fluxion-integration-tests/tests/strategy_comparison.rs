@@ -137,7 +137,8 @@ fn compare_strategies() {
 
     // Setup Winter Adaptive Strategy
     let winter_config = WinterAdaptiveConfig {
-        target_battery_soc: 90.0,
+        daily_charging_target_soc: 60.0,
+        charge_safety_multiplier: 1.1,
         ..Default::default()
     };
     // winter_config.enable_grid_charge = true; // Field does not exist, assuming enabled by default or logic
@@ -152,6 +153,27 @@ fn compare_strategies() {
         ..Default::default()
     };
 
+    // --- Database Setup for Results ---
+    let mut conn = Connection::open("solax_data.db").expect("Failed to open DB for writing");
+    conn.execute("DROP TABLE IF EXISTS simulation_winter_adaptive", [])
+        .expect("Failed to drop table");
+    conn.execute(
+        "CREATE TABLE simulation_winter_adaptive (
+            timestamp INTEGER PRIMARY KEY,
+            soc REAL NOT NULL,
+            import_w REAL NOT NULL,
+            export_w REAL NOT NULL,
+            battery_power_w REAL NOT NULL,
+            pv_power_w REAL NOT NULL,
+            house_load_w REAL NOT NULL,
+            mode TEXT NOT NULL
+        )",
+        [],
+    )
+    .expect("Failed to create table");
+
+    let tx = conn.transaction().expect("Failed to start transaction");
+
     // Simulation Loop
     let mut self_use_cost = 0.0;
     let mut winter_cost = 0.0;
@@ -161,21 +183,24 @@ fn compare_strategies() {
     let mut self_use_soc = start_soc;
     let mut winter_soc = start_soc;
 
+    // Consumption tracking
+    let mut cumulative_consumption_kwh = 0.0;
+    let mut current_day = data.history[0].timestamp.date_naive();
+
     println!("Starting simulation with SOC: {:.1}%", start_soc);
 
     // Assuming 5 min blocks in history
     let duration_h = 5.0 / 60.0;
 
     for record in data.history.iter() {
-        // Find matching price based on time of day
-        // We assume 'prices' contains a 24h profile or similar.
-        // We map record.timestamp to the same time in the price list.
-        // If price list is absolute timestamps, we might need modulo logic.
-        // Let's assume prices are just a list we cycle through if they don't match date.
+        // Reset consumption tracking on new day
+        let record_date = record.timestamp.date_naive();
+        if record_date != current_day {
+            cumulative_consumption_kwh = 0.0;
+            current_day = record_date;
+        }
 
-        // Better approach: Find price block that covers this time of day.
-        // Assuming prices are 15 min blocks? Or 1 hour?
-        // Let's just pick the price index = (hour * 60 + minute) / (24*60 / prices.len())
+        // Find matching price based on time of day
         let minute_of_day = record.timestamp.hour() * 60 + record.timestamp.minute();
         let total_minutes = 24 * 60;
         let price_idx = (minute_of_day as usize * data.prices.len()) / total_minutes as usize;
@@ -187,6 +212,13 @@ fn compare_strategies() {
         let load_kw = record.house_load_w / 1000.0;
         let pv_kw = record.pv_power_w / 1000.0;
 
+        // Update cumulative consumption BEFORE evaluation (so far today)
+        // Note: This is "consumed so far", so we add current block AFTER or BEFORE?
+        // The strategy expects "today_consumed_so_far".
+        // If we are at 10:00, we want consumption from 00:00 to 10:00.
+        // Let's add current block to it, assuming we know it (perfect foresight in sim)
+        cumulative_consumption_kwh += load_kw * duration_h;
+
         // --- Self-Use Simulation ---
         let (su_grid_kw, su_bat_kw) = SelfUseStrategy.evaluate(
             load_kw,
@@ -196,7 +228,6 @@ fn compare_strategies() {
         );
 
         // Update Self-Use SOC
-        // su_bat_kw > 0 means discharge
         let su_energy_change_kwh = -su_bat_kw * duration_h;
         let su_soc_change = (su_energy_change_kwh / control_config.battery_capacity_kwh) * 100.0;
         self_use_soc = (self_use_soc + su_soc_change).clamp(0.0, 100.0);
@@ -205,62 +236,42 @@ fn compare_strategies() {
         if su_grid_kw > 0.0 {
             self_use_cost += su_grid_kw * duration_h * price_buy;
         } else {
-            self_use_cost += su_grid_kw * duration_h * price_sell; // su_grid_kw is negative
+            self_use_cost += su_grid_kw * duration_h * price_sell;
         }
 
         // --- Winter Adaptive Simulation ---
-        // Construct Context
         let context = EvaluationContext {
             price_block,
             control_config: &control_config,
             current_battery_soc: winter_soc,
-            solar_forecast_kwh: pv_kw * duration_h, // Simple forecast = current
+            solar_forecast_kwh: pv_kw * duration_h,
             consumption_forecast_kwh: load_kw * duration_h,
             grid_export_price_czk_per_kwh: price_sell,
-            all_price_blocks: Some(&data.prices), // Pass all prices for lookahead
+            all_price_blocks: Some(&data.prices),
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
+            consumption_today_kwh: Some(cumulative_consumption_kwh),
         };
 
         let evaluation = winter_strategy.evaluate(&context);
-
-        // Apply Winter Strategy Decision
-        // The strategy returns a mode (Charge, Discharge, etc.)
-        // We need to simulate what actually happens in that mode given the physical constraints (PV, Load).
 
         let (wa_grid_kw, wa_bat_kw);
 
         match evaluation.mode {
             InverterOperationMode::ForceCharge => {
-                // Charge from Grid + PV
-                // Target is max charge rate
                 let max_charge = control_config.max_battery_charge_rate_kw;
-                let bat_kw = -max_charge; // Charge
-                // Grid = Load - PV - Bat (where Bat is negative)
-                // Grid = Load - PV + Charge
+                let bat_kw = -max_charge;
                 let grid_kw = load_kw - pv_kw - bat_kw;
                 (wa_grid_kw, wa_bat_kw) = (grid_kw, bat_kw);
             }
             InverterOperationMode::ForceDischarge => {
-                // Discharge to Grid
-                let max_discharge = control_config.max_battery_charge_rate_kw; // Assume discharge = charge rate
+                let max_discharge = control_config.max_battery_charge_rate_kw;
                 let bat_kw = max_discharge;
                 let grid_kw = load_kw - pv_kw - bat_kw;
                 (wa_grid_kw, wa_bat_kw) = (grid_kw, bat_kw);
             }
-            InverterOperationMode::SelfUse => {
-                // Same as Self-Use logic
-                let (g, b) = SelfUseStrategy.evaluate(
-                    load_kw,
-                    pv_kw,
-                    winter_soc,
-                    control_config.battery_capacity_kwh,
-                );
-                (wa_grid_kw, wa_bat_kw) = (g, b);
-            }
-            // Handle other modes
             _ => {
-                // Default to Self Use
+                // Self Use logic for other modes
                 let (g, b) = SelfUseStrategy.evaluate(
                     load_kw,
                     pv_kw,
@@ -282,7 +293,26 @@ fn compare_strategies() {
         } else {
             winter_cost += wa_grid_kw * duration_h * price_sell;
         }
+
+        // Write to DB (convert kW back to W for consistency with DB schema)
+        tx.execute(
+            "INSERT INTO simulation_winter_adaptive (timestamp, soc, import_w, export_w, battery_power_w, pv_power_w, house_load_w, mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                record.timestamp.timestamp(),
+                winter_soc,
+                if wa_grid_kw > 0.0 { wa_grid_kw * 1000.0 } else { 0.0 },
+                if wa_grid_kw < 0.0 { -wa_grid_kw * 1000.0 } else { 0.0 },
+                -wa_bat_kw * 1000.0, // Positive = Charge to match DB convention
+                record.pv_power_w,
+                record.house_load_w,
+                format!("{:?}", evaluation.mode),
+            ),
+        )
+        .unwrap();
     }
+
+    tx.commit().expect("Failed to commit transaction");
 
     println!("Simulation complete.");
     println!("Total Records: {}", data.history.len());
@@ -293,8 +323,6 @@ fn compare_strategies() {
     if winter_cost < self_use_cost {
         println!("SUCCESS: Winter Adaptive Strategy saved money!");
     } else {
-        println!(
-            "RESULT: Winter Adaptive Strategy cost more or same (might be expected depending on prices)."
-        );
+        println!("RESULT: Winter Adaptive Strategy cost more or same.");
     }
 }

@@ -20,7 +20,8 @@ pub struct SeasonalStrategiesConfig {
     pub winter_adaptive_enabled: bool,
     pub winter_adaptive_ema_period_days: usize,
     pub winter_adaptive_min_solar_percentage: f32,
-    pub winter_adaptive_target_battery_soc: f32,
+    pub winter_adaptive_daily_charging_target_soc: f32,
+    pub winter_adaptive_conservation_threshold_soc: f32,
     pub winter_adaptive_top_expensive_blocks: usize,
     pub winter_adaptive_tomorrow_preservation_threshold: f32,
     pub winter_adaptive_grid_export_price_threshold: f32,
@@ -36,7 +37,8 @@ impl Default for SeasonalStrategiesConfig {
             winter_adaptive_enabled: true,
             winter_adaptive_ema_period_days: 7,
             winter_adaptive_min_solar_percentage: 0.10,
-            winter_adaptive_target_battery_soc: 90.0,
+            winter_adaptive_daily_charging_target_soc: 90.0,
+            winter_adaptive_conservation_threshold_soc: 75.0,
             winter_adaptive_top_expensive_blocks: 12,
             winter_adaptive_tomorrow_preservation_threshold: 1.2,
             winter_adaptive_grid_export_price_threshold: 8.0,
@@ -54,7 +56,12 @@ impl From<&StrategiesConfigCore> for SeasonalStrategiesConfig {
             winter_adaptive_enabled: config.winter_adaptive.enabled,
             winter_adaptive_ema_period_days: config.winter_adaptive.ema_period_days,
             winter_adaptive_min_solar_percentage: config.winter_adaptive.min_solar_percentage,
-            winter_adaptive_target_battery_soc: config.winter_adaptive.target_battery_soc,
+            winter_adaptive_daily_charging_target_soc: config
+                .winter_adaptive
+                .daily_charging_target_soc,
+            winter_adaptive_conservation_threshold_soc: config
+                .winter_adaptive
+                .conservation_threshold_soc,
             winter_adaptive_top_expensive_blocks: config.winter_adaptive.top_expensive_blocks,
             winter_adaptive_tomorrow_preservation_threshold: config
                 .winter_adaptive
@@ -99,7 +106,8 @@ impl AdaptiveSeasonalOptimizer {
             enabled: config.winter_adaptive_enabled,
             ema_period_days: config.winter_adaptive_ema_period_days,
             min_solar_percentage: config.winter_adaptive_min_solar_percentage,
-            target_battery_soc: config.winter_adaptive_target_battery_soc,
+            daily_charging_target_soc: config.winter_adaptive_daily_charging_target_soc,
+            conservation_threshold_soc: config.winter_adaptive_conservation_threshold_soc,
             top_expensive_blocks: config.winter_adaptive_top_expensive_blocks,
             tomorrow_preservation_threshold: config.winter_adaptive_tomorrow_preservation_threshold,
             grid_export_price_threshold: config.winter_adaptive_grid_export_price_threshold,
@@ -227,6 +235,7 @@ mod tests {
             all_price_blocks: Some(&all),
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None, // Not needed in test
+            consumption_today_kwh: None, // Not needed in test
         };
         let eval = optimizer.evaluate(&ctx);
         assert!(!eval.strategy_name.is_empty());

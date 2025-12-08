@@ -540,6 +540,7 @@ pub fn has_price_data_changed(current: &SpotPriceData, new_last_updated: DateTim
 /// * `force_discharge_hours` - Number of hours to identify as most expensive (for discharging)
 /// * `use_spot_for_buy` - Whether to identify cheap blocks (if false, returns empty)
 /// * `use_spot_for_sell` - Whether to identify expensive blocks (if false, returns empty)
+/// * `min_consecutive_blocks` - Minimum consecutive blocks for force operations (for consecutive charging)
 ///
 /// # Returns
 /// `PriceAnalysis` with identified block indices and price statistics
@@ -549,6 +550,7 @@ pub fn analyze_prices(
     force_discharge_hours: usize,
     use_spot_for_buy: bool,
     use_spot_for_sell: bool,
+    min_consecutive_blocks: usize,
 ) -> PriceAnalysis {
     if time_block_prices.is_empty() {
         warn!("Cannot analyze empty price data");
@@ -583,22 +585,20 @@ pub fn analyze_prices(
     indexed_prices.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     // Convert hour-based config to block count (4 blocks per hour)
-    let charge_block_count = force_charge_hours * 4;
     let discharge_block_count = force_discharge_hours * 4;
 
-    // Identify cheapest blocks for charging
+    // Identify cheapest consecutive blocks for charging
     let charge_blocks = if use_spot_for_buy {
-        let count = charge_block_count.min(indexed_prices.len());
-        let mut blocks: Vec<usize> = indexed_prices
-            .iter()
-            .take(count)
-            .map(|(idx, _)| *idx)
-            .collect();
-        blocks.sort_unstable(); // Sort by time, not price
+        let blocks = find_cheapest_consecutive_blocks(
+            time_block_prices,
+            min_consecutive_blocks,
+            force_charge_hours,
+        );
         debug!(
-            "Identified {} cheapest blocks for charging (from {} hours)",
+            "Identified {} consecutive cheapest blocks for charging (from {} hours, min {} consecutive)",
             blocks.len(),
-            force_charge_hours
+            force_charge_hours,
+            min_consecutive_blocks
         );
         blocks
     } else {
@@ -631,6 +631,95 @@ pub fn analyze_prices(
         price_range,
         analyzed_at: Utc::now(),
     }
+}
+
+/// Find the cheapest consecutive blocks for charging
+///
+/// This function finds consecutive time periods with the lowest average price,
+/// respecting the minimum consecutive blocks requirement.
+///
+/// # Arguments
+/// * `time_block_prices` - Price data for 15-minute blocks
+/// * `min_consecutive_blocks` - Minimum number of consecutive blocks required
+/// * `total_charge_hours` - Total hours of charging desired
+///
+/// # Returns
+/// Vector of block indices representing the cheapest consecutive periods
+pub fn find_cheapest_consecutive_blocks(
+    time_block_prices: &[TimeBlockPrice],
+    min_consecutive_blocks: usize,
+    total_charge_hours: usize,
+) -> Vec<usize> {
+    if time_block_prices.is_empty() || min_consecutive_blocks == 0 {
+        return Vec::new();
+    }
+
+    let total_blocks_needed = total_charge_hours * 4; // 4 blocks per hour
+    if total_blocks_needed == 0 {
+        return Vec::new();
+    }
+
+    let mut selected_blocks = Vec::new();
+    let mut used_blocks = vec![false; time_block_prices.len()];
+
+    // Find consecutive sequences of the required minimum length
+    while selected_blocks.len() < total_blocks_needed {
+        let mut best_avg_price = f32::INFINITY;
+        let mut best_start_idx = None;
+        let mut best_length = min_consecutive_blocks;
+
+        // Try different sequence lengths, starting from minimum required
+        for seq_length in min_consecutive_blocks
+            ..=time_block_prices
+                .len()
+                .min(total_blocks_needed - selected_blocks.len() + min_consecutive_blocks - 1)
+        {
+            // Try all possible starting positions for this sequence length
+            for start_idx in 0..=(time_block_prices.len().saturating_sub(seq_length)) {
+                // Check if any blocks in this range are already used
+                if (start_idx..start_idx + seq_length).any(|i| used_blocks[i]) {
+                    continue;
+                }
+
+                // Calculate average price for this sequence
+                let total_price: f32 = (start_idx..start_idx + seq_length)
+                    .map(|i| time_block_prices[i].price_czk_per_kwh)
+                    .sum();
+                let avg_price = total_price / seq_length as f32;
+
+                if avg_price < best_avg_price {
+                    best_avg_price = avg_price;
+                    best_start_idx = Some(start_idx);
+                    best_length = seq_length;
+                }
+            }
+        }
+
+        // If we found a good sequence, mark it as selected
+        if let Some(start_idx) = best_start_idx {
+            let end_idx = start_idx + best_length;
+            #[expect(clippy::needless_range_loop)]
+            for i in start_idx..end_idx {
+                if selected_blocks.len() < total_blocks_needed {
+                    selected_blocks.push(i);
+                    used_blocks[i] = true;
+                }
+            }
+
+            debug!(
+                "Selected consecutive charging sequence: blocks {}-{} (avg price: {:.3} CZK/kWh)",
+                start_idx,
+                end_idx - 1,
+                best_avg_price
+            );
+        } else {
+            // No more valid sequences found
+            break;
+        }
+    }
+
+    selected_blocks.sort_unstable();
+    selected_blocks
 }
 
 /// Create fixed price data from hourly arrays

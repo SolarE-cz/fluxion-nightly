@@ -191,6 +191,7 @@ pub fn update_prices_system(
         config.control_config.force_discharge_hours,
         config.pricing_config.use_spot_prices_to_buy,
         config.pricing_config.use_spot_prices_to_sell,
+        config.control_config.min_consecutive_force_blocks,
     );
 
     let schedule_config = ScheduleConfig {

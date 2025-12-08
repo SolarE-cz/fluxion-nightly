@@ -200,6 +200,10 @@ pub struct EvaluationContext<'a> {
     /// Grid import energy consumed today (kWh)
     /// Read from sensor.<prefix>_today_s_import_energy sensor
     pub grid_import_today_kwh: Option<f32>,
+
+    /// Total household consumption today (kWh)
+    /// Used to track progress against daily predicted consumption
+    pub consumption_today_kwh: Option<f32>,
 }
 
 /// Trait for economic battery operation strategies

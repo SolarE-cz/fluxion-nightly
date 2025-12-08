@@ -66,8 +66,11 @@ pub struct WinterAdaptiveConfig {
     /// Minimum solar production percentage to consider (winter ignores solar if < 10%)
     pub min_solar_percentage: f32,
 
-    /// Target battery SOC (%)
-    pub target_battery_soc: f32,
+    /// Daily charging target SOC (%) - how full the battery should be charged each day
+    pub daily_charging_target_soc: f32,
+
+    /// Conservation threshold SOC (%) - below this level, be more careful about discharging
+    pub conservation_threshold_soc: f32,
 
     /// Number of most expensive blocks to target for discharge
     pub top_expensive_blocks: usize,
@@ -112,7 +115,12 @@ pub struct WinterAdaptiveConfig {
     /// Price tolerance for block consolidation (default: 0.15 = 15%)
     /// When selecting charge blocks, prefer consecutive blocks even if
     /// they're up to this percentage more expensive than the absolute cheapest
+    /// Tolerance for charge block consolidation (default: 0.15)
     pub charge_block_consolidation_tolerance: f32,
+
+    /// Safety multiplier for charge calculation (default: 1.3)
+    /// Increases the calculated charge requirement to avoid under-charging
+    pub charge_safety_multiplier: f32,
 }
 
 impl Default for WinterAdaptiveConfig {
@@ -121,7 +129,8 @@ impl Default for WinterAdaptiveConfig {
             enabled: true,
             ema_period_days: 7,
             min_solar_percentage: 0.10,
-            target_battery_soc: 90.0,
+            daily_charging_target_soc: 90.0,
+            conservation_threshold_soc: 75.0,
             top_expensive_blocks: 12,
             seasonal_history_days: 3,
             consumption_history_kwh: VecDeque::new(),
@@ -135,6 +144,7 @@ impl Default for WinterAdaptiveConfig {
             charge_on_negative_even_if_full: false,
             min_consecutive_charge_blocks: 2,
             charge_block_consolidation_tolerance: 0.15, // 15% tolerance
+            charge_safety_multiplier: 1.3,
         }
     }
 }
@@ -672,8 +682,25 @@ impl WinterAdaptiveStrategy {
         tomorrow_solar_estimate_kwh: f32,
     ) -> (usize, usize) {
         // Calculate remaining consumption for today
-        let remaining_consumption_today =
-            (predicted_consumption_kwh - today_consumed_so_far_kwh).max(0.0);
+        // Use dynamic prediction: if we are consuming more than expected, adjust the forecast
+        let current_hour = context.price_block.block_start.hour() as f32;
+        let current_minute = context.price_block.block_start.minute() as f32;
+        let hours_passed = current_hour + (current_minute / 60.0);
+
+        let remaining_consumption_today = if hours_passed > 0.5 {
+            // If we have some history today, check our run rate
+            let avg_hourly_consumption = today_consumed_so_far_kwh / hours_passed;
+            let remaining_hours = 24.0 - hours_passed;
+            let dynamic_remaining = avg_hourly_consumption * remaining_hours;
+
+            // Use the greater of static prediction or dynamic run-rate
+            // This ensures we handle days that are heavier than average
+            let static_remaining = (predicted_consumption_kwh - today_consumed_so_far_kwh).max(0.0);
+            dynamic_remaining.max(static_remaining)
+        } else {
+            // Early in the day, rely on static prediction
+            (predicted_consumption_kwh - today_consumed_so_far_kwh).max(0.0)
+        };
 
         // Estimate tomorrow's consumption (same as predicted daily)
         let tomorrow_consumption = predicted_consumption_kwh;
@@ -719,7 +746,7 @@ impl WinterAdaptiveStrategy {
 
         // Also consider target SOC (we want to end up with some charge)
         let energy_to_target_soc = context.control_config.battery_capacity_kwh
-            * (self.config.target_battery_soc - context.current_battery_soc)
+            * (self.config.daily_charging_target_soc - context.current_battery_soc)
             / 100.0;
         let energy_to_target_soc = energy_to_target_soc.max(0.0);
 
@@ -730,8 +757,7 @@ impl WinterAdaptiveStrategy {
         // over-charge, since max SOC is enforced elsewhere), apply a
         // small safety multiplier. This biases the strategy to plan
         // slightly more charge blocks than the bare minimum estimate.
-        const CHARGE_SAFETY_MULTIPLIER: f32 = 1.3; // 30% safety margin
-        total_charge_needed *= CHARGE_SAFETY_MULTIPLIER;
+        total_charge_needed *= self.config.charge_safety_multiplier;
 
         // Calculate number of charging blocks needed
         // Energy charged per 15-minute block
@@ -774,7 +800,7 @@ impl WinterAdaptiveStrategy {
 
         // Priority 0.5: Negative price - charge aggressively (Plan 3)
         if self.config.negative_price_handling_enabled && analysis.is_negative_price {
-            if context.current_battery_soc < self.config.target_battery_soc
+            if context.current_battery_soc < self.config.daily_charging_target_soc
                 || (self.config.charge_on_negative_even_if_full
                     && context.current_battery_soc < 100.0)
             {
@@ -875,7 +901,7 @@ impl WinterAdaptiveStrategy {
                 all_blocks,
                 current_block_index,
                 context.current_battery_soc,
-                self.config.target_battery_soc,
+                self.config.daily_charging_target_soc,
                 context.control_config.battery_capacity_kwh,
                 context.control_config.max_battery_charge_rate_kw,
                 tomorrow_expensive_start,
@@ -926,7 +952,7 @@ impl WinterAdaptiveStrategy {
                     all_blocks,
                     current_block_index,
                     context.current_battery_soc,
-                    self.config.target_battery_soc,
+                    self.config.daily_charging_target_soc,
                     context.control_config.battery_capacity_kwh,
                     context.control_config.max_battery_charge_rate_kw,
                     tomorrow_expensive_start,
@@ -983,7 +1009,8 @@ impl WinterAdaptiveStrategy {
                 .take(3)
                 .any(|idx| *idx == current_block_index);
 
-            if !is_top_peak && context.current_battery_soc <= self.config.target_battery_soc {
+            if !is_top_peak && context.current_battery_soc <= self.config.conservation_threshold_soc
+            {
                 // NEW: Check if there are cheap charging hours coming before tomorrow
                 // If yes, we can safely discharge now and recharge later
                 let has_cheap_charging_before_tomorrow =
@@ -1050,7 +1077,9 @@ impl WinterAdaptiveStrategy {
 
         // If block is cheap (below average), consider holding charge
         // BUT: Use smarter logic to avoid unnecessary backup mode
-        if analysis.is_cheap_block && context.current_battery_soc < self.config.target_battery_soc {
+        if analysis.is_cheap_block
+            && context.current_battery_soc < self.config.conservation_threshold_soc
+        {
             // Check if we should actually hold charge or just use battery
 
             // 1. Are there expensive blocks remaining today that we should save for?
@@ -1156,7 +1185,7 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
         // 3. Calculate Energy Requirements
         // For now, assume we are at start of day if we don't have detailed history
         // In a real implementation, we'd track cumulative consumption/solar for the day
-        let today_consumed_so_far = 0.0; // TODO: Get from context if available
+        let today_consumed_so_far = context.consumption_today_kwh.unwrap_or(0.0);
         let remaining_solar_today = context.solar_forecast_kwh; // Simplified
         let tomorrow_solar_estimate = context.solar_forecast_kwh; // Simplified persistence forecast
 
@@ -1223,7 +1252,8 @@ mod tests {
         // Setup - Scenario from user: expensive hours now, but cheap charging before tomorrow
         let config = WinterAdaptiveConfig {
             enabled: true,
-            target_battery_soc: 80.0,
+            daily_charging_target_soc: 80.0,
+            conservation_threshold_soc: 70.0,
             tomorrow_preservation_threshold: 1.2, // Tomorrow is 20% more expensive
             top_expensive_blocks: 6,
             ..Default::default()
@@ -1284,6 +1314,7 @@ mod tests {
             grid_export_price_czk_per_kwh: 0.1,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(15.0),
+            consumption_today_kwh: None,
         };
 
         // Evaluate
@@ -1312,7 +1343,8 @@ mod tests {
         // Setup
         let config = WinterAdaptiveConfig {
             enabled: true,
-            target_battery_soc: 80.0, // High target to trigger potential backup
+            daily_charging_target_soc: 80.0, // High target to trigger potential backup
+            conservation_threshold_soc: 75.0,
             ..Default::default()
         };
         let strategy = WinterAdaptiveStrategy::new(config);
@@ -1360,6 +1392,7 @@ mod tests {
             grid_export_price_czk_per_kwh: 0.1,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(12.0),
+            consumption_today_kwh: None,
         };
 
         // Evaluate

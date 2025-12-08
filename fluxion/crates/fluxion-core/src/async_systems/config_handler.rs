@@ -209,6 +209,10 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 params.system_config.control_config.force_discharge_hours,
                 params.system_config.pricing_config.use_spot_prices_to_buy,
                 params.system_config.pricing_config.use_spot_prices_to_sell,
+                params
+                    .system_config
+                    .control_config
+                    .min_consecutive_force_blocks,
             );
 
             // Create schedule config
