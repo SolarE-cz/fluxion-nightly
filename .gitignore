@@ -1,47 +1,66 @@
-# Rust
-/target/
-**/*.rs.bk
-*.pdb
-fluxion/target
-fluxion/fluxion/target
+# Node.js dependencies
+node_modules/
 
-# Sensitive files
-.token.txt
-*.token
+# Nix build outputs
+result
+result-*
+.direnv/
+target/**
+main/target/**
+bevy/claude/fluxion/target/**
+bevy/claude/fluxion/tools/ecs-inventory/target/**
+fluxion/target/**
 
-# Config files (may contain secrets)
-config.toml
-config.json
-!config.example.toml
+# Flake lock file (can be committed but optional)
+# flake.lock
 
-# IDE
+# Test output logs
+*.log
+
+# Editor files
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
 
-# OS
+# Environment files
+.env
+.env.local
+.env.production
+.env.development
+
+# Docker volumes and temporary files
+.docker/
+docker-volumes/
+*.tmp
+
+# Kubernetes secrets and temporary configs
+k8s/secrets/
+k8s/*.secret.yaml
+k8s/overlays/local/
+
+# ELK stack data
+elk/data/
+elk/logs/
+
+# Rust build artifacts and caches
+Cargo.lock.backup
+**/*.rs.bk
+.cargo/
+
+# MacOS
 .DS_Store
+
+# Linux
+.directory
+
+# Windows
 Thumbs.db
-
-# Test artifacts
-*.profraw
-*.profdata
-
-# Build artifacts
-/dist/
-/build/
-
-# Data exports and logs
-/data/*.json
-/data/*.log
-!/data/.gitkeep
-
-# Old/backup files
-*.old
-*.bak
-*.backup
-
-# Nix build result
-/result
+ehthumbs.db 
+/fluxion/.token.txt
+/.nix-bin/claude
+/.nix-bin/gemini
+/fluxion/.nix-bin/claude
+/fluxion/.nix-bin/gemini
+/.claude/
+__pycache__/
