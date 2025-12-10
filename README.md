@@ -333,9 +333,9 @@ You could [open an issue][issue] on GitLab.
 
 [aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
-[docs]: https://github.com/your-org/fluxion/blob/main/fluxion/DOCS.md
-[issue]: https://gitlab.com/your-org/fluxion/issues
+[docs]: https://github.com/SolarE-cz/fluxion/blob/main/fluxion/DOCS.md
+[issue]: https://gitlab.com/SolarE-cz/fluxion/issues
 [license-shield]: https://img.shields.io/badge/License-AGPL%20v3-blue.svg
 [project-stage-shield]: https://img.shields.io/badge/project%20stage-production%20ready-brightgreen.svg
-[releases]: https://github.com/your-org/fluxion/releases
-[releases-shield]: https://img.shields.io/github/release/your-org/fluxion.svg
+[releases]: https://github.com/SolarE-cz/fluxion/releases
+[releases-shield]: https://img.shields.io/github/release/SolarE-cz/fluxion.svg

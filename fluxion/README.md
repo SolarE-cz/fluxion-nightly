@@ -22,7 +22,7 @@ real-time control and monitoring of your solar energy system.
 1. Add this repository to Home Assistant:
 
    - Navigate to: Settings → Add-ons → Add-on Store → ⋮ (menu) → Repositories
-   - Add URL: `https://gitlab.com/your-org/fluxion`
+   - Add URL: `https://gitlab.com/SolarE-cz/fluxion`
 
 2. Find "FluxION ECS" in the add-on store and click Install
 
@@ -92,7 +92,7 @@ Fine-tune energy control parameters:
 ## Support
 
 For issues, feature requests, or contributions, please visit the
-[GitLab repository](https://gitlab.com/your-org/fluxion).
+[GitLab repository](https://gitlab.com/SolarE-cz/fluxion).
 
 ## License
 
