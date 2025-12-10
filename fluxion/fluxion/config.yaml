@@ -154,4 +154,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion
-version: 0.2.10
+version: 0.2.11
