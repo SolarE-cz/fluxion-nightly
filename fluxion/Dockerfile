@@ -54,14 +54,14 @@ RUN apk add --no-cache \
 COPY --from=builder /build/target/release/fluxion /usr/local/bin/fluxion-main
 
 # Copy run script
-COPY fluxion/run.sh /
+COPY fluxion/fluxion/run.sh /
 RUN chmod a+x /run.sh
 
 # Labels for Home Assistant addon
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.8" \
+    io.hass.version="0.2.9" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 
