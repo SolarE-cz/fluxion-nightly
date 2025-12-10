@@ -31,9 +31,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 
 # Copy workspace configuration
-COPY Cargo.toml ./
-COPY rust-toolchain.toml ./
-COPY crates/ ./crates/
+COPY fluxion/Cargo.toml ./
+COPY fluxion/rust-toolchain.toml ./
+COPY fluxion/crates/ ./crates/
 
 # Build release binary
 RUN cargo build --release --bin fluxion
@@ -61,7 +61,7 @@ RUN chmod a+x /run.sh
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.7" \
+    io.hass.version="0.2.8" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 

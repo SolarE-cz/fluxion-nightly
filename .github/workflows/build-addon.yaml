@@ -63,7 +63,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: fluxion
+          context: .
           file: fluxion/Dockerfile
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
