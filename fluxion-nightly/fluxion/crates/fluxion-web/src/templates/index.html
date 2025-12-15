@@ -1,0 +1,1085 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    <!-- Header stays outside SSE update area to prevent flickering -->
+    <div class="header">
+        <h1>⚡ {{ self.t("dashboard-title") }}</h1>
+        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <button id="debug-mode-toggle" class="debug-mode-button {% if debug_mode %}debug-active{% else %}normal-active{% endif %}" onclick="toggleDebugMode()">
+                {% if debug_mode %}
+                <span>🔍</span>
+                <span>{{ self.t("system-debug-mode") }}</span>
+                {% else %}
+                <span>✓</span>
+                <span>Normal Mode</span>
+                {% endif %}
+            </button>
+            <a href="{{ ingress_path }}/config" class="config-button">
+                <span>⚙️</span>
+                <span>Config</span>
+            </a>
+            <a href="{{ ingress_path }}/export" class="export-button" download>
+                <span>📊</span>
+                <span>Export Data</span>
+            </a>
+        </div>
+    </div>
+    
+    <div id="live-data" 
+         hx-ext="sse" 
+         sse-connect="{{ ingress_path }}/stream" 
+         sse-swap="update"
+         hx-swap="innerHTML">
+
+    <!-- System Health -->
+    <div class="card {% if !health.inverter_source || !health.price_source %}error{% endif %}">
+        <h2>🏥 {{ self.t("section-system") }}</h2>
+        <div class="stat">
+            <span class="stat-label">{{ self.t("inverter-connection") }}</span>
+            <span>
+                <span class="status-indicator {% if health.inverter_source %}status-online{% else %}status-offline{% endif %}"></span>
+                {% if health.inverter_source %}{{ self.t("status-online") }}{% else %}{{ self.t("status-offline") }}{% endif %}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">{{ self.t("schedule-price") }}</span>
+            <span>
+                <span class="status-indicator {% if health.price_source %}status-online{% else %}status-offline{% endif %}"></span>
+                {% if health.price_source %}{{ self.t("status-online") }}{% else %}{{ self.t("status-offline") }}{% endif %}
+            </span>
+        </div>
+        {% if !health.errors.is_empty() %}
+        <div class="error-list">
+            {% for error in health.errors %}
+            <div class="error-item">⚠️ {{ error }}</div>
+            {% endfor %}
+        </div>
+        {% endif %}
+        <div class="timestamp">Last update: {{ last_update_formatted }}</div>
+    </div>
+
+    <!-- Inverters Grid -->
+    {% if !inverters.is_empty() %}
+    <div class="grid">
+        {% for inverter in inverters %}
+        <div class="card">
+            <h2>🔌 {{ inverter.id }}</h2>
+            <div class="stat">
+                <span class="stat-label">{{ self.t("inverter-mode") }}</span>
+                <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-") }}">
+                    {{ inverter.mode }}
+                </span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">{{ self.t("battery-soc") }}</span>
+                <span class="stat-value">{{ inverter.battery_soc }}{{ self.t("unit-percent") }}</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">{{ self.t("battery-power") }}</span>
+                <span class="stat-value">{{ inverter.battery_power_w }} {{ self.t("unit-watt") }}</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">{{ self.t("grid-power") }}</span>
+                <span class="stat-value">{{ inverter.grid_power_w }} {{ self.t("unit-watt") }}</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">{{ self.t("pv-power") }}</span>
+                <span class="stat-value">{{ inverter.pv_power_w }} {{ self.t("unit-watt") }}</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">{{ self.t("inverter-topology") }}</span>
+                <span class="stat-value">{{ inverter.topology }}</span>
+            </div>
+            
+            <!-- Load -->
+            {% if let Some(load) = inverter.house_load_w %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("load-house") }}</span>
+                <span class="stat-value">{{ load }} {{ self.t("unit-watt") }}</span>
+            </div>
+            {% endif %}
+            
+            <!-- Grid Details -->
+            {% if let Some(import) = inverter.grid_import_w %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("grid-import-power") }}</span>
+                <span class="stat-value">{{ import }} {{ self.t("unit-watt") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(export) = inverter.grid_export_w %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("grid-export-power") }}</span>
+                <span class="stat-value">{{ export }} {{ self.t("unit-watt") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(import_today) = inverter.grid_import_today_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("grid-import-today") }}</span>
+                <span class="stat-value">{{ import_today }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(ema) = inverter.grid_import_ema_kwh %}
+            <div class="stat">
+                <span class="stat-label">Grid Import EMA (avg/day)</span>
+                <span class="stat-value">{{ ema }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(export_today) = inverter.grid_export_today_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("grid-export-today") }}</span>
+                <span class="stat-value">{{ export_today }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+            
+            <!-- Battery Extended -->
+            {% if let Some(capacity) = inverter.battery_capacity_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("battery-capacity") }}</span>
+                <span class="stat-value">{{ capacity }} {{ self.t("unit-percent") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(input) = inverter.battery_input_energy_today_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("battery-input-today") }}</span>
+                <span class="stat-value">{{ input }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(output) = inverter.battery_output_energy_today_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("battery-output-today") }}</span>
+                <span class="stat-value">{{ output }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+            
+            <!-- Inverter Details -->
+            {% if let Some(voltage) = inverter.inverter_voltage_v %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("inverter-voltage-total") }}</span>
+                <span class="stat-value">{{ voltage }} {{ self.t("unit-voltage") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(current) = inverter.inverter_current_a %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("inverter-current-total") }}</span>
+                <span class="stat-value">{{ current }} {{ self.t("unit-ampere") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(power) = inverter.inverter_power_w %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("inverter-power-total") }}</span>
+                <span class="stat-value">{{ power }} {{ self.t("unit-watt") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(freq) = inverter.inverter_frequency_hz %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("inverter-frequency") }}</span>
+                <span class="stat-value">{{ freq }} {{ self.t("unit-hertz") }}</span>
+            </div>
+            {% endif %}
+            
+            <!-- Solar Energy -->
+            {% if let Some(today) = inverter.today_solar_energy_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("solar-energy-today") }}</span>
+                <span class="stat-value">{{ today }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+            {% if let Some(total) = inverter.total_solar_energy_kwh %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("solar-energy-total") }}</span>
+                <span class="stat-value">{{ total }} {{ self.t("unit-kilowatt-hour") }}</span>
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="card warning">
+        <h2>⚠️ No Inverters</h2>
+        <p>No inverter data available. Waiting for system initialization...</p>
+        <div class="loading" style="margin-top: 10px;"></div>
+    </div>
+    {% endif %}
+
+    <!-- Current Schedule -->
+    {% if let Some(schedule) = schedule %}
+    <div class="card info">
+        <h2>📅 {{ self.t("section-schedule") }}</h2>
+        <div class="stat">
+            <span class="stat-label">{{ self.t("inverter-mode") }}</span>
+            <span class="mode-badge mode-{{ schedule.current_mode.to_lowercase().replace(" ", "-") }}">
+                {{ schedule.current_mode }}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">{{ self.t("schedule-reason") }}</span>
+            <span>{{ schedule.current_reason }}</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">{{ self.t("schedule-current-block") }}</span>
+            <span class="stat-value">{{ schedule.blocks_today }}</span>
+        </div>
+        {% if let Some(next_fmt) = next_change_formatted %}
+        <div class="stat">
+            <span class="stat-label">{{ self.t("schedule-next-block") }}</span>
+            <span>{{ next_fmt }}</span>
+        </div>
+        {% endif %}
+    </div>
+    {% else %}
+    <div class="card warning">
+        <h2>📅 Schedule</h2>
+        <p>No schedule generated yet. Waiting for price data...</p>
+        <div class="loading" style="margin-top: 10px;"></div>
+    </div>
+    {% endif %}
+
+    <!-- Price Information -->
+    {% if let Some(prices) = prices %}
+    <div class="card">
+        <h2>💰 Electricity Prices</h2>
+        <div class="stat">
+            <span class="stat-label">Current Price</span>
+            <span class="stat-value">{{ prices.current_price }} CZK/kWh</span>
+        </div>
+        <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📅 Today</h3>
+        <div class="stat">
+            <span class="stat-label">Minimum</span>
+            <span class="stat-value">{{ prices.today_min_price }} CZK/kWh</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Maximum</span>
+            <span class="stat-value">{{ prices.today_max_price }} CZK/kWh</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Average</span>
+            <span class="stat-value">{{ prices.today_avg_price }} CZK/kWh</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Median</span>
+            <span class="stat-value">{{ prices.today_median_price }} CZK/kWh</span>
+        </div>
+        <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📆 Tomorrow</h3>
+        {% match prices.tomorrow_min_price %}
+        {% when Some with (min) %}
+        <div class="stat">
+            <span class="stat-label">Minimum</span>
+            <span class="stat-value">{{ min }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Minimum</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+        {% match prices.tomorrow_max_price %}
+        {% when Some with (max) %}
+        <div class="stat">
+            <span class="stat-label">Maximum</span>
+            <span class="stat-value">{{ max }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Maximum</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+        {% match prices.tomorrow_avg_price %}
+        {% when Some with (avg) %}
+        <div class="stat">
+            <span class="stat-label">Average</span>
+            <span class="stat-value">{{ avg }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Average</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+        {% match prices.tomorrow_median_price %}
+        {% when Some with (median) %}
+        <div class="stat">
+            <span class="stat-label">Median</span>
+            <span class="stat-value">{{ median }} CZK/kWh</span>
+        </div>
+        {% when None %}
+        <div class="stat">
+            <span class="stat-label">Median</span>
+            <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+        </div>
+        {% endmatch %}
+    </div>
+    {% else %}
+    <div class="card warning">
+        <h2>💰 Prices</h2>
+        <p>No price data available yet...</p>
+        <div class="loading" style="margin-top: 10px;"></div>
+    </div>
+    {% endif %}
+
+    <!-- Consumption History / EMA -->
+    {% if let Some(stats) = consumption_stats %}
+    <div class="card">
+        <h2>📊 Consumption</h2>
+        <div class="stat">
+            <span class="stat-label">Historical EMA ({{ stats.ema_days }} days)</span>
+            <span class="stat-value">
+                {% match stats.ema_kwh %}
+                {% when Some with (ema) %}
+                {{ ema }} kWh/day
+                {% when None %}
+                <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+                {% endmatch %}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Grid import today</span>
+            <span class="stat-value">
+                {% match stats.today_import_kwh %}
+                {% when Some with (today) %}
+                {{ today }} kWh
+                {% when None %}
+                <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+                {% endmatch %}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Grid import yesterday</span>
+            <span class="stat-value">
+                {% match stats.yesterday_import_kwh %}
+                {% when Some with (yest) %}
+                {{ yest }} kWh
+                {% when None %}
+                <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+                {% endmatch %}
+            </span>
+        </div>
+    </div>
+    {% endif %}
+    </div><!-- End of #live-data -->
+    
+    <!-- Price Chart (Outside SSE update area - updates once per minute) -->
+    {% if let Some(prices) = prices %}
+    <div class="card" id="chart-container">
+        <h2>💰 Price Chart (48h)</h2>
+        <div class="price-chart-container">
+            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h)</h3>
+            <div class="price-legend">
+                <span><div class="legend-box charge"></div> Force Charge</span>
+                <span><div class="legend-box discharge"></div> Force Discharge</span>
+                <span><div class="legend-box backup"></div> Back Up Mode</span>
+                <span><div class="legend-box self-use"></div> Self-Use</span>
+                {% if let Some(inv) = inverters.first() %}
+                <span><div class="legend-box battery-soc"></div> Battery SOC ({{ inv.battery_soc }}%)</span>
+                <span><div class="legend-box pv-generation"></div> PV Generation ({{ inv.pv_power_w }} W)</span>
+                {% endif %}
+            </div>
+            <div class="chart-wrapper">
+                <canvas id="priceChart"></canvas>
+            </div>
+        </div>
+    </div>
+    <script>
+        (function() {
+            const chartData = {{ chart_data_json|safe }};
+            {% if let Some(inv) = inverters.first() %}
+            const currentBatterySoc = {{ inv.battery_soc }};
+            {% else %}
+            const currentBatterySoc = null;
+            {% endif %}
+            
+            if (chartData && chartData.labels && document.getElementById('priceChart')) {
+                const ctx = document.getElementById('priceChart').getContext('2d');
+                
+                // Map modes to colors (with reduced opacity for historical blocks)
+                const colors = chartData.modes.map((mode, idx) => {
+                    const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                    const opacity = isHistorical ? 0.4 : 0.8; // Dimmed for past blocks
+                    if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                    if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
+                });
+                
+                const borderColors = chartData.modes.map((mode, idx) => {
+                    const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                    const opacity = isHistorical ? 0.5 : 1.0;
+                    if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                    if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
+                });
+                
+                // Prepare datasets
+                const datasets = [{
+                    label: 'Price (Kč/kWh)',
+                    data: chartData.prices,
+                    backgroundColor: colors,
+                    borderColor: borderColors,
+                    borderWidth: 1,
+                    hoverBackgroundColor: colors.map(c => c.replace('0.8', '1')),
+                    hoverBorderColor: borderColors.map(c => c + 'FF'),
+                    hoverBorderWidth: 3,
+                    order: 2
+                }];
+                
+                // Add historical battery SOC line if available
+                console.log('📊 [CHART] Battery SOC history:', chartData.battery_soc_history);
+                console.log('📊 [CHART] Battery SOC history length:', chartData.battery_soc_history ? chartData.battery_soc_history.length : 0);
+                
+                if (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) {
+                    console.log('📊 [CHART] Processing', chartData.battery_soc_history.length, 'battery history points');
+                    console.log('📊 [CHART] First point:', chartData.battery_soc_history[0]);
+                    console.log('📊 [CHART] Last point:', chartData.battery_soc_history[chartData.battery_soc_history.length - 1]);
+                    
+                    // Create a mapping from label to SOC for the history data
+                    const socMap = new Map();
+                    chartData.battery_soc_history.forEach(point => {
+                        socMap.set(point.label, point.soc);
+                    });
+                    
+                    console.log('📊 [CHART] SOC map has', socMap.size, 'entries');
+                    console.log('📊 [CHART] Chart has', chartData.labels.length, 'labels');
+                    
+                    // Map history to chart labels (fill nulls where no data)
+                    const historicalData = chartData.labels.map(label => socMap.get(label) || null);
+                    const nonNullCount = historicalData.filter(v => v !== null).length;
+                    console.log('📊 [CHART] Mapped data: ', nonNullCount, 'non-null values out of', historicalData.length);
+                    
+                    datasets.push({
+                        label: 'Battery SOC History (%)',
+                        data: historicalData,
+                        type: 'line',
+                        borderColor: 'rgba(76, 175, 80, 0.9)',
+                        backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                        borderWidth: 3,
+                        pointRadius: 2,
+                        pointHoverRadius: 6,
+                        pointBackgroundColor: 'rgba(76, 175, 80, 1)',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 1,
+                        fill: false,
+                        tension: 0.4, // Smooth curves
+                        yAxisID: 'y1',
+                        order: 1,
+                        spanGaps: true // Connect across missing data points
+                    });
+                }
+                
+                // Add predicted battery SOC line if available
+                console.log('📈 [CHART] Battery SOC prediction:', chartData.battery_soc_prediction);
+                console.log('📈 [CHART] Battery SOC prediction length:', chartData.battery_soc_prediction ? chartData.battery_soc_prediction.length : 0);
+                
+                if (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) {
+                    console.log('📈 [CHART] Processing', chartData.battery_soc_prediction.length, 'battery prediction points');
+                    console.log('📈 [CHART] First prediction:', chartData.battery_soc_prediction[0]);
+                    console.log('📈 [CHART] Last prediction:', chartData.battery_soc_prediction[chartData.battery_soc_prediction.length - 1]);
+                    
+                    // Create a mapping from label to predicted SOC
+                    const predictionMap = new Map();
+                    chartData.battery_soc_prediction.forEach(point => {
+                        predictionMap.set(point.label, point.soc);
+                    });
+                    
+                    console.log('📈 [CHART] Prediction map has', predictionMap.size, 'entries');
+                    
+                    // Map prediction to chart labels (fill nulls where no data)
+                    const predictionData = chartData.labels.map(label => predictionMap.get(label) || null);
+                    const nonNullPredictionCount = predictionData.filter(v => v !== null).length;
+                    console.log('📈 [CHART] Mapped prediction data: ', nonNullPredictionCount, 'non-null values out of', predictionData.length);
+                    
+                    datasets.push({
+                        label: 'Predicted SOC (%)',
+                        data: predictionData,
+                        type: 'line',
+                        borderColor: 'rgba(33, 150, 243, 0.9)',
+                        backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                        borderWidth: 3,
+                        borderDash: [10, 5], // Dashed line to distinguish from history
+                        pointRadius: 3,
+                        pointHoverRadius: 7,
+                        pointBackgroundColor: 'rgba(33, 150, 243, 1)',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 1,
+                        pointStyle: 'triangle', // Different point style
+                        fill: false,
+                        tension: 0.4, // Smooth curves
+                        yAxisID: 'y1',
+                        order: 1,
+                        spanGaps: true // Connect across missing data points
+                    });
+                }
+                
+                // Add current battery SOC as horizontal reference line
+                if (currentBatterySoc !== null) {
+                    datasets.push({
+                        label: 'Current SOC (%)',
+                        data: chartData.labels.map(() => currentBatterySoc),
+                        type: 'line',
+                        borderColor: 'rgba(255, 193, 7, 0.6)',
+                        backgroundColor: 'rgba(255, 193, 7, 0.0)',
+                        borderWidth: 2,
+                        borderDash: [8, 4],
+                        pointRadius: 0,
+                        pointHoverRadius: 0,
+                        fill: false,
+                        yAxisID: 'y1',
+                        order: 2
+                    });
+                }
+                
+                // Add PV generation history as area chart if available
+                console.log('☀️ [CHART] PV generation history:', chartData.pv_generation_history);
+                console.log('☀️ [CHART] PV generation history length:', chartData.pv_generation_history ? chartData.pv_generation_history.length : 0);
+                
+                if (chartData.pv_generation_history && chartData.pv_generation_history.length > 0) {
+                    console.log('☀️ [CHART] Processing', chartData.pv_generation_history.length, 'PV history points');
+                    console.log('☀️ [CHART] First PV point:', chartData.pv_generation_history[0]);
+                    console.log('☀️ [CHART] Last PV point:', chartData.pv_generation_history[chartData.pv_generation_history.length - 1]);
+                    
+                    // Create a mapping from label to PV power
+                    const pvMap = new Map();
+                    chartData.pv_generation_history.forEach(point => {
+                        pvMap.set(point.label, point.power_w);
+                    });
+                    
+                    console.log('☀️ [CHART] PV map has', pvMap.size, 'entries');
+                    
+                    // Map PV history to chart labels (fill nulls where no data)
+                    const pvData = chartData.labels.map(label => pvMap.get(label) || null);
+                    const nonNullPvCount = pvData.filter(v => v !== null).length;
+                    console.log('☀️ [CHART] Mapped PV data: ', nonNullPvCount, 'non-null values out of', pvData.length);
+                    
+                    // Convert watts to kilowatts for better display scale
+                    const pvDataKw = pvData.map(v => v !== null ? v / 1000 : null);
+                    
+                    datasets.push({
+                        label: 'PV Generation (kW)',
+                        data: pvDataKw,
+                        type: 'line',
+                        borderColor: 'rgba(255, 193, 7, 0.8)',
+                        backgroundColor: 'rgba(255, 193, 7, 0.15)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        pointHoverRadius: 5,
+                        pointBackgroundColor: 'rgba(255, 193, 7, 1)',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 1,
+                        fill: 'origin', // Fill area under the line
+                        tension: 0.4, // Smooth curves
+                        yAxisID: 'y2',
+                        order: 3, // Behind the price bars
+                        spanGaps: true
+                    });
+                }
+                
+                window.priceChartInstance = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: chartData.labels,
+                        datasets: datasets
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: {
+                            mode: 'index',
+                            intersect: false
+                        },
+                        plugins: {
+                            legend: {
+                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || (chartData.pv_generation_history && chartData.pv_generation_history.length > 0),
+                                position: 'top',
+                                labels: {
+                                    color: '#999',
+                                    filter: function(item) {
+                                        // Show battery and PV related legends
+                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV');
+                                    }
+                                }
+                            },
+                            tooltip: {
+                                backgroundColor: 'rgba(0, 0, 0, 0.9)',
+                                padding: 12,
+                                titleColor: '#fff',
+                                bodyColor: '#fff',
+                                borderColor: 'rgba(255, 255, 255, 0.1)',
+                                borderWidth: 1,
+                                displayColors: false,
+                                callbacks: {
+                                    title: (items) => items[0].label,
+                                    label: (context) => {
+                                        if (context.dataset.label.includes('Battery') || context.dataset.label.includes('SOC') || context.dataset.label.includes('Predicted')) {
+                                            return `${context.dataset.label}: ${context.parsed.y.toFixed(1)}%`;
+                                        }
+                                        if (context.dataset.label.includes('PV')) {
+                                            return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} kW`;
+                                        }
+                                        const mode = chartData.modes[context.dataIndex];
+                                        const targetSoc = chartData.target_socs[context.dataIndex];
+                                        const strategy = chartData.strategies[context.dataIndex];
+                                        const profit = chartData.profits[context.dataIndex];
+                                        const debugInfo = chartData.debug_info ? chartData.debug_info[context.dataIndex] : null;
+                                        const isHistorical = chartData.is_historical && chartData.is_historical[context.dataIndex];
+                                        
+                                        const lines = [];
+                                        
+                                        // Warning for historical blocks
+                                        if (isHistorical) {
+                                            lines.push('⚠️ PAST BLOCK - Regenerated Schedule');
+                                            lines.push('(Not actual execution history)');
+                                            lines.push('');
+                                        }
+                                        
+                                        lines.push(`Price: ${context.parsed.y.toFixed(4)} Kč/kWh`);
+                                        lines.push(`Mode: ${mode}`);
+                                        
+                                        if (strategy) {
+                                            lines.push(`Strategy: ${strategy}`);
+                                        }
+                                        
+                                        if (profit !== null && profit !== undefined) {
+                                            const profitColor = profit >= 0 ? '✓' : '✗';
+                                            lines.push(`${profitColor} Expected Profit: ${profit.toFixed(2)} CZK`);
+                                        }
+                                        
+                                        if (targetSoc !== null && targetSoc !== undefined) {
+                                            if (mode === 'Force Charge') {
+                                                lines.push(`Target SOC: ${targetSoc.toFixed(1)}% (max)`);
+                                            } else if (mode === 'Force Discharge') {
+                                                lines.push(`Target SOC: ${targetSoc.toFixed(1)}% (min)`);
+                                            }
+                                        }
+                                        
+                                        // Add debug information if available
+                                        if (debugInfo) {
+                                            lines.push('');
+                                            lines.push('═══ DEBUG INFO ═══');
+                                            lines.push(`Reason: ${debugInfo.winning_reason}`);
+                                            lines.push('');
+                                            lines.push('Evaluated Strategies:');
+                                            debugInfo.evaluated_strategies.forEach(s => {
+                                                lines.push(`  • ${s.strategy_name}: ${s.net_profit_czk.toFixed(2)} CZK`);
+                                                lines.push(`    ${s.reason}`);
+                                            });
+                                            if (debugInfo.conditions && debugInfo.conditions.length > 0) {
+                                                lines.push('');
+                                                lines.push('Conditions:');
+                                                debugInfo.conditions.forEach(c => {
+                                                    lines.push(`  • ${c}`);
+                                                });
+                                            }
+                                        }
+                                        
+                                        return lines;
+                                    }
+                                }
+                            },
+                            annotation: {
+                                annotations: chartData.current_time_label ? {
+                                    nowLine: {
+                                        type: 'line',
+                                        xMin: chartData.current_time_label,
+                                        xMax: chartData.current_time_label,
+                                        borderColor: 'rgba(244, 67, 54, 0.8)',
+                                        borderWidth: 2,
+                                        borderDash: [3, 3],
+                                        label: {
+                                            display: true,
+                                            content: 'NOW',
+                                            position: 'start',
+                                            backgroundColor: 'rgba(244, 67, 54, 0.9)',
+                                            color: '#fff',
+                                            font: {
+                                                size: 11,
+                                                weight: 'bold'
+                                            },
+                                            padding: 4,
+                                            yAdjust: -10
+                                        }
+                                    }
+                                } : {}
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: chartData.prices.every(p => p >= 0),
+                                title: {
+                                    display: true,
+                                    text: 'Price (Kč/kWh)',
+                                    color: '#999'
+                                },
+                                ticks: { color: '#999' },
+                                grid: { color: 'rgba(255, 255, 255, 0.1)' },
+                                position: 'left'
+                            },
+                            y1: {
+                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null,
+                                beginAtZero: true,
+                                max: 100,
+                                title: {
+                                    display: true,
+                                    text: 'Battery SOC (%)',
+                                    color: 'rgba(76, 175, 80, 0.9)'
+                                },
+                                ticks: { color: 'rgba(76, 175, 80, 0.8)' },
+                                grid: { 
+                                    display: true,
+                                    color: 'rgba(76, 175, 80, 0.1)'
+                                },
+                                position: 'right'
+                            },
+                            y2: {
+                                display: (chartData.pv_generation_history && chartData.pv_generation_history.length > 0),
+                                beginAtZero: true,
+                                title: {
+                                    display: true,
+                                    text: 'PV Power (kW)',
+                                    color: 'rgba(255, 193, 7, 0.9)'
+                                },
+                                ticks: { color: 'rgba(255, 193, 7, 0.8)' },
+                                grid: { 
+                                    display: false // Don't show grid lines to avoid clutter
+                                },
+                                position: 'right',
+                                offset: true
+                            },
+                            x: {
+                                title: {
+                                    display: true,
+                                    text: 'Time',
+                                    color: '#999'
+                                },
+                                ticks: {
+                                    color: '#999',
+                                    maxRotation: 45,
+                                    minRotation: 45,
+                                    autoSkip: true,
+                                    maxTicksLimit: 24
+                                },
+                                grid: { display: false }
+                            }
+                        }
+                    }
+                });
+            }
+        })();
+    </script>
+    {% else %}
+    <div class="card warning">
+        <h2>💰 Price Chart</h2>
+        <p>No price data available yet...</p>
+        <div class="loading" style="margin-top: 10px;"></div>
+    </div>
+    {% endif %}
+    
+    <script>
+        // Refresh chart data every 10 seconds (independent of SSE)
+        const ingressPath = "{{ ingress_path }}";
+        setInterval(function() {
+            fetch(ingressPath + '/chart-data')
+                .then(response => response.json())
+                .then(data => {
+                    if (window.priceChartInstance && data) {
+                        // Update chart data
+                        window.priceChartInstance.data.labels = data.labels;
+                        window.priceChartInstance.data.datasets[0].data = data.prices;
+                        
+                        // Update battery SOC if present
+                        if (window.priceChartInstance.data.datasets.length > 1 && data.current_battery_soc) {
+                            window.priceChartInstance.data.datasets[1].data = data.labels.map(() => data.current_battery_soc);
+                        }
+                        
+                        // Update NOW line
+                        if (data.current_time_label) {
+                            window.priceChartInstance.options.plugins.annotation.annotations.nowLine.xMin = data.current_time_label;
+                            window.priceChartInstance.options.plugins.annotation.annotations.nowLine.xMax = data.current_time_label;
+                        }
+                        
+                        window.priceChartInstance.update('none'); // Update without animation
+                    }
+                })
+                .catch(err => console.error('Failed to update chart:', err));
+        }, 10000); // 10 seconds
+    </script>
+    
+    <!-- Upcoming Schedule (Outside SSE update area - updates every 15 minutes) -->
+    {% if let Some(prices) = prices %}
+    <div class="card info" id="upcoming-schedule-container" style="display: none;">
+        <h2><i class="mdi mdi-calendar-clock"></i> Upcoming Schedule</h2>
+        <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+                <thead>
+                    <tr style="background: rgba(255,255,255,0.05); border-bottom: 1px solid rgba(255,255,255,0.1);">
+                        <th style="padding: 8px; text-align: left;"><i class="mdi mdi-clock-outline"></i> Time</th>
+                        <th style="padding: 8px; text-align: left;"><i class="mdi mdi-cash"></i> Price</th>
+                        <th style="padding: 8px; text-align: left;"><i class="mdi mdi-cog"></i> Mode</th>
+                        <th style="padding: 8px; text-align: left;"><i class="mdi mdi-strategy"></i> Strategy</th>
+                        <th style="padding: 8px; text-align: right;"><i class="mdi mdi-trending-up"></i> Profit</th>
+                    </tr>
+                </thead>
+                <tbody id="upcoming-blocks">
+                    <!-- Populated by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <script>
+    // Populate upcoming blocks table from chart data
+    // Updates every 15 minutes or when data changes
+    (function() {
+        const tbody = document.getElementById('upcoming-blocks');
+        if (!tbody) return;
+        
+        const FETCH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+        
+        function fetchAndUpdateSchedule() {
+            const ingressPath = "{{ ingress_path }}";
+            fetch(ingressPath + '/chart-data')
+                .then(response => response.json())
+                .then(chartData => {
+                    if (!chartData) return;
+                    
+                    // Check if data actually changed
+                    const dataHash = JSON.stringify({
+                        labels: chartData.labels ? chartData.labels.slice(0, 24) : [],
+                        strategies: chartData.strategies ? chartData.strategies.slice(0, 24) : [],
+                        profits: chartData.profits ? chartData.profits.slice(0, 24) : []
+                    });
+                    
+                    if (window.lastUpcomingScheduleHash && window.lastUpcomingScheduleHash === dataHash) {
+                        // Data hasn't changed, skip update
+                        return;
+                    }
+                    
+                    window.lastUpcomingScheduleHash = dataHash;
+                    populateUpcomingBlocks(tbody, chartData);
+                })
+                .catch(err => console.error('Failed to load chart data for upcoming schedule:', err));
+        }
+        
+        // Initial load
+        fetchAndUpdateSchedule();
+        
+        // Update every 15 minutes
+        setInterval(fetchAndUpdateSchedule, FETCH_INTERVAL_MS);
+    })();
+    
+    function populateUpcomingBlocks(tbody, chartData) {
+        if (!tbody || !chartData) return;
+
+        // Clear existing rows
+        tbody.innerHTML = '';
+
+        if (!chartData.labels || chartData.labels.length === 0) return;
+
+        // Find the current block (from current time onward)
+        const currentTimeLabel = chartData.current_time_label;
+        let startIndex = -1; // Use -1 to indicate "not found"
+
+        console.log('🔍 [UPCOMING] Current time label:', currentTimeLabel);
+        console.log('🔍 [UPCOMING] First 5 labels:', chartData.labels.slice(0, 5));
+        console.log('🔍 [UPCOMING] Total labels:', chartData.labels.length);
+
+        // Find the first block at or after the current time (includes current block)
+        if (currentTimeLabel) {
+            for (let i = 0; i < chartData.labels.length; i++) {
+                if (chartData.labels[i] >= currentTimeLabel) {
+                    startIndex = i;
+                    console.log('🔍 [UPCOMING] Found current/upcoming block at index:', i, 'label:', chartData.labels[i]);
+                    break;
+                }
+            }
+        }
+
+        console.log('🔍 [UPCOMING] Start index:', startIndex);
+
+        // If no current/upcoming blocks found, hide the upcoming schedule
+        if (!currentTimeLabel || startIndex === -1 || startIndex >= chartData.labels.length) {
+            console.log('🔍 [UPCOMING] Hiding schedule - no upcoming blocks or invalid data');
+            const container = document.getElementById('upcoming-schedule-container');
+            if (container) {
+                container.style.display = 'none';
+            }
+            return;
+        }
+
+        // Show the container once we have data to display
+        console.log('🔍 [UPCOMING] Showing schedule with', chartData.labels.length - startIndex, 'upcoming blocks (including current)');
+        const container = document.getElementById('upcoming-schedule-container');
+        if (container) {
+            container.style.display = 'block';
+        }
+
+        // Group consecutive blocks with the same mode
+        const groups = [];
+        let i = startIndex;
+        const maxBlocks = Math.min(startIndex + 96, chartData.labels.length); // Next 24 hours (96 blocks)
+        
+        while (i < maxBlocks) {
+            const mode = chartData.modes[i];
+            
+            // Start a new group for this mode
+            const group = {
+                startLabel: chartData.labels[i],
+                endLabel: chartData.labels[i],
+                prices: [chartData.prices[i]],
+                mode: mode,
+                strategies: [chartData.strategies[i]],
+                profits: [chartData.profits[i]],
+                blockCount: 1
+            };
+            
+            // Collect consecutive blocks with the same mode
+            i++;
+            while (i < maxBlocks && chartData.modes[i] === mode) {
+                group.endLabel = chartData.labels[i];
+                group.prices.push(chartData.prices[i]);
+                group.strategies.push(chartData.strategies[i]);
+                group.profits.push(chartData.profits[i]);
+                group.blockCount++;
+                i++;
+            }
+            
+            groups.push(group);
+        }
+        
+        // Render groups
+        for (const group of groups) {
+            const row = document.createElement('tr');
+            row.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
+            
+            // Time (show range for grouped blocks)
+            const tdTime = document.createElement('td');
+            tdTime.style.padding = '8px';
+            if (group.blockCount > 1) {
+                // Extract just the time portion
+                const startTime = group.startLabel.split(' ')[1];
+                const endTime = group.endLabel.split(' ')[1];
+                tdTime.textContent = `${startTime}-${endTime}`;
+                tdTime.title = `${group.blockCount} blocks (${group.blockCount * 15} minutes)`;
+            } else {
+                tdTime.textContent = group.startLabel;
+            }
+            row.appendChild(tdTime);
+            
+            // Price (average for grouped blocks)
+            const tdPrice = document.createElement('td');
+            tdPrice.style.padding = '8px';
+            tdPrice.style.fontWeight = 'bold';
+            const avgPrice = group.prices.reduce((sum, p) => sum + p, 0) / group.prices.length;
+            tdPrice.textContent = avgPrice.toFixed(4) + ' Kč';
+            if (group.blockCount > 1) {
+                tdPrice.title = `Average of ${group.blockCount} blocks`;
+            }
+            row.appendChild(tdPrice);
+            
+            // Mode
+            const tdMode = document.createElement('td');
+            tdMode.style.padding = '8px';
+            const modeBadge = document.createElement('span');
+            modeBadge.className = 'mode-badge mode-' + group.mode.toLowerCase().replace(/ /g, '-');
+            modeBadge.style.fontSize = '0.8em';
+            modeBadge.style.padding = '2px 6px';
+            modeBadge.textContent = group.mode;
+            tdMode.appendChild(modeBadge);
+            row.appendChild(tdMode);
+            
+            // Strategy (show most common or first)
+            const tdStrategy = document.createElement('td');
+            tdStrategy.style.padding = '8px';
+            const strategy = group.strategies.find(s => s !== null && s !== undefined);
+            if (strategy) {
+                const stratBadge = document.createElement('span');
+                stratBadge.className = 'strategy-badge';
+                stratBadge.style.fontSize = '0.8em';
+                stratBadge.style.padding = '2px 6px';
+                stratBadge.textContent = strategy;
+                tdStrategy.appendChild(stratBadge);
+            } else {
+                const dash = document.createElement('span');
+                dash.style.color = '#666';
+                dash.textContent = '—';
+                tdStrategy.appendChild(dash);
+            }
+            row.appendChild(tdStrategy);
+            
+            // Profit (sum for grouped blocks)
+            const tdProfit = document.createElement('td');
+            tdProfit.style.padding = '8px';
+            tdProfit.style.textAlign = 'right';
+            tdProfit.style.fontWeight = 'bold';
+            const validProfits = group.profits.filter(p => p !== null && p !== undefined);
+            if (validProfits.length > 0) {
+                const totalProfit = validProfits.reduce((sum, p) => sum + p, 0);
+                const profitSpan = document.createElement('span');
+                profitSpan.style.color = totalProfit >= 0 ? '#4caf50' : '#f44336';
+                profitSpan.textContent = totalProfit.toFixed(2) + ' CZK';
+                if (group.blockCount > 1) {
+                    profitSpan.title = `Total for ${group.blockCount} blocks`;
+                }
+                tdProfit.appendChild(profitSpan);
+            } else {
+                const dash = document.createElement('span');
+                dash.style.color = '#666';
+                dash.textContent = '—';
+                tdProfit.appendChild(dash);
+            }
+            row.appendChild(tdProfit);
+            
+            tbody.appendChild(row);
+        }
+    }
+    </script>
+    {% endif %}
+    
+    <script>
+    // Toggle debug mode
+    async function toggleDebugMode() {
+        try {
+            const response = await fetch('{{ ingress_path }}/api/config');
+            const data = await response.json();
+            
+            // Toggle debug mode
+            const newDebugMode = !data.config.system.debug_mode;
+            data.config.system.debug_mode = newDebugMode;
+            
+            // Update config
+            const updateResponse = await fetch('{{ ingress_path }}/api/config/update', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    config: data.config,
+                    create_backup: true,
+                }),
+            });
+            
+            const result = await updateResponse.json();
+            
+            if (result.success) {
+                // Update the button
+                const button = document.getElementById('debug-mode-toggle');
+                if (newDebugMode) {
+                    button.className = 'debug-mode-button debug-active';
+                    button.innerHTML = '<span>🔍</span><span>{{ self.t("system-debug-mode") }}</span>';
+                } else {
+                    button.className = 'debug-mode-button normal-active';
+                    button.innerHTML = '<span>✓</span><span>Normal Mode</span>';
+                }
+                
+                // Show notification
+                alert(`Debug mode ${newDebugMode ? 'enabled' : 'disabled'} successfully. The system is now in ${newDebugMode ? 'safe testing mode' : 'normal operation mode'}.`);
+            } else {
+                alert('Failed to toggle debug mode: ' + (result.error || 'Unknown error'));
+            }
+        } catch (error) {
+            console.error('Error toggling debug mode:', error);
+            alert('Failed to toggle debug mode: ' + error.message);
+        }
+    }
+    </script>
+</div>
+{% endblock %}

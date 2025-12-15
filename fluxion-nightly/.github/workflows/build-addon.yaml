@@ -1,0 +1,74 @@
+name: Build Addon
+
+on:
+  push:
+    branches:
+      - restructure
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        arch: [aarch64, amd64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get version
+        id: version
+        run: |
+          # Extract version from Cargo.toml
+          VERSION=$(grep -m1 '^version = ' fluxion/Cargo.toml | sed 's/version = "//;s/"//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Map architecture
+        id: arch
+        run: |
+          case ${{ matrix.arch }} in
+            aarch64) echo "platform=linux/arm64" >> $GITHUB_OUTPUT ;;
+            amd64) echo "platform=linux/amd64" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Downcase repo name
+        run: |
+          echo "REPO_NAME=${REPO,,}" >> ${GITHUB_ENV}
+        env:
+          REPO: '${{ github.repository }}'
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: fluxion/Dockerfile
+          platforms: ${{ steps.arch.outputs.platform }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}-${{ matrix.arch }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}-${{ matrix.arch }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

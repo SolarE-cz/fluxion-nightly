@@ -1,0 +1,66 @@
+# Node.js dependencies
+node_modules/
+
+# Nix build outputs
+result
+result-*
+.direnv/
+target/**
+main/target/**
+bevy/claude/fluxion/target/**
+bevy/claude/fluxion/tools/ecs-inventory/target/**
+fluxion/target/**
+
+# Flake lock file (can be committed but optional)
+# flake.lock
+
+# Test output logs
+*.log
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Environment files
+.env
+.env.local
+.env.production
+.env.development
+
+# Docker volumes and temporary files
+.docker/
+docker-volumes/
+*.tmp
+
+# Kubernetes secrets and temporary configs
+k8s/secrets/
+k8s/*.secret.yaml
+k8s/overlays/local/
+
+# ELK stack data
+elk/data/
+elk/logs/
+
+# Rust build artifacts and caches
+Cargo.lock.backup
+**/*.rs.bk
+.cargo/
+
+# MacOS
+.DS_Store
+
+# Linux
+.directory
+
+# Windows
+Thumbs.db
+ehthumbs.db 
+/fluxion/.token.txt
+/.nix-bin/claude
+/.nix-bin/gemini
+/fluxion/.nix-bin/claude
+/fluxion/.nix-bin/gemini
+/.claude/
+__pycache__/
