@@ -47,10 +47,21 @@ jobs:
             echo "❌ ERROR: fluxion-nightly directory not found"
             exit 1
           fi
-          echo "✅ fluxion-nightly directory found"
+          if [ ! -f "fluxion-nightly/fluxion/config.yaml" ]; then
+            echo "❌ ERROR: fluxion-nightly/fluxion/config.yaml not found"
+            exit 1
+          fi
+          echo "✅ fluxion-nightly directory and config.yaml found"
+
+      - name: Configure Git
+        run: |
+          git config user.name "FluxION CI"
+          git config user.email "ci@solare.cz"
 
       - name: Copy nightly to stable directory and update config
         run: |
+          set -e  # Exit on any error
+
           # Remove existing fluxion directory if it exists
           if [ -d "fluxion" ]; then
             echo "Removing existing fluxion directory..."
@@ -61,34 +72,45 @@ jobs:
           echo "Copying fluxion-nightly to fluxion..."
           cp -r fluxion-nightly fluxion
 
-          # Update config.yaml for stable version
-          python3 << 'PYTHON_SCRIPT'
+          # Update config.yaml for stable version using Python
+          echo "Updating config.yaml..."
+          python3 -c "
           import yaml
+          import sys
 
-          VERSION = "${{ steps.version.outputs.version }}"
+          VERSION = '${{ steps.version.outputs.version }}'
 
-          # Update fluxion/fluxion/config.yaml for stable
-          with open('fluxion/fluxion/config.yaml', 'r') as f:
-              config = yaml.safe_load(f)
+          try:
+              # Update fluxion/fluxion/config.yaml for stable
+              with open('fluxion/fluxion/config.yaml', 'r') as f:
+                  config = yaml.safe_load(f)
 
-          config['name'] = 'FluxION ECS'
-          config['slug'] = 'fluxion'
-          config['version'] = VERSION
-          config['image'] = 'ghcr.io/solare-cz/fluxion-{arch}'
-          config['url'] = 'https://github.com/SolarE-cz/fluxion-nightly'
+              config['name'] = 'FluxION ECS'
+              config['slug'] = 'fluxion'
+              config['version'] = VERSION
+              config['image'] = 'ghcr.io/solare-cz/fluxion-{arch}'
+              config['url'] = 'https://github.com/SolarE-cz/fluxion-nightly'
 
-          with open('fluxion/fluxion/config.yaml', 'w') as f:
-              yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+              with open('fluxion/fluxion/config.yaml', 'w') as f:
+                  yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
-          print(f"✅ Updated fluxion config to version {VERSION}")
-          PYTHON_SCRIPT
+              print(f'✅ Updated fluxion config to version {VERSION}')
+          except Exception as e:
+              print(f'❌ ERROR updating config: {e}')
+              sys.exit(1)
+          "
 
           echo "✅ Created stable fluxion directory"
 
-      - name: Configure Git
+      - name: Verify stable config
         run: |
-          git config user.name "FluxION CI"
-          git config user.email "ci@solare.cz"
+          echo "Verifying stable config.yaml..."
+          if [ ! -f "fluxion/fluxion/config.yaml" ]; then
+            echo "❌ ERROR: fluxion/fluxion/config.yaml not found after copy"
+            exit 1
+          fi
+          cat fluxion/fluxion/config.yaml
+          echo "✅ Stable config verified"
 
       - name: Commit stable directory
         run: |
