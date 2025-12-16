@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fluxion-backtest = { path = "../fluxion-backtest" }
 fluxion-core = { path = "../fluxion-core" }
 fluxion-i18n = { path = "../fluxion-i18n" }
 fluxion-types = { path = "../fluxion-types" }

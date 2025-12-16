@@ -11,6 +11,7 @@
 // For commercial licensing, please contact: info@solare.cz
 
 use crate::strategy::winter_adaptive::{WinterAdaptiveConfig, WinterAdaptiveStrategy};
+use crate::strategy::winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy};
 use crate::strategy::{BlockEvaluation, EconomicStrategy, EvaluationContext};
 use fluxion_types::config::StrategiesConfigCore;
 
@@ -18,6 +19,9 @@ use fluxion_types::config::StrategiesConfigCore;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeasonalStrategiesConfig {
     pub winter_adaptive_enabled: bool,
+    /// Priority for winter adaptive strategy (0-100, higher wins in conflicts)
+    #[serde(default = "default_winter_adaptive_priority")]
+    pub winter_adaptive_priority: u8,
     pub winter_adaptive_ema_period_days: usize,
     pub winter_adaptive_min_solar_percentage: f32,
     pub winter_adaptive_daily_charging_target_soc: f32,
@@ -29,12 +33,26 @@ pub struct SeasonalStrategiesConfig {
     pub winter_adaptive_export_trigger_multiplier: f32,
     pub winter_adaptive_negative_price_handling_enabled: bool,
     pub winter_adaptive_charge_on_negative_even_if_full: bool,
+    // V2 strategy
+    pub winter_adaptive_v2_enabled: bool,
+    /// Priority for winter adaptive V2 strategy (0-100, higher wins in conflicts)
+    #[serde(default = "default_winter_adaptive_v2_priority")]
+    pub winter_adaptive_v2_priority: u8,
+}
+
+fn default_winter_adaptive_priority() -> u8 {
+    100
+}
+
+fn default_winter_adaptive_v2_priority() -> u8 {
+    100
 }
 
 impl Default for SeasonalStrategiesConfig {
     fn default() -> Self {
         Self {
             winter_adaptive_enabled: true,
+            winter_adaptive_priority: 100,
             winter_adaptive_ema_period_days: 7,
             winter_adaptive_min_solar_percentage: 0.10,
             winter_adaptive_daily_charging_target_soc: 90.0,
@@ -46,6 +64,8 @@ impl Default for SeasonalStrategiesConfig {
             winter_adaptive_export_trigger_multiplier: 2.5,
             winter_adaptive_negative_price_handling_enabled: true,
             winter_adaptive_charge_on_negative_even_if_full: false,
+            winter_adaptive_v2_enabled: false,
+            winter_adaptive_v2_priority: 100,
         }
     }
 }
@@ -54,6 +74,7 @@ impl From<&StrategiesConfigCore> for SeasonalStrategiesConfig {
     fn from(config: &StrategiesConfigCore) -> Self {
         Self {
             winter_adaptive_enabled: config.winter_adaptive.enabled,
+            winter_adaptive_priority: config.winter_adaptive.priority,
             winter_adaptive_ema_period_days: config.winter_adaptive.ema_period_days,
             winter_adaptive_min_solar_percentage: config.winter_adaptive.min_solar_percentage,
             winter_adaptive_daily_charging_target_soc: config
@@ -79,18 +100,27 @@ impl From<&StrategiesConfigCore> for SeasonalStrategiesConfig {
             winter_adaptive_charge_on_negative_even_if_full: config
                 .winter_adaptive
                 .charge_on_negative_even_if_full,
+            winter_adaptive_v2_enabled: config.winter_adaptive_v2.enabled,
+            winter_adaptive_v2_priority: config.winter_adaptive_v2.priority,
         }
     }
 }
 
 pub struct AdaptiveSeasonalOptimizer {
     winter_adaptive: WinterAdaptiveStrategy,
+    winter_adaptive_v2: WinterAdaptiveV2Strategy,
 }
 
 impl AdaptiveSeasonalOptimizer {
     #[must_use]
-    pub fn new(winter_adaptive: WinterAdaptiveStrategy) -> Self {
-        Self { winter_adaptive }
+    pub fn new(
+        winter_adaptive: WinterAdaptiveStrategy,
+        winter_adaptive_v2: WinterAdaptiveV2Strategy,
+    ) -> Self {
+        Self {
+            winter_adaptive,
+            winter_adaptive_v2,
+        }
     }
 
     /// Construct optimizer with sensible defaults
@@ -104,6 +134,7 @@ impl AdaptiveSeasonalOptimizer {
     pub fn with_config(config: &SeasonalStrategiesConfig) -> Self {
         let winter_adaptive_config = WinterAdaptiveConfig {
             enabled: config.winter_adaptive_enabled,
+            priority: config.winter_adaptive_priority,
             ema_period_days: config.winter_adaptive_ema_period_days,
             min_solar_percentage: config.winter_adaptive_min_solar_percentage,
             daily_charging_target_soc: config.winter_adaptive_daily_charging_target_soc,
@@ -118,13 +149,20 @@ impl AdaptiveSeasonalOptimizer {
             ..Default::default()
         };
 
+        let winter_adaptive_v2_config = WinterAdaptiveV2Config {
+            enabled: config.winter_adaptive_v2_enabled,
+            priority: config.winter_adaptive_v2_priority,
+            ..Default::default()
+        };
+
         Self {
             winter_adaptive: WinterAdaptiveStrategy::new(winter_adaptive_config),
+            winter_adaptive_v2: WinterAdaptiveV2Strategy::new(winter_adaptive_v2_config),
         }
     }
 
     /// Evaluate strategies and pick the best
-    /// Currently only supports WinterAdaptiveStrategy
+    /// Supports WinterAdaptiveStrategy (V1) and WinterAdaptiveV2Strategy
     #[must_use]
     pub fn evaluate(&self, context: &EvaluationContext) -> BlockEvaluation {
         self.evaluate_with_debug(context, false)
@@ -137,8 +175,20 @@ impl AdaptiveSeasonalOptimizer {
         context: &EvaluationContext,
         capture_debug: bool,
     ) -> BlockEvaluation {
-        // Only one strategy to evaluate
-        let mut eval = self.winter_adaptive.evaluate(context);
+        // Prefer V2 over V1 when both are enabled (V2 is the improved version)
+        let mut eval = if self.winter_adaptive_v2.is_enabled() {
+            self.winter_adaptive_v2.evaluate(context)
+        } else if self.winter_adaptive.is_enabled() {
+            self.winter_adaptive.evaluate(context)
+        } else {
+            // Return default SelfUse mode when no strategy is enabled
+            BlockEvaluation::new(
+                context.price_block.block_start,
+                context.price_block.duration_minutes,
+                fluxion_types::inverter::InverterOperationMode::SelfUse,
+                "No active strategy".to_string(),
+            )
+        };
 
         // Capture debug info if requested
         if capture_debug {

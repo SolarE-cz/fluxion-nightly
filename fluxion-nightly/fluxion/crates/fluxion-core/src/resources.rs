@@ -22,7 +22,8 @@ use std::time::Duration;
 pub use fluxion_types::config::{
     ControlConfig, Currency, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
     SolarAwareChargingConfigCore, StrategiesConfigCore, StrategyEnabledConfigCore, SystemConfig,
-    SystemSettingsConfig, WinterAdaptiveConfigCore, WinterPeakDischargeConfigCore,
+    SystemSettingsConfig, WinterAdaptiveConfigCore, WinterAdaptiveV2ConfigCore,
+    WinterPeakDischargeConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 

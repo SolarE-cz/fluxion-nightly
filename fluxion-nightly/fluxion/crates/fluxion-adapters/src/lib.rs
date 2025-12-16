@@ -15,9 +15,9 @@ pub mod solax;
 
 // Re-export commonly used types for convenience
 pub use ha::{
-    ConfigurablePriceDataSource, CzSpotPriceAdapter, HaClientResource,
-    HaConsumptionHistoryAdapter, HaEntityState, HaError, HaHistoryState, HaPlugin, HaResult,
-    HistoryDataPoint, HomeAssistantClient, HomeAssistantInverterAdapter,
+    ConfigurablePriceDataSource, CzSpotPriceAdapter, HaClientResource, HaConsumptionHistoryAdapter,
+    HaEntityState, HaError, HaHistoryState, HaPlugin, HaResult, HistoryDataPoint,
+    HomeAssistantClient, HomeAssistantInverterAdapter,
 };
 
 pub use solax::{

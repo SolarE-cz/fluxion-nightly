@@ -119,6 +119,31 @@ config-control-average-load-help = Průměrná spotřeba v kW (použito pro pred
 config-section-strategies = Konfigurace strategií
 config-section-strategies-desc = Zapnutí/vypnutí a nastavení optimalizačních strategií
 
+# Priorita strategií
+config-strat-priority = Priorita
+config-strat-priority-help = Priorita při řešení konfliktů (0-100, vyšší hodnota vyhrává při konfliktu strategií)
+
+# Názvy strategií (krátká forma)
+config-strat-winter-adaptive = Zimní adaptivní
+config-strat-winter-adaptive-desc = Komplexní zimní strategie se sledováním spotřeby, cenovou arbitráží a chytrým nabíjením
+config-strat-wa-ema-days = Období EMA (dny)
+config-strat-wa-target-soc = Cílové SOC (%)
+
+config-strat-winter-adaptive-v2 = Zimní adaptivní V2
+config-strat-winter-adaptive-v2-desc = Nová generace zimní strategie s predikováním po slotech, detekcí cenových špiček a lepšími arbitrážními okny
+
+config-strat-winter-peak-discharge = Zimní špičkové vybíjení
+config-strat-winter-peak-discharge-desc = Vybíjení baterie během drahých ranních hodin před sluncem
+config-strat-wpd-min-spread = Minimální rozpětí (Kč)
+config-strat-wpd-min-soc-start = Minimální SOC pro start (%)
+
+config-strat-solar-aware = Nabíjení s ohledem na solár
+config-strat-solar-aware-desc = Vyhýbání se nabíjení ze sítě když se očekává solární výroba
+
+config-strat-morning-precharge = Ranní přednabití
+config-strat-day-ahead = Plánování den dopředu
+config-strat-price-arbitrage = Cenová arbitráž
+
 config-strategy-winter-peak = Zimní špičkové vybíjení
 config-strategy-winter-peak-help = Vybít baterii během drahých zimních ranních hodin
 

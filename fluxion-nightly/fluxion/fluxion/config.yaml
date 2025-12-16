@@ -1,6 +1,6 @@
 # Home Assistant Add-on Configuration
 name: FluxION ECS
-version: "0.2.12"
+version: "0.2.13"
 slug: fluxion
 description: "Solar plant automation based on electricity spot prices"
 url: "https://github.com/SolarE-cz/fluxion"
@@ -154,7 +154,7 @@ schema:
       enabled: bool?
 
 # Image configuration
-image: "ghcr.io/donach/fluxion-{arch}-dev"
+image: "ghcr.io/solare-cz/fluxion-nightly-{arch}"
 
 # Add-on labels
 labels:

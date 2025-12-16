@@ -1,30 +1,311 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="container">
-    <!-- Header stays outside SSE update area to prevent flickering -->
-    <div class="header">
-        <h1>⚡ {{ self.t("dashboard-title") }}</h1>
-        <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-            <button id="debug-mode-toggle" class="debug-mode-button {% if debug_mode %}debug-active{% else %}normal-active{% endif %}" onclick="toggleDebugMode()">
-                {% if debug_mode %}
-                <span>🔍</span>
-                <span>{{ self.t("system-debug-mode") }}</span>
-                {% else %}
-                <span>✓</span>
-                <span>Normal Mode</span>
-                {% endif %}
-            </button>
-            <a href="{{ ingress_path }}/config" class="config-button">
-                <span>⚙️</span>
-                <span>Config</span>
-            </a>
-            <a href="{{ ingress_path }}/export" class="export-button" download>
-                <span>📊</span>
-                <span>Export Data</span>
-            </a>
-        </div>
-    </div>
+<style>
+    /* Config Sidebar Styles */
+    .dashboard-wrapper {
+        display: flex;
+        gap: 20px;
+        align-items: flex-start;
+    }
+
+    .dashboard-main {
+        flex: 1;
+        min-width: 0;
+        transition: all 0.3s ease;
+    }
+
+    .config-sidebar {
+        width: 450px;
+        max-height: 90vh;
+        overflow-y: auto;
+        background: var(--bg-secondary);
+        border-radius: 8px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+        position: sticky;
+        top: 20px;
+        transform: translateX(100%);
+        opacity: 0;
+        transition: all 0.3s ease;
+        pointer-events: none;
+    }
+
+    .config-sidebar.show {
+        transform: translateX(0);
+        opacity: 1;
+        pointer-events: all;
+    }
+
+    .config-sidebar-header {
+        background: var(--bg-tertiary);
+        padding: 20px;
+        border-bottom: 1px solid var(--border-color);
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .config-sidebar-header h2 {
+        margin: 0;
+        font-size: 1.3em;
+    }
+
+    .config-close-btn {
+        background: none;
+        border: none;
+        color: var(--text-primary);
+        font-size: 1.5em;
+        cursor: pointer;
+        padding: 5px 10px;
+        border-radius: 4px;
+        transition: background 0.2s;
+    }
+
+    .config-close-btn:hover {
+        background: rgba(255,255,255,0.1);
+    }
+
+    .config-sidebar-content {
+        padding: 20px;
+    }
+
+    .config-section {
+        margin: 20px 0;
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        overflow: hidden;
+    }
+
+    .config-section-header {
+        background: var(--bg-tertiary);
+        padding: 12px 15px;
+        cursor: pointer;
+        user-select: none;
+        border-bottom: 1px solid var(--border-color);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .config-section-header:hover {
+        background: #454545;
+    }
+
+    .config-section-title {
+        font-size: 1em;
+        font-weight: 600;
+        margin: 0;
+    }
+
+    .config-section-content {
+        padding: 15px;
+        display: none;
+    }
+
+    .config-section.expanded .config-section-content {
+        display: block;
+    }
+
+    .config-section.expanded .config-section-header::after {
+        content: '▼';
+    }
+
+    .config-section-header::after {
+        content: '▶';
+        font-size: 0.8em;
+    }
+
+    .config-form-group {
+        margin: 15px 0;
+    }
+
+    .config-form-label {
+        display: block;
+        font-weight: 500;
+        margin-bottom: 5px;
+        color: var(--text-primary);
+        font-size: 0.9em;
+    }
+
+    .config-form-help {
+        display: block;
+        font-size: 0.75em;
+        color: var(--text-secondary);
+        margin-top: 3px;
+    }
+
+    .config-form-input {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid var(--border-color);
+        border-radius: 4px;
+        font-size: 0.9em;
+        box-sizing: border-box;
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+
+    .config-form-input:focus {
+        outline: none;
+        border-color: var(--info);
+    }
+
+    .config-toggle-switch {
+        position: relative;
+        display: inline-block;
+        width: 44px;
+        height: 22px;
+    }
+
+    .config-toggle-input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+
+    .config-toggle-slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: #555;
+        transition: .3s;
+        border-radius: 22px;
+    }
+
+    .config-toggle-slider:before {
+        position: absolute;
+        content: "";
+        height: 16px;
+        width: 16px;
+        left: 3px;
+        bottom: 3px;
+        background-color: white;
+        transition: .3s;
+        border-radius: 50%;
+    }
+
+    .config-toggle-input:checked + .config-toggle-slider {
+        background-color: var(--success);
+    }
+
+    .config-toggle-input:checked + .config-toggle-slider:before {
+        transform: translateX(22px);
+    }
+
+    .config-save-btn {
+        width: 100%;
+        padding: 12px;
+        background: var(--success);
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+        cursor: pointer;
+        font-size: 1em;
+        transition: all 0.2s;
+    }
+
+    .config-save-btn:hover {
+        background: #45a049;
+        transform: translateY(-1px);
+        box-shadow: 0 2px 8px rgba(76, 175, 80, 0.4);
+    }
+
+    .config-save-btn:active {
+        transform: translateY(0);
+    }
+
+    .config-notification {
+        padding: 12px;
+        border-radius: 4px;
+        margin-bottom: 15px;
+        display: none;
+        font-size: 0.9em;
+    }
+
+    .config-notification.success {
+        background: rgba(76, 175, 80, 0.2);
+        border: 1px solid var(--success);
+        color: #81c784;
+    }
+
+    .config-notification.error {
+        background: rgba(244, 67, 54, 0.2);
+        border: 1px solid var(--error);
+        color: #e57373;
+    }
+
+    @media (max-width: 1200px) {
+        .config-sidebar {
+            position: fixed;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            width: 400px;
+            max-height: 100vh;
+            border-radius: 0;
+            z-index: 1000;
+        }
+
+        .dashboard-wrapper::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s;
+            z-index: 999;
+        }
+
+        .dashboard-wrapper.config-open::before {
+            opacity: 1;
+            pointer-events: all;
+        }
+    }
+
+    @media (max-width: 768px) {
+        .config-sidebar {
+            width: 100%;
+        }
+    }
+</style>
+
+<div class="dashboard-wrapper" id="dashboard-wrapper">
+    <div class="dashboard-main">
+        <div class="container">
+            <!-- Header stays outside SSE update area to prevent flickering -->
+            <div class="header">
+                <h1>⚡ {{ self.t("dashboard-title") }}</h1>
+                <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                    <button id="debug-mode-toggle" class="debug-mode-button {% if debug_mode %}debug-active{% else %}normal-active{% endif %}" onclick="toggleDebugMode()">
+                        {% if debug_mode %}
+                        <span>🔍</span>
+                        <span>{{ self.t("system-debug-mode") }}</span>
+                        {% else %}
+                        <span>✓</span>
+                        <span>Normal Mode</span>
+                        {% endif %}
+                    </button>
+                    <button id="config-toggle" class="config-button" onclick="toggleConfigSidebar()">
+                        <span>⚙️</span>
+                        <span>Config</span>
+                    </button>
+                    <a href="{{ ingress_path }}/export" class="export-button" download>
+                        <span>📊</span>
+                        <span>Export Data</span>
+                    </a>
+                </div>
+            </div>
     
     <div id="live-data" 
          hx-ext="sse" 
@@ -1040,11 +1321,11 @@
         try {
             const response = await fetch('{{ ingress_path }}/api/config');
             const data = await response.json();
-            
+
             // Toggle debug mode
             const newDebugMode = !data.config.system.debug_mode;
             data.config.system.debug_mode = newDebugMode;
-            
+
             // Update config
             const updateResponse = await fetch('{{ ingress_path }}/api/config/update', {
                 method: 'POST',
@@ -1056,9 +1337,9 @@
                     create_backup: true,
                 }),
             });
-            
+
             const result = await updateResponse.json();
-            
+
             if (result.success) {
                 // Update the button
                 const button = document.getElementById('debug-mode-toggle');
@@ -1069,7 +1350,7 @@
                     button.className = 'debug-mode-button normal-active';
                     button.innerHTML = '<span>✓</span><span>Normal Mode</span>';
                 }
-                
+
                 // Show notification
                 alert(`Debug mode ${newDebugMode ? 'enabled' : 'disabled'} successfully. The system is now in ${newDebugMode ? 'safe testing mode' : 'normal operation mode'}.`);
             } else {
@@ -1081,5 +1362,322 @@
         }
     }
     </script>
-</div>
+        </div> <!-- End container -->
+    </div> <!-- End dashboard-main -->
+
+    <!-- Config Sidebar -->
+    <div class="config-sidebar" id="config-sidebar">
+        <div class="config-sidebar-header">
+            <h2>⚙️ Configuration</h2>
+            <button class="config-close-btn" onclick="toggleConfigSidebar()">×</button>
+        </div>
+        <div class="config-sidebar-content">
+            <div id="config-notification" class="config-notification"></div>
+
+            <form id="config-form" novalidate>
+                <!-- Control Section (Most commonly used) -->
+                <div class="config-section expanded">
+                    <div class="config-section-header" onclick="toggleConfigSection(this)">
+                        <h3 class="config-section-title">Battery Control</h3>
+                    </div>
+                    <div class="config-section-content">
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="control_min_battery_soc">Minimum Battery SOC</label>
+                            <input type="number" id="control_min_battery_soc" class="config-form-input" step="1" min="0" max="100">
+                            <span class="config-form-help">Minimum battery charge level (recommended: 10-20%)</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="control_max_battery_soc">Maximum Battery SOC</label>
+                            <input type="number" id="control_max_battery_soc" class="config-form-input" step="1" min="0" max="100">
+                            <span class="config-form-help">Maximum battery charge level (recommended: 90-100%)</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="control_force_charge_hours">Force Charge Hours</label>
+                            <input type="number" id="control_force_charge_hours" class="config-form-input" step="1" min="0" max="24">
+                            <span class="config-form-help">Max hours per day to force charge</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="control_force_discharge_hours">Force Discharge Hours</label>
+                            <input type="number" id="control_force_discharge_hours" class="config-form-input" step="1" min="0" max="24">
+                            <span class="config-form-help">Max hours per day to force discharge</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="control_evening_target_soc">Evening Target SOC</label>
+                            <input type="number" id="control_evening_target_soc" class="config-form-input" step="1" min="0" max="100">
+                            <span class="config-form-help">Target battery level for evening peak</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Strategies Section -->
+                <div class="config-section">
+                    <div class="config-section-header" onclick="toggleConfigSection(this)">
+                        <h3 class="config-section-title">Strategies</h3>
+                    </div>
+                    <div class="config-section-content">
+                        <div class="config-form-group">
+                            <label class="config-toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_wa_enabled" class="config-toggle-input">
+                                <span class="config-toggle-slider"></span>
+                            </label>
+                            <label class="config-form-label">Winter Adaptive</label>
+                            <span class="config-form-help">Adapt charging based on consumption history</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_wav2_enabled" class="config-toggle-input">
+                                <span class="config-toggle-slider"></span>
+                            </label>
+                            <label class="config-form-label">Winter Adaptive V2</label>
+                            <span class="config-form-help">Next-gen with per-slot forecasting & spike detection</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_wpd_enabled" class="config-toggle-input">
+                                <span class="config-toggle-slider"></span>
+                            </label>
+                            <label class="config-form-label">Winter Peak Discharge</label>
+                            <span class="config-form-help">Discharge during high-price peaks</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_sac_enabled" class="config-toggle-input">
+                                <span class="config-toggle-slider"></span>
+                            </label>
+                            <label class="config-form-label">Solar Aware Charging</label>
+                            <span class="config-form-help">Consider solar production in planning</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-toggle-switch" style="float: right;">
+                                <input type="checkbox" id="strat_mp_enabled" class="config-toggle-input">
+                                <span class="config-toggle-slider"></span>
+                            </label>
+                            <label class="config-form-label">Morning Precharge</label>
+                            <span class="config-form-help">Precharge before morning peak</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Pricing Section -->
+                <div class="config-section">
+                    <div class="config-section-header" onclick="toggleConfigSection(this)">
+                        <h3 class="config-section-title">Pricing</h3>
+                    </div>
+                    <div class="config-section-content">
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="pricing_buy_fee">Buy Fee (CZK/kWh)</label>
+                            <input type="number" id="pricing_buy_fee" class="config-form-input" step="0.01" min="0">
+                            <span class="config-form-help">Additional fee when buying from grid</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="pricing_sell_fee">Sell Fee (CZK/kWh)</label>
+                            <input type="number" id="pricing_sell_fee" class="config-form-input" step="0.01" min="0">
+                            <span class="config-form-help">Additional fee when selling to grid</span>
+                        </div>
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="pricing_dist_fee">Distribution Fee (CZK/kWh)</label>
+                            <input type="number" id="pricing_dist_fee" class="config-form-input" step="0.01" min="0">
+                            <span class="config-form-help">Grid distribution/transmission fee</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button type="submit" class="config-save-btn">💾 Save & Update Plan</button>
+            </form>
+        </div>
+    </div>
+</div> <!-- End dashboard-wrapper -->
+
+<script>
+// Toggle config sidebar
+function toggleConfigSidebar() {
+    const sidebar = document.getElementById('config-sidebar');
+    const wrapper = document.getElementById('dashboard-wrapper');
+
+    if (sidebar.classList.contains('show')) {
+        sidebar.classList.remove('show');
+        wrapper.classList.remove('config-open');
+    } else {
+        sidebar.classList.add('show');
+        wrapper.classList.add('config-open');
+        loadConfigToSidebar();
+    }
+}
+
+// Toggle config section
+function toggleConfigSection(header) {
+    const section = header.parentElement;
+    section.classList.toggle('expanded');
+}
+
+// Load config into sidebar
+async function loadConfigToSidebar() {
+    try {
+        const response = await fetch('{{ ingress_path }}/api/config');
+        const data = await response.json();
+
+        if (data.config.control) {
+            document.getElementById('control_min_battery_soc').value = data.config.control.min_battery_soc || 10;
+            document.getElementById('control_max_battery_soc').value = data.config.control.max_battery_soc || 100;
+            document.getElementById('control_force_charge_hours').value = data.config.control.force_charge_hours || 4;
+            document.getElementById('control_force_discharge_hours').value = data.config.control.force_discharge_hours || 2;
+            document.getElementById('control_evening_target_soc').value = data.config.control.evening_target_soc || 90;
+        }
+
+        if (data.config.strategies) {
+            const s = data.config.strategies;
+            // Use nested structure: winter_adaptive.enabled, not winter_adaptive_enabled
+            document.getElementById('strat_wa_enabled').checked = s.winter_adaptive?.enabled !== false;
+            document.getElementById('strat_wav2_enabled').checked = s.winter_adaptive_v2?.enabled === true;
+            document.getElementById('strat_wpd_enabled').checked = s.winter_peak_discharge?.enabled !== false;
+            document.getElementById('strat_sac_enabled').checked = s.solar_aware_charging?.enabled !== false;
+            document.getElementById('strat_mp_enabled').checked = s.morning_precharge?.enabled !== false;
+        }
+
+        if (data.config.pricing) {
+            document.getElementById('pricing_buy_fee').value = data.config.pricing.spot_buy_fee_czk || 0;
+            document.getElementById('pricing_sell_fee').value = data.config.pricing.spot_sell_fee_czk || 0;
+            document.getElementById('pricing_dist_fee').value = data.config.pricing.grid_distribution_fee_czk || 0;
+        }
+    } catch (error) {
+        console.error('Failed to load config:', error);
+        showConfigNotification('Failed to load config: ' + error.message, 'error');
+    }
+}
+
+// Show notification
+function showConfigNotification(message, type) {
+    const notification = document.getElementById('config-notification');
+    notification.className = `config-notification ${type}`;
+    notification.textContent = message;
+    notification.style.display = 'block';
+
+    setTimeout(() => {
+        notification.style.display = 'none';
+    }, 5000);
+}
+
+// Handle config form submission
+document.getElementById('config-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    try {
+        // First, load current config
+        const response = await fetch('{{ ingress_path }}/api/config');
+        const data = await response.json();
+
+        // Update only the changed fields
+        data.config.control.min_battery_soc = parseFloat(document.getElementById('control_min_battery_soc').value);
+        data.config.control.max_battery_soc = parseFloat(document.getElementById('control_max_battery_soc').value);
+        data.config.control.force_charge_hours = parseInt(document.getElementById('control_force_charge_hours').value);
+        data.config.control.force_discharge_hours = parseInt(document.getElementById('control_force_discharge_hours').value);
+        data.config.control.evening_target_soc = parseFloat(document.getElementById('control_evening_target_soc').value);
+
+        // Use nested structure for strategies (winter_adaptive.enabled, not winter_adaptive_enabled)
+        if (!data.config.strategies.winter_adaptive) data.config.strategies.winter_adaptive = {};
+        if (!data.config.strategies.winter_adaptive_v2) data.config.strategies.winter_adaptive_v2 = {};
+        if (!data.config.strategies.winter_peak_discharge) data.config.strategies.winter_peak_discharge = {};
+        if (!data.config.strategies.solar_aware_charging) data.config.strategies.solar_aware_charging = {};
+        if (!data.config.strategies.morning_precharge) data.config.strategies.morning_precharge = {};
+
+        data.config.strategies.winter_adaptive.enabled = document.getElementById('strat_wa_enabled').checked;
+        data.config.strategies.winter_adaptive_v2.enabled = document.getElementById('strat_wav2_enabled').checked;
+        data.config.strategies.winter_peak_discharge.enabled = document.getElementById('strat_wpd_enabled').checked;
+        data.config.strategies.solar_aware_charging.enabled = document.getElementById('strat_sac_enabled').checked;
+        data.config.strategies.morning_precharge.enabled = document.getElementById('strat_mp_enabled').checked;
+
+        data.config.pricing.spot_buy_fee_czk = parseFloat(document.getElementById('pricing_buy_fee').value);
+        data.config.pricing.spot_sell_fee_czk = parseFloat(document.getElementById('pricing_sell_fee').value);
+        data.config.pricing.grid_distribution_fee_czk = parseFloat(document.getElementById('pricing_dist_fee').value);
+
+        // Update config
+        const updateResponse = await fetch('{{ ingress_path }}/api/config/update', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                config: data.config,
+                create_backup: true,
+            }),
+        });
+
+        const result = await updateResponse.json();
+
+        if (result.success) {
+            showConfigNotification('✓ Configuration saved! Updating plan...', 'success');
+
+            // Force immediate refresh of chart and schedule
+            // Wait a moment for the backend to recalculate the plan
+            setTimeout(async () => {
+                try {
+                    // Refresh chart data
+                    const chartResponse = await fetch('{{ ingress_path }}/chart-data');
+                    const chartData = await chartResponse.json();
+
+                    if (window.priceChartInstance && chartData) {
+                        // Update all chart datasets
+                        window.priceChartInstance.data.labels = chartData.labels;
+                        window.priceChartInstance.data.datasets[0].data = chartData.prices;
+                        window.priceChartInstance.data.datasets[0].backgroundColor = chartData.modes.map((mode, idx) => {
+                            const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                            const opacity = isHistorical ? 0.4 : 0.8;
+                            if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                            if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                            if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                            return `rgba(33, 150, 243, ${opacity})`;
+                        });
+                        window.priceChartInstance.data.datasets[0].borderColor = chartData.modes.map((mode, idx) => {
+                            const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                            const opacity = isHistorical ? 0.5 : 1.0;
+                            if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                            if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                            if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                            return `rgba(33, 150, 243, ${opacity})`;
+                        });
+
+                        // Update NOW line
+                        if (chartData.current_time_label) {
+                            window.priceChartInstance.options.plugins.annotation.annotations.nowLine.xMin = chartData.current_time_label;
+                            window.priceChartInstance.options.plugins.annotation.annotations.nowLine.xMax = chartData.current_time_label;
+                        }
+
+                        window.priceChartInstance.update('active'); // Update with animation to show change
+                    }
+
+                    // Refresh upcoming schedule
+                    const tbody = document.getElementById('upcoming-blocks');
+                    if (tbody && chartData) {
+                        window.lastUpcomingScheduleHash = null; // Force update by clearing hash
+                        populateUpcomingBlocks(tbody, chartData);
+                    }
+
+                    showConfigNotification('✓ Plan updated successfully!', 'success');
+                } catch (error) {
+                    console.error('Failed to refresh plan:', error);
+                    showConfigNotification('Config saved but failed to refresh display. Please reload page.', 'error');
+                }
+            }, 1500); // Wait 1.5 seconds for backend to recalculate
+        } else {
+            showConfigNotification('Failed to save config: ' + (result.error || 'Unknown error'), 'error');
+        }
+    } catch (error) {
+        console.error('Error saving config:', error);
+        showConfigNotification('Failed to save config: ' + error.message, 'error');
+    }
+});
+
+// Close sidebar when clicking on overlay (on mobile)
+document.getElementById('dashboard-wrapper').addEventListener('click', function(e) {
+    const sidebar = document.getElementById('config-sidebar');
+    const wrapper = document.getElementById('dashboard-wrapper');
+
+    if (wrapper.classList.contains('config-open') &&
+        e.target === wrapper &&
+        window.innerWidth <= 1200) {
+        sidebar.classList.remove('show');
+        wrapper.classList.remove('config-open');
+    }
+});
+</script>
 {% endblock %}

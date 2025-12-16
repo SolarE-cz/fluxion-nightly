@@ -172,15 +172,14 @@ fn initialize_and_run() -> Result<()> {
     };
 
     // Wrap spot adapter in configurable source that respects use_spot_prices_to_buy/sell flags
-    let price_source: Arc<dyn fluxion_core::PriceDataSource> = Arc::new(
-        fluxion_adapters::ConfigurablePriceDataSource::new(
+    let price_source: Arc<dyn fluxion_core::PriceDataSource> =
+        Arc::new(fluxion_adapters::ConfigurablePriceDataSource::new(
             spot_adapter,
             config.pricing.use_spot_prices_to_buy,
             config.pricing.use_spot_prices_to_sell,
             config.pricing.fixed_buy_prices.clone(),
             config.pricing.fixed_sell_prices.clone(),
-        ),
-    );
+        ));
     info!("💰 Price data source: {}", price_source.name());
 
     let history_source: Arc<dyn fluxion_core::traits::ConsumptionHistoryDataSource> = Arc::new(
@@ -233,6 +232,7 @@ fn initialize_and_run() -> Result<()> {
             8099,
             config_json,
             Some(config_sender_for_web),
+            Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
         )
         .await
         {

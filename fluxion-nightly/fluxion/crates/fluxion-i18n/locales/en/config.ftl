@@ -119,6 +119,31 @@ config-control-average-load-help = Average power consumption in kW (used for SOC
 config-section-strategies = Strategy Configuration
 config-section-strategies-desc = Enable/disable and configure optimization strategies
 
+# Strategy Priority
+config-strat-priority = Priority
+config-strat-priority-help = Conflict resolution priority (0-100, higher wins when strategies conflict)
+
+# Strategy Names (Short Form)
+config-strat-winter-adaptive = Winter Adaptive
+config-strat-winter-adaptive-desc = Comprehensive winter strategy with consumption tracking, price arbitrage, and smart charging
+config-strat-wa-ema-days = EMA Period (Days)
+config-strat-wa-target-soc = Target SOC (%)
+
+config-strat-winter-adaptive-v2 = Winter Adaptive V2
+config-strat-winter-adaptive-v2-desc = Next-generation winter strategy with per-slot forecasting, spike detection, and better arbitrage windows
+
+config-strat-winter-peak-discharge = Winter Peak Discharge
+config-strat-winter-peak-discharge-desc = Discharge battery during expensive morning hours before solar
+config-strat-wpd-min-spread = Minimum Spread (CZK)
+config-strat-wpd-min-soc-start = Minimum SOC to Start (%)
+
+config-strat-solar-aware = Solar Aware Charging
+config-strat-solar-aware-desc = Avoid grid charging when solar production is expected
+
+config-strat-morning-precharge = Morning Precharge
+config-strat-day-ahead = Day Ahead Planning
+config-strat-price-arbitrage = Price Arbitrage
+
 config-strategy-winter-peak = Winter Peak Discharge
 config-strategy-winter-peak-help = Discharge battery during expensive winter morning hours
 

@@ -613,7 +613,8 @@ impl ConfigurablePriceDataSource {
 
             for quarter in 0..4 {
                 let minutes = quarter * 15;
-                let block_start = today_start + chrono::Duration::hours(hour as i64)
+                let block_start = today_start
+                    + chrono::Duration::hours(hour as i64)
                     + chrono::Duration::minutes(minutes);
 
                 time_block_prices.push(TimeBlockPrice {
@@ -650,7 +651,9 @@ impl PriceDataSource for ConfigurablePriceDataSource {
             self.spot_adapter.read_prices().await
         } else {
             // Use fixed prices
-            info!("💰 [ConfigurablePrice] Using fixed prices for buy decisions (use_spot_prices_to_buy=false)");
+            info!(
+                "💰 [ConfigurablePrice] Using fixed prices for buy decisions (use_spot_prices_to_buy=false)"
+            );
             self.generate_fixed_price_data()
         }
     }
