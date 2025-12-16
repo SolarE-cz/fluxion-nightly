@@ -3,159 +3,194 @@ name: Promote to Production
 on:
   workflow_dispatch:
     inputs:
-      nightly_version:
-        description: "Nightly version to promote (e.g., 0.1.5-nightly)"
+      version_tag:
+        description: "Version tag to promote to stable (e.g., v0.2.14)"
         required: true
-        type: string
-      prod_version:
-        description: "Production version (e.g., 0.2.0) - leave empty to auto-increment"
-        required: false
         type: string
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
 
 jobs:
   promote:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Validate nightly version format
-        run: |
-          NIGHTLY="${{ inputs.nightly_version }}"
-          if [[ ! "$NIGHTLY" =~ -nightly$ ]]; then
-            echo "❌ Error: Version must end with '-nightly'"
-            echo "Example: 0.1.5-nightly"
-            exit 1
-          fi
-          echo "✅ Valid nightly version: $NIGHTLY"
-
-      - name: Prepare work directories
-        run: |
-          # Create unique work directory for this run
-          WORK_DIR="/tmp/fluxion-promote-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "WORK_DIR=$WORK_DIR" >> $GITHUB_ENV
-          mkdir -p "$WORK_DIR"
-          echo "✅ Work directory: $WORK_DIR"
-
-      - name: Clone nightly repo
-        run: |
-          git clone --depth 1 --branch "${{ inputs.nightly_version }}" \
-            https://github.com/SolarE-cz/fluxion-nightly.git "$WORK_DIR/nightly"
-          
-          echo "✅ Cloned nightly at version ${{ inputs.nightly_version }}"
-
-      - name: Determine production version
+      - name: Parse version
         id: version
         run: |
-          NIGHTLY="${{ inputs.nightly_version }}"
-          
-          if [ -n "${{ inputs.prod_version }}" ]; then
-            # User specified prod version
-            PROD_VERSION="${{ inputs.prod_version }}"
-          else
-            # Auto-increment: remove -nightly suffix
-            PROD_VERSION=$(echo "$NIGHTLY" | sed 's/-nightly$//')
-          fi
-          
-          echo "Production version: $PROD_VERSION"
-          echo "version=$PROD_VERSION" >> $GITHUB_OUTPUT
+          TAG="${{ inputs.version_tag }}"
+          # Remove 'v' prefix if present
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "✅ Promoting version: $VERSION"
+
+      - name: Checkout at version tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.version_tag }}
 
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y rsync ripgrep
+          sudo apt-get install -y python3-pip
+          pip3 install pyyaml
 
-      - name: Secret scan nightly snapshot
+      - name: Validate fluxion-nightly directory exists
         run: |
-          # Install trufflehog
-          wget -q https://github.com/trufflesecurity/trufflehog/releases/latest/download/trufflehog_linux_amd64.tar.gz
-          tar -xzf trufflehog_linux_amd64.tar.gz
-          chmod +x trufflehog
-          
-          # Scan filesystem
-          ./trufflehog filesystem "$WORK_DIR/nightly" --only-verified --fail
+          if [ ! -d "fluxion-nightly" ]; then
+            echo "❌ ERROR: fluxion-nightly directory not found"
+            exit 1
+          fi
+          echo "✅ fluxion-nightly directory found"
 
-      - name: Validate nightly has required files
+      - name: Copy nightly to stable directory and update config
         run: |
-          echo "Validating nightly snapshot..."
-          REQUIRED_FILES=(
-            "README.md"
-            "fluxion/LICENSE"
-            "fluxion/Cargo.toml"
-            "fluxion/crates/fluxion-main/Cargo.toml"
-          )
-          
-          for file in "${REQUIRED_FILES[@]}"; do
-            if [ ! -f "$WORK_DIR/nightly/$file" ]; then
-              echo "❌ ERROR: Required file missing: $file"
-              exit 1
-            fi
-          done
-          
-          echo "✅ All required files present"
+          # Remove existing fluxion directory if it exists
+          if [ -d "fluxion" ]; then
+            echo "Removing existing fluxion directory..."
+            rm -rf fluxion
+          fi
 
-      - name: Load deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.FLUXION_PROD_DEPLOY_KEY }}
+          # Copy fluxion-nightly to fluxion
+          echo "Copying fluxion-nightly to fluxion..."
+          cp -r fluxion-nightly fluxion
+
+          # Update config.yaml for stable version
+          python3 << 'PYTHON_SCRIPT'
+          import yaml
+
+          VERSION = "${{ steps.version.outputs.version }}"
+
+          # Update fluxion/fluxion/config.yaml for stable
+          with open('fluxion/fluxion/config.yaml', 'r') as f:
+              config = yaml.safe_load(f)
+
+          config['name'] = 'FluxION ECS'
+          config['slug'] = 'fluxion'
+          config['version'] = VERSION
+          config['image'] = 'ghcr.io/solare-cz/fluxion-{arch}'
+          config['url'] = 'https://github.com/SolarE-cz/fluxion-nightly'
+
+          with open('fluxion/fluxion/config.yaml', 'w') as f:
+              yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+          print(f"✅ Updated fluxion config to version {VERSION}")
+          PYTHON_SCRIPT
+
+          echo "✅ Created stable fluxion directory"
 
       - name: Configure Git
         run: |
-          git config --global user.name "FluxION CI"
-          git config --global user.email "ci@solare.cz"
-
-      - name: Add GitHub to known_hosts
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          echo "✅ GitHub added to known_hosts"
-
-      - name: Clone prod repo
-        run: |
-          git clone --depth 1 git@github.com:SolarE-cz/fluxion.git "$WORK_DIR/prod"
-          cd "$WORK_DIR/prod"
           git config user.name "FluxION CI"
           git config user.email "ci@solare.cz"
 
-      - name: Sync and publish
+      - name: Commit stable directory
         run: |
-          # Sync nightly to prod (delete files not in nightly)
-          rsync -a --delete --exclude='.git' "$WORK_DIR/nightly/" "$WORK_DIR/prod/"
-          
-          cd "$WORK_DIR/prod"
-          
-          # Always create commit (we're promoting a specific version)
-          git add -A
-          
-          VERSION="${{ steps.version.outputs.version }}"
-          NIGHTLY="${{ inputs.nightly_version }}"
-          COMMIT_MSG="release: $VERSION (promoted from $NIGHTLY)"
-          echo "$COMMIT_MSG"
-          
-          git commit -m "$COMMIT_MSG"
-          
-          # Create production tag
-          git tag -a "v$VERSION" -m "Production release $VERSION"
-          
-          # Push commit and tag
-          git push origin main
-          git push origin "v$VERSION"
-          
-          echo "✅ Published production release: v$VERSION"
+          git add fluxion
 
-      - name: Cleanup
-        if: always()
-        run: |
-          # Clean up work directory
-          if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
-            rm -rf "$WORK_DIR"
-            echo "✅ Cleaned up work directory: $WORK_DIR"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
           fi
 
-      - name: Summary
-        if: always()
+          VERSION="${{ steps.version.outputs.version }}"
+          COMMIT_MSG="release: Add stable addon for version $VERSION"
+
+          git commit -m "$COMMIT_MSG"
+          echo "✅ Created commit for stable addon"
+
+      - name: Create stable tag
         run: |
-          echo "## ✅ Production Release Published" >> $GITHUB_STEP_SUMMARY
-          echo "Repository: https://github.com/SolarE-cz/fluxion" >> $GITHUB_STEP_SUMMARY
-          echo "Version: v${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "Promoted from: ${{ inputs.nightly_version }}" >> $GITHUB_STEP_SUMMARY
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Create stable tag with stable directory included
+          git tag -a "v$VERSION-stable" -m "Stable release version $VERSION (includes stable addon)"
+
+          # Push the commit and stable tag
+          git push origin HEAD:main
+          git push origin "v$VERSION-stable"
+
+          echo "✅ Created stable tag v$VERSION-stable with stable addon"
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## ✅ Stable Addon Promoted" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: https://github.com/SolarE-cz/fluxion-nightly" >> $GITHUB_STEP_SUMMARY
+          echo "Nightly Tag: ${{ inputs.version_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "Stable Tag: v${{ steps.version.outputs.version }}-stable" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Both addons are now available in Home Assistant:" >> $GITHUB_STEP_SUMMARY
+          echo "- **FluxION ECS (Nightly)** - slug: fluxion-nightly, dir: fluxion-nightly/, tag: ${{ inputs.version_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **FluxION ECS** - slug: fluxion, dir: fluxion/, tag: v${{ steps.version.outputs.version }}-stable" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Next: Docker images will be built in the build_stable job" >> $GITHUB_STEP_SUMMARY
+
+  build_stable:
+    needs: promote
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        arch: [aarch64, amd64]
+    steps:
+      - name: Checkout at stable tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.promote.outputs.version }}-stable
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION="${{ needs.promote.outputs.version }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building stable version: $VERSION"
+
+      - name: Map architecture
+        id: arch
+        run: |
+          case ${{ matrix.arch }} in
+            aarch64) echo "platform=linux/arm64" >> $GITHUB_OUTPUT ;;
+            amd64) echo "platform=linux/amd64" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Build and push stable
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: fluxion/fluxion/Dockerfile
+          platforms: ${{ steps.arch.outputs.platform }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build summary
+        if: success()
+        run: |
+          echo "## ✅ Stable Docker Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "Architecture: ${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
