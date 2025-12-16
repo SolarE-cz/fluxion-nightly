@@ -41,8 +41,17 @@ jobs:
       - name: Get version
         id: version
         run: |
-          # Extract version from Cargo.toml
-          VERSION=$(grep -m1 '^version = ' fluxion/Cargo.toml | sed 's/version = "//;s/"//')
+          # If triggered by a tag, use the tag version; otherwise use Cargo.toml
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+            # Remove 'v' prefix if present
+            VERSION="${VERSION#v}"
+            echo "Using tag version: $VERSION"
+          else
+            # Extract version from Cargo.toml
+            VERSION=$(grep -m1 '^version = ' fluxion-nightly/fluxion/Cargo.toml | sed 's/version = "//;s/"//')
+            echo "Using Cargo.toml version: $VERSION"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
 
@@ -64,7 +73,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: fluxion/Dockerfile
+          file: fluxion-nightly/fluxion/Dockerfile
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
           tags: |

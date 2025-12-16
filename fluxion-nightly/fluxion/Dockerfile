@@ -61,7 +61,7 @@ RUN chmod a+x /run.sh
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.14" \
+    io.hass.version="0.2.15" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 
