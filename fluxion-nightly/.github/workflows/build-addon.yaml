@@ -42,7 +42,7 @@ jobs:
         id: version
         run: |
           # Extract version from Cargo.toml
-          VERSION=$(grep -m1 '^version = ' fluxion/Cargo.toml | sed 's/version = "//;s/"//')
+          VERSION=$(grep -m1 '^version = ' fluxion-nightly/fluxion/Cargo.toml | sed 's/version = "//;s/"//')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
 
