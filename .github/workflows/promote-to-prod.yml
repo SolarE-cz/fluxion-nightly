@@ -30,10 +30,11 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "✅ Promoting version: $VERSION"
 
-      - name: Checkout at version tag
+      - name: Checkout at version tag (with full history)
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.version_tag }}
+          fetch-depth: 0  # Fetch full history, not shallow clone
 
       - name: Install dependencies
         run: |
@@ -43,12 +44,18 @@ jobs:
 
       - name: Validate fluxion-nightly directory exists
         run: |
+          echo "Checking repository structure..."
+          ls -la
           if [ ! -d "fluxion-nightly" ]; then
             echo "❌ ERROR: fluxion-nightly directory not found"
+            echo "Directory contents:"
+            ls -la
             exit 1
           fi
           if [ ! -f "fluxion-nightly/fluxion/config.yaml" ]; then
             echo "❌ ERROR: fluxion-nightly/fluxion/config.yaml not found"
+            echo "fluxion-nightly contents:"
+            ls -la fluxion-nightly/
             exit 1
           fi
           echo "✅ fluxion-nightly directory and config.yaml found"
