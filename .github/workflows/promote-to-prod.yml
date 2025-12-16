@@ -2,11 +2,6 @@ name: Promote to Production
 
 on:
   workflow_dispatch:
-    inputs:
-      version_tag:
-        description: "Version tag to promote to stable (e.g., v0.2.14)"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -21,19 +16,31 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - name: Parse version
+      - name: Validate ref is a tag (not a branch)
+        run: |
+          REF="${{ github.ref }}"
+          if [[ ! "$REF" =~ ^refs/tags/ ]]; then
+            echo "❌ ERROR: This workflow must be run on a tag, not a branch!"
+            echo "Current ref: $REF"
+            echo "Please select a tag (e.g., v0.2.14) when running this workflow."
+            exit 1
+          fi
+          echo "✅ Running on tag: $REF"
+
+      - name: Parse version from tag
         id: version
         run: |
-          TAG="${{ inputs.version_tag }}"
+          # Extract tag name from ref (refs/tags/v0.2.14 -> v0.2.14)
+          TAG="${{ github.ref_name }}"
           # Remove 'v' prefix if present
           VERSION="${TAG#v}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "✅ Promoting version: $VERSION"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "✅ Promoting tag $TAG (version: $VERSION) to stable"
 
-      - name: Checkout at version tag (with full history)
+      - name: Checkout at tag (with full history)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.version_tag }}
           fetch-depth: 0  # Fetch full history, not shallow clone
 
       - name: Install dependencies
@@ -52,10 +59,14 @@ jobs:
             ls -la
             exit 1
           fi
-          if [ ! -f "fluxion-nightly/fluxion/config.yaml" ]; then
-            echo "❌ ERROR: fluxion-nightly/fluxion/config.yaml not found"
-            echo "fluxion-nightly contents:"
-            ls -la fluxion-nightly/
+          echo "fluxion-nightly contents:"
+          ls -la fluxion-nightly/
+
+          # Check for the flat config.yaml path (at root of fluxion-nightly)
+          if [ ! -f "fluxion-nightly/config.yaml" ]; then
+            echo "❌ ERROR: fluxion-nightly/config.yaml not found"
+            echo "Looking for config.yaml:"
+            find fluxion-nightly -name "config.yaml" || echo "No config.yaml found"
             exit 1
           fi
           echo "✅ fluxion-nightly directory and config.yaml found"
@@ -75,7 +86,7 @@ jobs:
             rm -rf fluxion
           fi
 
-          # Copy fluxion-nightly to fluxion
+          # Copy entire fluxion-nightly structure to fluxion (flat copy)
           echo "Copying fluxion-nightly to fluxion..."
           cp -r fluxion-nightly fluxion
 
@@ -86,19 +97,21 @@ jobs:
           import sys
 
           VERSION = '${{ steps.version.outputs.version }}'
+          REPO_URL = 'https://github.com/${{ github.repository }}'
+          REPO_OWNER = '${{ github.repository_owner }}'
 
           try:
-              # Update fluxion/fluxion/config.yaml for stable
-              with open('fluxion/fluxion/config.yaml', 'r') as f:
+              # Update fluxion/config.yaml for stable
+              with open('fluxion/config.yaml', 'r') as f:
                   config = yaml.safe_load(f)
 
               config['name'] = 'FluxION ECS'
               config['slug'] = 'fluxion'
               config['version'] = VERSION
-              config['image'] = 'ghcr.io/solare-cz/fluxion-{arch}'
-              config['url'] = 'https://github.com/SolarE-cz/fluxion-nightly'
+              config['image'] = f'ghcr.io/{REPO_OWNER.lower()}/fluxion-{{arch}}'
+              config['url'] = REPO_URL
 
-              with open('fluxion/fluxion/config.yaml', 'w') as f:
+              with open('fluxion/config.yaml', 'w') as f:
                   yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
               print(f'✅ Updated fluxion config to version {VERSION}')
@@ -112,11 +125,13 @@ jobs:
       - name: Verify stable config
         run: |
           echo "Verifying stable config.yaml..."
-          if [ ! -f "fluxion/fluxion/config.yaml" ]; then
-            echo "❌ ERROR: fluxion/fluxion/config.yaml not found after copy"
+          if [ ! -f "fluxion/config.yaml" ]; then
+            echo "❌ ERROR: fluxion/config.yaml not found after copy"
+            echo "Checking fluxion structure:"
+            find fluxion -name "config.yaml" || echo "No config.yaml found"
             exit 1
           fi
-          cat fluxion/fluxion/config.yaml
+          cat fluxion/config.yaml
           echo "✅ Stable config verified"
 
       - name: Commit stable directory
@@ -151,13 +166,13 @@ jobs:
         if: success()
         run: |
           echo "## ✅ Stable Addon Promoted" >> $GITHUB_STEP_SUMMARY
-          echo "Repository: https://github.com/SolarE-cz/fluxion-nightly" >> $GITHUB_STEP_SUMMARY
-          echo "Nightly Tag: ${{ inputs.version_tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "Stable Tag: v${{ steps.version.outputs.version }}-stable" >> $GITHUB_STEP_SUMMARY
+          echo "Repository: https://github.com/${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "Promoted from nightly tag: ${{ steps.version.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "Created stable tag: v${{ steps.version.outputs.version }}-stable" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Both addons are now available in Home Assistant:" >> $GITHUB_STEP_SUMMARY
-          echo "- **FluxION ECS (Nightly)** - slug: fluxion-nightly, dir: fluxion-nightly/, tag: ${{ inputs.version_tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **FluxION ECS** - slug: fluxion, dir: fluxion/, tag: v${{ steps.version.outputs.version }}-stable" >> $GITHUB_STEP_SUMMARY
+          echo "- **FluxION ECS (Nightly)** - slug: fluxion-nightly" >> $GITHUB_STEP_SUMMARY
+          echo "- **FluxION ECS** - slug: fluxion" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Next: Docker images will be built in the build_stable job" >> $GITHUB_STEP_SUMMARY
 
@@ -204,16 +219,22 @@ jobs:
             amd64) echo "platform=linux/amd64" >> $GITHUB_OUTPUT ;;
           esac
 
+      - name: Downcase repo owner
+        run: |
+          echo "REPO_OWNER=${OWNER,,}" >> ${GITHUB_ENV}
+        env:
+          OWNER: '${{ github.repository_owner }}'
+
       - name: Build and push stable
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: fluxion/fluxion/Dockerfile
+          file: fluxion/Dockerfile
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:latest
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/fluxion-${{ matrix.arch }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -222,4 +243,4 @@ jobs:
         run: |
           echo "## ✅ Stable Docker Image Built" >> $GITHUB_STEP_SUMMARY
           echo "Architecture: ${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          echo "Image: ${{ env.REGISTRY }}/solare-cz/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ env.REGISTRY }}/${{ env.REPO_OWNER }}/fluxion-${{ matrix.arch }}:${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY

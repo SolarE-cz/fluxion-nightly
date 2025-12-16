@@ -73,7 +73,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: fluxion-nightly/fluxion/Dockerfile
+          file: fluxion-nightly/Dockerfile
           platforms: ${{ steps.arch.outputs.platform }}
           push: true
           tags: |
