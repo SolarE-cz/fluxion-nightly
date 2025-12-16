@@ -108,7 +108,7 @@ jobs:
               config['name'] = 'FluxION ECS'
               config['slug'] = 'fluxion'
               config['version'] = VERSION
-              config['image'] = f'ghcr.io/{REPO_OWNER.lower()}/fluxion-{{arch}}'
+              config['image'] = 'ghcr.io/' + REPO_OWNER.lower() + '/fluxion-{arch}'
               config['url'] = REPO_URL
 
               with open('fluxion/config.yaml', 'w') as f:

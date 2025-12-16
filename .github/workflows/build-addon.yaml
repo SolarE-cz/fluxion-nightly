@@ -2,9 +2,6 @@ name: Build Addon
 
 on:
   push:
-    branches:
-      - restructure
-      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -48,8 +45,8 @@ jobs:
             VERSION="${VERSION#v}"
             echo "Using tag version: $VERSION"
           else
-            # Extract version from Cargo.toml
-            VERSION=$(grep -m1 '^version = ' fluxion-nightly/fluxion/Cargo.toml | sed 's/version = "//;s/"//')
+            # Extract version from Cargo.toml (flattened structure)
+            VERSION=$(grep -m1 '^version = ' fluxion-nightly/Cargo.toml | sed 's/version = "//;s/"//')
             echo "Using Cargo.toml version: $VERSION"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT

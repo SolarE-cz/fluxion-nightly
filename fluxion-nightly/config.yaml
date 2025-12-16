@@ -1,9 +1,9 @@
 # Home Assistant Add-on Configuration
 name: FluxION ECS
-version: "0.2.19"
+version: "0.2.20"
 slug: fluxion
 description: "Solar plant automation based on electricity spot prices"
-url: "https://github.com/SolarE-cz/fluxion"
+url: "https://github.com/SolarE-cz/fluxion-nightly"
 arch:
   - aarch64
   - amd64
@@ -160,5 +160,5 @@ image: "ghcr.io/solare-cz/fluxion-nightly-{arch}"
 labels:
   org.opencontainers.image.title: "FluxION ECS"
   org.opencontainers.image.description: "Solar plant automation based on electricity spot prices"
-  org.opencontainers.image.source: "https://github.com/SolarE-cz/fluxion"
+  org.opencontainers.image.source: "https://github.com/SolarE-cz/fluxion-nightly"
   org.opencontainers.image.licenses: "CC-BY-NC-ND-4.0"
