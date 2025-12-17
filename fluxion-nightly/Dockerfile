@@ -30,10 +30,10 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Set working directory
 WORKDIR /build
 
-# Copy workspace configuration
-COPY fluxion/Cargo.toml ./
-COPY fluxion/rust-toolchain.toml ./
-COPY fluxion/crates/ ./crates/
+# Copy workspace configuration (flat structure)
+COPY Cargo.toml ./
+COPY rust-toolchain.toml ./
+COPY crates/ ./crates/
 
 # Build release binary
 RUN cargo build --release --bin fluxion
@@ -53,15 +53,15 @@ RUN apk add --no-cache \
 # Copy binary from builder
 COPY --from=builder /build/target/release/fluxion /usr/local/bin/fluxion-main
 
-# Copy run script
-COPY fluxion/fluxion/run.sh /
+# Copy run script (flat structure after publishing)
+COPY run.sh /
 RUN chmod a+x /run.sh
 
 # Labels for Home Assistant addon
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.22" \
+    io.hass.version="0.2.23" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 
