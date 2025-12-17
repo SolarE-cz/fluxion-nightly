@@ -60,6 +60,18 @@ options:
     winter_adaptive:
       charge_on_negative_even_if_full: false
       ema_period_days: 7
+      enabled: false
+      export_trigger_multiplier: 2.5
+      grid_export_price_threshold: 8.0
+      min_soc_for_export: 50.0
+      min_solar_percentage: 0.1
+      negative_price_handling_enabled: true
+      target_battery_soc: 90.0
+      tomorrow_preservation_threshold: 1.2
+      top_expensive_blocks: 12
+    winter_adaptive_v2:
+      charge_on_negative_even_if_full: false
+      ema_period_days: 7
       enabled: true
       export_trigger_multiplier: 2.5
       grid_export_price_threshold: 8.0
@@ -185,6 +197,18 @@ schema:
       target_battery_soc: float(0,100)?
       tomorrow_preservation_threshold: float?
       top_expensive_blocks: int(0,96)?
+    winter_adaptive_v2:
+      charge_on_negative_even_if_full: bool?
+      ema_period_days: int(1,30)?
+      enabled: bool?
+      export_trigger_multiplier: float?
+      grid_export_price_threshold: float?
+      min_soc_for_export: float(0,100)?
+      min_solar_percentage: float(0,1)?
+      negative_price_handling_enabled: bool?
+      target_battery_soc: float(0,100)?
+      tomorrow_preservation_threshold: float?
+      top_expensive_blocks: int(0,96)?
     winter_peak_discharge:
       enabled: bool?
       min_hours_to_solar: int(0,24)?
@@ -200,4 +224,4 @@ schema:
 slug: fluxion
 startup: application
 url: "https://github.com/SolarE-cz/fluxion-nightly"
-version: "0.2.23"
+version: "0.2.24"
