@@ -553,6 +553,130 @@ impl CzSpotPriceAdapter {
     }
 }
 
+/// Configurable price data source that switches between spot and fixed prices
+/// based on configuration flags (use_spot_prices_to_buy/sell)
+pub struct ConfigurablePriceDataSource {
+    spot_adapter: Arc<CzSpotPriceAdapter>,
+    use_spot_for_buy: bool,
+    #[expect(dead_code, reason = "Reserved for future sell-back functionality")]
+    use_spot_for_sell: bool,
+    fixed_buy_prices: Vec<f32>,
+    #[expect(dead_code, reason = "Reserved for future sell-back functionality")]
+    fixed_sell_prices: Vec<f32>,
+}
+
+impl ConfigurablePriceDataSource {
+    pub fn new(
+        spot_adapter: Arc<CzSpotPriceAdapter>,
+        use_spot_for_buy: bool,
+        use_spot_for_sell: bool,
+        fixed_buy_prices: Vec<f32>,
+        fixed_sell_prices: Vec<f32>,
+    ) -> Self {
+        Self {
+            spot_adapter,
+            use_spot_for_buy,
+            use_spot_for_sell,
+            fixed_buy_prices,
+            fixed_sell_prices,
+        }
+    }
+
+    /// Generate SpotPriceData from fixed hourly prices
+    /// Expands 24 hourly prices to 96 15-minute blocks (4 blocks per hour with same price)
+    fn generate_fixed_price_data(&self) -> Result<SpotPriceData> {
+        use chrono::Utc;
+        use fluxion_core::TimeBlockPrice;
+
+        if self.fixed_buy_prices.len() != 24 {
+            anyhow::bail!(
+                "Fixed buy prices must have exactly 24 hourly values, got {}",
+                self.fixed_buy_prices.len()
+            );
+        }
+
+        let now = Utc::now();
+        let today_start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .context("Failed to create today start time")?
+            .and_local_timezone(chrono::Local)
+            .single()
+            .context("Ambiguous time")?
+            .with_timezone(&Utc);
+
+        let mut time_block_prices = Vec::with_capacity(96);
+
+        // Generate 96 15-minute blocks for today
+        for hour in 0..24 {
+            let hour_price = self.fixed_buy_prices[hour];
+
+            for quarter in 0..4 {
+                let minutes = quarter * 15;
+                let block_start = today_start
+                    + chrono::Duration::hours(hour as i64)
+                    + chrono::Duration::minutes(minutes);
+
+                time_block_prices.push(TimeBlockPrice {
+                    block_start,
+                    duration_minutes: 15,
+                    price_czk_per_kwh: hour_price,
+                });
+            }
+        }
+
+        let spot_data = SpotPriceData {
+            time_block_prices,
+            block_duration_minutes: 15,
+            fetched_at: Utc::now(),
+            ha_last_updated: Utc::now(),
+        };
+
+        info!(
+            "✅ [ConfigurablePrice] Generated fixed price data: {} blocks from {} hourly prices",
+            spot_data.time_block_prices.len(),
+            self.fixed_buy_prices.len()
+        );
+
+        Ok(spot_data)
+    }
+}
+
+#[async_trait]
+impl PriceDataSource for ConfigurablePriceDataSource {
+    async fn read_prices(&self) -> Result<SpotPriceData> {
+        // If using spot prices for buying, fetch from spot adapter
+        if self.use_spot_for_buy {
+            info!("💰 [ConfigurablePrice] Using spot prices for buy decisions");
+            self.spot_adapter.read_prices().await
+        } else {
+            // Use fixed prices
+            info!(
+                "💰 [ConfigurablePrice] Using fixed prices for buy decisions (use_spot_prices_to_buy=false)"
+            );
+            self.generate_fixed_price_data()
+        }
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        // Health check depends on whether we're using spot or fixed prices
+        if self.use_spot_for_buy {
+            self.spot_adapter.health_check().await
+        } else {
+            // Fixed prices are always available
+            Ok(true)
+        }
+    }
+
+    fn name(&self) -> &str {
+        if self.use_spot_for_buy {
+            "ConfigurablePrice(Spot)"
+        } else {
+            "ConfigurablePrice(Fixed)"
+        }
+    }
+}
+
 /// Adapter for fetching consumption history from Home Assistant
 pub struct HaConsumptionHistoryAdapter {
     client: Arc<HomeAssistantClient>,

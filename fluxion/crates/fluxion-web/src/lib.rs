@@ -10,12 +10,13 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+mod backtest;
 mod chart;
 mod config_api;
-mod config_ui;
 mod routes;
 mod validation;
 
+pub use backtest::BacktestState;
 pub use chart::generate_price_chart_svg;
 pub use config_api::ConfigApiState;
 use routes::{DashboardTemplate, LiveDataTemplate};
@@ -90,6 +91,7 @@ pub async fn start_web_server(
     port: u16,
     config_json: serde_json::Value,
     config_update_sender: Option<ConfigUpdateSender>,
+    backtest_db_path: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_state = AppState {
         query_sender,
@@ -98,9 +100,8 @@ pub async fn start_web_server(
     let config_state =
         config_api::ConfigApiState::new(config_json, "/data/config.json", config_update_sender);
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/", get(index_handler))
-        .route("/config", get(config_ui_handler).with_state(i18n))
         .route("/stream", get(stream_handler))
         .route("/chart-data", get(chart_data_handler))
         .route("/export", get(export_handler))
@@ -126,7 +127,37 @@ pub async fn start_web_server(
         .route(
             "/api/config/export",
             get(config_api::export_config_handler).with_state(config_state),
-        )
+        );
+
+    // Add backtest routes if database path is provided
+    if let Some(db_path) = backtest_db_path {
+        info!("📊 Backtest feature enabled with database: {:?}", db_path);
+        let backtest_state = backtest::BacktestState::new(db_path, i18n);
+
+        app = app
+            .route(
+                "/backtest",
+                get(backtest::backtest_page_handler).with_state(backtest_state.clone()),
+            )
+            .route(
+                "/api/backtest/days",
+                get(backtest::available_days_handler).with_state(backtest_state.clone()),
+            )
+            .route(
+                "/api/backtest/day/{date}",
+                get(backtest::day_data_handler).with_state(backtest_state.clone()),
+            )
+            .route(
+                "/api/backtest/simulate",
+                axum::routing::post(backtest::simulate_handler).with_state(backtest_state.clone()),
+            )
+            .route(
+                "/api/backtest/compare",
+                axum::routing::post(backtest::compare_handler).with_state(backtest_state),
+            );
+    }
+
+    let app = app
         .layer(CorsLayer::permissive()) // Allow HA Ingress
         .with_state(app_state);
 
@@ -229,7 +260,6 @@ async fn stream_handler(
 
 /// Chart data JSON response
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct ChartDataJson {
     labels: Vec<String>,
     prices: Vec<f32>,
@@ -330,19 +360,6 @@ async fn health_handler(State(app_state): State<AppState>) -> impl IntoResponse 
         }
         Err(_) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "ERROR"),
     }
-}
-
-/// Config UI page handler
-async fn config_ui_handler(
-    headers: axum::http::HeaderMap,
-    State(i18n): State<Arc<I18n>>,
-) -> impl IntoResponse {
-    let ingress_path = extract_ingress_path(&headers);
-    let template = config_ui::ConfigTemplate { i18n, ingress_path };
-    let html = template
-        .render()
-        .unwrap_or_else(|e| format!("<h1>Template error</h1><p>{e}</p>"));
-    Html(html)
 }
 
 /// Create compact export data with space optimizations

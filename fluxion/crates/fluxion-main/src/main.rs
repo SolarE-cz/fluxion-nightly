@@ -156,20 +156,30 @@ fn initialize_and_run() -> Result<()> {
         Arc::new(HomeAssistantInverterAdapter::new(ha_client.clone(), mapper));
     info!("🔌 Inverter data source: {}", inverter_source.name());
 
+    // Create spot price adapter (always create, but may not be used)
+    let spot_adapter = if let Some(tomorrow_entity) = &config.pricing.tomorrow_price_entity {
+        info!("💰 Using separate tomorrow sensor: {}", tomorrow_entity);
+        Arc::new(CzSpotPriceAdapter::with_tomorrow_sensor(
+            ha_client.clone(),
+            config.pricing.spot_price_entity.clone(),
+            tomorrow_entity.clone(),
+        ))
+    } else {
+        Arc::new(CzSpotPriceAdapter::new(
+            ha_client.clone(),
+            config.pricing.spot_price_entity.clone(),
+        ))
+    };
+
+    // Wrap spot adapter in configurable source that respects use_spot_prices_to_buy/sell flags
     let price_source: Arc<dyn fluxion_core::PriceDataSource> =
-        if let Some(tomorrow_entity) = &config.pricing.tomorrow_price_entity {
-            info!("💰 Using separate tomorrow sensor: {}", tomorrow_entity);
-            Arc::new(CzSpotPriceAdapter::with_tomorrow_sensor(
-                ha_client.clone(),
-                config.pricing.spot_price_entity.clone(),
-                tomorrow_entity.clone(),
-            ))
-        } else {
-            Arc::new(CzSpotPriceAdapter::new(
-                ha_client.clone(),
-                config.pricing.spot_price_entity.clone(),
-            ))
-        };
+        Arc::new(fluxion_adapters::ConfigurablePriceDataSource::new(
+            spot_adapter,
+            config.pricing.use_spot_prices_to_buy,
+            config.pricing.use_spot_prices_to_sell,
+            config.pricing.fixed_buy_prices.clone(),
+            config.pricing.fixed_sell_prices.clone(),
+        ));
     info!("💰 Price data source: {}", price_source.name());
 
     let history_source: Arc<dyn fluxion_core::traits::ConsumptionHistoryDataSource> = Arc::new(
@@ -222,6 +232,7 @@ fn initialize_and_run() -> Result<()> {
             8099,
             config_json,
             Some(config_sender_for_web),
+            Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
         )
         .await
         {

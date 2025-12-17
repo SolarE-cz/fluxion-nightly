@@ -16,7 +16,10 @@ pub mod errors;
 pub mod plugin;
 pub mod types;
 
-pub use adapters::{CzSpotPriceAdapter, HaConsumptionHistoryAdapter, HomeAssistantInverterAdapter};
+pub use adapters::{
+    ConfigurablePriceDataSource, CzSpotPriceAdapter, HaConsumptionHistoryAdapter,
+    HomeAssistantInverterAdapter,
+};
 pub use client::HomeAssistantClient;
 pub use errors::{HaError, HaResult};
 pub use plugin::{HaClientResource, HaPlugin};

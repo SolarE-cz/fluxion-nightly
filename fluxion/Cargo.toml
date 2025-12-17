@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/fluxion-adapters",
+    "crates/fluxion-backtest",
     "crates/fluxion-core",
     "crates/fluxion-i18n",
     "crates/fluxion-integration-tests",
@@ -12,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.11"
+version = "0.2.15"
 edition = "2024"
 license = "CC-BY-NC-ND-4.0"
 repository = "https://github.com/SolarE-cz/fluxion-nightly"

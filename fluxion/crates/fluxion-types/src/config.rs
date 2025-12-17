@@ -238,6 +238,8 @@ pub struct StrategiesConfigCore {
     #[serde(default)]
     pub winter_adaptive: WinterAdaptiveConfigCore,
     #[serde(default)]
+    pub winter_adaptive_v2: WinterAdaptiveV2ConfigCore,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfigCore,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfigCore,
@@ -258,6 +260,9 @@ pub struct StrategiesConfigCore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinterPeakDischargeConfigCore {
     pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_strategy_priority")]
+    pub priority: u8,
     pub min_spread_czk: f32,
     pub min_soc_to_start: f32,
     pub min_soc_target: f32,
@@ -270,6 +275,7 @@ impl Default for WinterPeakDischargeConfigCore {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 80, // High priority for peak discharge
             min_spread_czk: 3.0,
             min_soc_to_start: 70.0,
             min_soc_target: 50.0,
@@ -283,6 +289,9 @@ impl Default for WinterPeakDischargeConfigCore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolarAwareChargingConfigCore {
     pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_strategy_priority")]
+    pub priority: u8,
     pub solar_window_start_hour: u32,
     pub solar_window_end_hour: u32,
     pub midday_max_soc: f32,
@@ -293,6 +302,7 @@ impl Default for SolarAwareChargingConfigCore {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 70, // Medium-high priority for solar awareness
             solar_window_start_hour: 10,
             solar_window_end_hour: 14,
             midday_max_soc: 90.0,
@@ -301,20 +311,34 @@ impl Default for SolarAwareChargingConfigCore {
     }
 }
 
+/// Default strategy priority (used when strategies conflict)
+fn default_strategy_priority() -> u8 {
+    50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyEnabledConfigCore {
     pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_strategy_priority")]
+    pub priority: u8,
 }
 
 impl Default for StrategyEnabledConfigCore {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            priority: 50,
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinterAdaptiveConfigCore {
     pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_strategy_priority")]
+    pub priority: u8,
     pub ema_period_days: usize,
     pub min_solar_percentage: f32,
     pub daily_charging_target_soc: f32,
@@ -359,6 +383,7 @@ impl Default for WinterAdaptiveConfigCore {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 100, // Highest priority by default (main strategy)
             ema_period_days: 7,
             min_solar_percentage: 0.10,
             daily_charging_target_soc: 90.0,
@@ -371,6 +396,78 @@ impl Default for WinterAdaptiveConfigCore {
             negative_price_handling_enabled: true,
             charge_on_negative_even_if_full: false,
             historical_daily_consumption: Vec::new(),
+        }
+    }
+}
+
+/// Winter Adaptive V2 strategy configuration (simplified, enabled/disabled only at core level)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV2ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v2_priority")]
+    pub priority: u8,
+}
+
+fn default_winter_adaptive_v2_priority() -> u8 {
+    100
+}
+
+impl Default for WinterAdaptiveV2ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: false, // Disabled by default (V1 is the default)
+            priority: 100,
+        }
+    }
+}
+
+/// All available strategy types - add new strategies here to ensure they're tracked
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum StrategyType {
+    WinterAdaptive,
+    WinterAdaptiveV2,
+    WinterPeakDischarge,
+    SolarAwareCharging,
+    MorningPrecharge,
+    DayAheadPlanning,
+    TimeAwareCharge,
+    PriceArbitrage,
+    SolarFirst,
+    SelfUse,
+}
+
+impl StrategyType {
+    /// Get all strategy types
+    pub fn all() -> &'static [StrategyType] {
+        &[
+            StrategyType::WinterAdaptive,
+            StrategyType::WinterAdaptiveV2,
+            StrategyType::WinterPeakDischarge,
+            StrategyType::SolarAwareCharging,
+            StrategyType::MorningPrecharge,
+            StrategyType::DayAheadPlanning,
+            StrategyType::TimeAwareCharge,
+            StrategyType::PriceArbitrage,
+            StrategyType::SolarFirst,
+            StrategyType::SelfUse,
+        ]
+    }
+
+    /// Get display name for the strategy
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            StrategyType::WinterAdaptive => "Winter Adaptive",
+            StrategyType::WinterAdaptiveV2 => "Winter Adaptive V2",
+            StrategyType::WinterPeakDischarge => "Winter Peak Discharge",
+            StrategyType::SolarAwareCharging => "Solar Aware Charging",
+            StrategyType::MorningPrecharge => "Morning Precharge",
+            StrategyType::DayAheadPlanning => "Day Ahead Planning",
+            StrategyType::TimeAwareCharge => "Time Aware Charge",
+            StrategyType::PriceArbitrage => "Price Arbitrage",
+            StrategyType::SolarFirst => "Solar First",
+            StrategyType::SelfUse => "Self Use",
         }
     }
 }

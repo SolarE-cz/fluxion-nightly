@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-adapters"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1088,8 +1088,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxion-backtest"
+version = "0.2.22"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "fluxion-core",
+ "fluxion-types",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tracing",
+]
+
+[[package]]
 name = "fluxion-core"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1123,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-i18n"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "fluent",
  "fluent-bundle",
@@ -1136,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-integration-tests"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1153,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-main"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "bevy_app",
@@ -1180,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-types"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "bevy_ecs",
@@ -1191,12 +1207,13 @@ dependencies = [
 
 [[package]]
 name = "fluxion-web"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "askama",
  "axum",
  "chrono",
  "chrono-tz",
+ "fluxion-backtest",
  "fluxion-core",
  "fluxion-i18n",
  "fluxion-types",
@@ -2753,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "solax-csv-importer"
-version = "0.2.11"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "chrono",

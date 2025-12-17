@@ -7,7 +7,7 @@ hassio_api: true
 hassio_role: default
 homeassistant_api: true
 host_network: false
-image: ghcr.io/solare-cz/fluxion-nightly-{arch}
+image: "ghcr.io/solare-cz/fluxion-{arch}"
 ingress: true
 ingress_port: 8099
 init: false
@@ -15,9 +15,9 @@ labels:
   org.opencontainers.image.description: Solar plant automation based on electricity
     spot prices
   org.opencontainers.image.licenses: CC-BY-NC-ND-4.0
-  org.opencontainers.image.source: https://github.com/SolarE-cz/fluxion
+  org.opencontainers.image.source: https://github.com/SolarE-cz/fluxion-nightly
   org.opencontainers.image.title: FluxION ECS
-name: FluxION ECS (Nightly)
+name: FluxION ECS
 options:
   control:
     average_household_load_kw: 0.5
@@ -46,7 +46,7 @@ options:
     price_arbitrage:
       enabled: false
     self_use:
-      enabled: false
+      enabled: true
     solar_aware_charging:
       enabled: false
       midday_max_soc: 90.0
@@ -103,7 +103,53 @@ schema:
   pricing:
     fixed_buy_prices:
     - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
     fixed_sell_prices:
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
     - float?
     spot_price_entity: str?
     use_spot_prices_to_buy: bool?
@@ -151,7 +197,7 @@ schema:
     debug_mode: bool?
     log_level: list(trace|debug|info|warning|error)?
     update_interval_secs: int(10,3600)?
-slug: fluxion-nightly
+slug: fluxion
 startup: application
-url: https://github.com/SolarE-cz/fluxion
-version: 0.2.11
+url: "https://github.com/SolarE-cz/fluxion-nightly"
+version: "0.2.22"

@@ -275,6 +275,8 @@ pub struct StrategiesConfig {
     #[serde(default)]
     pub winter_adaptive: WinterAdaptiveConfig,
     #[serde(default)]
+    pub winter_adaptive_v2: WinterAdaptiveV2Config,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfig,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfig,
@@ -294,10 +296,16 @@ pub struct StrategiesConfig {
     pub seasonal: SeasonalConfig,
 }
 
+fn default_strategy_priority() -> u8 {
+    50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WinterAdaptiveConfig {
     pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_priority")]
+    pub priority: u8,
     pub ema_period_days: usize,
     pub min_solar_percentage: f32,
     pub daily_charging_target_soc: f32,
@@ -311,10 +319,15 @@ pub struct WinterAdaptiveConfig {
     pub charge_on_negative_even_if_full: bool,
 }
 
+fn default_winter_adaptive_priority() -> u8 {
+    100
+}
+
 impl Default for WinterAdaptiveConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 100,
             ema_period_days: 7,
             min_solar_percentage: 0.10,
             daily_charging_target_soc: 90.0,
@@ -330,9 +343,32 @@ impl Default for WinterAdaptiveConfig {
     }
 }
 
+/// Winter Adaptive V2 config (simplified for config UI - detailed config is in core)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV2Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v2_priority")]
+    pub priority: u8,
+}
+
+fn default_winter_adaptive_v2_priority() -> u8 {
+    100
+}
+
+impl Default for WinterAdaptiveV2Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V1 is default
+            priority: 100,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinterPeakDischargeConfig {
     pub enabled: bool,
+    #[serde(default = "default_winter_peak_discharge_priority")]
+    pub priority: u8,
     pub min_spread_czk: f32,
     pub min_soc_to_start: f32,
     pub min_soc_target: f32,
@@ -341,10 +377,15 @@ pub struct WinterPeakDischargeConfig {
     pub min_hours_to_solar: u32,
 }
 
+fn default_winter_peak_discharge_priority() -> u8 {
+    80
+}
+
 impl Default for WinterPeakDischargeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 80,
             min_spread_czk: 3.0,
             min_soc_to_start: 70.0,
             min_soc_target: 50.0,
@@ -358,16 +399,23 @@ impl Default for WinterPeakDischargeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolarAwareChargingConfig {
     pub enabled: bool,
+    #[serde(default = "default_solar_aware_priority")]
+    pub priority: u8,
     pub solar_window_start_hour: u32,
     pub solar_window_end_hour: u32,
     pub midday_max_soc: f32,
     pub min_solar_forecast_kwh: f32,
 }
 
+fn default_solar_aware_priority() -> u8 {
+    70
+}
+
 impl Default for SolarAwareChargingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 70,
             solar_window_start_hour: 10,
             solar_window_end_hour: 14,
             midday_max_soc: 90.0,
@@ -379,11 +427,16 @@ impl Default for SolarAwareChargingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyEnabledConfig {
     pub enabled: bool,
+    #[serde(default = "default_strategy_priority")]
+    pub priority: u8,
 }
 
 impl Default for StrategyEnabledConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            priority: 50,
+        }
     }
 }
 
@@ -1044,6 +1097,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
             strategies_config: fluxion_core::StrategiesConfigCore {
                 winter_adaptive: fluxion_core::WinterAdaptiveConfigCore {
                     enabled: app_config.strategies.winter_adaptive.enabled,
+                    priority: app_config.strategies.winter_adaptive.priority,
                     ema_period_days: app_config.strategies.winter_adaptive.ema_period_days,
                     min_solar_percentage: app_config
                         .strategies
@@ -1084,8 +1138,13 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .charge_on_negative_even_if_full,
                     historical_daily_consumption: Vec::new(),
                 },
+                winter_adaptive_v2: fluxion_core::WinterAdaptiveV2ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v2.enabled,
+                    priority: app_config.strategies.winter_adaptive_v2.priority,
+                },
                 winter_peak_discharge: fluxion_core::WinterPeakDischargeConfigCore {
                     enabled: app_config.strategies.winter_peak_discharge.enabled,
+                    priority: app_config.strategies.winter_peak_discharge.priority,
                     min_spread_czk: app_config.strategies.winter_peak_discharge.min_spread_czk,
                     min_soc_to_start: app_config.strategies.winter_peak_discharge.min_soc_to_start,
                     min_soc_target: app_config.strategies.winter_peak_discharge.min_soc_target,
@@ -1104,6 +1163,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 },
                 solar_aware_charging: fluxion_core::SolarAwareChargingConfigCore {
                     enabled: app_config.strategies.solar_aware_charging.enabled,
+                    priority: app_config.strategies.solar_aware_charging.priority,
                     solar_window_start_hour: app_config
                         .strategies
                         .solar_aware_charging
@@ -1120,21 +1180,27 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 },
                 morning_precharge: fluxion_core::StrategyEnabledConfigCore {
                     enabled: app_config.strategies.morning_precharge.enabled,
+                    priority: app_config.strategies.morning_precharge.priority,
                 },
                 day_ahead_planning: fluxion_core::StrategyEnabledConfigCore {
                     enabled: app_config.strategies.day_ahead_planning.enabled,
+                    priority: app_config.strategies.day_ahead_planning.priority,
                 },
                 time_aware_charge: fluxion_core::StrategyEnabledConfigCore {
                     enabled: app_config.strategies.time_aware_charge.enabled,
+                    priority: app_config.strategies.time_aware_charge.priority,
                 },
                 price_arbitrage: fluxion_core::StrategyEnabledConfigCore {
                     enabled: app_config.strategies.price_arbitrage.enabled,
+                    priority: app_config.strategies.price_arbitrage.priority,
                 },
                 solar_first: fluxion_core::StrategyEnabledConfigCore {
                     enabled: app_config.strategies.solar_first.enabled,
+                    priority: app_config.strategies.solar_first.priority,
                 },
                 self_use: fluxion_core::StrategyEnabledConfigCore {
                     enabled: app_config.strategies.self_use.enabled,
+                    priority: app_config.strategies.self_use.priority,
                 },
             },
             history: fluxion_core::ConsumptionHistoryConfig {

@@ -535,21 +535,27 @@ pub fn has_price_data_changed(current: &SpotPriceData, new_last_updated: DateTim
 /// Analyze price data and identify cheapest/most expensive blocks
 ///
 /// # Arguments
-/// * `time_block_prices` - Price data for 15-minute blocks
-/// * `force_charge_hours` - Number of hours to identify as cheapest (for charging)
-/// * `force_discharge_hours` - Number of hours to identify as most expensive (for discharging)
-/// * `use_spot_for_buy` - Whether to identify cheap blocks (if false, returns empty)
-/// * `use_spot_for_sell` - Whether to identify expensive blocks (if false, returns empty)
+/// * `time_block_prices` - Price data for 15-minute blocks (either spot or fixed prices)
+/// * `force_charge_hours` - Number of hours to identify as cheapest (for charging), 0 to disable
+/// * `force_discharge_hours` - Number of hours to identify as most expensive (for discharging), 0 to disable
+/// * `use_spot_for_buy` - Deprecated: Price source selection is now handled by ConfigurablePriceDataSource
+/// * `use_spot_for_sell` - Deprecated: Price source selection is now handled by ConfigurablePriceDataSource
 /// * `min_consecutive_blocks` - Minimum consecutive blocks for force operations (for consecutive charging)
 ///
 /// # Returns
 /// `PriceAnalysis` with identified block indices and price statistics
+///
+/// # Note
+/// The `use_spot_for_buy` and `use_spot_for_sell` flags are kept for backward compatibility but
+/// no longer control block identification. Price source selection (spot vs fixed) is now handled
+/// upstream by `ConfigurablePriceDataSource`. This function always identifies cheap/expensive blocks
+/// from whatever prices it receives, as long as `force_charge_hours` or `force_discharge_hours` > 0.
 pub fn analyze_prices(
     time_block_prices: &[TimeBlockPrice],
     force_charge_hours: usize,
     force_discharge_hours: usize,
-    use_spot_for_buy: bool,
-    use_spot_for_sell: bool,
+    _use_spot_for_buy: bool,
+    _use_spot_for_sell: bool,
     min_consecutive_blocks: usize,
 ) -> PriceAnalysis {
     if time_block_prices.is_empty() {
@@ -588,7 +594,9 @@ pub fn analyze_prices(
     let discharge_block_count = force_discharge_hours * 4;
 
     // Identify cheapest consecutive blocks for charging
-    let charge_blocks = if use_spot_for_buy {
+    // Note: The price source (spot vs fixed) is determined upstream by ConfigurablePriceDataSource.
+    // Here we always identify cheap blocks from whatever prices we received.
+    let charge_blocks = if force_charge_hours > 0 {
         let blocks = find_cheapest_consecutive_blocks(
             time_block_prices,
             min_consecutive_blocks,
@@ -606,7 +614,9 @@ pub fn analyze_prices(
     };
 
     // Identify most expensive blocks for discharging
-    let discharge_blocks = if use_spot_for_sell {
+    // Note: The price source (spot vs fixed) is determined upstream by ConfigurablePriceDataSource.
+    // Here we always identify expensive blocks from whatever prices we received.
+    let discharge_blocks = if force_discharge_hours > 0 {
         let count = discharge_block_count.min(indexed_prices.len());
         let mut blocks: Vec<usize> = indexed_prices
             .iter()

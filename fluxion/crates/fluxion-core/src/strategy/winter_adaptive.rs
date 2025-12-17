@@ -60,6 +60,9 @@ pub struct WinterAdaptiveConfig {
     /// Enable/disable the strategy
     pub enabled: bool,
 
+    /// Priority for conflict resolution (0-100, higher wins)
+    pub priority: u8,
+
     /// Number of days to track for EMA calculation
     pub ema_period_days: usize,
 
@@ -112,10 +115,11 @@ pub struct WinterAdaptiveConfig {
     /// This prevents rapid on/off cycling that damages the inverter
     pub min_consecutive_charge_blocks: usize,
 
-    /// Price tolerance for block consolidation (default: 0.15 = 15%)
+    /// Price tolerance for block consolidation (default: 0.30 = 30%)
     /// When selecting charge blocks, prefer consecutive blocks even if
-    /// they're up to this percentage more expensive than the absolute cheapest
-    /// Tolerance for charge block consolidation (default: 0.15)
+    /// they're up to this percentage more expensive than the absolute cheapest.
+    /// Higher tolerance (30%) allows capturing more of the cheap overnight window
+    /// even when blocks have small price variations.
     pub charge_block_consolidation_tolerance: f32,
 
     /// Safety multiplier for charge calculation (default: 1.3)
@@ -127,6 +131,7 @@ impl Default for WinterAdaptiveConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            priority: 100, // Highest priority by default
             ema_period_days: 7,
             min_solar_percentage: 0.10,
             daily_charging_target_soc: 90.0,
@@ -143,7 +148,7 @@ impl Default for WinterAdaptiveConfig {
             negative_price_handling_enabled: true,
             charge_on_negative_even_if_full: false,
             min_consecutive_charge_blocks: 2,
-            charge_block_consolidation_tolerance: 0.15, // 15% tolerance
+            charge_block_consolidation_tolerance: 0.30, // 30% tolerance for better overnight window capture
             charge_safety_multiplier: 1.3,
         }
     }
@@ -446,6 +451,11 @@ impl WinterAdaptiveStrategy {
     /// * `battery_capacity_kwh` - Battery capacity in kWh
     /// * `charge_rate_kw` - Charging rate in kW
     /// * `deadline_block_index` - Latest block index by which charging must be complete
+    ///
+    /// IMPROVED: Instead of just picking the cheapest N blocks (which may be scattered
+    /// and get removed by post-processing), prefer consecutive runs of cheap blocks.
+    /// This ensures the charging blocks form a continuous sequence that won't be
+    /// filtered out as "isolated" blocks.
     fn select_optimal_charge_blocks(
         all_blocks: &[TimeBlockPrice],
         current_block_index: usize,
@@ -466,7 +476,6 @@ impl WinterAdaptiveStrategy {
         }
 
         // Calculate blocks needed (15 minutes = 0.25 hours)
-        // Energy charged per block
         let charge_per_block = charge_rate_kw * 0.25;
         if charge_per_block <= 0.0 {
             return Vec::new();
@@ -489,17 +498,92 @@ impl WinterAdaptiveStrategy {
             return Vec::new();
         }
 
-        // Sort by price (cheapest first)
-        let mut blocks_by_price = available_blocks;
-        blocks_by_price.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Find cheapest price
+        let cheapest_price = available_blocks
+            .iter()
+            .map(|(_, p)| *p)
+            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap_or(f32::MAX);
 
-        // Select the cheapest N blocks needed
-        let selected_count = blocks_needed.min(blocks_by_price.len());
-        blocks_by_price
-            .into_iter()
-            .take(selected_count)
-            .map(|(idx, _)| idx)
-            .collect()
+        // Use 30% tolerance to include blocks in the cheap price range
+        let tolerance = 0.30;
+        let threshold = cheapest_price * (1.0 + tolerance);
+
+        // Get all blocks within tolerance, sorted by index for run detection
+        let mut within_tolerance: Vec<(usize, f32)> = available_blocks
+            .iter()
+            .filter(|(_, p)| *p <= threshold)
+            .cloned()
+            .collect();
+        within_tolerance.sort_by_key(|(idx, _)| *idx);
+
+        // Find consecutive runs within tolerance blocks
+        let mut runs: Vec<Vec<(usize, f32)>> = Vec::new();
+        let mut current_run: Vec<(usize, f32)> = Vec::new();
+
+        for (idx, price) in &within_tolerance {
+            if current_run.is_empty() || *idx == current_run.last().unwrap().0 + 1 {
+                current_run.push((*idx, *price));
+            } else {
+                if !current_run.is_empty() {
+                    runs.push(current_run);
+                }
+                current_run = vec![(*idx, *price)];
+            }
+        }
+        if !current_run.is_empty() {
+            runs.push(current_run);
+        }
+
+        // Score runs: prefer runs that meet min_consecutive requirement (2+), then cheaper average
+        runs.sort_by(|a, b| {
+            let a_len_ok = a.len() >= 2;
+            let b_len_ok = b.len() >= 2;
+            if a_len_ok != b_len_ok {
+                return b_len_ok.cmp(&a_len_ok);
+            }
+            // Same category: prefer cheaper average
+            let a_avg: f32 = a.iter().map(|(_, p)| p).sum::<f32>() / a.len() as f32;
+            let b_avg: f32 = b.iter().map(|(_, p)| p).sum::<f32>() / b.len() as f32;
+            a_avg
+                .partial_cmp(&b_avg)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Greedily select blocks from best runs
+        let mut selected: Vec<usize> = Vec::new();
+
+        for run in &runs {
+            if selected.len() >= blocks_needed {
+                break;
+            }
+            // Take blocks from this run
+            for (idx, _) in run {
+                if selected.len() >= blocks_needed {
+                    break;
+                }
+                if !selected.contains(idx) {
+                    selected.push(*idx);
+                }
+            }
+        }
+
+        // If not enough from runs, fall back to cheapest individual blocks
+        if selected.len() < blocks_needed {
+            let mut sorted_by_price = available_blocks;
+            sorted_by_price
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (idx, _) in &sorted_by_price {
+                if selected.len() >= blocks_needed {
+                    break;
+                }
+                if !selected.contains(idx) {
+                    selected.push(*idx);
+                }
+            }
+        }
+
+        selected
     }
 
     /// Analyze prices across different time horizons
@@ -611,10 +695,38 @@ impl WinterAdaptiveStrategy {
         // Global cheapest blocks (up to 96 to allow full filling if needed, filtered later by count)
         let cheapest_blocks: Vec<usize> = price_indexed.iter().map(|(idx, _)| *idx).collect();
 
-        // Find cheapest blocks TODAY
+        // OVERNIGHT CHARGING FIX: Extend the charging window to include overnight blocks
+        // whenever it makes sense for planning purposes. This treats 12:00-08:00 next day
+        // as the relevant window for "today's" charging decisions.
+        //
+        // The window is extended when:
+        // 1. It's afternoon or evening (12:00+) - gives enough time to plan overnight charging
+        // 2. Or it's early morning (before 08:00) - we're in the overnight charging window
+        let current_hour = current_block_start.hour();
+        let should_extend_overnight = !(8..12).contains(&current_hour);
+
+        // Calculate the end of the charging window
+        let charging_window_end = if should_extend_overnight {
+            // Include blocks until 8 AM tomorrow for overnight charging planning
+            let window_end_date = if current_hour < 8 {
+                // Early morning: use today's 8 AM
+                now_date
+            } else {
+                // Afternoon/evening: use tomorrow's 8 AM
+                tomorrow_date
+            };
+            let window_end_8am = window_end_date.and_hms_opt(8, 0, 0).unwrap();
+            DateTime::<Utc>::from_naive_utc_and_offset(window_end_8am, Utc)
+        } else {
+            // Morning (08:00-12:00): just today's remaining blocks
+            let today_end = now_date.and_hms_opt(23, 59, 59).unwrap();
+            DateTime::<Utc>::from_naive_utc_and_offset(today_end, Utc)
+        };
+
+        // Find cheapest blocks in the charging window (TODAY + early morning if evening)
         let mut price_indexed_today: Vec<(usize, f32)> = upcoming_blocks
             .iter()
-            .filter(|(_, b)| b.block_start.date_naive() == now_date)
+            .filter(|(_, b)| b.block_start <= charging_window_end)
             .map(|(idx, b)| (*idx, b.price_czk_per_kwh))
             .collect();
         price_indexed_today
@@ -875,44 +987,142 @@ impl WinterAdaptiveStrategy {
             && total_blocks_needed > 0
             && let Some(all_blocks) = context.all_price_blocks
         {
-            // Calculate deadline: Use a more aggressive deadline to ensure force charging happens soon
-            // Target: 6 AM tomorrow (typically before expensive periods start)
-            let tomorrow_date = context
-                .price_block
-                .block_start
-                .date_naive()
-                .succ_opt()
-                .unwrap_or(context.price_block.block_start.date_naive());
+            // SMART DEADLINE CALCULATION: Instead of a fixed 8-hour deadline,
+            // analyze price patterns to find when prices rise significantly,
+            // and ensure we're fully charged BEFORE that price rise.
+            let soc_deficit = self.config.daily_charging_target_soc - context.current_battery_soc;
+            let is_significantly_below_target = soc_deficit > 30.0;
 
-            let tomorrow_6am = tomorrow_date.and_hms_opt(6, 0, 0).unwrap();
-            let tomorrow_6am_utc = DateTime::<Utc>::from_naive_utc_and_offset(tomorrow_6am, Utc);
+            let deadline_blocks_ahead = if is_significantly_below_target {
+                // Find when prices start rising significantly and charge before that
+                let horizon_blocks = 96.min(all_blocks.len() - current_block_index); // 24 hours max
 
-            // Find the block closest to 6 AM tomorrow
-            let tomorrow_expensive_start = all_blocks
-                .iter()
-                .enumerate()
-                .find(|(_, block)| block.block_start >= tomorrow_6am_utc)
-                .map(|(idx, _)| idx)
-                // Fallback: if no 6 AM block, use 12 hours ahead
-                .unwrap_or(current_block_index + 48);
+                // Calculate average price in the horizon
+                let horizon_prices: Vec<f32> = all_blocks[current_block_index..]
+                    .iter()
+                    .take(horizon_blocks)
+                    .map(|b| b.price_czk_per_kwh)
+                    .collect();
 
-            // Use optimal charge block selection
-            let optimal_slots = Self::select_optimal_charge_blocks(
+                let avg_price = if !horizon_prices.is_empty() {
+                    horizon_prices.iter().sum::<f32>() / horizon_prices.len() as f32
+                } else {
+                    2.5 // Fallback
+                };
+
+                // Find the first sustained expensive period (3+ consecutive blocks above avg + 0.5)
+                let expensive_threshold = avg_price + 0.5;
+                let mut expensive_start_idx: Option<usize> = None;
+                let mut consecutive_expensive = 0;
+
+                for (offset, price) in horizon_prices.iter().enumerate() {
+                    if *price > expensive_threshold {
+                        consecutive_expensive += 1;
+                        if consecutive_expensive >= 3 && expensive_start_idx.is_none() {
+                            // Found sustained expensive period
+                            expensive_start_idx = Some(offset - 2); // Start of the 3-block sequence
+                        }
+                    } else {
+                        consecutive_expensive = 0;
+                    }
+                }
+
+                // If we found an expensive period, set deadline to be fully charged before it
+                // Otherwise, use 24 hours as fallback
+                if let Some(expensive_offset) = expensive_start_idx {
+                    // Ensure we have enough cheap blocks to charge
+                    let min_blocks_for_deadline = (total_blocks_needed + 4).max(8); // Need at least N blocks
+                    expensive_offset.max(min_blocks_for_deadline)
+                } else {
+                    // No sustained expensive period found, use 24 hours
+                    96
+                }
+            } else {
+                // Normal: charge before tomorrow 6 AM
+                let tomorrow_date = context
+                    .price_block
+                    .block_start
+                    .date_naive()
+                    .succ_opt()
+                    .unwrap_or(context.price_block.block_start.date_naive());
+
+                let tomorrow_6am = tomorrow_date.and_hms_opt(6, 0, 0).unwrap();
+                let tomorrow_6am_utc =
+                    DateTime::<Utc>::from_naive_utc_and_offset(tomorrow_6am, Utc);
+
+                // Find the block closest to 6 AM tomorrow
+                all_blocks
+                    .iter()
+                    .enumerate()
+                    .find(|(_, block)| block.block_start >= tomorrow_6am_utc)
+                    .map(|(idx, _)| idx)
+                    // Fallback: use 12 hours ahead
+                    .unwrap_or(current_block_index + 48)
+                    .saturating_sub(current_block_index)
+            };
+
+            let deadline_index = current_block_index + deadline_blocks_ahead;
+
+            // IMPORTANT FIX: To prevent SOC prediction drift from causing the scheduler to
+            // spread charging across multiple nights, we use a FIXED minimum SOC reference
+            // when significantly below target. This ensures ALL blocks in the charging window
+            // are evaluated with the same "need to charge" calculation, preventing the scheduler
+            // from thinking "I only need 3 more blocks" halfway through the session.
+            let reference_soc_for_planning = if is_significantly_below_target {
+                // Use hardware minimum as stable reference for the entire charging session
+                // This way, all 8 blocks are evaluated as "we need 8 blocks from 10% to 90%"
+                // instead of recalculating on each block with the predicted SOC
+                context.control_config.hardware_min_battery_soc
+            } else {
+                // Normal operation: use current predicted SOC
+                context.current_battery_soc
+            };
+
+            // Use optimal charge block selection with stable reference
+            let raw_optimal_slots = Self::select_optimal_charge_blocks(
                 all_blocks,
                 current_block_index,
-                context.current_battery_soc,
+                reference_soc_for_planning, // Use stable reference to prevent drift
                 self.config.daily_charging_target_soc,
                 context.control_config.battery_capacity_kwh,
                 context.control_config.max_battery_charge_rate_kw,
-                tomorrow_expensive_start,
+                deadline_index,
             );
 
-            if optimal_slots.contains(&current_block_index) {
+            // IMPORTANT: Apply consolidation to prevent isolated blocks that will be removed later
+            // Build price list for consolidation
+            let optimal_blocks_with_prices: Vec<(usize, f32)> = raw_optimal_slots
+                .iter()
+                .filter_map(|idx| all_blocks.get(*idx).map(|b| (*idx, b.price_czk_per_kwh)))
+                .collect();
+
+            // Consolidate to ensure consecutive blocks
+            let consolidated_optimal_slots = if !optimal_blocks_with_prices.is_empty() {
+                Self::consolidate_charge_blocks(
+                    &optimal_blocks_with_prices,
+                    raw_optimal_slots.len(),
+                    self.config.charge_block_consolidation_tolerance,
+                    self.config.min_consecutive_charge_blocks,
+                )
+            } else {
+                Vec::new()
+            };
+
+            if consolidated_optimal_slots.contains(&current_block_index) {
                 should_charge = true;
-                charge_reason = format!(
-                    "Optimal charging for horizon/target ({:.3} CZK/kWh)",
-                    context.price_block.price_czk_per_kwh
-                );
+                charge_reason = if is_significantly_below_target {
+                    format!(
+                        "Aggressive charge to target ({:.1}% → {:.1}%, {:.3} CZK/kWh)",
+                        context.current_battery_soc,
+                        self.config.daily_charging_target_soc,
+                        context.price_block.price_czk_per_kwh
+                    )
+                } else {
+                    format!(
+                        "Optimal charging for horizon/target ({:.3} CZK/kWh)",
+                        context.price_block.price_czk_per_kwh
+                    )
+                };
             }
         }
 
