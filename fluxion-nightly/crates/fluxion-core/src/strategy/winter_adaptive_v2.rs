@@ -1056,26 +1056,75 @@ impl WinterAdaptiveV2Strategy {
             self.find_sustained_peak_start(all_blocks, current_block_index, &windows);
         let next_valley_start = self.find_next_valley_start(current_block_index, &windows);
 
-        // Calculate average price for emergency check
+        // Calculate average and minimum price for emergency check
         let avg_price =
             all_blocks.iter().map(|b| b.price_czk_per_kwh).sum::<f32>() / all_blocks.len() as f32;
+        let min_price = all_blocks
+            .iter()
+            .map(|b| b.price_czk_per_kwh)
+            .fold(f32::INFINITY, f32::min);
         let in_valley = self.is_in_valley_window(current_block_index, &windows);
 
         // Priority 1: Emergency charge check - prevent depletion before next valley
-        // Rules:
-        // - If we're IN a valley window, let normal scheduling handle it (don't emergency charge)
-        // - If we're NOT in a valley AND will deplete AND (price reasonable OR critically low), emergency charge
+        // Rules for fixed prices (where we have clear cheap/expensive tariffs):
+        // - If at CHEAPEST price: emergency charge if will deplete (price is optimal)
+        // - If NOT at cheapest price: only emergency charge if we'd hit HARDWARE MINIMUM
+        //   before the next cheap block (otherwise wait for cheap tariff)
         let will_deplete = self.will_deplete_before_next_valley(
             context,
             current_block_index,
             next_valley_start,
             &net_consumption_p50,
         );
-        let price_is_reasonable = current_price <= avg_price;
-        let soc_is_critical = context.current_battery_soc < 20.0;
 
-        if !in_valley && will_deplete && (price_is_reasonable || soc_is_critical) {
-            // Emergency charge: NOT in valley, will deplete, and (price OK or desperate)
+        // Check if we're at the cheapest available price (1% tolerance for floating point)
+        let at_cheapest_price = current_price <= min_price * 1.01;
+        let price_is_reasonable = current_price <= avg_price;
+
+        let should_emergency_charge = if at_cheapest_price {
+            // At cheapest price: emergency charge if will deplete (we're already at the best rate)
+            will_deplete && price_is_reasonable
+        } else {
+            // At expensive price: only emergency charge if we'd hit TRUE CRITICAL level
+            // before cheap prices arrive. With fixed prices, cheap is GUARANTEED to come.
+            // The battery can survive below hardware_min - it just means we're in protection mode.
+            // Only charge at expensive rate if we'd hit ~5% (true critical) before cheap blocks.
+            const TRUE_CRITICAL_SOC: f32 = 5.0;
+
+            // Find next cheap block in the schedule
+            let next_cheap_block_idx = all_blocks
+                .iter()
+                .enumerate()
+                .skip(current_block_index + 1)
+                .find(|(_, b)| b.price_czk_per_kwh <= min_price * 1.01)
+                .map(|(i, _)| i);
+
+            if let Some(next_cheap_idx) = next_cheap_block_idx {
+                // Calculate consumption until next cheap block
+                let blocks_until_cheap = next_cheap_idx.saturating_sub(current_block_index);
+                let consumption_until_cheap: f32 = net_consumption_p50
+                    .iter()
+                    .skip(current_block_index)
+                    .take(blocks_until_cheap)
+                    .sum();
+
+                // Available energy before hitting TRUE CRITICAL (not just hardware minimum)
+                // Battery at 7% can still survive, but at 5% it's truly critical
+                let available_before_critical = ((context.current_battery_soc - TRUE_CRITICAL_SOC)
+                    / 100.0)
+                    * context.control_config.battery_capacity_kwh;
+
+                // Only emergency charge at expensive rate if we'd hit true critical
+                available_before_critical < consumption_until_cheap
+            } else {
+                // No cheap block found in horizon (unusual for fixed prices)
+                // Fall back to original logic
+                will_deplete && price_is_reasonable
+            }
+        };
+
+        if !in_valley && should_emergency_charge {
+            // Emergency charge: NOT in valley and (at cheap price with depletion risk OR would hit hardware min)
             return (
                 InverterOperationMode::ForceCharge,
                 format!(
