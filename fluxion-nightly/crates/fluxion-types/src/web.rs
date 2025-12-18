@@ -71,9 +71,13 @@ pub struct InverterData {
     pub id: String,
     pub topology: String,
 
-    // Current mode
+    // Current mode (FluxION's internal planned mode)
     pub mode: String,
     pub mode_reason: String,
+    // Actual mode reported by the inverter hardware
+    pub actual_mode: Option<String>,
+    // Whether actual mode matches the planned mode
+    pub mode_synced: bool,
 
     // Battery
     pub battery_soc: f32,

@@ -278,6 +278,36 @@
             width: 100%;
         }
     }
+
+    /* Mode sync warning indicator */
+    .mode-sync-warning {
+        font-size: 0.85em;
+        color: #f0ad4e;
+        margin-left: 8px;
+        font-style: italic;
+    }
+
+    /* Apply Plan button */
+    .apply-plan-btn {
+        background: #28a745;
+        color: white;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.9em;
+        margin-left: 10px;
+        transition: background 0.2s;
+    }
+
+    .apply-plan-btn:hover {
+        background: #218838;
+    }
+
+    .apply-plan-btn:disabled {
+        background: #6c757d;
+        cursor: not-allowed;
+    }
 </style>
 
 <div class="dashboard-wrapper" id="dashboard-wrapper">
@@ -348,9 +378,21 @@
             <h2>🔌 {{ inverter.id }}</h2>
             <div class="stat">
                 <span class="stat-label">{{ self.t("inverter-mode") }}</span>
+                {% if let Some(actual) = inverter.actual_mode %}
+                <span class="mode-badge mode-{{ actual.to_lowercase().replace(" ", "-") }}">
+                    {{ actual }}
+                </span>
+                {% if !inverter.mode_synced %}
+                <span class="mode-sync-warning" title="Planned: {{ inverter.mode }}">
+                    (pending: {{ inverter.mode }})
+                </span>
+                {% endif %}
+                {% else %}
                 <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-") }}">
                     {{ inverter.mode }}
                 </span>
+                <span class="mode-sync-warning">(no data)</span>
+                {% endif %}
             </div>
             <div class="stat">
                 <span class="stat-label">{{ self.t("battery-soc") }}</span>

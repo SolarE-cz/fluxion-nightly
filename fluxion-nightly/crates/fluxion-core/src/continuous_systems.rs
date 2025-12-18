@@ -48,19 +48,32 @@ impl Default for BatteryHistoryFetchTimer {
     }
 }
 
+/// Resource to track if initial mode sync has been completed for each inverter
+/// This allows bypassing the debounce on the first mode change after startup
+#[derive(Resource, Default)]
+pub struct InitialModeSyncTracker {
+    /// Set of inverter IDs that have completed initial sync
+    pub synced_inverters: std::collections::HashSet<String>,
+}
+
 /// System that executes scheduled mode changes
 /// Runs every update cycle to check if mode changes are needed
 ///
-/// NOTE: SOC check temporarily removed to avoid blocking.
-/// Future: Implement battery SOC validation via channels or ECS components before mode changes.
-/// This would prevent mode changes when battery status is unavailable or out-of-date.
+/// On initial startup, compares against ACTUAL inverter mode and applies immediately.
+/// After initial sync, uses debounce interval between mode changes.
 pub fn schedule_execution_system(
     schedule_query: Query<&OperationSchedule>,
     async_writer: Res<crate::resources::AsyncInverterWriter>,
-    mut current_mode_query: Query<(&mut CurrentMode, &Inverter, Option<&BatteryStatus>)>,
+    mut current_mode_query: Query<(
+        &mut CurrentMode,
+        &Inverter,
+        Option<&BatteryStatus>,
+        Option<&RawInverterState>,
+    )>,
     config: Res<ExecutionConfig>,
     debug: Res<DebugModeConfig>,
     system_config: Res<crate::resources::SystemConfig>,
+    mut sync_tracker: ResMut<InitialModeSyncTracker>,
 ) {
     let now = Utc::now();
 
@@ -74,7 +87,7 @@ pub fn schedule_execution_system(
     };
 
     // Process each inverter
-    for (mut current_mode, inverter, battery_status) in current_mode_query.iter_mut() {
+    for (mut current_mode, inverter, battery_status, raw_state) in current_mode_query.iter_mut() {
         // Find inverter config
         let inverter_config = system_config.inverters.iter().find(|i| i.id == inverter.id);
 
@@ -107,10 +120,26 @@ pub fn schedule_execution_system(
                     continue;
                 }
 
+                // Check if this is the initial sync for this inverter
+                let is_initial_sync = !sync_tracker.synced_inverters.contains(&inverter.id);
+
+                // Get actual inverter mode from hardware (if available)
+                let actual_mode = raw_state.map(|r| r.state.work_mode);
+
+                // Determine which mode to compare against:
+                // - On initial sync: use actual inverter mode (if available) to detect mismatch
+                // - After initial sync: use CurrentMode (our internal tracking)
+                let effective_current_mode = if is_initial_sync {
+                    actual_mode.unwrap_or(current_mode.mode)
+                } else {
+                    current_mode.mode
+                };
+
                 // Check if mode change is needed
-                if scheduled_mode.mode != current_mode.mode {
-                    // Check minimum interval
-                    if !can_change_mode(&current_mode, &config, now) {
+                if scheduled_mode.mode != effective_current_mode {
+                    // On initial sync: bypass debounce to apply plan immediately
+                    // After initial sync: check minimum interval
+                    if !is_initial_sync && !can_change_mode(&current_mode, &config, now) {
                         debug!(
                             "Skipping mode change for {}: too soon since last change",
                             inverter.id
@@ -138,6 +167,14 @@ pub fn schedule_execution_system(
                             "Skipping force-charge for {}: SOC ({:.1}%) >= max ({:.1}%)",
                             inverter.id, soc, system_config.control_config.max_battery_soc
                         );
+                        // Mark as synced even if skipped due to SOC (schedule is correct, just not needed)
+                        if is_initial_sync {
+                            sync_tracker.synced_inverters.insert(inverter.id.clone());
+                            info!(
+                                "🔄 Initial sync for {}: skipped (SOC at max), mode already aligned",
+                                inverter.id
+                            );
+                        }
                         continue;
                     }
 
@@ -149,17 +186,26 @@ pub fn schedule_execution_system(
                             "Skipping force-discharge for {}: SOC ({:.1}%) <= min ({:.1}%)",
                             inverter.id, soc, system_config.control_config.min_battery_soc
                         );
+                        // Mark as synced even if skipped due to SOC
+                        if is_initial_sync {
+                            sync_tracker.synced_inverters.insert(inverter.id.clone());
+                            info!(
+                                "🔄 Initial sync for {}: skipped (SOC at min), mode already aligned",
+                                inverter.id
+                            );
+                        }
                         continue;
                     }
 
                     // Execute mode change
                     if debug.enabled {
                         info!(
-                            "🔧 [DEBUG] Would change {} from {:?} to {:?}: {}",
+                            "🔧 [DEBUG] Would change {} from {:?} to {:?}: {}{}",
                             inverter.id,
-                            current_mode.mode,
+                            effective_current_mode,
                             scheduled_mode.mode,
-                            scheduled_mode.reason
+                            scheduled_mode.reason,
+                            if is_initial_sync { " (initial sync)" } else { "" }
                         );
                         // In debug mode, update the mode immediately for testing
                         current_mode.mode = scheduled_mode.mode;
@@ -170,8 +216,11 @@ pub fn schedule_execution_system(
                         let command = InverterCommand::SetMode(scheduled_mode.mode);
 
                         info!(
-                            "📤 Sending command to change {} to {:?}: {}",
-                            inverter.id, scheduled_mode.mode, scheduled_mode.reason
+                            "📤 Sending command to change {} to {:?}: {}{}",
+                            inverter.id,
+                            scheduled_mode.mode,
+                            scheduled_mode.reason,
+                            if is_initial_sync { " (initial sync - bypassing debounce)" } else { "" }
                         );
 
                         // Use async fire-and-forget for mode changes (don't block the ECS system)
@@ -181,6 +230,21 @@ pub fn schedule_execution_system(
                         current_mode.mode = scheduled_mode.mode;
                         current_mode.set_at = now;
                         current_mode.reason = scheduled_mode.reason.clone();
+                    }
+
+                    // Mark inverter as synced after first mode change
+                    if is_initial_sync {
+                        sync_tracker.synced_inverters.insert(inverter.id.clone());
+                        info!("🔄 Initial sync completed for {}", inverter.id);
+                    }
+                } else {
+                    // Mode matches schedule - mark as synced
+                    if is_initial_sync {
+                        sync_tracker.synced_inverters.insert(inverter.id.clone());
+                        info!(
+                            "🔄 Initial sync for {}: mode already matches schedule ({:?})",
+                            inverter.id, scheduled_mode.mode
+                        );
                     }
                 }
             }
@@ -325,6 +389,8 @@ impl Plugin for ContinuousSystemsPlugin {
             .init_resource::<PvHistory>()
             // Initialize consumption history for winter adaptive strategy
             .init_resource::<crate::components::ConsumptionHistory>()
+            // Initialize mode sync tracker for initial sync bypass
+            .init_resource::<InitialModeSyncTracker>()
             .add_systems(
                 Startup,
                 (

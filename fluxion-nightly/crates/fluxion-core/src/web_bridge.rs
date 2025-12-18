@@ -172,9 +172,13 @@ pub struct InverterData {
     pub id: String,
     pub topology: String,
 
-    // Current mode
+    // Current mode (FluxION's internal planned mode)
     pub mode: String,
     pub mode_reason: String,
+    // Actual mode reported by the inverter hardware
+    pub actual_mode: Option<String>,
+    // Whether actual mode matches the planned mode
+    pub mode_synced: bool,
 
     // Battery
     pub battery_soc: f32,
@@ -471,9 +475,15 @@ fn build_dashboard_response(
                 id: inv.id.clone(),
                 topology: get_topology_string(&inv.id, system_config),
 
-                // Current mode
+                // Current mode (planned by FluxION)
                 mode: format!("{}", mode.mode),
                 mode_reason: mode.reason.clone(),
+                // Actual mode from inverter hardware
+                actual_mode: raw_state.map(|r| format!("{}", r.state.work_mode)),
+                // Whether actual mode matches planned mode
+                mode_synced: raw_state
+                    .map(|r| r.state.work_mode == mode.mode)
+                    .unwrap_or(false),
 
                 // Battery
                 battery_soc: battery.map(|b| b.soc_percent as f32).unwrap_or(0.0),
