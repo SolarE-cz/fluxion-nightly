@@ -205,7 +205,11 @@ pub fn schedule_execution_system(
                             effective_current_mode,
                             scheduled_mode.mode,
                             scheduled_mode.reason,
-                            if is_initial_sync { " (initial sync)" } else { "" }
+                            if is_initial_sync {
+                                " (initial sync)"
+                            } else {
+                                ""
+                            }
                         );
                         // In debug mode, update the mode immediately for testing
                         current_mode.mode = scheduled_mode.mode;
@@ -220,7 +224,11 @@ pub fn schedule_execution_system(
                             inverter.id,
                             scheduled_mode.mode,
                             scheduled_mode.reason,
-                            if is_initial_sync { " (initial sync - bypassing debounce)" } else { "" }
+                            if is_initial_sync {
+                                " (initial sync - bypassing debounce)"
+                            } else {
+                                ""
+                            }
                         );
 
                         // Use async fire-and-forget for mode changes (don't block the ECS system)

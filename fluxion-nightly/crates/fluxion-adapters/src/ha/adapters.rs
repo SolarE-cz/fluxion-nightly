@@ -104,7 +104,7 @@ impl HomeAssistantInverterAdapter {
             if let Some(idx) = current_index
                 && let Some(mode) = self.mapper.map_mode_from_vendor(idx as i32)
             {
-                info!(
+                debug!(
                     "✅ [ADAPTER] Work mode mapped from options[{}] = {:?}",
                     idx, mode
                 );
@@ -116,7 +116,7 @@ impl HomeAssistantInverterAdapter {
         if let Ok(mode_num) = state.state.parse::<i32>()
             && let Some(mode) = self.mapper.map_mode_from_vendor(mode_num)
         {
-            info!(
+            debug!(
                 "✅ [ADAPTER] Work mode mapped from numeric value {} = {:?}",
                 mode_num, mode
             );
@@ -132,7 +132,7 @@ impl HomeAssistantInverterAdapter {
 #[async_trait]
 impl InverterDataSource for HomeAssistantInverterAdapter {
     async fn read_state(&self, inverter_id: &str) -> Result<GenericInverterState> {
-        info!("🔋 [ADAPTER] Reading inverter state for: {}", inverter_id);
+        debug!("🔋 [ADAPTER] Reading inverter state for: {}", inverter_id);
 
         // Read all required sensor entities
         let battery_soc = self
@@ -408,7 +408,7 @@ impl CzSpotPriceAdapter {
 #[async_trait]
 impl PriceDataSource for CzSpotPriceAdapter {
     async fn read_prices(&self) -> Result<SpotPriceData> {
-        info!("💰 [ADAPTER] Reading spot prices from: {}", self.entity_id);
+        debug!("💰 [ADAPTER] Reading spot prices from: {}", self.entity_id);
 
         let state = self
             .client
@@ -452,7 +452,7 @@ impl PriceDataSource for CzSpotPriceAdapter {
         let price_data =
             parse_spot_price_response(&entity_json).context("Failed to parse spot price data")?;
 
-        info!(
+        debug!(
             "✅ [ADAPTER] Parsed {} price blocks",
             price_data.time_block_prices.len()
         );
@@ -647,11 +647,11 @@ impl PriceDataSource for ConfigurablePriceDataSource {
     async fn read_prices(&self) -> Result<SpotPriceData> {
         // If using spot prices for buying, fetch from spot adapter
         if self.use_spot_for_buy {
-            info!("💰 [ConfigurablePrice] Using spot prices for buy decisions");
+            debug!("💰 [ConfigurablePrice] Using spot prices for buy decisions");
             self.spot_adapter.read_prices().await
         } else {
             // Use fixed prices
-            info!(
+            debug!(
                 "💰 [ConfigurablePrice] Using fixed prices for buy decisions (use_spot_prices_to_buy=false)"
             );
             self.generate_fixed_price_data()

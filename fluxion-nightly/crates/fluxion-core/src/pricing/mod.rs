@@ -465,7 +465,7 @@ fn parse_timestamp_keyed_attributes(
         60 // Default to hourly if only one block
     };
 
-    info!(
+    debug!(
         "🔍 Found {} price blocks in sensor, detected {} minute intervals",
         time_block_prices.len(),
         detected_duration
@@ -502,7 +502,7 @@ fn parse_timestamp_keyed_attributes(
         data.time_block_prices.len() / 4
     };
 
-    info!(
+    debug!(
         "✅ Parsed timestamp-keyed price data: {} total 15-min blocks from {} source blocks ({}min each)",
         data.time_block_prices.len(),
         source_blocks,

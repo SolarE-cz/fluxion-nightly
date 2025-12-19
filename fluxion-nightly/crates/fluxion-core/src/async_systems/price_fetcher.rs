@@ -175,7 +175,7 @@ pub fn update_prices_system(
         commands.spawn(new_prices.clone());
     }
 
-    info!(
+    debug!(
         "🔄 Regenerating schedule due to: {}",
         if is_day_ahead_arrival {
             "day-ahead prices arrival"
@@ -271,7 +271,7 @@ pub fn update_prices_system(
     // Update schedule or create if doesn't exist
     if let Ok(mut schedule) = schedule_query.single_mut() {
         *schedule = new_schedule;
-        info!("✅ Schedule regenerated based on new price data");
+        debug!("✅ Schedule regenerated based on new price data");
     } else {
         commands.spawn(new_schedule);
         info!("✅ Initial schedule created");

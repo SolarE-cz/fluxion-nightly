@@ -43,10 +43,66 @@ use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::TimeBlockPrice;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::RwLock;
 
 // ============================================================================
 // Configuration
 // ============================================================================
+
+/// A locked schedule entry - mode decision that should not change
+#[derive(Debug, Clone)]
+pub struct LockedBlock {
+    /// Start time of this block
+    pub block_start: DateTime<Utc>,
+    /// The locked mode for this block
+    pub mode: InverterOperationMode,
+    /// Reason for this mode (for logging)
+    pub reason: String,
+}
+
+/// State for schedule locking to prevent oscillation
+#[derive(Debug, Clone, Default)]
+pub struct ScheduleLockState {
+    /// Locked blocks - mode decisions that should not be recalculated
+    pub locked_blocks: Vec<LockedBlock>,
+}
+
+impl ScheduleLockState {
+    /// Check if a block is locked and return its mode if so
+    pub fn get_locked_mode(
+        &self,
+        block_start: DateTime<Utc>,
+    ) -> Option<(InverterOperationMode, String)> {
+        self.locked_blocks
+            .iter()
+            .find(|b| b.block_start == block_start)
+            .map(|b| (b.mode, format!("LOCKED: {}", b.reason)))
+    }
+
+    /// Lock modes for the specified blocks
+    pub fn lock_blocks(&mut self, blocks: Vec<LockedBlock>) {
+        // Clear old locks (blocks in the past)
+        let now = Utc::now();
+        self.locked_blocks.retain(|b| b.block_start >= now);
+
+        // Add new locks, avoiding duplicates
+        for block in blocks {
+            if !self
+                .locked_blocks
+                .iter()
+                .any(|b| b.block_start == block.block_start)
+            {
+                self.locked_blocks.push(block);
+            }
+        }
+    }
+
+    /// Clear all locks (for testing or reset)
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.locked_blocks.clear();
+    }
+}
 
 /// Historical day data for seasonal mode detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -693,7 +749,11 @@ mod scheduling {
 
         // Simple case: if we need fewer than min_consecutive, just take cheapest
         if count_needed < min_consecutive {
-            let mut result: Vec<usize> = sorted.iter().take(count_needed).map(|(idx, _)| *idx).collect();
+            let mut result: Vec<usize> = sorted
+                .iter()
+                .take(count_needed)
+                .map(|(idx, _)| *idx)
+                .collect();
             result.sort();
             return result;
         }
@@ -702,7 +762,12 @@ mod scheduling {
         let mut selected: Vec<usize> = Vec::new();
 
         // Start with just the cheapest count_needed blocks, then expand if needed
-        for pool_size in [count_needed, count_needed * 2, count_needed * 3, sorted.len()] {
+        for pool_size in [
+            count_needed,
+            count_needed * 2,
+            count_needed * 3,
+            sorted.len(),
+        ] {
             let pool_size = pool_size.min(sorted.len());
             let candidates: Vec<(usize, f32)> = sorted.iter().take(pool_size).copied().collect();
 
@@ -732,7 +797,8 @@ mod scheduling {
             let mut scored_runs: Vec<(f32, Vec<usize>)> = runs
                 .into_iter()
                 .map(|run| {
-                    let avg_price: f32 = run.iter().map(|(_, p)| *p).sum::<f32>() / run.len() as f32;
+                    let avg_price: f32 =
+                        run.iter().map(|(_, p)| *p).sum::<f32>() / run.len() as f32;
                     let indices: Vec<usize> = run.iter().map(|(idx, _)| *idx).collect();
                     (avg_price, indices)
                 })
@@ -815,10 +881,7 @@ mod scheduling {
     }
 
     /// Find blocks where price is above median (expensive periods)
-    pub fn find_expensive_periods(
-        prices: &[f32],
-        current_index: usize,
-    ) -> Vec<(usize, usize)> {
+    pub fn find_expensive_periods(prices: &[f32], current_index: usize) -> Vec<(usize, usize)> {
         // Calculate median of remaining blocks
         let remaining_prices: Vec<f32> = prices.iter().skip(current_index).copied().collect();
         if remaining_prices.is_empty() {
@@ -866,23 +929,30 @@ mod scheduling {
 // Main Strategy Implementation
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WinterAdaptiveV2Strategy {
     config: WinterAdaptiveV2Config,
+    /// Schedule lock state to prevent mode oscillation
+    lock_state: RwLock<ScheduleLockState>,
 }
 
 impl WinterAdaptiveV2Strategy {
     pub fn new(config: WinterAdaptiveV2Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            lock_state: RwLock::new(ScheduleLockState::default()),
+        }
     }
 
-    /// Main decision logic for current block - SIMPLIFIED ALGORITHM
+    /// Main decision logic for current block - GLOBAL OPTIMIZATION ALGORITHM
     ///
     /// 1. Find the cheapest N blocks (based on force_charge_hours config)
-    /// 2. Simulate SOC through the day with this schedule
-    /// 3. For each expensive period (above median), check if SOC can cover it
-    /// 4. If not, add more charge blocks before that expensive period
-    /// 5. Decide current block based on final schedule
+    /// 2. Simulate SOC through the day and identify expensive periods (above median)
+    /// 3. Calculate total energy deficit across ALL expensive periods
+    /// 4. Select globally cheapest blocks from ENTIRE remaining schedule to cover deficit
+    /// 5. Apply cost-benefit filter: only use blocks where charging is economical
+    /// 6. Validate temporal feasibility: ensure adequate SOC before each expensive period
+    /// 7. Decide current block based on final schedule
     fn decide_mode(
         &self,
         context: &EvaluationContext,
@@ -890,9 +960,27 @@ impl WinterAdaptiveV2Strategy {
         current_block_index: usize,
     ) -> (InverterOperationMode, String) {
         let current_price = context.price_block.price_czk_per_kwh;
+        let current_block_start = context.price_block.block_start;
         let min_consecutive = context.control_config.min_consecutive_force_blocks;
 
-        // Priority 0: Negative prices - always charge (free energy!)
+        // =====================================================================
+        // PRIORITY 0: Check if this block is locked (prevents oscillation)
+        // =====================================================================
+        {
+            let lock_state = self.lock_state.read().unwrap();
+            if let Some((locked_mode, locked_reason)) =
+                lock_state.get_locked_mode(current_block_start)
+            {
+                tracing::debug!(
+                    "V2: Block {} is locked to {:?}",
+                    current_block_start,
+                    locked_mode
+                );
+                return (locked_mode, locked_reason);
+            }
+        }
+
+        // Priority 1: Negative prices - always charge (free energy!)
         if self.config.negative_price_handling_enabled && current_price < 0.0 {
             if context.current_battery_soc < 100.0 {
                 return (
@@ -930,9 +1018,41 @@ impl WinterAdaptiveV2Strategy {
             .map(|(idx, b)| (idx, b.price_czk_per_kwh))
             .collect();
 
+        // =====================================================================
+        // HARD FILTER: Never charge in top 50% most expensive slots
+        // Calculate median price and filter out expensive blocks
+        // =====================================================================
+        let median_price = {
+            let mut sorted_prices: Vec<f32> = remaining_blocks.iter().map(|(_, p)| *p).collect();
+            sorted_prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if sorted_prices.is_empty() {
+                0.0
+            } else if sorted_prices.len().is_multiple_of(2) {
+                let mid = sorted_prices.len() / 2;
+                (sorted_prices[mid - 1] + sorted_prices[mid]) / 2.0
+            } else {
+                sorted_prices[sorted_prices.len() / 2]
+            }
+        };
+
+        // Only allow charging in blocks with price BELOW median (bottom 50%)
+        let affordable_blocks: Vec<(usize, f32)> = remaining_blocks
+            .iter()
+            .filter(|(_, price)| *price < median_price)
+            .copied()
+            .collect();
+
+        tracing::debug!(
+            "V2: Median price: {:.3} CZK/kWh, {} of {} blocks are affordable for charging",
+            median_price,
+            affordable_blocks.len(),
+            remaining_blocks.len()
+        );
+
         // Select cheapest blocks respecting min_consecutive constraint
+        // ONLY from affordable blocks (below median price)
         let mut charge_schedule = scheduling::select_cheapest_blocks(
-            &remaining_blocks,
+            &affordable_blocks,
             base_charge_blocks,
             min_consecutive,
         );
@@ -943,8 +1063,12 @@ impl WinterAdaptiveV2Strategy {
         let expensive_periods = scheduling::find_expensive_periods(&prices, current_block_index);
 
         // =====================================================================
-        // STEP 3: For each expensive period, ensure we have enough SOC
+        // STEP 3: Calculate total energy deficit across ALL expensive periods
         // =====================================================================
+
+        // First pass: calculate total deficit across all expensive periods
+        let mut total_deficit_kwh = 0.0;
+
         for (period_start, period_end) in &expensive_periods {
             // Simulate SOC with current schedule
             let soc_trajectory = scheduling::simulate_soc(
@@ -969,29 +1093,125 @@ impl WinterAdaptiveV2Strategy {
                 .copied()
                 .unwrap_or(context.current_battery_soc);
 
-            // If we won't have enough SOC, find additional cheap blocks BEFORE this period
+            // If we won't have enough SOC, accumulate the deficit
             if soc_at_period_start < soc_needed {
                 let soc_deficit = soc_needed - soc_at_period_start;
                 let energy_deficit_kwh = (soc_deficit / 100.0) * battery_capacity_kwh;
-                let extra_blocks_needed = (energy_deficit_kwh / charge_per_block_kwh).ceil() as usize;
+                total_deficit_kwh += energy_deficit_kwh;
+            }
+        }
 
-                // Find cheapest blocks BEFORE this expensive period that aren't already scheduled
+        // =====================================================================
+        // STEP 4: Select globally cheapest blocks to cover total deficit
+        // =====================================================================
+
+        if total_deficit_kwh > 0.0 {
+            let extra_blocks_needed = (total_deficit_kwh / charge_per_block_kwh).ceil() as usize;
+
+            // Find all unscheduled blocks from the ENTIRE remaining schedule
+            // HARD FILTER: Only include blocks BELOW median price (never charge in top 50%)
+            let available_blocks: Vec<(usize, f32)> = remaining_blocks
+                .iter()
+                .filter(|(idx, price)| {
+                    *idx >= current_block_index
+                        && !charge_schedule.contains(idx)
+                        && *price < median_price // NEVER charge above median
+                })
+                .copied()
+                .collect();
+
+            // Cost-benefit check: only add blocks if charging is economical
+            // Compare: cost_to_charge vs cost_to_buy_from_grid_during_expensive_period
+            // Account for round-trip efficiency loss
+            let efficiency = self.config.round_trip_efficiency;
+            let avg_expensive_price = if expensive_periods.is_empty() {
+                median_price * 1.5 // Assume 50% markup if no periods identified
+            } else {
+                expensive_periods
+                    .iter()
+                    .flat_map(|(start, end)| {
+                        (*start..*end).map(|i| prices.get(i).copied().unwrap_or(0.0))
+                    })
+                    .sum::<f32>()
+                    / expensive_periods
+                        .iter()
+                        .map(|(start, end)| (end - start) as f32)
+                        .sum::<f32>()
+            };
+
+            // Select the globally cheapest blocks (already filtered to below median)
+            let mut extra_blocks = scheduling::select_cheapest_blocks(
+                &available_blocks,
+                extra_blocks_needed,
+                min_consecutive,
+            );
+
+            // Additional cost-benefit filter: charge_price / efficiency < expensive_price
+            extra_blocks.retain(|&idx| {
+                let charge_price = prices.get(idx).copied().unwrap_or(0.0);
+                let effective_charge_cost = charge_price / efficiency;
+                effective_charge_cost < avg_expensive_price
+            });
+
+            // Add selected blocks to schedule
+            for idx in extra_blocks {
+                if !charge_schedule.contains(&idx) {
+                    charge_schedule.push(idx);
+                }
+            }
+            charge_schedule.sort();
+        }
+
+        // =====================================================================
+        // STEP 5: Validate temporal feasibility - ensure blocks before periods
+        // =====================================================================
+
+        // For each expensive period, verify we have adequate SOC at start
+        // If blocks after a period were selected, they must serve a FUTURE period
+        for (period_start, period_end) in &expensive_periods {
+            let soc_trajectory = scheduling::simulate_soc(
+                context.current_battery_soc,
+                &charge_schedule,
+                num_remaining_blocks,
+                consumption_per_block_kwh,
+                charge_per_block_kwh,
+                battery_capacity_kwh,
+                min_soc,
+            );
+
+            let period_length = period_end - period_start;
+            let energy_needed_kwh = period_length as f32 * consumption_per_block_kwh;
+            let soc_needed = (energy_needed_kwh / battery_capacity_kwh) * 100.0 + min_soc;
+
+            let rel_period_start = period_start.saturating_sub(current_block_index);
+            let soc_at_period_start = soc_trajectory
+                .get(rel_period_start)
+                .copied()
+                .unwrap_or(context.current_battery_soc);
+
+            // If still insufficient, add blocks that complete BEFORE this period
+            if soc_at_period_start < soc_needed {
+                let soc_deficit = soc_needed - soc_at_period_start;
+                let energy_deficit_kwh = (soc_deficit / 100.0) * battery_capacity_kwh;
+                let extra_blocks_needed =
+                    (energy_deficit_kwh / charge_per_block_kwh).ceil() as usize;
+
+                // Find cheapest blocks BEFORE this period (timing constraint)
+                // HARD FILTER: Only include blocks BELOW median price (never charge in top 50%)
                 let mut available_before: Vec<(usize, f32)> = remaining_blocks
                     .iter()
-                    .filter(|(idx, _)| {
+                    .filter(|(idx, price)| {
                         *idx >= current_block_index
                             && *idx < *period_start
                             && !charge_schedule.contains(idx)
+                            && *price < median_price // NEVER charge above median
                     })
                     .copied()
                     .collect();
 
-                // Sort by price
-                available_before.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                available_before
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-                // Add cheapest available blocks (respecting min_consecutive)
                 let extra_blocks = scheduling::select_cheapest_blocks(
                     &available_before,
                     extra_blocks_needed,
@@ -1008,25 +1228,78 @@ impl WinterAdaptiveV2Strategy {
         }
 
         // =====================================================================
-        // STEP 4: Make decision for current block
+        // STEP 6: Make decision for current block
         // =====================================================================
 
-        // Is current block in our charge schedule?
-        if charge_schedule.contains(&current_block_index) {
+        let (mode, reason) = if charge_schedule.contains(&current_block_index) {
             // Only charge if not already full
             if context.current_battery_soc < self.config.daily_charging_target_soc {
-                return (
+                (
                     InverterOperationMode::ForceCharge,
                     format!("Scheduled charge: {:.3} CZK/kWh", current_price),
-                );
+                )
+            } else {
+                (
+                    InverterOperationMode::SelfUse,
+                    format!(
+                        "Battery full, skipping charge: {:.3} CZK/kWh",
+                        current_price
+                    ),
+                )
             }
+        } else {
+            // Default: Self-use (battery covers consumption, no grid charging)
+            (
+                InverterOperationMode::SelfUse,
+                format!("Hold: {:.3} CZK/kWh", current_price),
+            )
+        };
+
+        // =====================================================================
+        // STEP 7: Lock the next min_consecutive blocks to prevent oscillation
+        // =====================================================================
+        {
+            let mut lock_state = self.lock_state.write().unwrap();
+            let mut blocks_to_lock = Vec::new();
+
+            // Lock current block and next (min_consecutive - 1) blocks
+            // Total locked = min_consecutive blocks
+            for i in 0..min_consecutive {
+                let block_idx = current_block_index + i;
+                if block_idx < all_blocks.len() {
+                    let block = &all_blocks[block_idx];
+                    let block_mode = if charge_schedule.contains(&block_idx)
+                        && context.current_battery_soc < self.config.daily_charging_target_soc
+                    {
+                        InverterOperationMode::ForceCharge
+                    } else {
+                        InverterOperationMode::SelfUse
+                    };
+                    let block_reason = if charge_schedule.contains(&block_idx) {
+                        format!("Scheduled charge: {:.3} CZK/kWh", block.price_czk_per_kwh)
+                    } else {
+                        format!("Hold: {:.3} CZK/kWh", block.price_czk_per_kwh)
+                    };
+
+                    blocks_to_lock.push(LockedBlock {
+                        block_start: block.block_start,
+                        mode: block_mode,
+                        reason: block_reason,
+                    });
+                }
+            }
+
+            let blocks_locked = blocks_to_lock.len();
+            lock_state.lock_blocks(blocks_to_lock);
+            tracing::debug!(
+                "V2: Locked {} blocks ({}min) starting at {}",
+                blocks_locked,
+                blocks_locked * 15,
+                current_block_start
+            );
         }
 
-        // Default: Self-use (battery covers consumption, no grid charging)
-        (
-            InverterOperationMode::SelfUse,
-            format!("Hold: {:.3} CZK/kWh", current_price),
-        )
+        (mode, reason)
     }
 }
 

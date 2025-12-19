@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-adapters"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-backtest"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-core"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1139,7 +1139,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-i18n"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "fluent",
  "fluent-bundle",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-integration-tests"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-main"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "bevy_app",
@@ -1196,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-types"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "bevy_ecs",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-web"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "askama",
  "axum",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "solax-csv-importer"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "anyhow",
  "chrono",

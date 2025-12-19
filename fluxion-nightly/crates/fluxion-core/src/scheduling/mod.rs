@@ -125,7 +125,7 @@ pub fn generate_schedule_with_optimizer(
         return OperationSchedule::default();
     }
 
-    info!(
+    debug!(
         "Scheduling for {} blocks (filtered {} past blocks, current SOC: {:.1}%)",
         relevant_blocks.len(),
         time_block_prices.len() - relevant_blocks.len(),
@@ -310,7 +310,7 @@ pub fn generate_schedule_with_optimizer(
         .filter(|b| b.mode == InverterOperationMode::SelfUse)
         .count();
 
-    info!(
+    debug!(
         "Generated economic schedule: {} blocks, {} charge, {} discharge, {} self-use, total expected profit: {:.2} CZK",
         schedule.scheduled_blocks.len(),
         charge_count,
@@ -558,7 +558,7 @@ fn remove_short_force_sequences(schedule: &mut OperationSchedule, config: &Contr
     }
 
     if changes > 0 {
-        info!(
+        debug!(
             "Removed {} short force operation blocks (< {} consecutive blocks required)",
             changes, min_consecutive
         );
