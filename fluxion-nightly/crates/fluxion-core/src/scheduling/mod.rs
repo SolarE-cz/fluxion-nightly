@@ -283,6 +283,7 @@ pub fn generate_schedule_with_optimizer(
                 "{} - {} (expected profit: {:.2} CZK)",
                 evaluation.strategy_name, evaluation.reason, evaluation.net_profit_czk
             ),
+            decision_uid: evaluation.decision_uid.clone(),
             debug_info: evaluation.debug_info,
         });
     }
@@ -438,6 +439,7 @@ pub fn generate_schedule(
             },
             mode,
             reason,
+            decision_uid: None, // Legacy scheduler doesn't generate decision UIDs
             debug_info: None, // Legacy scheduler doesn't generate debug info
         });
     }

@@ -138,6 +138,10 @@ pub struct BlockEvaluation {
     /// Name of the strategy that generated this evaluation
     pub strategy_name: String,
 
+    /// Unique identifier for the decision logic path
+    /// Format: "strategy_name:decision_point" for debugging
+    pub decision_uid: Option<String>,
+
     /// Debug information (only populated when log_level = debug)
     pub debug_info: Option<BlockDebugInfo>,
 }
@@ -161,8 +165,15 @@ impl BlockEvaluation {
             assumptions: Assumptions::default(),
             reason: String::new(),
             strategy_name,
+            decision_uid: None,
             debug_info: None,
         }
+    }
+
+    /// Set the decision UID for tracking which logic path made this decision
+    pub fn with_decision_uid(mut self, uid: impl Into<String>) -> Self {
+        self.decision_uid = Some(uid.into());
+        self
     }
 
     /// Calculate net profit from revenue and cost

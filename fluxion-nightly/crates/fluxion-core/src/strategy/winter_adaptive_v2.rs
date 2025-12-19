@@ -732,8 +732,10 @@ mod scheduling {
     /// 1. Sort all blocks by price (cheapest first)
     /// 2. Take the top N cheapest blocks as candidates
     /// 3. From candidates, find consecutive runs >= min_consecutive
-    /// 4. Select cheapest runs until we have enough blocks
-    /// 5. If not enough consecutive runs, expand candidate pool
+    /// 4. For each run, try shifting earlier (up to min_consecutive * 2 blocks back)
+    ///    to find a cheaper consecutive window
+    /// 5. Select cheapest runs until we have enough blocks
+    /// 6. If not enough consecutive runs, expand candidate pool
     pub fn select_cheapest_blocks(
         blocks_with_prices: &[(usize, f32)], // (index, price) pairs
         count_needed: usize,
@@ -742,6 +744,10 @@ mod scheduling {
         if blocks_with_prices.is_empty() || count_needed == 0 {
             return Vec::new();
         }
+
+        // Build a lookup map for quick price access by index
+        let price_map: std::collections::HashMap<usize, f32> =
+            blocks_with_prices.iter().copied().collect();
 
         // Sort by price (cheapest first)
         let mut sorted = blocks_with_prices.to_vec();
@@ -793,14 +799,48 @@ mod scheduling {
                 runs.push(current_run);
             }
 
-            // Score runs by average price
+            // Score runs by average price, but also try shifting earlier to find cheaper windows
             let mut scored_runs: Vec<(f32, Vec<usize>)> = runs
                 .into_iter()
                 .map(|run| {
-                    let avg_price: f32 =
+                    let original_avg: f32 =
                         run.iter().map(|(_, p)| *p).sum::<f32>() / run.len() as f32;
-                    let indices: Vec<usize> = run.iter().map(|(idx, _)| *idx).collect();
-                    (avg_price, indices)
+                    let original_indices: Vec<usize> = run.iter().map(|(idx, _)| *idx).collect();
+                    let run_length = run.len();
+                    let run_start = run.first().map(|(idx, _)| *idx).unwrap_or(0);
+
+                    // Try shifting the window earlier by up to min_consecutive * 2 blocks
+                    // to find a potentially cheaper consecutive window
+                    let max_shift_back = min_consecutive * 2;
+                    let mut best_avg = original_avg;
+                    let mut best_indices = original_indices.clone();
+
+                    for shift in 1..=max_shift_back {
+                        if run_start < shift {
+                            break; // Can't shift back further
+                        }
+                        let new_start = run_start - shift;
+
+                        // Check if we can form a valid consecutive window of run_length blocks
+                        // All blocks in the new window must exist in blocks_with_prices
+                        let new_indices: Vec<usize> = (new_start..new_start + run_length).collect();
+                        let all_available = new_indices.iter().all(|idx| price_map.contains_key(idx));
+
+                        if all_available {
+                            let new_avg: f32 = new_indices
+                                .iter()
+                                .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
+                                .sum::<f32>()
+                                / run_length as f32;
+
+                            if new_avg < best_avg {
+                                best_avg = new_avg;
+                                best_indices = new_indices;
+                            }
+                        }
+                    }
+
+                    (best_avg, best_indices)
                 })
                 .collect();
 
@@ -953,12 +993,14 @@ impl WinterAdaptiveV2Strategy {
     /// 5. Apply cost-benefit filter: only use blocks where charging is economical
     /// 6. Validate temporal feasibility: ensure adequate SOC before each expensive period
     /// 7. Decide current block based on final schedule
+    ///
+    /// Returns (mode, reason, decision_uid)
     fn decide_mode(
         &self,
         context: &EvaluationContext,
         all_blocks: &[TimeBlockPrice],
         current_block_index: usize,
-    ) -> (InverterOperationMode, String) {
+    ) -> (InverterOperationMode, String, String) {
         let current_price = context.price_block.price_czk_per_kwh;
         let current_block_start = context.price_block.block_start;
         let min_consecutive = context.control_config.min_consecutive_force_blocks;
@@ -976,7 +1018,11 @@ impl WinterAdaptiveV2Strategy {
                     current_block_start,
                     locked_mode
                 );
-                return (locked_mode, locked_reason);
+                return (
+                    locked_mode,
+                    locked_reason,
+                    "winter_adaptive_v2:locked_block".to_string(),
+                );
             }
         }
 
@@ -986,11 +1032,13 @@ impl WinterAdaptiveV2Strategy {
                 return (
                     InverterOperationMode::ForceCharge,
                     format!("Negative price: {:.3} CZK/kWh", current_price),
+                    "winter_adaptive_v2:negative_price_charge".to_string(),
                 );
             }
             return (
                 InverterOperationMode::SelfUse,
                 format!("Negative price, battery full: {:.3} CZK/kWh", current_price),
+                "winter_adaptive_v2:negative_price_full".to_string(),
             );
         }
 
@@ -1231,12 +1279,13 @@ impl WinterAdaptiveV2Strategy {
         // STEP 6: Make decision for current block
         // =====================================================================
 
-        let (mode, reason) = if charge_schedule.contains(&current_block_index) {
+        let (mode, reason, decision_uid) = if charge_schedule.contains(&current_block_index) {
             // Only charge if not already full
             if context.current_battery_soc < self.config.daily_charging_target_soc {
                 (
                     InverterOperationMode::ForceCharge,
                     format!("Scheduled charge: {:.3} CZK/kWh", current_price),
+                    "winter_adaptive_v2:scheduled_charge".to_string(),
                 )
             } else {
                 (
@@ -1245,6 +1294,7 @@ impl WinterAdaptiveV2Strategy {
                         "Battery full, skipping charge: {:.3} CZK/kWh",
                         current_price
                     ),
+                    "winter_adaptive_v2:battery_full".to_string(),
                 )
             }
         } else {
@@ -1252,6 +1302,7 @@ impl WinterAdaptiveV2Strategy {
             (
                 InverterOperationMode::SelfUse,
                 format!("Hold: {:.3} CZK/kWh", current_price),
+                "winter_adaptive_v2:hold".to_string(),
             )
         };
 
@@ -1299,7 +1350,7 @@ impl WinterAdaptiveV2Strategy {
             );
         }
 
-        (mode, reason)
+        (mode, reason, decision_uid)
     }
 }
 
@@ -1340,10 +1391,11 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
             .position(|b| b.block_start == context.price_block.block_start)
             .unwrap_or(0);
 
-        let (mode, reason) = self.decide_mode(context, all_blocks, current_block_index);
+        let (mode, reason, decision_uid) = self.decide_mode(context, all_blocks, current_block_index);
 
         eval.mode = mode;
         eval.reason = reason;
+        eval.decision_uid = Some(decision_uid);
 
         // Calculate energy flows based on mode
         match mode {

@@ -275,6 +275,8 @@ pub struct PriceBlockData {
     pub expected_profit: Option<f32>, // Expected profit for this block (CZK)
     pub reason: Option<String>,       // Detailed reason for the decision
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_uid: Option<String>, // Decision UID for debugging (e.g., "winter_adaptive_v2:scheduled_charge")
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<crate::strategy::BlockDebugInfo>, // Debug info (only when log_level=debug)
     pub is_historical: bool, // True if block is in the past (shows regenerated schedule, not actual history)
 }
@@ -597,7 +599,7 @@ fn build_dashboard_response(
                         // CRITICAL: Match schedule blocks by TIMESTAMP, not array index
                         // This is essential because schedule may have filtered past blocks,
                         // causing index misalignment with price data blocks.
-                        let (block_type, target_soc, strategy, profit, reason, debug_info) = sched
+                        let (block_type, target_soc, strategy, profit, reason, decision_uid, debug_info) = sched
                             .and_then(|s| {
                                 // Find the scheduled block that matches this price block's timestamp
                                 s.scheduled_blocks
@@ -628,6 +630,7 @@ fn build_dashboard_response(
                                     strat,
                                     prof,
                                     Some(sb.reason.clone()),
+                                    sb.decision_uid.clone(),
                                     sb.debug_info.clone(),
                                 )
                             })
@@ -645,6 +648,7 @@ fn build_dashboard_response(
                                             block.price_czk_per_kwh
                                         )),
                                         None,
+                                        None,
                                     )
                                 } else if analysis.discharge_blocks.contains(&idx) {
                                     (
@@ -656,6 +660,7 @@ fn build_dashboard_response(
                                             "Winter-Peak-Discharge - Peak price ({:.3} CZK/kWh)",
                                             block.price_czk_per_kwh
                                         )),
+                                        None,
                                         None,
                                     )
                                 } else {
@@ -670,6 +675,7 @@ fn build_dashboard_response(
                                             block.price_czk_per_kwh
                                         )),
                                         None,
+                                        None,
                                     )
                                 }
                             });
@@ -682,6 +688,7 @@ fn build_dashboard_response(
                             strategy,
                             expected_profit: profit,
                             reason,
+                            decision_uid,
                             debug_info,
                             is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
                         }

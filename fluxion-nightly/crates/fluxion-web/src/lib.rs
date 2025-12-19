@@ -453,6 +453,7 @@ fn create_compact_export(response: &WebQueryResponse) -> serde_json::Value {
                         "st": block.strategy.as_ref().map(|s| abbreviate_strategy(s)),
                         "pr": block.expected_profit.map(round_2_decimals),
                         "r": block.reason.as_ref().map(|r| abbreviate_reason(r)),
+                        "uid": block.decision_uid.as_ref(),
                         "h": block.is_historical
                     })
                 }).collect::<Vec<_>>(),
