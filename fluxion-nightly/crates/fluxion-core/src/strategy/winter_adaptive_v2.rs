@@ -33,10 +33,7 @@
 //! - `simulation`: Forward SOC tracking and validation
 //! - `spike_detection`: Extreme price event handling
 
-use crate::strategy::{
-    Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics,
-    seasonal_mode::SeasonalMode,
-};
+use crate::strategy::{Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics};
 use crate::utils::calculate_ema;
 use chrono::{DateTime, Datelike, Utc};
 use fluxion_types::inverter::InverterOperationMode;
@@ -44,6 +41,44 @@ use fluxion_types::pricing::TimeBlockPrice;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::RwLock;
+
+/// Seasonal operating mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SeasonalMode {
+    /// May-September: More solar, lower min SOC
+    Summer,
+    /// October-April: Less solar, higher min SOC
+    Winter,
+}
+
+impl SeasonalMode {
+    /// Determine the season from a UTC date
+    #[must_use]
+    pub fn from_date(date: DateTime<Utc>) -> Self {
+        match date.month() {
+            5..=9 => Self::Summer,
+            _ => Self::Winter,
+        }
+    }
+
+    /// Minimum SOC recommendation by season (percent)
+    #[must_use]
+    pub fn min_soc_percent(&self) -> f32 {
+        match self {
+            Self::Summer => 20.0,
+            Self::Winter => 50.0,
+        }
+    }
+
+    /// Minimum spread threshold for arbitrage (CZK/kWh)
+    #[must_use]
+    pub fn min_spread_threshold(&self) -> f32 {
+        match self {
+            Self::Summer => 2.0,
+            Self::Winter => 3.0,
+        }
+    }
+}
 
 // ============================================================================
 // Configuration
@@ -97,11 +132,6 @@ impl ScheduleLockState {
         }
     }
 
-    /// Clear all locks (for testing or reset)
-    #[allow(dead_code)]
-    pub fn clear(&mut self) {
-        self.locked_blocks.clear();
-    }
 }
 
 /// Historical day data for seasonal mode detection
@@ -155,8 +185,6 @@ pub struct WinterAdaptiveV2Config {
     pub history_days: usize,
     /// P90 multiplier for conservative consumption estimate (default: 1.3)
     pub consumption_p90_multiplier: f32,
-    /// P10 multiplier for optimistic consumption estimate (default: 0.7)
-    pub consumption_p10_multiplier: f32,
     /// Solar discount factor for P90 scenario (default: 0.8)
     pub solar_p90_discount: f32,
 
@@ -222,7 +250,6 @@ impl Default for WinterAdaptiveV2Config {
             priority: 100, // Highest priority (same as Winter Adaptive v1)
             history_days: 3,
             consumption_p90_multiplier: 1.3,
-            consumption_p10_multiplier: 0.7,
             solar_p90_discount: 0.8,
             safety_margin_pct: 0.15,
             min_soc_pct: 10.0,
@@ -308,9 +335,6 @@ pub mod forecasting {
         pub p50_kwh: f32,
         /// Conservative estimate (P90)
         pub p90_kwh: f32,
-        /// Optimistic estimate (P10)
-        #[allow(dead_code)]
-        pub p10_kwh: f32,
     }
 
     /// Per-slot solar forecast
@@ -342,7 +366,6 @@ pub mod forecasting {
             return ConsumptionForecast {
                 p50_kwh: fallback_per_slot_kwh,
                 p90_kwh: fallback_per_slot_kwh * config.consumption_p90_multiplier,
-                p10_kwh: fallback_per_slot_kwh * config.consumption_p10_multiplier,
             };
         }
 
@@ -358,7 +381,6 @@ pub mod forecasting {
             return ConsumptionForecast {
                 p50_kwh: fallback_per_slot_kwh,
                 p90_kwh: fallback_per_slot_kwh * config.consumption_p90_multiplier,
-                p10_kwh: fallback_per_slot_kwh * config.consumption_p10_multiplier,
             };
         }
 
@@ -368,7 +390,6 @@ pub mod forecasting {
         ConsumptionForecast {
             p50_kwh: p50,
             p90_kwh: p50 * config.consumption_p90_multiplier,
-            p10_kwh: p50 * config.consumption_p10_multiplier,
         }
     }
 
@@ -1308,8 +1329,16 @@ impl WinterAdaptiveV2Strategy {
 
         // =====================================================================
         // STEP 7: Lock the next min_consecutive blocks to prevent oscillation
+        // ONLY lock when evaluating the CURRENT block (not future blocks for preview)
         // =====================================================================
-        {
+        let now = Utc::now();
+        let block_age_seconds = (now - current_block_start).num_seconds();
+
+        // Only lock if this block is the current block (started within last 15 minutes)
+        // This prevents locking ALL blocks when generating schedule preview
+        let is_current_block = (0..900).contains(&block_age_seconds); // 15 min = 900 sec
+
+        if is_current_block {
             let mut lock_state = self.lock_state.write().unwrap();
             let mut blocks_to_lock = Vec::new();
 
@@ -1415,7 +1444,24 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            _ => {}
+            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+                // Estimate profit based on usable battery capacity vs consumption
+                // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
+                let usable_battery_kwh = ((context.current_battery_soc - context.control_config.hardware_min_battery_soc).max(0.0) / 100.0)
+                    * context.control_config.battery_capacity_kwh;
+                let price = context.price_block.price_czk_per_kwh;
+
+                if usable_battery_kwh >= context.consumption_forecast_kwh {
+                    // Battery can fully cover consumption - show as avoided grid import cost
+                    eval.revenue_czk = context.consumption_forecast_kwh * price;
+                } else {
+                    // Battery partially depleted - split between battery and grid
+                    // Battery covers what it can (avoided cost = profit)
+                    eval.revenue_czk = usable_battery_kwh * price;
+                    // Grid must cover the rest (actual cost)
+                    eval.cost_czk = (context.consumption_forecast_kwh - usable_battery_kwh) * price;
+                }
+            }
         }
 
         eval.calculate_net_profit();

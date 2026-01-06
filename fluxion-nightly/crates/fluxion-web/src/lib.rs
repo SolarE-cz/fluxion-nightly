@@ -11,14 +11,14 @@
 // For commercial licensing, please contact: info@solare.cz
 
 mod backtest;
-mod chart;
 mod config_api;
+mod plugin_api;
 mod routes;
 mod validation;
 
 pub use backtest::BacktestState;
-pub use chart::generate_price_chart_svg;
 pub use config_api::ConfigApiState;
+pub use plugin_api::PluginApiState;
 use routes::{DashboardTemplate, LiveDataTemplate};
 
 use askama::Template;
@@ -73,6 +73,10 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 /// * `query_sender` - Channel sender to query ECS World
 /// * `i18n` - Internationalization support
 /// * `port` - Port to listen on (8099 for HA Ingress)
+/// * `config_json` - Current configuration as JSON
+/// * `config_update_sender` - Optional channel for config updates
+/// * `backtest_db_path` - Optional path to backtest database
+/// * `plugin_api_state` - Optional plugin API state for plugin management
 ///
 /// # HA Ingress Support
 /// When running as HA addon, routes are accessible via:
@@ -92,6 +96,7 @@ pub async fn start_web_server(
     config_json: serde_json::Value,
     config_update_sender: Option<ConfigUpdateSender>,
     backtest_db_path: Option<std::path::PathBuf>,
+    plugin_api_state: Option<PluginApiState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app_state = AppState {
         query_sender,
@@ -154,6 +159,36 @@ pub async fn start_web_server(
             .route(
                 "/api/backtest/compare",
                 axum::routing::post(backtest::compare_handler).with_state(backtest_state),
+            );
+    }
+
+    // Add plugin management API routes if state is provided
+    if let Some(plugin_state) = plugin_api_state {
+        info!("🔌 Plugin API enabled");
+        app = app
+            .route(
+                "/api/plugins",
+                get(plugin_api::list_plugins_handler).with_state(plugin_state.clone()),
+            )
+            .route(
+                "/api/plugins/register",
+                axum::routing::post(plugin_api::register_plugin_handler)
+                    .with_state(plugin_state.clone()),
+            )
+            .route(
+                "/api/plugins/{name}",
+                axum::routing::delete(plugin_api::unregister_plugin_handler)
+                    .with_state(plugin_state.clone()),
+            )
+            .route(
+                "/api/plugins/{name}/priority",
+                axum::routing::put(plugin_api::update_priority_handler)
+                    .with_state(plugin_state.clone()),
+            )
+            .route(
+                "/api/plugins/{name}/enabled",
+                axum::routing::put(plugin_api::update_enabled_handler)
+                    .with_state(plugin_state),
             );
     }
 

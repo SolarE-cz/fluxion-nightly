@@ -10,15 +10,11 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-pub mod seasonal_mode;
-pub mod seasonal_optimizer;
 pub mod utils;
 pub mod winter_adaptive;
 pub mod winter_adaptive_v2;
 
 // Re-export strategies
-pub use seasonal_mode::SeasonalMode;
-pub use seasonal_optimizer::{AdaptiveSeasonalOptimizer, SeasonalStrategiesConfig};
 pub use winter_adaptive::{
     DayEnergyBalance, PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy,
 };

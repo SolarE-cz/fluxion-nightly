@@ -24,9 +24,12 @@ use fluxion_adapters::{
     HomeAssistantInverterAdapter,
 };
 use fluxion_core::{
-    ConfigUpdateSender, FluxionCorePlugin, SystemConfig, TimezoneConfig, WebQuerySender,
+    ConfigUpdateSender, FluxionCorePlugin, PluginManagerResource, SystemConfig, TimezoneConfig, WebQuerySender,
+    plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::I18n;
+use fluxion_web::PluginApiState;
+use parking_lot::RwLock;
 
 fn main() -> Result<()> {
     // Handle command line arguments
@@ -190,6 +193,14 @@ fn initialize_and_run() -> Result<()> {
     // Convert AppConfig to SystemConfig for ECS
     let system_config = SystemConfig::from(config.clone());
 
+    // Create shared plugin manager with built-in strategies
+    let plugin_manager = create_plugin_manager(
+        Some(&system_config.strategies_config),
+        &system_config.control_config,
+    );
+    let plugin_manager = Arc::new(RwLock::new(plugin_manager));
+    info!("🔌 Plugin manager initialized with built-in strategies");
+
     // Configure debug mode
     let debug_config = if config.system.debug_mode {
         fluxion_core::DebugModeConfig::enabled()
@@ -225,6 +236,7 @@ fn initialize_and_run() -> Result<()> {
         serde_json::json!({})
     });
     let config_sender_for_web = config_update_sender.clone();
+    let plugin_api_state = PluginApiState::new(plugin_manager.clone());
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -233,6 +245,7 @@ fn initialize_and_run() -> Result<()> {
             config_json,
             Some(config_sender_for_web),
             Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
+            Some(plugin_api_state), // Plugin API with shared PluginManager
         )
         .await
         {
@@ -263,6 +276,7 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
             history_source,
         ))
+        .insert_resource(PluginManagerResource(plugin_manager))
         .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>();
 
     info!("✅ Starting main loop...");

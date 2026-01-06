@@ -1027,7 +1027,19 @@
                         },
                         scales: {
                             y: {
-                                beginAtZero: chartData.prices.every(p => p >= 0),
+                                beginAtZero: false,
+                                min: (() => {
+                                    const minPrice = Math.min(...chartData.prices);
+                                    const maxPrice = Math.max(...chartData.prices);
+                                    const priceRange = maxPrice - minPrice;
+                                    return minPrice - priceRange * 0.1;
+                                })(),
+                                max: (() => {
+                                    const minPrice = Math.min(...chartData.prices);
+                                    const maxPrice = Math.max(...chartData.prices);
+                                    const priceRange = maxPrice - minPrice;
+                                    return maxPrice + priceRange * 0.1;
+                                })(),
                                 title: {
                                     display: true,
                                     text: 'Price (Kč/kWh)',

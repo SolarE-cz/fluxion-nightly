@@ -10,13 +10,15 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-use crate::strategy::{
-    AdaptiveSeasonalOptimizer, BlockEvaluation, EvaluationContext, SeasonalStrategiesConfig,
-};
+use crate::strategy::BlockEvaluation;
 use chrono::Utc;
 use fluent::fluent_args;
 use fluxion_i18n::I18n;
-use fluxion_types::config::{ControlConfig, Currency, StrategiesConfigCore};
+use fluxion_plugins::{
+    BatteryState, BlockDecision, EvaluationRequest, ForecastData, HistoricalData, OperationMode,
+    PriceBlock, PluginManager,
+};
+use fluxion_types::config::{ControlConfig, Currency};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
@@ -71,9 +73,9 @@ impl Default for ScheduleConfig {
 /// * `solar_forecast` - Optional solar generation forecast per block (kWh)
 /// * `consumption_forecast` - Optional consumption forecast per block (kWh)
 /// * Export price is taken from control_config.grid_export_fee_czk_per_kwh (fixed fee)
-/// * `strategies_config` - Optional strategies configuration (uses defaults if None)
 /// * `backup_discharge_min_soc` - Minimum SOC from HA sensor (backup_discharge_min_soc)
 /// * `grid_import_today_kwh` - Optional grid import energy consumed today (kWh)
+/// * `plugin_manager` - The shared plugin manager with registered strategies
 ///
 /// # Returns
 /// Complete `OperationSchedule` with economically optimized mode assignments
@@ -85,21 +87,14 @@ pub fn generate_schedule_with_optimizer(
     current_battery_soc: f32,
     solar_forecast: Option<&[f32]>,
     consumption_forecast: Option<&[f32]>,
-    strategies_config: Option<&StrategiesConfigCore>,
     backup_discharge_min_soc: f32,
     grid_import_today_kwh: Option<f32>,
+    plugin_manager: &PluginManager,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
         return OperationSchedule::default();
     }
-
-    let optimizer = if let Some(config) = strategies_config {
-        let seasonal_config = SeasonalStrategiesConfig::from(config);
-        AdaptiveSeasonalOptimizer::with_config(&seasonal_config)
-    } else {
-        AdaptiveSeasonalOptimizer::with_defaults()
-    };
     let mut scheduled_blocks = Vec::new();
     let mut total_profit = 0.0;
 
@@ -157,20 +152,20 @@ pub fn generate_schedule_with_optimizer(
             .map(|(_, block)| (*block).clone())
             .collect();
 
-        let context = EvaluationContext {
+        let request = create_evaluation_request(
             price_block,
+            &remaining_blocks,
             control_config,
-            current_battery_soc: temp_predicted_soc,
-            solar_forecast_kwh: solar_kwh,
-            consumption_forecast_kwh: consumption_kwh,
-            grid_export_price_czk_per_kwh: export_price,
-            all_price_blocks: Some(&remaining_blocks),
+            temp_predicted_soc,
+            solar_kwh,
+            consumption_kwh,
+            export_price,
             backup_discharge_min_soc,
             grid_import_today_kwh,
-            consumption_today_kwh: None,
-        };
+        );
 
-        let evaluation = optimizer.evaluate(&context);
+        let decision = plugin_manager.evaluate(&request);
+        let evaluation = convert_decision_to_evaluation(&decision, &request);
         temp_predicted_soc = update_soc_prediction(
             temp_predicted_soc,
             &evaluation,
@@ -229,27 +224,24 @@ pub fn generate_schedule_with_optimizer(
             .map(|(_, block)| (*block).clone())
             .collect();
 
-        // Create evaluation context with appropriate SOC
-        let context = EvaluationContext {
+        // Create evaluation request for plugin manager
+        let request = create_evaluation_request(
             price_block,
+            &remaining_blocks,
             control_config,
-            current_battery_soc: soc_for_evaluation,
-            solar_forecast_kwh: solar_kwh,
-            consumption_forecast_kwh: consumption_kwh,
-            grid_export_price_czk_per_kwh: export_price,
-            all_price_blocks: Some(&remaining_blocks),
+            soc_for_evaluation,
+            solar_kwh,
+            consumption_kwh,
+            export_price,
             backup_discharge_min_soc,
             grid_import_today_kwh,
-            consumption_today_kwh: None,
-        };
+        );
 
-        // Optimize and get best strategy evaluation
-        // Capture debug info if debug logging is enabled
-        let capture_debug = is_debug_enabled();
-        let evaluation = optimizer.evaluate_with_debug(&context, capture_debug);
+        // Get decision from plugin manager
+        let decision = plugin_manager.evaluate(&request);
+        let evaluation = convert_decision_to_evaluation(&decision, &request);
 
         // Update predicted SOC for next block
-        // Since all blocks in relevant_blocks are current/future, always update prediction
         predicted_soc = update_soc_prediction(
             predicted_soc,
             &evaluation,
@@ -634,4 +626,113 @@ fn update_soc_prediction(
 
     // Clamp SOC to hardware limits
     new_soc.clamp(config.hardware_min_battery_soc, 100.0)
+}
+
+/// Create an evaluation request for the plugin manager
+#[expect(clippy::too_many_arguments)]
+fn create_evaluation_request(
+    price_block: &TimeBlockPrice,
+    remaining_blocks: &[TimeBlockPrice],
+    control_config: &ControlConfig,
+    current_soc: f32,
+    solar_kwh: f32,
+    consumption_kwh: f32,
+    export_price: f32,
+    backup_discharge_min_soc: f32,
+    grid_import_today_kwh: Option<f32>,
+) -> EvaluationRequest {
+    EvaluationRequest {
+        block: PriceBlock {
+            block_start: price_block.block_start,
+            duration_minutes: price_block.duration_minutes,
+            price_czk_per_kwh: price_block.price_czk_per_kwh,
+        },
+        battery: BatteryState {
+            current_soc_percent: current_soc,
+            capacity_kwh: control_config.battery_capacity_kwh,
+            max_charge_rate_kw: control_config.max_battery_charge_rate_kw,
+            min_soc_percent: control_config.hardware_min_battery_soc,
+            max_soc_percent: 100.0,
+            efficiency: control_config.battery_efficiency,
+            wear_cost_czk_per_kwh: control_config.battery_wear_cost_czk_per_kwh,
+        },
+        forecast: ForecastData {
+            solar_kwh,
+            consumption_kwh,
+            grid_export_price_czk_per_kwh: export_price,
+        },
+        all_blocks: remaining_blocks
+            .iter()
+            .map(|b| PriceBlock {
+                block_start: b.block_start,
+                duration_minutes: b.duration_minutes,
+                price_czk_per_kwh: b.price_czk_per_kwh,
+            })
+            .collect(),
+        historical: HistoricalData {
+            grid_import_today_kwh,
+            consumption_today_kwh: None, // TODO: Track actual consumption
+        },
+        backup_discharge_min_soc,
+    }
+}
+
+/// Convert a plugin decision back to a BlockEvaluation for compatibility
+fn convert_decision_to_evaluation(decision: &BlockDecision, request: &EvaluationRequest) -> BlockEvaluation {
+    use crate::strategy::{Assumptions, EnergyFlows};
+    use fluxion_types::scheduling::{BlockDebugInfo, StrategyEvaluation};
+
+    let mode = match decision.mode {
+        OperationMode::SelfUse => InverterOperationMode::SelfUse,
+        OperationMode::ForceCharge => InverterOperationMode::ForceCharge,
+        OperationMode::ForceDischarge => InverterOperationMode::ForceDischarge,
+        OperationMode::BackUpMode => InverterOperationMode::BackUpMode,
+    };
+
+    let net_profit = decision.expected_profit_czk.unwrap_or(0.0);
+
+    // Use actual strategy name from decision, falling back to priority-based name
+    let strategy_name = decision
+        .strategy_name
+        .clone()
+        .unwrap_or_else(|| format!("Plugin (priority {})", decision.priority));
+
+    BlockEvaluation {
+        block_start: decision.block_start,
+        duration_minutes: decision.duration_minutes,
+        mode,
+        revenue_czk: if net_profit > 0.0 { net_profit } else { 0.0 },
+        cost_czk: if net_profit < 0.0 { -net_profit } else { 0.0 },
+        net_profit_czk: net_profit,
+        energy_flows: EnergyFlows::default(),
+        assumptions: Assumptions {
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            current_battery_soc: request.battery.current_soc_percent,
+            battery_efficiency: request.battery.efficiency,
+            battery_wear_cost_czk_per_kwh: request.battery.wear_cost_czk_per_kwh,
+            grid_import_price_czk_per_kwh: request.block.price_czk_per_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+        },
+        reason: decision.reason.clone(),
+        strategy_name: strategy_name.clone(),
+        decision_uid: decision.decision_uid.clone(),
+        debug_info: if is_debug_enabled() {
+            Some(BlockDebugInfo {
+                evaluated_strategies: vec![StrategyEvaluation {
+                    strategy_name,
+                    mode,
+                    net_profit_czk: net_profit,
+                    reason: decision.reason.clone(),
+                }],
+                winning_reason: decision.reason.clone(),
+                conditions: vec![
+                    format!("SOC: {:.1}%", request.battery.current_soc_percent),
+                    format!("Price: {:.3} CZK/kWh", request.block.price_czk_per_kwh),
+                ],
+            })
+        } else {
+            None
+        },
+    }
 }

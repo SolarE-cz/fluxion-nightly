@@ -16,7 +16,7 @@ use bevy_ecs::prelude::*;
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    PriceDataSourceResource,
+    PriceDataSourceResource, PluginManagerResource,
     components::*,
     pricing::analyze_prices,
     resources::SystemConfig,
@@ -124,6 +124,7 @@ pub fn update_prices_system(
     backup_soc: Option<Res<BackupDischargeMinSoc>>,
     consumption_history: Res<crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<&RawInverterState>,
+    plugin_manager_res: Res<PluginManagerResource>,
 ) {
     // Only fetch if cache is stale (non-blocking check)
     if !price_cache.is_stale() {
@@ -248,7 +249,8 @@ pub fn update_prices_system(
                 .map(|s| s.grid_import_kwh)
         });
 
-    // Use economic optimizer for schedule generation
+    // Use economic optimizer for schedule generation with shared plugin manager
+    let plugin_manager = plugin_manager_res.0.read();
     let new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
@@ -256,9 +258,9 @@ pub fn update_prices_system(
         current_soc,
         None, // Future: Add solar forecast integration (Solcast/Forecast.Solar API)
         consumption_forecast.as_deref(), // Enhanced consumption forecast
-        Some(&config.strategies_config),
         backup_discharge_min_soc,
         grid_import_today_kwh,
+        &plugin_manager,
     );
 
     // Update or create PriceAnalysis entity

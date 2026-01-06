@@ -6,6 +6,7 @@ members = [
     "crates/fluxion-i18n",
     "crates/fluxion-integration-tests",
     "crates/fluxion-main",
+    "crates/fluxion-plugins",
     "crates/fluxion-types",
     "crates/fluxion-web",
     "crates/solax-csv-importer",
@@ -142,15 +143,6 @@ features = [
 version = "0.3.20"
 features = [
     "env-filter",
-]
-
-[workspace.dependencies.plotters]
-version = "0.3.7"
-default-features = false
-features = [
-    "svg_backend",
-    "chrono",
-    "line_series",
 ]
 
 [workspace.dependencies.rusqlite]

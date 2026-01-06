@@ -24,10 +24,6 @@ struct HistoricalData {
     timestamp: DateTime<Utc>,
     battery_soc: f32,
     pv_power_w: f32,
-    #[allow(dead_code)]
-    battery_power_w: f32,
-    #[allow(dead_code)]
-    grid_power_w: f32,
     house_load_w: f32,
 }
 
@@ -57,7 +53,7 @@ fn load_data() -> TestData {
 
     let prices: Vec<TimeBlockPrice> = price_iter.map(|r| r.unwrap()).collect();
 
-    let mut stmt = conn.prepare("SELECT timestamp, battery_soc, pv_power_w, battery_power_w, grid_power_w, house_load_w FROM historical_plant_data ORDER BY timestamp ASC").unwrap();
+    let mut stmt = conn.prepare("SELECT timestamp, battery_soc, pv_power_w, house_load_w FROM historical_plant_data ORDER BY timestamp ASC").unwrap();
     let hist_iter = stmt
         .query_map([], |row| {
             let ts: i64 = row.get(0)?;
@@ -65,9 +61,7 @@ fn load_data() -> TestData {
                 timestamp: Utc.timestamp_opt(ts, 0).unwrap(),
                 battery_soc: row.get::<_, f64>(1)? as f32,
                 pv_power_w: row.get::<_, f64>(2)? as f32,
-                battery_power_w: row.get::<_, f64>(3)? as f32,
-                grid_power_w: row.get::<_, f64>(4)? as f32,
-                house_load_w: row.get::<_, f64>(5)? as f32,
+                house_load_w: row.get::<_, f64>(3)? as f32,
             })
         })
         .unwrap();

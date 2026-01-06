@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-adapters"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1089,7 +1089,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-backtest"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-core"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1122,6 +1122,7 @@ dependencies = [
  "csv",
  "fluent",
  "fluxion-i18n",
+ "fluxion-plugins",
  "fluxion-types",
  "futures-timer",
  "parking_lot",
@@ -1139,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-i18n"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "fluent",
  "fluent-bundle",
@@ -1152,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-integration-tests"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1169,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-main"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "bevy_app",
@@ -1195,8 +1196,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxion-plugins"
+version = "0.2.28"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "fluxion-types",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "fluxion-types"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "bevy_ecs",
@@ -1207,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-web"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "askama",
  "axum",
@@ -1216,9 +1233,9 @@ dependencies = [
  "fluxion-backtest",
  "fluxion-core",
  "fluxion-i18n",
+ "fluxion-plugins",
  "fluxion-types",
  "parking_lot",
- "plotters",
  "serde",
  "serde_json",
  "tokio",
@@ -2143,35 +2160,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
-name = "plotters"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
-dependencies = [
- "chrono",
- "num-traits",
- "plotters-backend",
- "plotters-svg",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "plotters-backend"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
-
-[[package]]
-name = "plotters-svg"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
-dependencies = [
- "plotters-backend",
-]
-
-[[package]]
 name = "portable-atomic"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2770,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "solax-csv-importer"
-version = "0.2.27"
+version = "0.2.28"
 dependencies = [
  "anyhow",
  "chrono",

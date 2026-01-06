@@ -18,10 +18,13 @@ use bevy_app::App;
 use bevy_ecs::system::RunSystemOnce;
 use fluxion_core::{
     ConfigSection, ConfigUpdateEvent, ConfigUpdateSender, DebugModeConfig, OperationSchedule,
-    SpotPriceData, SystemConfig, TimeBlockPrice, components::ConsumptionHistory,
+    PluginManagerResource, SpotPriceData, SystemConfig, TimeBlockPrice,
+    components::ConsumptionHistory, plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::Language;
+use parking_lot::RwLock;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 #[test]
 fn test_config_update_flow() {
@@ -63,11 +66,19 @@ fn test_config_update_flow() {
     // Create config update channel
     let (config_sender, config_channel) = ConfigUpdateSender::new();
 
+    // Create plugin manager for scheduling
+    let plugin_manager = create_plugin_manager(
+        Some(&initial_config.strategies_config),
+        &initial_config.control_config,
+    );
+    let plugin_manager_res = PluginManagerResource(Arc::new(RwLock::new(plugin_manager)));
+
     // Insert resources
     app.insert_resource(initial_config.clone());
     app.insert_resource(config_channel);
     app.insert_resource(DebugModeConfig::default());
     app.insert_resource(ConsumptionHistory::default());
+    app.insert_resource(plugin_manager_res);
 
     // Create some dummy price data
     let price_data = SpotPriceData {
@@ -163,11 +174,19 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
     // Create config update channel
     let (config_sender, config_channel) = ConfigUpdateSender::new();
 
+    // Create plugin manager for scheduling
+    let plugin_manager = create_plugin_manager(
+        Some(&initial_config.strategies_config),
+        &initial_config.control_config,
+    );
+    let plugin_manager_res = PluginManagerResource(Arc::new(RwLock::new(plugin_manager)));
+
     // Insert resources
     app.insert_resource(initial_config.clone());
     app.insert_resource(config_channel);
     app.insert_resource(DebugModeConfig::default());
     app.insert_resource(ConsumptionHistory::default());
+    app.insert_resource(plugin_manager_res);
 
     // Modify only system settings (not Control/Pricing/Strategies)
     initial_config.system_config.debug_mode = false;

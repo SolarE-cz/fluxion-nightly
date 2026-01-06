@@ -10,16 +10,51 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-use crate::strategy::{
-    Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics,
-    seasonal_mode::SeasonalMode,
-};
+use crate::strategy::{Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics};
 use crate::utils::calculate_ema;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::TimeBlockPrice;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+
+/// Seasonal operating mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SeasonalMode {
+    /// May-September: More solar, lower min SOC
+    Summer,
+    /// October-April: Less solar, higher min SOC
+    Winter,
+}
+
+impl SeasonalMode {
+    /// Determine the season from a UTC date
+    #[must_use]
+    pub fn from_date(date: DateTime<Utc>) -> Self {
+        match date.month() {
+            5..=9 => Self::Summer,
+            _ => Self::Winter,
+        }
+    }
+
+    /// Minimum SOC recommendation by season (percent)
+    #[must_use]
+    pub fn min_soc_percent(&self) -> f32 {
+        match self {
+            Self::Summer => 20.0,
+            Self::Winter => 50.0,
+        }
+    }
+
+    /// Minimum spread threshold for arbitrage (CZK/kWh)
+    #[must_use]
+    pub fn min_spread_threshold(&self) -> f32 {
+        match self {
+            Self::Summer => 2.0,
+            Self::Winter => 3.0,
+        }
+    }
+}
 
 /// Historical day data for seasonal mode detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,6 +921,7 @@ impl WinterAdaptiveStrategy {
     }
 
     /// Determine operation mode for current block
+    /// Returns (mode, reason, decision_uid)
     fn determine_mode(
         &self,
         context: &EvaluationContext,
@@ -893,7 +929,7 @@ impl WinterAdaptiveStrategy {
         current_block_index: usize,
         urgent_blocks_today: usize,
         total_blocks_needed: usize,
-    ) -> (InverterOperationMode, String) {
+    ) -> (InverterOperationMode, String, String) {
         // Priority 0: Export to grid during extreme price spikes (Plan 2)
         if analysis.is_export_opportunity
             && context.current_battery_soc > self.config.min_soc_for_export
@@ -907,6 +943,7 @@ impl WinterAdaptiveStrategy {
                     self.config.export_trigger_multiplier,
                     exportable_soc
                 ),
+                "wa1:force_discharge:export_opportunity".to_owned(),
             );
         }
 
@@ -922,6 +959,7 @@ impl WinterAdaptiveStrategy {
                         "Negative price charging: {:.3} CZK/kWh (PAID to consume!)",
                         context.price_block.price_czk_per_kwh
                     ),
+                    "wa1:force_charge:negative_price".to_owned(),
                 );
             }
             // Battery full - at minimum don't export (we'd pay to export)
@@ -931,6 +969,7 @@ impl WinterAdaptiveStrategy {
                     "Negative price - avoiding export: {:.3} CZK/kWh",
                     context.price_block.price_czk_per_kwh
                 ),
+                "wa1:backup:negative_price_full".to_owned(),
             );
         }
 
@@ -1127,9 +1166,15 @@ impl WinterAdaptiveStrategy {
         }
 
         if should_charge {
+            let decision_uid = if urgent_blocks_today > 0 {
+                "wa1:force_charge:urgent_today".to_owned()
+            } else {
+                "wa1:force_charge:optimal_horizon".to_owned()
+            };
             return (
                 InverterOperationMode::ForceCharge,
                 format!("{} (avg: {:.3})", charge_reason, analysis.avg_all_price),
+                decision_uid,
             );
         }
 
@@ -1198,6 +1243,7 @@ impl WinterAdaptiveStrategy {
                     "Battery critical ({:.1}% < {:.1}%)",
                     context.current_battery_soc, context.backup_discharge_min_soc
                 ),
+                "wa1:backup:battery_critical".to_owned(),
             );
         }
 
@@ -1268,6 +1314,7 @@ impl WinterAdaptiveStrategy {
                             analysis.tomorrow_peak_avg.unwrap_or(0.0),
                             analysis.today_peak_avg
                         ),
+                        "wa1:backup:preserve_tomorrow".to_owned(),
                     );
                 }
                 // Otherwise, allow discharge - we'll recharge tonight
@@ -1282,6 +1329,7 @@ impl WinterAdaptiveStrategy {
                     "Discharging during expensive block ({:.3} CZK/kWh)",
                     context.price_block.price_czk_per_kwh
                 ),
+                "wa1:self_use:expensive_block".to_owned(),
             );
         }
 
@@ -1323,6 +1371,7 @@ impl WinterAdaptiveStrategy {
                         "Holding charge during cheap block ({:.3} < {:.3})",
                         context.price_block.price_czk_per_kwh, analysis.avg_all_price
                     ),
+                    "wa1:backup:hold_for_expensive".to_owned(),
                 );
             }
 
@@ -1333,7 +1382,8 @@ impl WinterAdaptiveStrategy {
         // Default: SelfUse (allow discharge if needed, but don't force it)
         (
             InverterOperationMode::SelfUse,
-            "Standard operation".to_string(),
+            "Standard operation".to_owned(),
+            "wa1:self_use:standard".to_owned(),
         )
     }
 }
@@ -1408,7 +1458,7 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
         );
 
         // 4. Determine Mode
-        let (mode, reason) = self.determine_mode(
+        let (mode, reason, decision_uid) = self.determine_mode(
             context,
             &analysis,
             current_block_index,
@@ -1418,6 +1468,7 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
 
         eval.mode = mode;
         eval.reason = reason;
+        eval.decision_uid = Some(decision_uid);
 
         // 5. Calculate Financials (simplified for now)
         match mode {
@@ -1439,9 +1490,23 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            _ => {
-                // SelfUse or BackUpMode - standard flows
-                // (Already handled by default BlockEvaluation logic, but we can refine here if needed)
+            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+                // Estimate profit based on usable battery capacity vs consumption
+                // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
+                let usable_battery_kwh = ((context.current_battery_soc - context.control_config.hardware_min_battery_soc).max(0.0) / 100.0)
+                    * context.control_config.battery_capacity_kwh;
+                let price = context.price_block.price_czk_per_kwh;
+
+                if usable_battery_kwh >= context.consumption_forecast_kwh {
+                    // Battery can fully cover consumption - show as avoided grid import cost
+                    eval.revenue_czk = context.consumption_forecast_kwh * price;
+                } else {
+                    // Battery partially depleted - split between battery and grid
+                    // Battery covers what it can (avoided cost = profit)
+                    eval.revenue_czk = usable_battery_kwh * price;
+                    // Grid must cover the rest (actual cost)
+                    eval.cost_czk = (context.consumption_forecast_kwh - usable_battery_kwh) * price;
+                }
             }
         }
 

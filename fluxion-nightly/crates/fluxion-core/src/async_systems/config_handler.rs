@@ -14,6 +14,7 @@ use bevy_ecs::prelude::*;
 use tracing::{error, info, trace};
 
 use crate::{
+    PluginManagerResource,
     components::*,
     config_events::ConfigSection,
     debug::DebugModeConfig,
@@ -110,6 +111,7 @@ pub struct ConfigEventParams<'w, 's> {
     backup_soc: Option<Res<'w, BackupDischargeMinSoc>>,
     consumption_history: Res<'w, crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
+    plugin_manager_res: Res<'w, PluginManagerResource>,
 }
 
 /// System that processes config update events from the web UI
@@ -274,7 +276,8 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                         .map(|s| s.grid_import_kwh)
                 });
 
-            // Generate new schedule with updated config
+            // Generate new schedule with updated config using shared plugin manager
+            let plugin_manager = params.plugin_manager_res.0.read();
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
@@ -282,9 +285,9 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 current_soc,
                 None,                            // Future: Solar forecast
                 consumption_forecast.as_deref(), // Enhanced consumption forecast
-                Some(&params.system_config.strategies_config),
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
+                &plugin_manager,
             );
 
             // Update schedule

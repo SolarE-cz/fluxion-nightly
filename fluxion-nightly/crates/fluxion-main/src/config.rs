@@ -20,7 +20,6 @@ use anyhow::{Context, Result};
 use bevy_ecs::prelude::*;
 use fluxion_i18n::Language;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tracing::{info, warn};
 
 /// Main application configuration - FluxION MVP
@@ -935,32 +934,16 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Save current configuration to file
-    ///
-    /// Future use: Will enable runtime configuration changes via Web UI
-    /// Currently used in tests to verify serialization/deserialization
-    #[allow(dead_code)]
-    pub fn save(&self, path: &str) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self)?;
-        std::fs::write(path, toml_str)?;
-        info!("Configuration saved to {}", path);
-        Ok(())
+}
+
+#[cfg(test)]
+impl AppConfig {
+    /// Get update interval as Duration (test helper)
+    pub fn update_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.system.update_interval_secs)
     }
 
-    /// Get update interval as Duration
-    ///
-    /// Helper method for converting update_interval_secs to Duration type
-    /// Currently used in tests; may be used by future runtime config updates
-    #[allow(dead_code)]
-    pub fn update_interval(&self) -> Duration {
-        Duration::from_secs(self.system.update_interval_secs)
-    }
-
-    /// Check if running in debug mode
-    ///
-    /// Helper method for debug mode status
-    /// Currently used in tests; may be used by future conditional features
-    #[allow(dead_code)]
+    /// Check if running in debug mode (test helper)
     pub fn is_debug_mode(&self) -> bool {
         self.system.debug_mode
     }
@@ -1363,7 +1346,7 @@ mod tests {
         let config = AppConfig::default();
         let duration = config.update_interval();
 
-        assert_eq!(duration, Duration::from_secs(60));
+        assert_eq!(duration, std::time::Duration::from_secs(60));
     }
 
     #[test]
