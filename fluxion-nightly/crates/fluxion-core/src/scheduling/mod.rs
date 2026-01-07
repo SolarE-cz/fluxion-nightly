@@ -16,7 +16,7 @@ use fluent::fluent_args;
 use fluxion_i18n::I18n;
 use fluxion_plugins::{
     BatteryState, BlockDecision, EvaluationRequest, ForecastData, HistoricalData, OperationMode,
-    PriceBlock, PluginManager,
+    PluginManager, PriceBlock,
 };
 use fluxion_types::config::{ControlConfig, Currency};
 use fluxion_types::inverter::InverterOperationMode;
@@ -432,7 +432,7 @@ pub fn generate_schedule(
             mode,
             reason,
             decision_uid: None, // Legacy scheduler doesn't generate decision UIDs
-            debug_info: None, // Legacy scheduler doesn't generate debug info
+            debug_info: None,   // Legacy scheduler doesn't generate debug info
         });
     }
 
@@ -678,7 +678,10 @@ fn create_evaluation_request(
 }
 
 /// Convert a plugin decision back to a BlockEvaluation for compatibility
-fn convert_decision_to_evaluation(decision: &BlockDecision, request: &EvaluationRequest) -> BlockEvaluation {
+fn convert_decision_to_evaluation(
+    decision: &BlockDecision,
+    request: &EvaluationRequest,
+) -> BlockEvaluation {
     use crate::strategy::{Assumptions, EnergyFlows};
     use fluxion_types::scheduling::{BlockDebugInfo, StrategyEvaluation};
 

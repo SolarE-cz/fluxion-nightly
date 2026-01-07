@@ -33,7 +33,9 @@
 //! - `simulation`: Forward SOC tracking and validation
 //! - `spike_detection`: Extreme price event handling
 
-use crate::strategy::{Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics};
+use crate::strategy::{
+    Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics,
+};
 use crate::utils::calculate_ema;
 use chrono::{DateTime, Datelike, Utc};
 use fluxion_types::inverter::InverterOperationMode;
@@ -131,7 +133,6 @@ impl ScheduleLockState {
             }
         }
     }
-
 }
 
 /// Historical day data for seasonal mode detection
@@ -220,6 +221,19 @@ pub struct WinterAdaptiveV2Config {
     /// Price tolerance for consolidation (default: 0.50 = 50%)
     pub charge_consolidation_tolerance: f32,
 
+    // ---- Price Optimization ----
+    /// Maximum price premium (%) above cheapest block to accept for charging
+    /// Default: 15% - will skip 2.5 CZK blocks if 2.0 CZK blocks are available
+    /// Example: if cheapest block is 2.0 CZK, max acceptable is 2.3 CZK (2.0 * 1.15)
+    #[serde(default = "default_charge_price_tolerance")]
+    pub charge_price_tolerance_percent: f32,
+
+    /// How much above median (%) to allow when SOC deficit is predicted
+    /// Default: 10% - when battery will hit min_soc, allow charging at median * 1.10
+    /// This helps cover gaps where isolated cheap blocks exist just above median
+    #[serde(default = "default_deficit_median_relaxation")]
+    pub deficit_median_relaxation_percent: f32,
+
     // ---- Negative Prices ----
     /// Enable negative price handling (default: true)
     pub negative_price_handling_enabled: bool,
@@ -243,6 +257,14 @@ fn default_winter_adaptive_v2_priority() -> u8 {
     100
 }
 
+fn default_charge_price_tolerance() -> f32 {
+    15.0 // 15% above cheapest price
+}
+
+fn default_deficit_median_relaxation() -> f32 {
+    10.0 // 10% above median when deficit exists
+}
+
 impl Default for WinterAdaptiveV2Config {
     fn default() -> Self {
         Self {
@@ -262,6 +284,8 @@ impl Default for WinterAdaptiveV2Config {
             expected_future_value_per_wh: 0.002,
             min_consecutive_charge_blocks: 2,
             charge_consolidation_tolerance: 0.50,
+            charge_price_tolerance_percent: 15.0,
+            deficit_median_relaxation_percent: 10.0,
             negative_price_handling_enabled: true,
             charge_on_negative_even_if_full: false,
             slot_history: VecDeque::new(),
@@ -753,14 +777,16 @@ mod scheduling {
     /// 1. Sort all blocks by price (cheapest first)
     /// 2. Take the top N cheapest blocks as candidates
     /// 3. From candidates, find consecutive runs >= min_consecutive
-    /// 4. For each run, try shifting earlier (up to min_consecutive * 2 blocks back)
+    /// 4. For each run, try shifting earlier AND later (up to min_consecutive * 2 blocks)
     ///    to find a cheaper consecutive window
-    /// 5. Select cheapest runs until we have enough blocks
-    /// 6. If not enough consecutive runs, expand candidate pool
+    /// 5. Apply price tolerance filter (if set) - reject runs > tolerance% above cheapest
+    /// 6. Select cheapest runs until we have enough blocks
+    /// 7. If not enough consecutive runs, expand candidate pool
     pub fn select_cheapest_blocks(
         blocks_with_prices: &[(usize, f32)], // (index, price) pairs
         count_needed: usize,
         min_consecutive: usize,
+        price_tolerance_percent: Option<f32>, // Max premium (%) above cheapest to accept
     ) -> Vec<usize> {
         if blocks_with_prices.is_empty() || count_needed == 0 {
             return Vec::new();
@@ -845,7 +871,39 @@ mod scheduling {
                         // Check if we can form a valid consecutive window of run_length blocks
                         // All blocks in the new window must exist in blocks_with_prices
                         let new_indices: Vec<usize> = (new_start..new_start + run_length).collect();
-                        let all_available = new_indices.iter().all(|idx| price_map.contains_key(idx));
+                        let all_available =
+                            new_indices.iter().all(|idx| price_map.contains_key(idx));
+
+                        if all_available {
+                            let new_avg: f32 = new_indices
+                                .iter()
+                                .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
+                                .sum::<f32>()
+                                / run_length as f32;
+
+                            if new_avg < best_avg {
+                                best_avg = new_avg;
+                                best_indices = new_indices;
+                            }
+                        }
+                    }
+
+                    // ALSO try shifting the window LATER (forward in time) to find cheaper blocks
+                    // This is critical for scenarios where cheaper prices exist later in the night
+                    let max_shift_forward = min_consecutive * 2;
+                    let max_idx = price_map.keys().max().copied().unwrap_or(0);
+
+                    for shift in 1..=max_shift_forward {
+                        let new_start = run_start + shift;
+
+                        // Ensure we don't exceed available blocks
+                        if new_start + run_length - 1 > max_idx {
+                            break;
+                        }
+
+                        let new_indices: Vec<usize> = (new_start..new_start + run_length).collect();
+                        let all_available =
+                            new_indices.iter().all(|idx| price_map.contains_key(idx));
 
                         if all_available {
                             let new_avg: f32 = new_indices
@@ -867,6 +925,27 @@ mod scheduling {
 
             // Sort runs by average price (cheapest first)
             scored_runs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Apply price tolerance filter: reject runs with price > tolerance% above cheapest
+            // This ensures we strongly prefer the cheapest blocks (even if they're later)
+            // and only use more expensive blocks when absolutely necessary
+            if let Some(tolerance_pct) = price_tolerance_percent
+                && let Some((min_avg, _)) = scored_runs.first()
+            {
+                let max_acceptable_price = min_avg * (1.0 + tolerance_pct / 100.0);
+                let original_count = scored_runs.len();
+                scored_runs.retain(|(avg_price, _)| *avg_price <= max_acceptable_price);
+
+                if scored_runs.len() < original_count {
+                    tracing::debug!(
+                        "Price tolerance filter: kept {} of {} runs (max price: {:.3} CZK, tolerance: {}%)",
+                        scored_runs.len(),
+                        original_count,
+                        max_acceptable_price,
+                        tolerance_pct
+                    );
+                }
+            }
 
             // Select blocks from cheapest runs first
             selected.clear();
@@ -1120,10 +1199,12 @@ impl WinterAdaptiveV2Strategy {
 
         // Select cheapest blocks respecting min_consecutive constraint
         // ONLY from affordable blocks (below median price)
+        // Apply price tolerance to strongly prefer the cheapest available blocks
         let mut charge_schedule = scheduling::select_cheapest_blocks(
             &affordable_blocks,
             base_charge_blocks,
             min_consecutive,
+            Some(self.config.charge_price_tolerance_percent),
         );
 
         // =====================================================================
@@ -1177,14 +1258,27 @@ impl WinterAdaptiveV2Strategy {
         if total_deficit_kwh > 0.0 {
             let extra_blocks_needed = (total_deficit_kwh / charge_per_block_kwh).ceil() as usize;
 
+            // When deficit exists, use RELAXED median threshold to allow blocks
+            // slightly above median - this helps capture adjacent blocks that
+            // would otherwise be isolated (e.g., 3.38 CZK below median, 3.54 CZK just above)
+            let relaxed_median_threshold =
+                median_price * (1.0 + self.config.deficit_median_relaxation_percent / 100.0);
+
+            tracing::debug!(
+                "V2: Deficit of {:.2} kWh detected. Relaxing median filter from {:.3} to {:.3} CZK/kWh",
+                total_deficit_kwh,
+                median_price,
+                relaxed_median_threshold
+            );
+
             // Find all unscheduled blocks from the ENTIRE remaining schedule
-            // HARD FILTER: Only include blocks BELOW median price (never charge in top 50%)
+            // Use RELAXED median threshold when deficit exists
             let available_blocks: Vec<(usize, f32)> = remaining_blocks
                 .iter()
                 .filter(|(idx, price)| {
                     *idx >= current_block_index
                         && !charge_schedule.contains(idx)
-                        && *price < median_price // NEVER charge above median
+                        && *price < relaxed_median_threshold // Relaxed when deficit exists
                 })
                 .copied()
                 .collect();
@@ -1209,10 +1303,12 @@ impl WinterAdaptiveV2Strategy {
             };
 
             // Select the globally cheapest blocks (already filtered to below median)
+            // Use tolerance to prefer cheapest blocks for deficit coverage too
             let mut extra_blocks = scheduling::select_cheapest_blocks(
                 &available_blocks,
                 extra_blocks_needed,
                 min_consecutive,
+                Some(self.config.charge_price_tolerance_percent),
             );
 
             // Additional cost-benefit filter: charge_price / efficiency < expensive_price
@@ -1265,15 +1361,19 @@ impl WinterAdaptiveV2Strategy {
                 let extra_blocks_needed =
                     (energy_deficit_kwh / charge_per_block_kwh).ceil() as usize;
 
+                // When deficit exists for a specific period, use RELAXED median threshold
+                let relaxed_median_threshold =
+                    median_price * (1.0 + self.config.deficit_median_relaxation_percent / 100.0);
+
                 // Find cheapest blocks BEFORE this period (timing constraint)
-                // HARD FILTER: Only include blocks BELOW median price (never charge in top 50%)
+                // Use relaxed median threshold when deficit exists
                 let mut available_before: Vec<(usize, f32)> = remaining_blocks
                     .iter()
                     .filter(|(idx, price)| {
                         *idx >= current_block_index
                             && *idx < *period_start
                             && !charge_schedule.contains(idx)
-                            && *price < median_price // NEVER charge above median
+                            && *price < relaxed_median_threshold // Relaxed when deficit exists
                     })
                     .copied()
                     .collect();
@@ -1281,10 +1381,13 @@ impl WinterAdaptiveV2Strategy {
                 available_before
                     .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
+                // For timing-constrained blocks before a period, apply tolerance filter
+                // If tolerance rejects too many, the function will fall back to individual blocks
                 let extra_blocks = scheduling::select_cheapest_blocks(
                     &available_before,
                     extra_blocks_needed,
                     min_consecutive,
+                    Some(self.config.charge_price_tolerance_percent),
                 );
 
                 for idx in extra_blocks {
@@ -1420,7 +1523,8 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
             .position(|b| b.block_start == context.price_block.block_start)
             .unwrap_or(0);
 
-        let (mode, reason, decision_uid) = self.decide_mode(context, all_blocks, current_block_index);
+        let (mode, reason, decision_uid) =
+            self.decide_mode(context, all_blocks, current_block_index);
 
         eval.mode = mode;
         eval.reason = reason;
@@ -1447,7 +1551,10 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
             InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
                 // Estimate profit based on usable battery capacity vs consumption
                 // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
-                let usable_battery_kwh = ((context.current_battery_soc - context.control_config.hardware_min_battery_soc).max(0.0) / 100.0)
+                let usable_battery_kwh = ((context.current_battery_soc
+                    - context.control_config.hardware_min_battery_soc)
+                    .max(0.0)
+                    / 100.0)
                     * context.control_config.battery_capacity_kwh;
                 let price = context.price_block.price_czk_per_kwh;
 

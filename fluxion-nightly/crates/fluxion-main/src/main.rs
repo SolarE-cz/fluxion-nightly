@@ -24,8 +24,8 @@ use fluxion_adapters::{
     HomeAssistantInverterAdapter,
 };
 use fluxion_core::{
-    ConfigUpdateSender, FluxionCorePlugin, PluginManagerResource, SystemConfig, TimezoneConfig, WebQuerySender,
-    plugin_adapters::create_plugin_manager,
+    ConfigUpdateSender, FluxionCorePlugin, PluginManagerResource, SystemConfig, TimezoneConfig,
+    WebQuerySender, plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::I18n;
 use fluxion_web::PluginApiState;

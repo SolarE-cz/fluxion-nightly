@@ -16,7 +16,7 @@ use bevy_ecs::prelude::*;
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    PriceDataSourceResource, PluginManagerResource,
+    PluginManagerResource, PriceDataSourceResource,
     components::*,
     pricing::analyze_prices,
     resources::SystemConfig,

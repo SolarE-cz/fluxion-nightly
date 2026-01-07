@@ -10,7 +10,9 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-use crate::strategy::{Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics};
+use crate::strategy::{
+    Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics,
+};
 use crate::utils::calculate_ema;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use fluxion_types::inverter::InverterOperationMode;
@@ -1493,7 +1495,10 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
             InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
                 // Estimate profit based on usable battery capacity vs consumption
                 // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
-                let usable_battery_kwh = ((context.current_battery_soc - context.control_config.hardware_min_battery_soc).max(0.0) / 100.0)
+                let usable_battery_kwh = ((context.current_battery_soc
+                    - context.control_config.hardware_min_battery_soc)
+                    .max(0.0)
+                    / 100.0)
                     * context.control_config.battery_capacity_kwh;
                 let price = context.price_block.price_czk_per_kwh;
 

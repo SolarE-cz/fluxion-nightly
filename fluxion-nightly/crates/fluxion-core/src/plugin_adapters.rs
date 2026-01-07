@@ -17,9 +17,7 @@ use crate::strategy::{
     winter_adaptive::{WinterAdaptiveConfig, WinterAdaptiveStrategy},
     winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy},
 };
-use fluxion_plugins::{
-    BlockDecision, EvaluationRequest, Plugin, PluginManager,
-};
+use fluxion_plugins::{BlockDecision, EvaluationRequest, Plugin, PluginManager};
 use fluxion_types::config::ControlConfig;
 use fluxion_types::pricing::TimeBlockPrice;
 use std::sync::Arc;
@@ -214,12 +212,15 @@ pub fn init_plugin_manager(
         v1_config.daily_charging_target_soc = sc.winter_adaptive.daily_charging_target_soc;
         v1_config.conservation_threshold_soc = sc.winter_adaptive.conservation_threshold_soc;
         v1_config.top_expensive_blocks = sc.winter_adaptive.top_expensive_blocks;
-        v1_config.tomorrow_preservation_threshold = sc.winter_adaptive.tomorrow_preservation_threshold;
+        v1_config.tomorrow_preservation_threshold =
+            sc.winter_adaptive.tomorrow_preservation_threshold;
         v1_config.grid_export_price_threshold = sc.winter_adaptive.grid_export_price_threshold;
         v1_config.min_soc_for_export = sc.winter_adaptive.min_soc_for_export;
         v1_config.export_trigger_multiplier = sc.winter_adaptive.export_trigger_multiplier;
-        v1_config.negative_price_handling_enabled = sc.winter_adaptive.negative_price_handling_enabled;
-        v1_config.charge_on_negative_even_if_full = sc.winter_adaptive.charge_on_negative_even_if_full;
+        v1_config.negative_price_handling_enabled =
+            sc.winter_adaptive.negative_price_handling_enabled;
+        v1_config.charge_on_negative_even_if_full =
+            sc.winter_adaptive.charge_on_negative_even_if_full;
     }
 
     // Create Winter Adaptive V2 config from core config or defaults

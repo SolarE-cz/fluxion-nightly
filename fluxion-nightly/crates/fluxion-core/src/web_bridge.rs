@@ -599,7 +599,15 @@ fn build_dashboard_response(
                         // CRITICAL: Match schedule blocks by TIMESTAMP, not array index
                         // This is essential because schedule may have filtered past blocks,
                         // causing index misalignment with price data blocks.
-                        let (block_type, target_soc, strategy, profit, reason, decision_uid, debug_info) = sched
+                        let (
+                            block_type,
+                            target_soc,
+                            strategy,
+                            profit,
+                            reason,
+                            decision_uid,
+                            debug_info,
+                        ) = sched
                             .and_then(|s| {
                                 // Find the scheduled block that matches this price block's timestamp
                                 s.scheduled_blocks

@@ -19,14 +19,13 @@
 //! - Update plugin priorities
 
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use fluxion_plugins::{
-    HttpPlugin, PluginManager, PluginRegistrationRequest,
-    PluginRegistrationResponse,
+    HttpPlugin, PluginManager, PluginRegistrationRequest, PluginRegistrationResponse,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -78,9 +77,7 @@ pub struct PriorityUpdateResponse {
 /// List all registered plugins
 ///
 /// GET /api/plugins
-pub async fn list_plugins_handler(
-    State(state): State<PluginApiState>,
-) -> impl IntoResponse {
+pub async fn list_plugins_handler(State(state): State<PluginApiState>) -> impl IntoResponse {
     debug!("Listing all plugins");
 
     let manager = state.plugin_manager.read();
@@ -139,7 +136,8 @@ pub async fn register_plugin_handler(
     }
 
     // Validate the callback URL format
-    if !request.callback_url.starts_with("http://") && !request.callback_url.starts_with("https://") {
+    if !request.callback_url.starts_with("http://") && !request.callback_url.starts_with("https://")
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(PluginRegistrationResponse {
@@ -228,10 +226,7 @@ pub async fn update_priority_handler(
             StatusCode::OK,
             Json(PriorityUpdateResponse {
                 success: true,
-                message: format!(
-                    "Plugin '{}' priority updated to {}",
-                    name, request.priority
-                ),
+                message: format!("Plugin '{}' priority updated to {}", name, request.priority),
             }),
         )
     } else {
@@ -267,7 +262,11 @@ pub async fn update_enabled_handler(
     let mut manager = state.plugin_manager.write();
 
     if manager.set_enabled(&name, request.enabled) {
-        let state_str = if request.enabled { "enabled" } else { "disabled" };
+        let state_str = if request.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
         info!("Successfully {} plugin '{}'", state_str, name);
         (
             StatusCode::OK,

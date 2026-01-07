@@ -187,8 +187,7 @@ pub async fn start_web_server(
             )
             .route(
                 "/api/plugins/{name}/enabled",
-                axum::routing::put(plugin_api::update_enabled_handler)
-                    .with_state(plugin_state),
+                axum::routing::put(plugin_api::update_enabled_handler).with_state(plugin_state),
             );
     }
 

@@ -320,7 +320,7 @@ mod tests {
                     target_inverters: None,
                     mode: InverterOperationMode::ForceCharge,
                     reason: "Charge".to_string(),
-                decision_uid: None,
+                    decision_uid: None,
                     debug_info: None,
                 },
                 ScheduledMode {
@@ -329,7 +329,7 @@ mod tests {
                     target_inverters: None,
                     mode: InverterOperationMode::ForceCharge,
                     reason: "Charge".to_string(),
-                decision_uid: None,
+                    decision_uid: None,
                     debug_info: None,
                 },
                 ScheduledMode {
@@ -338,7 +338,7 @@ mod tests {
                     target_inverters: None,
                     mode: InverterOperationMode::ForceDischarge,
                     reason: "Discharge".to_string(),
-                decision_uid: None,
+                    decision_uid: None,
                     debug_info: None,
                 },
             ],

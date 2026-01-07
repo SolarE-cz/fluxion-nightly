@@ -51,7 +51,8 @@ impl std::fmt::Debug for PluginEntry {
 
 impl PluginEntry {
     fn effective_priority(&self) -> u8 {
-        self.priority_override.unwrap_or_else(|| self.plugin.priority())
+        self.priority_override
+            .unwrap_or_else(|| self.plugin.priority())
     }
 }
 
@@ -95,7 +96,11 @@ impl PluginManager {
     /// Register a plugin
     pub fn register(&mut self, plugin: Arc<dyn Plugin>) {
         let name = plugin.name().to_owned();
-        debug!("Registering plugin: {} (priority: {})", name, plugin.priority());
+        debug!(
+            "Registering plugin: {} (priority: {})",
+            name,
+            plugin.priority()
+        );
         self.plugins.insert(
             name,
             PluginEntry {
@@ -174,7 +179,11 @@ impl PluginManager {
     /// 2. If tied, highest confidence wins
     /// 3. If still tied, highest expected profit wins
     #[must_use]
-    pub fn merge_decisions(&self, mut decisions: Vec<BlockDecision>, request: &EvaluationRequest) -> BlockDecision {
+    pub fn merge_decisions(
+        &self,
+        mut decisions: Vec<BlockDecision>,
+        request: &EvaluationRequest,
+    ) -> BlockDecision {
         if decisions.is_empty() {
             // Fallback decision
             return BlockDecision {
@@ -197,12 +206,16 @@ impl PluginManager {
                 .then_with(|| {
                     let a_conf = a.confidence.unwrap_or(0.0);
                     let b_conf = b.confidence.unwrap_or(0.0);
-                    b_conf.partial_cmp(&a_conf).unwrap_or(std::cmp::Ordering::Equal)
+                    b_conf
+                        .partial_cmp(&a_conf)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .then_with(|| {
                     let a_profit = a.expected_profit_czk.unwrap_or(0.0);
                     let b_profit = b.expected_profit_czk.unwrap_or(0.0);
-                    b_profit.partial_cmp(&a_profit).unwrap_or(std::cmp::Ordering::Equal)
+                    b_profit
+                        .partial_cmp(&a_profit)
+                        .unwrap_or(std::cmp::Ordering::Equal)
                 })
         });
 

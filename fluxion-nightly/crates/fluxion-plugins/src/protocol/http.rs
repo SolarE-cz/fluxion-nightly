@@ -118,7 +118,8 @@ impl HttpPlugin {
         if prev + 1 >= self.max_failures {
             warn!(
                 "Plugin {} has {} consecutive failures, auto-disabling",
-                self.manifest.name, prev + 1
+                self.manifest.name,
+                prev + 1
             );
         }
     }
@@ -200,10 +201,7 @@ impl Plugin for HttpPlugin {
             }
             Err(e) => {
                 self.record_failure();
-                error!(
-                    "HttpPlugin {} request failed: {}",
-                    self.manifest.name, e
-                );
+                error!("HttpPlugin {} request failed: {}", self.manifest.name, e);
                 Err(anyhow::anyhow!("Request failed: {e}"))
             }
         }

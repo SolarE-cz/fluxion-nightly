@@ -1,10 +1,13 @@
 # Custom External Strategies Guide
 
-This guide explains how to create custom battery control strategies for FluxION using any programming language (Python, Go, Node.js, etc.) via the HTTP Plugin Protocol.
+This guide explains how to create custom battery control strategies for FluxION using any
+programming language (Python, Go, Node.js, etc.) via the HTTP Plugin Protocol.
 
 ## Overview
 
-FluxION's plugin architecture allows external strategies to participate in battery scheduling decisions alongside built-in strategies. External plugins communicate via HTTP/REST, making them language-agnostic.
+FluxION's plugin architecture allows external strategies to participate in battery scheduling
+decisions alongside built-in strategies. External plugins communicate via HTTP/REST, making them
+language-agnostic.
 
 ### How It Works
 
@@ -35,7 +38,7 @@ FluxION's plugin architecture allows external strategies to participate in batte
 └─────────────────────────────────────────────────────────────┘
 ```
 
----
+______________________________________________________________________
 
 ## Protocol Specification
 
@@ -60,6 +63,7 @@ Content-Type: application/json
 ```
 
 **Response:**
+
 ```json
 {
   "success": true,
@@ -126,28 +130,23 @@ Your plugin must respond with:
 
 **Fields:**
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `block_start` | ISO8601 datetime | Yes | Must match request |
-| `duration_minutes` | integer | Yes | Must match request (usually 15) |
-| `mode` | string | Yes | One of: `SelfUse`, `ForceCharge`, `ForceDischarge`, `BackUpMode` |
-| `reason` | string | Yes | Human-readable explanation |
-| `priority` | integer (0-100) | Yes | Higher wins conflicts |
-| `strategy_name` | string | No | Your strategy name (for logging) |
-| `confidence` | float (0.0-1.0) | No | Confidence in decision (tiebreaker) |
-| `expected_profit_czk` | float | No | Expected profit/cost (tiebreaker) |
-| `decision_uid` | string | No | Unique ID for debugging |
+| Field | Type | Required | Description | |-------|------|----------|-------------| | `block_start`
+| ISO8601 datetime | Yes | Must match request | | `duration_minutes` | integer | Yes | Must match
+request (usually 15) | | `mode` | string | Yes | One of: `SelfUse`, `ForceCharge`, `ForceDischarge`,
+`BackUpMode` | | `reason` | string | Yes | Human-readable explanation | | `priority` | integer
+(0-100) | Yes | Higher wins conflicts | | `strategy_name` | string | No | Your strategy name (for
+logging) | | `confidence` | float (0.0-1.0) | No | Confidence in decision (tiebreaker) | |
+`expected_profit_czk` | float | No | Expected profit/cost (tiebreaker) | | `decision_uid` | string |
+No | Unique ID for debugging |
 
 ### Operation Modes
 
-| Mode | Description |
-|------|-------------|
-| `SelfUse` | Normal operation - battery assists household load |
-| `ForceCharge` | Force charge from grid at maximum rate |
-| `ForceDischarge` | Force discharge to grid/load at maximum rate |
-| `BackUpMode` | Hold battery charge, prevent discharge |
+| Mode | Description | |------|-------------| | `SelfUse` | Normal operation - battery assists
+household load | | `ForceCharge` | Force charge from grid at maximum rate | | `ForceDischarge` |
+Force discharge to grid/load at maximum rate | | `BackUpMode` | Hold battery charge, prevent
+discharge |
 
----
+______________________________________________________________________
 
 ## Priority System
 
@@ -161,13 +160,10 @@ Your plugin must respond with:
 
 ### Priority Guidelines
 
-| Priority Range | Recommended Use |
-|----------------|-----------------|
-| 100 | Critical safety overrides (e.g., battery protection) |
-| 90-99 | Primary strategies (built-in Winter Adaptive V1 uses 100) |
-| 70-89 | Secondary strategies, experimental algorithms |
-| 50-69 | Advisory strategies, logging-only |
-| 0-49 | Fallback strategies |
+| Priority Range | Recommended Use | |----------------|-----------------| | 100 | Critical safety
+overrides (e.g., battery protection) | | 90-99 | Primary strategies (built-in Winter Adaptive V1
+uses 100) | | 70-89 | Secondary strategies, experimental algorithms | | 50-69 | Advisory strategies,
+logging-only | | 0-49 | Fallback strategies |
 
 ### Strategy Competition Example
 
@@ -183,7 +179,7 @@ Winner: Winter-Adaptive V1 (ForceCharge) - highest priority
 
 If you want your strategy to override built-in strategies, set priority > 100.
 
----
+______________________________________________________________________
 
 ## Python Implementation
 
@@ -463,7 +459,7 @@ requests>=2.25.0
 numpy>=1.20.0
 ```
 
----
+______________________________________________________________________
 
 ## Plugin Lifecycle
 
@@ -539,7 +535,7 @@ curl -X PUT http://localhost:8099/api/plugins/http:my-strategy/enabled \
 curl -X DELETE http://localhost:8099/api/plugins/http:my-strategy
 ```
 
----
+______________________________________________________________________
 
 ## Deployment Patterns
 
@@ -614,7 +610,7 @@ def evaluate():
         })
 ```
 
----
+______________________________________________________________________
 
 ## Best Practices
 
@@ -713,24 +709,27 @@ def log_decision(request, decision):
                  f"reason={decision['reason']}")
 ```
 
----
+______________________________________________________________________
 
 ## Troubleshooting
 
 ### Plugin Not Receiving Requests
 
 1. Check registration succeeded:
+
    ```bash
    curl http://localhost:8099/api/plugins | jq
    ```
 
 2. Verify callback URL is reachable from FluxION:
+
    ```bash
    # From FluxION container/host
    curl http://your-plugin:8100/health
    ```
 
 3. Check FluxION logs for errors:
+
    ```bash
    docker logs fluxion 2>&1 | grep -i plugin
    ```
@@ -748,12 +747,13 @@ curl -X PUT http://localhost:8099/api/plugins/http:my-strategy/enabled \
 ### Priority Not Working
 
 Ensure your priority is higher than competing strategies:
+
 - Winter-Adaptive V1: priority 100 (default)
 - Winter-Adaptive V2: priority 90 (default)
 
 Set `priority > 100` to override built-in strategies.
 
----
+______________________________________________________________________
 
 ## Security Considerations
 
@@ -762,13 +762,14 @@ Set `priority > 100` to override built-in strategies.
 3. **No Sensitive Data**: Don't log or store sensitive information
 4. **Rate Limiting**: FluxION only calls once per 15-min block, but protect against abuse
 
----
+______________________________________________________________________
 
 ## Strategy Management & Configuration
 
 ### Current Approach: API-Based Registration
 
 External strategies register themselves via the REST API. This is flexible but requires:
+
 - External service must be running before registration
 - Registration is lost on FluxION restart (plugin must re-register)
 - No visibility in FluxION's main configuration
@@ -804,6 +805,7 @@ strategies:
 ```
 
 This would provide:
+
 - Persistent configuration across restarts
 - Web UI integration for enable/disable
 - Centralized priority management
@@ -834,13 +836,11 @@ def main():
 
 When setting priority for your custom strategy:
 
-| Scenario | Recommended Priority | Reason |
-|----------|---------------------|--------|
-| **Override everything** | 101+ | Higher than all built-in strategies |
-| **Primary custom strategy** | 95 | Below V1 (100) but above V2 (90) |
-| **Experimental / testing** | 80-89 | Can be overridden by built-ins |
-| **Advisory only** | 50-70 | Suggestions, not commands |
-| **Logging / monitoring** | 0-30 | Never wins, just observes |
+| Scenario | Recommended Priority | Reason | |----------|---------------------|--------| |
+**Override everything** | 101+ | Higher than all built-in strategies | | **Primary custom strategy**
+| 95 | Below V1 (100) but above V2 (90) | | **Experimental / testing** | 80-89 | Can be overridden
+by built-ins | | **Advisory only** | 50-70 | Suggestions, not commands | | **Logging / monitoring**
+| 0-30 | Never wins, just observes |
 
 ### Multiple Custom Strategies
 
@@ -862,16 +862,18 @@ You can run multiple external strategies simultaneously:
 ```
 
 Each strategy:
+
 - Receives the same `EvaluationRequest`
 - Returns its own `BlockDecision`
 - Competes based on priority
 
 This allows:
+
 - A/B testing between strategies
 - Fallback chains (if high-priority fails, lower takes over)
 - Monitoring strategies that log but don't control
 
----
+______________________________________________________________________
 
 ## Integration Status
 
@@ -928,7 +930,7 @@ def keep_registered():
 threading.Thread(target=keep_registered, daemon=True).start()
 ```
 
----
+______________________________________________________________________
 
 ## Further Reading
 
