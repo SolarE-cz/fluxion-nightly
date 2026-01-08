@@ -773,15 +773,18 @@ mod scheduling {
     /// Select cheapest blocks respecting min_consecutive constraint
     /// Returns indices of blocks to charge, sorted by time
     ///
-    /// Algorithm:
-    /// 1. Sort all blocks by price (cheapest first)
-    /// 2. Take the top N cheapest blocks as candidates
-    /// 3. From candidates, find consecutive runs >= min_consecutive
-    /// 4. For each run, try shifting earlier AND later (up to min_consecutive * 2 blocks)
-    ///    to find a cheaper consecutive window
-    /// 5. Apply price tolerance filter (if set) - reject runs > tolerance% above cheapest
-    /// 6. Select cheapest runs until we have enough blocks
-    /// 7. If not enough consecutive runs, expand candidate pool
+    /// Algorithm (Global Sliding Window Search):
+    /// 1. Find all consecutive ranges in the available blocks
+    /// 2. Use sliding window to generate ALL possible windows of min_consecutive length
+    /// 3. Score each window by average price
+    /// 4. Sort all windows by average price (cheapest first)
+    /// 5. Apply price tolerance filter (if set) - reject windows > tolerance% above cheapest
+    /// 6. Greedily select non-overlapping windows until we have enough blocks
+    /// 7. If still need more, extend selected windows with cheapest adjacent blocks
+    /// 8. Final fallback: add cheapest individual blocks
+    ///
+    /// This approach guarantees finding the globally cheapest consecutive windows,
+    /// unlike the previous algorithm which only searched within candidate pools.
     pub fn select_cheapest_blocks(
         blocks_with_prices: &[(usize, f32)], // (index, price) pairs
         count_needed: usize,
@@ -796,7 +799,7 @@ mod scheduling {
         let price_map: std::collections::HashMap<usize, f32> =
             blocks_with_prices.iter().copied().collect();
 
-        // Sort by price (cheapest first)
+        // Sort by price (cheapest first) for fallback
         let mut sorted = blocks_with_prices.to_vec();
         sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -811,166 +814,151 @@ mod scheduling {
             return result;
         }
 
-        // Try with progressively larger candidate pools until we find enough
-        let mut selected: Vec<usize> = Vec::new();
+        // =====================================================================
+        // GLOBAL SLIDING WINDOW SEARCH
+        // Find ALL consecutive windows of min_consecutive length, score by avg price
+        // This guarantees finding the globally cheapest consecutive window
+        // =====================================================================
 
-        // Start with just the cheapest count_needed blocks, then expand if needed
-        for pool_size in [
-            count_needed,
-            count_needed * 2,
-            count_needed * 3,
-            sorted.len(),
-        ] {
-            let pool_size = pool_size.min(sorted.len());
-            let candidates: Vec<(usize, f32)> = sorted.iter().take(pool_size).copied().collect();
+        // Sort blocks by index to find consecutive ranges
+        let mut by_idx = blocks_with_prices.to_vec();
+        by_idx.sort_by_key(|(idx, _)| *idx);
 
-            // Sort candidates by index to find consecutive runs
-            let mut by_idx = candidates.clone();
-            by_idx.sort_by_key(|(idx, _)| *idx);
+        // Find all consecutive ranges in the available blocks
+        let mut consecutive_ranges: Vec<(usize, usize)> = Vec::new(); // (start_idx, end_idx exclusive)
+        if !by_idx.is_empty() {
+            let mut range_start = by_idx[0].0;
+            let mut prev_idx = by_idx[0].0;
 
-            // Find all consecutive runs of at least min_consecutive length
-            let mut runs: Vec<Vec<(usize, f32)>> = Vec::new();
-            let mut current_run: Vec<(usize, f32)> = Vec::new();
-
-            for (idx, price) in by_idx {
-                if current_run.is_empty() || idx == current_run.last().unwrap().0 + 1 {
-                    current_run.push((idx, price));
-                } else {
-                    if current_run.len() >= min_consecutive {
-                        runs.push(current_run);
-                    }
-                    current_run = vec![(idx, price)];
+            #[expect(clippy::needless_range_loop)]
+            for i in 1..by_idx.len() {
+                let curr_idx = by_idx[i].0;
+                if curr_idx != prev_idx + 1 {
+                    // Gap found - close current range
+                    consecutive_ranges.push((range_start, prev_idx + 1));
+                    range_start = curr_idx;
                 }
+                prev_idx = curr_idx;
             }
-            if current_run.len() >= min_consecutive {
-                runs.push(current_run);
-            }
+            // Close final range
+            consecutive_ranges.push((range_start, prev_idx + 1));
+        }
 
-            // Score runs by average price, but also try shifting earlier to find cheaper windows
-            let mut scored_runs: Vec<(f32, Vec<usize>)> = runs
-                .into_iter()
-                .map(|run| {
-                    let original_avg: f32 =
-                        run.iter().map(|(_, p)| *p).sum::<f32>() / run.len() as f32;
-                    let original_indices: Vec<usize> = run.iter().map(|(idx, _)| *idx).collect();
-                    let run_length = run.len();
-                    let run_start = run.first().map(|(idx, _)| *idx).unwrap_or(0);
+        // Generate all possible windows of min_consecutive length within consecutive ranges
+        // Each window is scored by its average price
+        let mut all_windows: Vec<(f32, Vec<usize>)> = Vec::new();
 
-                    // Try shifting the window earlier by up to min_consecutive * 2 blocks
-                    // to find a potentially cheaper consecutive window
-                    let max_shift_back = min_consecutive * 2;
-                    let mut best_avg = original_avg;
-                    let mut best_indices = original_indices.clone();
-
-                    for shift in 1..=max_shift_back {
-                        if run_start < shift {
-                            break; // Can't shift back further
-                        }
-                        let new_start = run_start - shift;
-
-                        // Check if we can form a valid consecutive window of run_length blocks
-                        // All blocks in the new window must exist in blocks_with_prices
-                        let new_indices: Vec<usize> = (new_start..new_start + run_length).collect();
-                        let all_available =
-                            new_indices.iter().all(|idx| price_map.contains_key(idx));
-
-                        if all_available {
-                            let new_avg: f32 = new_indices
-                                .iter()
-                                .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
-                                .sum::<f32>()
-                                / run_length as f32;
-
-                            if new_avg < best_avg {
-                                best_avg = new_avg;
-                                best_indices = new_indices;
-                            }
-                        }
-                    }
-
-                    // ALSO try shifting the window LATER (forward in time) to find cheaper blocks
-                    // This is critical for scenarios where cheaper prices exist later in the night
-                    let max_shift_forward = min_consecutive * 2;
-                    let max_idx = price_map.keys().max().copied().unwrap_or(0);
-
-                    for shift in 1..=max_shift_forward {
-                        let new_start = run_start + shift;
-
-                        // Ensure we don't exceed available blocks
-                        if new_start + run_length - 1 > max_idx {
-                            break;
-                        }
-
-                        let new_indices: Vec<usize> = (new_start..new_start + run_length).collect();
-                        let all_available =
-                            new_indices.iter().all(|idx| price_map.contains_key(idx));
-
-                        if all_available {
-                            let new_avg: f32 = new_indices
-                                .iter()
-                                .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
-                                .sum::<f32>()
-                                / run_length as f32;
-
-                            if new_avg < best_avg {
-                                best_avg = new_avg;
-                                best_indices = new_indices;
-                            }
-                        }
-                    }
-
-                    (best_avg, best_indices)
-                })
-                .collect();
-
-            // Sort runs by average price (cheapest first)
-            scored_runs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Apply price tolerance filter: reject runs with price > tolerance% above cheapest
-            // This ensures we strongly prefer the cheapest blocks (even if they're later)
-            // and only use more expensive blocks when absolutely necessary
-            if let Some(tolerance_pct) = price_tolerance_percent
-                && let Some((min_avg, _)) = scored_runs.first()
-            {
-                let max_acceptable_price = min_avg * (1.0 + tolerance_pct / 100.0);
-                let original_count = scored_runs.len();
-                scored_runs.retain(|(avg_price, _)| *avg_price <= max_acceptable_price);
-
-                if scored_runs.len() < original_count {
-                    tracing::debug!(
-                        "Price tolerance filter: kept {} of {} runs (max price: {:.3} CZK, tolerance: {}%)",
-                        scored_runs.len(),
-                        original_count,
-                        max_acceptable_price,
-                        tolerance_pct
-                    );
-                }
+        for (range_start, range_end) in &consecutive_ranges {
+            let range_len = range_end - range_start;
+            if range_len < min_consecutive {
+                continue; // Range too short for even one window
             }
 
-            // Select blocks from cheapest runs first
-            selected.clear();
-            for (_, run) in &scored_runs {
-                if selected.len() >= count_needed {
-                    break;
-                }
-                for &idx in run {
-                    if selected.len() >= count_needed {
-                        break;
-                    }
-                    if !selected.contains(&idx) {
-                        selected.push(idx);
-                    }
-                }
-            }
+            // Slide window across this consecutive range
+            for window_start in *range_start..=(range_end - min_consecutive) {
+                let window_indices: Vec<usize> =
+                    (window_start..window_start + min_consecutive).collect();
 
-            // If we found enough blocks in consecutive runs, we're done
-            if selected.len() >= count_needed {
-                break;
+                // Calculate average price for this window
+                let avg_price: f32 = window_indices
+                    .iter()
+                    .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
+                    .sum::<f32>()
+                    / min_consecutive as f32;
+
+                all_windows.push((avg_price, window_indices));
             }
         }
 
-        // If still need more blocks (couldn't find enough consecutive runs),
-        // fall back to cheapest individual blocks
+        // Sort all windows by average price (cheapest first)
+        all_windows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply price tolerance filter if specified
+        let cheapest_window_price = all_windows.first().map(|(p, _)| *p);
+        if let Some(tolerance_pct) = price_tolerance_percent
+            && let Some(min_price) = cheapest_window_price
+        {
+            let max_acceptable_price = min_price * (1.0 + tolerance_pct / 100.0);
+            let original_count = all_windows.len();
+            all_windows.retain(|(avg_price, _)| *avg_price <= max_acceptable_price);
+
+            if all_windows.len() < original_count {
+                tracing::debug!(
+                    "Price tolerance filter: kept {} of {} windows (cheapest: {:.3}, max: {:.3} CZK, tolerance: {}%)",
+                    all_windows.len(),
+                    original_count,
+                    min_price,
+                    max_acceptable_price,
+                    tolerance_pct
+                );
+            }
+        }
+
+        // Greedily select non-overlapping windows until we have enough blocks
+        let mut selected: Vec<usize> = Vec::new();
+
+        for (avg_price, window_indices) in &all_windows {
+            if selected.len() >= count_needed {
+                break;
+            }
+
+            // Check if this window overlaps with already selected blocks
+            let overlaps = window_indices.iter().any(|idx| selected.contains(idx));
+            if overlaps {
+                continue;
+            }
+
+            // Add all blocks from this window
+            tracing::debug!(
+                "Selecting window at indices {:?} with avg price {:.3} CZK/kWh",
+                window_indices,
+                avg_price
+            );
+            for &idx in window_indices {
+                if selected.len() >= count_needed {
+                    break;
+                }
+                selected.push(idx);
+            }
+        }
+
+        // If still need more blocks after selecting windows,
+        // extend from adjacent blocks to selected windows (prefer cheaper)
+        if selected.len() < count_needed {
+            // Try extending existing windows with adjacent blocks
+            let mut extensions: Vec<(usize, f32)> = Vec::new();
+
+            for &sel_idx in &selected {
+                // Check block before
+                if sel_idx > 0
+                    && !selected.contains(&(sel_idx - 1))
+                    && let Some(&price) = price_map.get(&(sel_idx - 1))
+                {
+                    extensions.push((sel_idx - 1, price));
+                }
+                // Check block after
+                if !selected.contains(&(sel_idx + 1))
+                    && let Some(&price) = price_map.get(&(sel_idx + 1))
+                {
+                    extensions.push((sel_idx + 1, price));
+                }
+            }
+
+            // Sort extensions by price and add cheapest
+            extensions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            extensions.dedup_by_key(|(idx, _)| *idx);
+
+            for (idx, _) in extensions {
+                if selected.len() >= count_needed {
+                    break;
+                }
+                if !selected.contains(&idx) {
+                    selected.push(idx);
+                }
+            }
+        }
+
+        // Final fallback: if still need more blocks, add cheapest individual blocks
         if selected.len() < count_needed {
             for (idx, _) in &sorted {
                 if selected.len() >= count_needed {
