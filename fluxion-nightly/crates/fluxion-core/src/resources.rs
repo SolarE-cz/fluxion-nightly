@@ -23,7 +23,7 @@ pub use fluxion_types::config::{
     ControlConfig, Currency, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
     SolarAwareChargingConfigCore, StrategiesConfigCore, StrategyEnabledConfigCore, SystemConfig,
     SystemSettingsConfig, WinterAdaptiveConfigCore, WinterAdaptiveV2ConfigCore,
-    WinterPeakDischargeConfigCore,
+    WinterAdaptiveV3ConfigCore, WinterPeakDischargeConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 

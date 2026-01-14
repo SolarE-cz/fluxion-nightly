@@ -16,6 +16,7 @@ use crate::strategy::{
     EconomicStrategy, EvaluationContext,
     winter_adaptive::{WinterAdaptiveConfig, WinterAdaptiveStrategy},
     winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy},
+    winter_adaptive_v3::{WinterAdaptiveV3Config, WinterAdaptiveV3Strategy},
 };
 use fluxion_plugins::{BlockDecision, EvaluationRequest, Plugin, PluginManager};
 use fluxion_types::config::ControlConfig;
@@ -166,6 +167,78 @@ impl Plugin for WinterAdaptiveV2Plugin {
     }
 }
 
+/// Adapter that wraps WinterAdaptiveV3Strategy as a Plugin
+pub struct WinterAdaptiveV3Plugin {
+    strategy: WinterAdaptiveV3Strategy,
+    priority: u8,
+    control_config: ControlConfig,
+}
+
+impl std::fmt::Debug for WinterAdaptiveV3Plugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinterAdaptiveV3Plugin")
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl WinterAdaptiveV3Plugin {
+    /// Create a new Winter Adaptive V3 plugin
+    pub fn new(config: WinterAdaptiveV3Config, control_config: ControlConfig) -> Self {
+        Self {
+            priority: config.priority,
+            strategy: WinterAdaptiveV3Strategy::new(config),
+            control_config,
+        }
+    }
+}
+
+impl Plugin for WinterAdaptiveV3Plugin {
+    fn name(&self) -> &str {
+        self.strategy.name()
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        let (price_block, all_blocks) = convert_request(request);
+
+        let context = EvaluationContext {
+            price_block: &price_block,
+            control_config: &self.control_config,
+            current_battery_soc: request.battery.current_soc_percent,
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+            all_price_blocks: Some(&all_blocks),
+            backup_discharge_min_soc: request.backup_discharge_min_soc,
+            grid_import_today_kwh: request.historical.grid_import_today_kwh,
+            consumption_today_kwh: request.historical.consumption_today_kwh,
+        };
+
+        let eval = self.strategy.evaluate(&context);
+        let strategy_name = self.strategy.name().to_owned();
+
+        Ok(BlockDecision {
+            block_start: eval.block_start,
+            duration_minutes: eval.duration_minutes,
+            mode: eval.mode.into(),
+            reason: eval.reason,
+            priority: self.priority,
+            strategy_name: Some(strategy_name),
+            confidence: None,
+            expected_profit_czk: Some(eval.net_profit_czk),
+            decision_uid: eval.decision_uid,
+        })
+    }
+}
+
 /// Convert an EvaluationRequest to the types needed by strategies
 fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBlockPrice>) {
     let price_block = TimeBlockPrice {
@@ -228,6 +301,20 @@ pub fn init_plugin_manager(
     if let Some(sc) = strategies_config {
         v2_config.enabled = sc.winter_adaptive_v2.enabled;
         v2_config.priority = sc.winter_adaptive_v2.priority;
+        v2_config.daily_charging_target_soc = sc.winter_adaptive_v2.daily_charging_target_soc;
+    }
+
+    // Create Winter Adaptive V3 config from core config or defaults
+    let mut v3_config = WinterAdaptiveV3Config::default();
+    if let Some(sc) = strategies_config {
+        v3_config.enabled = sc.winter_adaptive_v3.enabled;
+        v3_config.priority = sc.winter_adaptive_v3.priority;
+        v3_config.daily_charging_target_soc = sc.winter_adaptive_v3.daily_charging_target_soc;
+        v3_config.hdo_sensor_entity = sc.winter_adaptive_v3.hdo_sensor_entity.clone();
+        v3_config.hdo_low_tariff_czk = sc.winter_adaptive_v3.hdo_low_tariff_czk;
+        v3_config.hdo_high_tariff_czk = sc.winter_adaptive_v3.hdo_high_tariff_czk;
+        v3_config.winter_discharge_min_soc = sc.winter_adaptive_v3.winter_discharge_min_soc;
+        v3_config.top_discharge_blocks_per_day = sc.winter_adaptive_v3.top_discharge_blocks_per_day;
     }
 
     // Register Winter Adaptive V1
@@ -237,6 +324,10 @@ pub fn init_plugin_manager(
     // Register Winter Adaptive V2
     let v2_plugin = WinterAdaptiveV2Plugin::new(v2_config, control_config.clone());
     manager.register(Arc::new(v2_plugin));
+
+    // Register Winter Adaptive V3
+    let v3_plugin = WinterAdaptiveV3Plugin::new(v3_config, control_config.clone());
+    manager.register(Arc::new(v3_plugin));
 }
 
 /// Create a PluginManager with the default strategies registered.

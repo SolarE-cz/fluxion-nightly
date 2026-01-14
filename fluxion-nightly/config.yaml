@@ -72,7 +72,7 @@ options:
     winter_adaptive_v2:
       charge_on_negative_even_if_full: false
       ema_period_days: 7
-      enabled: true
+      enabled: false
       export_trigger_multiplier: 2.5
       grid_export_price_threshold: 8.0
       min_soc_for_export: 50.0
@@ -81,6 +81,15 @@ options:
       target_battery_soc: 90.0
       tomorrow_preservation_threshold: 1.2
       top_expensive_blocks: 12
+    winter_adaptive_v3:
+      daily_charging_target_soc: 90.0
+      discharge_arbitrage_buffer: 1.0
+      enabled: true
+      hdo_high_tariff_czk: 1.8
+      hdo_low_tariff_czk: 0.5
+      hdo_sensor_entity: sensor.cez_hdo_lowtariffstart
+      top_discharge_blocks_per_day: 4
+      winter_discharge_min_soc: 50.0
     winter_peak_discharge:
       enabled: false
       min_hours_to_solar: 4
@@ -209,6 +218,15 @@ schema:
       target_battery_soc: float(0,100)?
       tomorrow_preservation_threshold: float?
       top_expensive_blocks: int(0,96)?
+    winter_adaptive_v3:
+      daily_charging_target_soc: float(0,100)?
+      discharge_arbitrage_buffer: float?
+      enabled: bool?
+      hdo_high_tariff_czk: float?
+      hdo_low_tariff_czk: float?
+      hdo_sensor_entity: str?
+      top_discharge_blocks_per_day: int(1,96)?
+      winter_discharge_min_soc: float(0,100)?
     winter_peak_discharge:
       enabled: bool?
       min_hours_to_solar: int(0,24)?
@@ -224,4 +242,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.30
+version: 0.2.31

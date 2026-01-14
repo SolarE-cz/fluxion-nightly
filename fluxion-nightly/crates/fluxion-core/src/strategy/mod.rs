@@ -13,12 +13,14 @@
 pub mod utils;
 pub mod winter_adaptive;
 pub mod winter_adaptive_v2;
+pub mod winter_adaptive_v3;
 
 // Re-export strategies
 pub use winter_adaptive::{
     DayEnergyBalance, PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy,
 };
 pub use winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy};
+pub use winter_adaptive_v3::{WinterAdaptiveV3Config, WinterAdaptiveV3Strategy};
 
 use chrono::{DateTime, Utc};
 use fluxion_types::config::ControlConfig;

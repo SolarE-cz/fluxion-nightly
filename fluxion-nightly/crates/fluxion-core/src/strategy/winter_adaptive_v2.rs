@@ -770,207 +770,197 @@ pub mod simulation {
 // ============================================================================
 
 mod scheduling {
-    /// Select cheapest blocks respecting min_consecutive constraint
+    /// Select cheapest consecutive window of count_needed blocks
     /// Returns indices of blocks to charge, sorted by time
     ///
-    /// Algorithm (Global Sliding Window Search):
+    /// Algorithm (Sliding Window Optimization):
     /// 1. Find all consecutive ranges in the available blocks
-    /// 2. Use sliding window to generate ALL possible windows of min_consecutive length
-    /// 3. Score each window by average price
-    /// 4. Sort all windows by average price (cheapest first)
-    /// 5. Apply price tolerance filter (if set) - reject windows > tolerance% above cheapest
-    /// 6. Greedily select non-overlapping windows until we have enough blocks
-    /// 7. If still need more, extend selected windows with cheapest adjacent blocks
-    /// 8. Final fallback: add cheapest individual blocks
+    /// 2. For each range >= count_needed, slide a window and calculate average price
+    /// 3. Return the window with minimum average price
+    /// 4. If no single range fits, find best combination of smaller windows
     ///
-    /// This approach guarantees finding the globally cheapest consecutive windows,
-    /// unlike the previous algorithm which only searched within candidate pools.
+    /// Price tolerance is applied AFTER finding the optimal window - blocks above
+    /// tolerance are only included if necessary to meet min_consecutive constraint.
     pub fn select_cheapest_blocks(
         blocks_with_prices: &[(usize, f32)], // (index, price) pairs
         count_needed: usize,
         min_consecutive: usize,
-        price_tolerance_percent: Option<f32>, // Max premium (%) above cheapest to accept
+        price_tolerance_percent: Option<f32>, // Soft preference, not hard filter
     ) -> Vec<usize> {
         if blocks_with_prices.is_empty() || count_needed == 0 {
             return Vec::new();
         }
 
-        // Build a lookup map for quick price access by index
+        // Build price lookup and index set
         let price_map: std::collections::HashMap<usize, f32> =
             blocks_with_prices.iter().copied().collect();
+        let all_indices: std::collections::HashSet<usize> =
+            blocks_with_prices.iter().map(|(idx, _)| *idx).collect();
 
-        // Sort by price (cheapest first) for fallback
-        let mut sorted = blocks_with_prices.to_vec();
-        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Simple case: if we need fewer than min_consecutive, just take cheapest
-        if count_needed < min_consecutive {
-            let mut result: Vec<usize> = sorted
-                .iter()
-                .take(count_needed)
-                .map(|(idx, _)| *idx)
-                .collect();
-            result.sort();
-            return result;
-        }
-
-        // =====================================================================
-        // GLOBAL SLIDING WINDOW SEARCH
-        // Find ALL consecutive windows of min_consecutive length, score by avg price
-        // This guarantees finding the globally cheapest consecutive window
-        // =====================================================================
-
-        // Sort blocks by index to find consecutive ranges
+        // Sort by index to find consecutive ranges
         let mut by_idx = blocks_with_prices.to_vec();
         by_idx.sort_by_key(|(idx, _)| *idx);
 
-        // Find all consecutive ranges in the available blocks
-        let mut consecutive_ranges: Vec<(usize, usize)> = Vec::new(); // (start_idx, end_idx exclusive)
+        // Find all consecutive ranges
+        let mut ranges: Vec<(usize, usize)> = Vec::new(); // (start, end exclusive)
         if !by_idx.is_empty() {
             let mut range_start = by_idx[0].0;
             let mut prev_idx = by_idx[0].0;
 
-            #[expect(clippy::needless_range_loop)]
-            for i in 1..by_idx.len() {
-                let curr_idx = by_idx[i].0;
-                if curr_idx != prev_idx + 1 {
-                    // Gap found - close current range
-                    consecutive_ranges.push((range_start, prev_idx + 1));
-                    range_start = curr_idx;
+            for (curr_idx, _) in by_idx.iter().skip(1) {
+                if *curr_idx != prev_idx + 1 {
+                    ranges.push((range_start, prev_idx + 1));
+                    range_start = *curr_idx;
                 }
-                prev_idx = curr_idx;
+                prev_idx = *curr_idx;
             }
-            // Close final range
-            consecutive_ranges.push((range_start, prev_idx + 1));
+            ranges.push((range_start, prev_idx + 1));
         }
 
-        // Generate all possible windows of min_consecutive length within consecutive ranges
-        // Each window is scored by its average price
-        let mut all_windows: Vec<(f32, Vec<usize>)> = Vec::new();
+        // Calculate cheapest price for tolerance filtering (if used)
+        let cheapest_price = by_idx
+            .iter()
+            .map(|(_, p)| *p)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+        let max_acceptable = if let Some(tolerance_pct) = price_tolerance_percent {
+            cheapest_price * (1.0 + tolerance_pct / 100.0)
+        } else {
+            f32::MAX
+        };
 
-        for (range_start, range_end) in &consecutive_ranges {
+        // =====================================================================
+        // APPROACH 1: Find best single consecutive window of count_needed blocks
+        // =====================================================================
+        let mut best_window: Option<(f32, Vec<usize>)> = None;
+
+        for (range_start, range_end) in &ranges {
             let range_len = range_end - range_start;
-            if range_len < min_consecutive {
-                continue; // Range too short for even one window
-            }
+            if range_len >= count_needed {
+                // Slide window across this range
+                for window_start in *range_start..=(range_end - count_needed) {
+                    let window: Vec<usize> = (window_start..window_start + count_needed).collect();
+                    let avg: f32 = window
+                        .iter()
+                        .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
+                        .sum::<f32>()
+                        / count_needed as f32;
 
-            // Slide window across this consecutive range
-            for window_start in *range_start..=(range_end - min_consecutive) {
-                let window_indices: Vec<usize> =
-                    (window_start..window_start + min_consecutive).collect();
+                    // Prefer windows where more blocks are within tolerance
+                    let blocks_within_tolerance = window
+                        .iter()
+                        .filter(|idx| {
+                            price_map.get(*idx).copied().unwrap_or(f32::MAX) <= max_acceptable
+                        })
+                        .count();
 
-                // Calculate average price for this window
-                let avg_price: f32 = window_indices
-                    .iter()
-                    .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
-                    .sum::<f32>()
-                    / min_consecutive as f32;
+                    // Score: prioritize tolerance compliance, then avg price
+                    let tolerance_score = blocks_within_tolerance as f32 / count_needed as f32;
 
-                all_windows.push((avg_price, window_indices));
+                    if let Some((best_avg, _)) = &best_window {
+                        // Accept if: (1) more blocks within tolerance, or (2) same tolerance but cheaper
+                        let current_tolerance_score = best_window
+                            .as_ref()
+                            .map(|(_, w)| {
+                                w.iter()
+                                    .filter(|idx| {
+                                        price_map.get(*idx).copied().unwrap_or(f32::MAX)
+                                            <= max_acceptable
+                                    })
+                                    .count() as f32
+                                    / count_needed as f32
+                            })
+                            .unwrap_or(0.0);
+
+                        if tolerance_score > current_tolerance_score
+                            || (tolerance_score == current_tolerance_score && avg < *best_avg)
+                        {
+                            best_window = Some((avg, window));
+                        }
+                    } else {
+                        best_window = Some((avg, window));
+                    }
+                }
             }
         }
 
-        // Sort all windows by average price (cheapest first)
+        if let Some((avg, window)) = best_window {
+            tracing::debug!(
+                "V2: Found optimal consecutive window of {} blocks with avg {:.3} CZK: {:?}",
+                count_needed,
+                avg,
+                &window[..window.len().min(10)]
+            );
+            return window;
+        }
+
+        // =====================================================================
+        // APPROACH 2: No single range fits - combine windows greedily
+        // =====================================================================
+        tracing::debug!(
+            "V2: No single range fits {} blocks, combining windows",
+            count_needed
+        );
+
+        // Generate all windows of min_consecutive length
+        let mut all_windows: Vec<(f32, Vec<usize>)> = Vec::new();
+        for (range_start, range_end) in &ranges {
+            let range_len = range_end - range_start;
+            if range_len >= min_consecutive {
+                for window_start in *range_start..=(range_end - min_consecutive) {
+                    let window: Vec<usize> =
+                        (window_start..window_start + min_consecutive).collect();
+                    let avg: f32 = window
+                        .iter()
+                        .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
+                        .sum::<f32>()
+                        / min_consecutive as f32;
+                    all_windows.push((avg, window));
+                }
+            }
+        }
+
+        // Sort by average price
         all_windows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply price tolerance filter if specified
-        let cheapest_window_price = all_windows.first().map(|(p, _)| *p);
-        if let Some(tolerance_pct) = price_tolerance_percent
-            && let Some(min_price) = cheapest_window_price
-        {
-            let max_acceptable_price = min_price * (1.0 + tolerance_pct / 100.0);
-            let original_count = all_windows.len();
-            all_windows.retain(|(avg_price, _)| *avg_price <= max_acceptable_price);
-
-            if all_windows.len() < original_count {
-                tracing::debug!(
-                    "Price tolerance filter: kept {} of {} windows (cheapest: {:.3}, max: {:.3} CZK, tolerance: {}%)",
-                    all_windows.len(),
-                    original_count,
-                    min_price,
-                    max_acceptable_price,
-                    tolerance_pct
-                );
-            }
-        }
-
-        // Greedily select non-overlapping windows until we have enough blocks
+        // Greedily select non-overlapping windows
         let mut selected: Vec<usize> = Vec::new();
-
-        for (avg_price, window_indices) in &all_windows {
+        for (_, window) in &all_windows {
             if selected.len() >= count_needed {
                 break;
             }
-
-            // Check if this window overlaps with already selected blocks
-            let overlaps = window_indices.iter().any(|idx| selected.contains(idx));
-            if overlaps {
+            if window.iter().any(|idx| selected.contains(idx)) {
                 continue;
             }
-
-            // Add all blocks from this window
-            tracing::debug!(
-                "Selecting window at indices {:?} with avg price {:.3} CZK/kWh",
-                window_indices,
-                avg_price
-            );
-            for &idx in window_indices {
-                if selected.len() >= count_needed {
-                    break;
-                }
-                selected.push(idx);
-            }
-        }
-
-        // If still need more blocks after selecting windows,
-        // extend from adjacent blocks to selected windows (prefer cheaper)
-        if selected.len() < count_needed {
-            // Try extending existing windows with adjacent blocks
-            let mut extensions: Vec<(usize, f32)> = Vec::new();
-
-            for &sel_idx in &selected {
-                // Check block before
-                if sel_idx > 0
-                    && !selected.contains(&(sel_idx - 1))
-                    && let Some(&price) = price_map.get(&(sel_idx - 1))
-                {
-                    extensions.push((sel_idx - 1, price));
-                }
-                // Check block after
-                if !selected.contains(&(sel_idx + 1))
-                    && let Some(&price) = price_map.get(&(sel_idx + 1))
-                {
-                    extensions.push((sel_idx + 1, price));
-                }
-            }
-
-            // Sort extensions by price and add cheapest
-            extensions.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            extensions.dedup_by_key(|(idx, _)| *idx);
-
-            for (idx, _) in extensions {
-                if selected.len() >= count_needed {
-                    break;
-                }
-                if !selected.contains(&idx) {
+            // Add whole window
+            for &idx in window {
+                if selected.len() < count_needed {
                     selected.push(idx);
                 }
             }
         }
 
-        // Final fallback: if still need more blocks, add cheapest individual blocks
+        // Extend selected windows if still need more
         if selected.len() < count_needed {
-            for (idx, _) in &sorted {
+            // Sort by price for extension
+            let mut sorted = blocks_with_prices.to_vec();
+            sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            for (idx, _) in sorted {
                 if selected.len() >= count_needed {
                     break;
                 }
-                if !selected.contains(idx) {
-                    selected.push(*idx);
+                if !selected.contains(&idx) {
+                    // Only add if adjacent to existing selection
+                    let adjacent = selected.contains(&(idx.saturating_sub(1)))
+                        || selected.contains(&(idx + 1));
+                    if adjacent && all_indices.contains(&idx) {
+                        selected.push(idx);
+                    }
                 }
             }
         }
 
-        // Return sorted by time
         selected.sort();
         selected
     }
@@ -1141,10 +1131,29 @@ impl WinterAdaptiveV2Strategy {
         let min_soc = self.config.min_soc_pct;
 
         // =====================================================================
-        // STEP 1: Find the cheapest N blocks for base charging
-        // N = force_charge_hours * 4 (convert hours to 15-min blocks)
+        // STEP 1: Calculate charge blocks needed based on ACTUAL SOC deficit
+        // Ensures battery reaches target_soc (>95%) before cheap prices end
         // =====================================================================
-        let base_charge_blocks = context.control_config.force_charge_hours * 4;
+        let target_soc = self.config.daily_charging_target_soc.max(95.0); // At least 95%
+        let soc_deficit = (target_soc - context.current_battery_soc).max(0.0);
+        let energy_needed_kwh = (soc_deficit / 100.0) * battery_capacity_kwh;
+        let blocks_for_soc_target = (energy_needed_kwh / charge_per_block_kwh).ceil() as usize;
+
+        // Use the MAXIMUM of:
+        // 1. force_charge_hours * 4 (minimum guaranteed charge time from config)
+        // 2. blocks_for_soc_target (blocks needed to reach target SOC)
+        let config_charge_blocks = context.control_config.force_charge_hours * 4;
+        let base_charge_blocks = config_charge_blocks.max(blocks_for_soc_target);
+
+        tracing::debug!(
+            "V2: SOC {:.1}% → {:.1}% target, need {:.2} kWh = {} blocks (config min: {}, using: {})",
+            context.current_battery_soc,
+            target_soc,
+            energy_needed_kwh,
+            blocks_for_soc_target,
+            config_charge_blocks,
+            base_charge_blocks
+        );
 
         // Collect all remaining blocks with prices (only from current index onward)
         let remaining_blocks: Vec<(usize, f32)> = all_blocks
@@ -1188,12 +1197,40 @@ impl WinterAdaptiveV2Strategy {
         // Select cheapest blocks respecting min_consecutive constraint
         // ONLY from affordable blocks (below median price)
         // Apply price tolerance to strongly prefer the cheapest available blocks
+        tracing::debug!(
+            "V2: Calling select_cheapest_blocks with {} affordable blocks, count_needed={}, min_consecutive={}",
+            affordable_blocks.len(),
+            base_charge_blocks,
+            min_consecutive
+        );
+        // Log the cheapest 10 affordable blocks for debugging
+        let mut affordable_sorted = affordable_blocks.clone();
+        affordable_sorted
+            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let cheapest_affordable: Vec<_> = affordable_sorted.iter().take(10).collect();
+        tracing::debug!(
+            "V2: Cheapest 10 affordable blocks: {:?}",
+            cheapest_affordable
+        );
+
         let mut charge_schedule = scheduling::select_cheapest_blocks(
             &affordable_blocks,
             base_charge_blocks,
             min_consecutive,
             Some(self.config.charge_price_tolerance_percent),
         );
+
+        // Log what was selected
+        let selected_with_prices: Vec<_> = charge_schedule
+            .iter()
+            .filter_map(|&idx| {
+                affordable_blocks
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(i, p)| (*i, *p))
+            })
+            .collect();
+        tracing::debug!("V2: Selected charge schedule: {:?}", selected_with_prices);
 
         // =====================================================================
         // STEP 2: Simulate SOC and find expensive periods
@@ -1391,7 +1428,23 @@ impl WinterAdaptiveV2Strategy {
         // STEP 6: Make decision for current block
         // =====================================================================
 
-        let (mode, reason, decision_uid) = if charge_schedule.contains(&current_block_index) {
+        // DEBUG: Log the critical decision inputs
+        let should_charge = charge_schedule.contains(&current_block_index);
+        tracing::debug!(
+            "V2 DECISION: block_start={}, current_block_index={}, all_blocks_len={}, charge_schedule_len={}, contains_current={}, schedule={:?}",
+            current_block_start,
+            current_block_index,
+            all_blocks.len(),
+            charge_schedule.len(),
+            should_charge,
+            if charge_schedule.len() <= 20 {
+                charge_schedule.clone()
+            } else {
+                charge_schedule[..20].to_vec()
+            }
+        );
+
+        let (mode, reason, decision_uid) = if should_charge {
             // Only charge if not already full
             if context.current_battery_soc < self.config.daily_charging_target_soc {
                 (
@@ -1670,5 +1723,118 @@ mod tests {
         assert_eq!(spikes.len(), 1, "Should detect 1 spike");
         assert_eq!(spikes[0].slot_index, 10);
         assert_eq!(spikes[0].price_czk, 10.0);
+    }
+
+    /// Test that replicates the exact scenario from Export 1:
+    /// - Affordable blocks from index 85-122 (consecutive range)
+    /// - Need to select 7 blocks with min_consecutive=6
+    /// - Cheapest blocks are at indices 107-112 (02:45-04:00)
+    /// - Algorithm SHOULD select window 107-112 + extend, NOT 102-108
+    #[test]
+    fn test_select_cheapest_blocks_export1_scenario() {
+        use super::scheduling;
+
+        // Replicate the affordable blocks from Export 1 (prices from analysis)
+        // Key indices and their prices:
+        // 102: 2.14, 103: 2.04, 104: 2.06, 105: 1.97, 106: 2.03, 107: 1.90, 108: 1.70
+        // 109: 1.63, 110: 1.61, 111: 1.54, 112: 1.92, 113: 1.97
+        let affordable_blocks: Vec<(usize, f32)> = vec![
+            // Earlier blocks
+            (85, 2.50),
+            (86, 2.45),
+            (87, 2.40),
+            (88, 2.35),
+            (89, 2.30),
+            (90, 2.25),
+            (91, 2.20),
+            (92, 2.15),
+            (93, 2.10),
+            (94, 2.05),
+            (95, 1.99), // 23:45 - cheap but earlier
+            (96, 2.20),
+            (97, 2.25),
+            (98, 2.14), // 00:30
+            (99, 2.13), // 00:45
+            (100, 2.20),
+            (101, 2.25),
+            (102, 2.14), // 01:30 - currently selected start
+            (103, 2.04), // 01:45
+            (104, 2.06), // 02:00
+            (105, 1.97), // 02:15
+            (106, 2.03), // 02:30
+            (107, 1.90), // 02:45
+            (108, 1.70), // 03:00
+            (109, 1.63), // 03:15 - CHEAPEST WINDOW START
+            (110, 1.61), // 03:30
+            (111, 1.54), // 03:45 - CHEAPEST
+            (112, 1.92), // 04:00
+            (113, 1.97), // 04:15
+            (114, 2.06), // 04:30
+            (115, 2.15), // 04:45
+            (116, 2.03), // 05:00
+            (117, 2.13), // 05:15
+            (118, 2.20),
+            (119, 2.25),
+            (120, 2.30),
+            (121, 2.35),
+            (122, 2.40),
+        ];
+
+        let count_needed = 7;
+        let min_consecutive = 2; // Production uses 2 (default), not 6!
+        let price_tolerance = Some(15.0); // 15% tolerance
+
+        let selected = scheduling::select_cheapest_blocks(
+            &affordable_blocks,
+            count_needed,
+            min_consecutive,
+            price_tolerance,
+        );
+
+        println!("Selected blocks: {:?}", selected);
+
+        // Get prices for selected blocks
+        let selected_prices: Vec<f32> = selected
+            .iter()
+            .filter_map(|&idx| {
+                affordable_blocks
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, p)| *p)
+            })
+            .collect();
+        println!("Selected prices: {:?}", selected_prices);
+
+        let avg_price: f32 = selected_prices.iter().sum::<f32>() / selected_prices.len() as f32;
+        println!("Average price: {:.3} CZK", avg_price);
+
+        // The algorithm SHOULD select blocks around the cheapest window (107-112)
+        // NOT the earlier window (102-108)
+        assert!(
+            selected.contains(&111),
+            "Should include index 111 (cheapest block at 1.54 CZK)"
+        );
+        assert!(
+            selected.contains(&110),
+            "Should include index 110 (1.61 CZK)"
+        );
+        assert!(
+            selected.contains(&109),
+            "Should include index 109 (1.63 CZK)"
+        );
+
+        // Average should be less than 1.85 CZK (better than 1.977 CZK of wrong selection)
+        assert!(
+            avg_price < 1.85,
+            "Average price should be < 1.85 CZK, got {:.3} CZK",
+            avg_price
+        );
+
+        // Should NOT include expensive early blocks like 102 when cheaper alternatives exist
+        let incorrect_selection = vec![102, 103, 104, 105, 106, 107, 108];
+        assert_ne!(
+            selected, incorrect_selection,
+            "Should NOT select the suboptimal window 102-108"
+        );
     }
 }

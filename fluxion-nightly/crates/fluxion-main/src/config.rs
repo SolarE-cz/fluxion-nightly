@@ -276,6 +276,8 @@ pub struct StrategiesConfig {
     #[serde(default)]
     pub winter_adaptive_v2: WinterAdaptiveV2Config,
     #[serde(default)]
+    pub winter_adaptive_v3: WinterAdaptiveV3Config,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfig,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfig,
@@ -325,7 +327,7 @@ fn default_winter_adaptive_priority() -> u8 {
 impl Default for WinterAdaptiveConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false, // V3 is now the default
             priority: 100,
             ema_period_days: 7,
             min_solar_percentage: 0.10,
@@ -348,10 +350,16 @@ pub struct WinterAdaptiveV2Config {
     pub enabled: bool,
     #[serde(default = "default_winter_adaptive_v2_priority")]
     pub priority: u8,
+    #[serde(default = "default_daily_charging_target_soc")]
+    pub daily_charging_target_soc: f32,
 }
 
 fn default_winter_adaptive_v2_priority() -> u8 {
     100
+}
+
+fn default_daily_charging_target_soc() -> f32 {
+    90.0
 }
 
 impl Default for WinterAdaptiveV2Config {
@@ -359,6 +367,77 @@ impl Default for WinterAdaptiveV2Config {
         Self {
             enabled: false, // V1 is default
             priority: 100,
+            daily_charging_target_soc: 90.0,
+        }
+    }
+}
+
+/// Winter Adaptive V3 config with HDO tariff integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV3Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v3_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v3_daily_charging_target_soc")]
+    pub daily_charging_target_soc: f32,
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    #[serde(default = "default_winter_discharge_min_soc")]
+    pub winter_discharge_min_soc: f32,
+    #[serde(default = "default_top_discharge_blocks_per_day")]
+    pub top_discharge_blocks_per_day: usize,
+    #[serde(default = "default_discharge_arbitrage_buffer")]
+    pub discharge_arbitrage_buffer: f32,
+}
+
+fn default_winter_adaptive_v3_priority() -> u8 {
+    100
+}
+
+fn default_v3_daily_charging_target_soc() -> f32 {
+    90.0
+}
+
+fn default_hdo_sensor_entity() -> String {
+    "sensor.cez_hdo_lowtariffstart".to_string()
+}
+
+fn default_hdo_low_tariff_czk() -> f32 {
+    0.50
+}
+
+fn default_hdo_high_tariff_czk() -> f32 {
+    1.80
+}
+
+fn default_winter_discharge_min_soc() -> f32 {
+    50.0
+}
+
+fn default_top_discharge_blocks_per_day() -> usize {
+    4
+}
+
+fn default_discharge_arbitrage_buffer() -> f32 {
+    1.0 // 1.0 CZK, use 0.05 for EUR
+}
+
+impl Default for WinterAdaptiveV3Config {
+    fn default() -> Self {
+        Self {
+            enabled: true, // V3 is the default strategy
+            priority: 100,
+            daily_charging_target_soc: 90.0,
+            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            winter_discharge_min_soc: 50.0,
+            top_discharge_blocks_per_day: 4,
+            discharge_arbitrage_buffer: 1.0,
         }
     }
 }
@@ -1123,6 +1202,40 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 winter_adaptive_v2: fluxion_core::WinterAdaptiveV2ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v2.enabled,
                     priority: app_config.strategies.winter_adaptive_v2.priority,
+                    daily_charging_target_soc: app_config
+                        .strategies
+                        .winter_adaptive_v2
+                        .daily_charging_target_soc,
+                },
+                winter_adaptive_v3: fluxion_core::WinterAdaptiveV3ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v3.enabled,
+                    priority: app_config.strategies.winter_adaptive_v3.priority,
+                    daily_charging_target_soc: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .daily_charging_target_soc,
+                    hdo_sensor_entity: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .hdo_sensor_entity
+                        .clone(),
+                    hdo_low_tariff_czk: app_config.strategies.winter_adaptive_v3.hdo_low_tariff_czk,
+                    hdo_high_tariff_czk: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .hdo_high_tariff_czk,
+                    winter_discharge_min_soc: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .winter_discharge_min_soc,
+                    top_discharge_blocks_per_day: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .top_discharge_blocks_per_day,
+                    discharge_arbitrage_buffer: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .discharge_arbitrage_buffer,
                 },
                 winter_peak_discharge: fluxion_core::WinterPeakDischargeConfigCore {
                     enabled: app_config.strategies.winter_peak_discharge.enabled,

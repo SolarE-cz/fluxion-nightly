@@ -240,6 +240,8 @@ pub struct StrategiesConfigCore {
     #[serde(default)]
     pub winter_adaptive_v2: WinterAdaptiveV2ConfigCore,
     #[serde(default)]
+    pub winter_adaptive_v3: WinterAdaptiveV3ConfigCore,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfigCore,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfigCore,
@@ -382,8 +384,8 @@ fn default_charge_on_negative_even_if_full() -> bool {
 impl Default for WinterAdaptiveConfigCore {
     fn default() -> Self {
         Self {
-            enabled: true,
-            priority: 100, // Highest priority by default (main strategy)
+            enabled: false, // V3 is now the default strategy
+            priority: 100,  // Highest priority by default (main strategy)
             ema_period_days: 7,
             min_solar_percentage: 0.10,
             daily_charging_target_soc: 90.0,
@@ -400,13 +402,20 @@ impl Default for WinterAdaptiveConfigCore {
     }
 }
 
-/// Winter Adaptive V2 strategy configuration (simplified, enabled/disabled only at core level)
+/// Winter Adaptive V2 strategy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinterAdaptiveV2ConfigCore {
     pub enabled: bool,
     /// Priority for conflict resolution (0-100, higher wins)
     #[serde(default = "default_winter_adaptive_v2_priority")]
     pub priority: u8,
+    /// Target battery SOC for charging (default: 90%)
+    #[serde(default = "default_daily_charging_target_soc")]
+    pub daily_charging_target_soc: f32,
+}
+
+fn default_daily_charging_target_soc() -> f32 {
+    90.0
 }
 
 fn default_winter_adaptive_v2_priority() -> u8 {
@@ -416,8 +425,89 @@ fn default_winter_adaptive_v2_priority() -> u8 {
 impl Default for WinterAdaptiveV2ConfigCore {
     fn default() -> Self {
         Self {
-            enabled: false, // Disabled by default (V1 is the default)
+            enabled: false, // V3 is now the default strategy
             priority: 100,
+            daily_charging_target_soc: 90.0,
+        }
+    }
+}
+
+/// Winter Adaptive V3 strategy configuration
+/// Simplified strategy with HDO tariff integration for accurate grid fee calculation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV3ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v3_priority")]
+    pub priority: u8,
+    /// Target battery SOC for charging (default: 90%)
+    #[serde(default = "default_v3_daily_charging_target_soc")]
+    pub daily_charging_target_soc: f32,
+    /// Home Assistant entity for HDO tariff schedule
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    /// Grid fee during HDO low tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    /// Grid fee during HDO high tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    /// Minimum SOC for winter discharge (default: 50%)
+    #[serde(default = "default_winter_discharge_min_soc")]
+    pub winter_discharge_min_soc: f32,
+    /// Number of top expensive blocks per day to allow discharge (default: 4)
+    #[serde(default = "default_top_discharge_blocks_per_day")]
+    pub top_discharge_blocks_per_day: usize,
+    /// Minimum arbitrage buffer above median+high_grid_fee for discharge to be worthwhile
+    /// Default: 1.0 CZK (use 0.05 for EUR)
+    #[serde(default = "default_discharge_arbitrage_buffer")]
+    pub discharge_arbitrage_buffer: f32,
+}
+
+fn default_winter_adaptive_v3_priority() -> u8 {
+    100
+}
+
+fn default_v3_daily_charging_target_soc() -> f32 {
+    90.0
+}
+
+fn default_hdo_sensor_entity() -> String {
+    "sensor.cez_hdo_lowtariffstart".to_string()
+}
+
+fn default_hdo_low_tariff_czk() -> f32 {
+    0.50
+}
+
+fn default_hdo_high_tariff_czk() -> f32 {
+    1.80
+}
+
+fn default_winter_discharge_min_soc() -> f32 {
+    50.0
+}
+
+fn default_top_discharge_blocks_per_day() -> usize {
+    4
+}
+
+fn default_discharge_arbitrage_buffer() -> f32 {
+    1.0 // 1.0 CZK, use 0.05 for EUR
+}
+
+impl Default for WinterAdaptiveV3ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: true, // V3 is the default strategy
+            priority: 100,
+            daily_charging_target_soc: 90.0,
+            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            winter_discharge_min_soc: 50.0,
+            top_discharge_blocks_per_day: 4,
+            discharge_arbitrage_buffer: 1.0,
         }
     }
 }
@@ -428,6 +518,7 @@ impl Default for WinterAdaptiveV2ConfigCore {
 pub enum StrategyType {
     WinterAdaptive,
     WinterAdaptiveV2,
+    WinterAdaptiveV3,
     WinterPeakDischarge,
     SolarAwareCharging,
     MorningPrecharge,
@@ -444,6 +535,7 @@ impl StrategyType {
         &[
             StrategyType::WinterAdaptive,
             StrategyType::WinterAdaptiveV2,
+            StrategyType::WinterAdaptiveV3,
             StrategyType::WinterPeakDischarge,
             StrategyType::SolarAwareCharging,
             StrategyType::MorningPrecharge,
@@ -460,6 +552,7 @@ impl StrategyType {
         match self {
             StrategyType::WinterAdaptive => "Winter Adaptive",
             StrategyType::WinterAdaptiveV2 => "Winter Adaptive V2",
+            StrategyType::WinterAdaptiveV3 => "Winter Adaptive V3",
             StrategyType::WinterPeakDischarge => "Winter Peak Discharge",
             StrategyType::SolarAwareCharging => "Solar Aware Charging",
             StrategyType::MorningPrecharge => "Morning Precharge",
