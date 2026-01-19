@@ -38,6 +38,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
+            effective_price_czk_per_kwh: 2.5,
         });
     }
 
@@ -47,6 +48,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.3,
+            effective_price_czk_per_kwh: 2.3,
         });
     }
 
@@ -56,6 +58,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
+            effective_price_czk_per_kwh: 2.0,
         });
     }
 
@@ -65,6 +68,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.8,
+            effective_price_czk_per_kwh: 2.8,
         });
     }
 
@@ -74,6 +78,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 4.0,
+            effective_price_czk_per_kwh: 4.0,
         });
     }
 
@@ -83,6 +88,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
+            effective_price_czk_per_kwh: 3.0,
         });
     }
 
@@ -92,6 +98,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
+            effective_price_czk_per_kwh: 5.0,
         });
     }
 

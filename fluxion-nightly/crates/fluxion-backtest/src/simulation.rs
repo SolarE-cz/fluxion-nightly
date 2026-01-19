@@ -198,6 +198,7 @@ fn simulate_winter_adaptive(
         .map(|p| TimeBlockPrice {
             block_start: p.timestamp,
             price_czk_per_kwh: p.price_czk_per_kwh,
+            effective_price_czk_per_kwh: p.price_czk_per_kwh,
             duration_minutes: 15,
         })
         .collect();
@@ -234,6 +235,7 @@ fn simulate_winter_adaptive(
         let fallback_price_block = TimeBlockPrice {
             block_start: record.timestamp,
             price_czk_per_kwh: price,
+            effective_price_czk_per_kwh: price,
             duration_minutes: 15,
         };
         let price_block = time_block_prices

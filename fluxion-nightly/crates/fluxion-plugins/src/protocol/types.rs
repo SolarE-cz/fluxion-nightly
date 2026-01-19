@@ -23,8 +23,11 @@ pub struct PriceBlock {
     pub block_start: DateTime<Utc>,
     /// Block duration in minutes (typically 15)
     pub duration_minutes: u32,
-    /// Price per kWh in CZK
+    /// Spot price per kWh in CZK (raw market price without fees)
     pub price_czk_per_kwh: f32,
+    /// Effective import price per kWh in CZK (spot price + grid fees from HDO tariff)
+    /// This is the final price strategies should use for buy decisions
+    pub effective_price_czk_per_kwh: f32,
 }
 
 /// Battery state information
@@ -81,6 +84,10 @@ pub struct EvaluationRequest {
     pub historical: HistoricalData,
     /// Backup discharge minimum SOC from inverter (%)
     pub backup_discharge_min_soc: f32,
+    /// Raw HDO (grid tariff) sensor data for V3 strategy
+    /// Contains JSON with low/high tariff periods
+    #[serde(default)]
+    pub hdo_raw_data: Option<String>,
 }
 
 /// Operation mode decision

@@ -21,7 +21,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use fluxion_adapters::{
     CzSpotPriceAdapter, HaClientResource, HaPlugin, HomeAssistantClient,
-    HomeAssistantInverterAdapter,
+    HomeAssistantInverterAdapter, PriceAdapterTimezoneHandle,
 };
 use fluxion_core::{
     ConfigUpdateSender, FluxionCorePlugin, PluginManagerResource, SystemConfig, TimezoneConfig,
@@ -162,22 +162,25 @@ fn initialize_and_run() -> Result<()> {
     // Create spot price adapter (always create, but may not be used)
     let spot_adapter = if let Some(tomorrow_entity) = &config.pricing.tomorrow_price_entity {
         info!("💰 Using separate tomorrow sensor: {}", tomorrow_entity);
-        Arc::new(CzSpotPriceAdapter::with_tomorrow_sensor(
+        CzSpotPriceAdapter::with_tomorrow_sensor(
             ha_client.clone(),
             config.pricing.spot_price_entity.clone(),
             tomorrow_entity.clone(),
-        ))
+        )
     } else {
-        Arc::new(CzSpotPriceAdapter::new(
-            ha_client.clone(),
-            config.pricing.spot_price_entity.clone(),
-        ))
+        CzSpotPriceAdapter::new(ha_client.clone(), config.pricing.spot_price_entity.clone())
     };
+
+    // Get the timezone handle from the spot adapter for later synchronization
+    // This allows the timezone_sync_system to update the adapter's timezone
+    // when the Home Assistant timezone changes
+    let price_adapter_tz_handle = PriceAdapterTimezoneHandle::new(spot_adapter.timezone_handle());
+    info!("🌍 Price adapter timezone handle created for HA timezone sync");
 
     // Wrap spot adapter in configurable source that respects use_spot_prices_to_buy/sell flags
     let price_source: Arc<dyn fluxion_core::PriceDataSource> =
         Arc::new(fluxion_adapters::ConfigurablePriceDataSource::new(
-            spot_adapter,
+            Arc::new(spot_adapter),
             config.pricing.use_spot_prices_to_buy,
             config.pricing.use_spot_prices_to_sell,
             config.pricing.fixed_buy_prices.clone(),
@@ -246,6 +249,7 @@ fn initialize_and_run() -> Result<()> {
             Some(config_sender_for_web),
             Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
             Some(plugin_api_state), // Plugin API with shared PluginManager
+            Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
         )
         .await
         {
@@ -271,13 +275,15 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(config_update_channel)
         .insert_resource(timezone_config)
         .insert_resource(HaClientResource(ha_client))
+        .insert_resource(price_adapter_tz_handle)
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
         .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
         .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
             history_source,
         ))
         .insert_resource(PluginManagerResource(plugin_manager))
-        .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>();
+        .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>()
+        .init_resource::<fluxion_core::async_systems::HdoScheduleData>();
 
     info!("✅ Starting main loop...");
 

@@ -54,8 +54,12 @@ pub struct TimeBlockPrice {
     /// Duration of this block (typically 15 minutes)
     pub duration_minutes: u32,
 
-    /// Price for this time block (CZK/kWh)
+    /// Spot price for this time block (CZK/kWh) - raw market price without fees
     pub price_czk_per_kwh: f32,
+
+    /// Effective import price (CZK/kWh) = spot price + grid fees (HDO tariff)
+    /// This is the final price strategies should use for buy decisions
+    pub effective_price_czk_per_kwh: f32,
 }
 
 /// Fixed price data when spot prices are disabled

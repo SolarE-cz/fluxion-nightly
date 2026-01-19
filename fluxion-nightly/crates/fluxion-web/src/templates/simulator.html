@@ -1,0 +1,1491 @@
+{% extends "base.html" %}
+
+{% block title %}FluxION Strategy Simulator{% endblock %}
+
+{% block content %}
+<style>
+    /* Simulator-specific styles */
+    .simulator-header {
+        background: var(--bg-secondary);
+        padding: 20px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 15px;
+    }
+
+    .simulator-header h1 {
+        font-size: 1.6em;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .nav-buttons {
+        display: flex;
+        gap: 10px;
+    }
+
+    /* Config Panel */
+    .config-panel {
+        margin-bottom: 15px;
+    }
+
+    .config-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 20px;
+        margin-bottom: 20px;
+    }
+
+    .config-group {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .config-group label {
+        font-size: 0.85em;
+        color: var(--text-secondary);
+        font-weight: 500;
+    }
+
+    .config-group select,
+    .config-group input {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        padding: 10px 15px;
+        border-radius: 6px;
+        font-size: 0.95em;
+    }
+
+    .config-group input[type="range"] {
+        padding: 0;
+        cursor: pointer;
+    }
+
+    .range-value {
+        text-align: right;
+        font-weight: 600;
+        color: var(--info);
+    }
+
+    /* Strategy checkboxes */
+    .strategy-checkboxes {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+    }
+
+    .strategy-checkbox {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+        padding: 6px 12px;
+        background: var(--bg-tertiary);
+        border-radius: 4px;
+        transition: background 0.2s;
+    }
+
+    .strategy-checkbox:hover {
+        background: var(--border-color);
+    }
+
+    .strategy-checkbox input {
+        width: 16px;
+        height: 16px;
+        cursor: pointer;
+    }
+
+    .strategy-checkbox span {
+        font-size: 0.9em;
+    }
+
+    .create-btn {
+        background: linear-gradient(135deg, #4caf50 0%, #2e7d32 100%);
+        color: #fff;
+        padding: 12px 24px;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 1em;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        transition: all 0.2s;
+    }
+
+    .create-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(76, 175, 80, 0.4);
+    }
+
+    .create-btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        transform: none;
+    }
+
+    /* Time Controls */
+    .time-controls {
+        margin-bottom: 15px;
+    }
+
+    .time-slider-container {
+        margin-bottom: 15px;
+    }
+
+    .time-slider {
+        width: 100%;
+        height: 8px;
+        cursor: pointer;
+    }
+
+    .time-labels {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.8em;
+        color: var(--text-secondary);
+        margin-top: 8px;
+    }
+
+    .current-time {
+        text-align: center;
+        font-size: 2em;
+        font-weight: 700;
+        color: var(--info);
+        margin-bottom: 15px;
+    }
+
+    .playback-controls {
+        display: flex;
+        justify-content: center;
+        gap: 10px;
+        margin-bottom: 15px;
+    }
+
+    .playback-btn {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        padding: 10px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 1.1em;
+        transition: all 0.2s;
+    }
+
+    .playback-btn:hover {
+        background: var(--border-color);
+    }
+
+    .playback-btn:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+    }
+
+    .playback-btn.primary {
+        background: linear-gradient(135deg, #2196f3 0%, #1976d2 100%);
+        border-color: transparent;
+    }
+
+    .playback-btn.primary:hover {
+        background: linear-gradient(135deg, #42a5f5 0%, #1e88e5 100%);
+    }
+
+    .block-info {
+        text-align: center;
+        color: var(--text-secondary);
+        font-size: 0.9em;
+    }
+
+    /* Overrides Panel */
+    .overrides-panel {
+        background: var(--bg-secondary);
+        padding: 15px 20px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 20px;
+        align-items: flex-end;
+    }
+
+    .override-group {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .override-group label {
+        font-size: 0.9em;
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+
+    .override-group input {
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        padding: 8px 12px;
+        border-radius: 4px;
+        width: 80px;
+        text-align: right;
+    }
+
+    .override-btn {
+        background: var(--warning);
+        color: #000;
+        border: none;
+        padding: 8px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 0.85em;
+    }
+
+    .override-btn:hover {
+        background: #ffb74d;
+    }
+
+    /* Charts */
+    .charts-container {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 15px;
+    }
+
+    .chart-section {
+        /* No background/padding needed - using grid-quadrant styles */
+    }
+
+    .chart-title {
+        font-size: 1.1em;
+        font-weight: 600;
+        margin-bottom: 15px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .chart-container {
+        height: 280px; /* Static height */
+        position: relative;
+    }
+
+    /* 2-Column Grid Layout (720px per column) */
+    .simulator-grid {
+        display: grid;
+        grid-template-columns: 720px 720px;
+        grid-template-rows: auto; /* Auto-height rows */
+        gap: 20px;
+        margin-bottom: 20px;
+        justify-content: center; /* Center the grid */
+    }
+
+    .grid-quadrant {
+        background: var(--bg-secondary);
+        border-radius: 8px;
+        padding: 20px;
+        overflow-y: auto;
+        height: auto; /* Static height per block */
+    }
+
+    .grid-quadrant h3 {
+        margin-top: 0;
+        margin-bottom: 15px;
+        color: var(--text-primary);
+        font-size: 1.1rem;
+        border-bottom: 1px solid var(--border-color);
+        padding-bottom: 8px;
+    }
+
+    /* Row 1: Configuration | Results */
+    .config-section {
+        grid-column: 1;
+        grid-row: 1;
+    }
+
+    .results-panel {
+        grid-column: 2;
+        grid-row: 1;
+    }
+
+    /* Row 2: Price Chart | SOC Chart */
+    .price-chart-section {
+        grid-column: 1;
+        grid-row: 2;
+    }
+
+    .soc-chart-section {
+        grid-column: 2;
+        grid-row: 2;
+    }
+
+    /* Row 3: Cost Chart | Time Controls */
+    .cost-chart-section {
+        grid-column: 1;
+        grid-row: 3;
+    }
+
+    .time-controls-section {
+        grid-column: 2;
+        grid-row: 3;
+    }
+
+    /* Row 4: Overrides | Decisions */
+    .overrides-section {
+        grid-column: 1;
+        grid-row: 4;
+    }
+
+    .analytics-panel {
+        grid-column: 2;
+        grid-row: 4;
+    }
+
+    /* Responsive: stack on smaller screens */
+    @media (max-width: 1500px) {
+        .simulator-grid {
+            grid-template-columns: 1fr;
+            justify-content: stretch;
+        }
+
+        .config-section,
+        .results-panel,
+        .price-chart-section,
+        .soc-chart-section,
+        .cost-chart-section,
+        .time-controls-section,
+        .overrides-section,
+        .analytics-panel {
+            grid-column: 1;
+        }
+
+        .config-section { grid-row: 1; }
+        .results-panel { grid-row: 2; }
+        .price-chart-section { grid-row: 3; }
+        .soc-chart-section { grid-row: 4; }
+        .cost-chart-section { grid-row: 5; }
+        .time-controls-section { grid-row: 6; }
+        .overrides-section { grid-row: 7; }
+        .analytics-panel { grid-row: 8; }
+
+        .chart-container {
+            height: 300px;
+        }
+    }
+
+    /* Current Decision Panel */
+    .decisions-panel {
+        /* No padding/background needed - using grid-quadrant styles */
+    }
+
+    .decision-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .decision-item {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+        padding: 12px 15px;
+        background: var(--bg-tertiary);
+        border-radius: 6px;
+    }
+
+    .decision-strategy {
+        font-weight: 600;
+        min-width: 120px;
+    }
+
+    .decision-mode {
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 0.85em;
+        font-weight: 600;
+        min-width: 100px;
+        text-align: center;
+    }
+
+    .decision-mode.force-charge { background: var(--warning); color: #000; }
+    .decision-mode.force-discharge { background: var(--success); color: #fff; }
+    .decision-mode.self-use { background: var(--info); color: #fff; }
+    .decision-mode.back-up-mode { background: #9c27b0; color: #fff; }
+
+    .decision-reason {
+        flex: 1;
+        color: var(--text-secondary);
+        font-size: 0.9em;
+    }
+
+    /* Results Table */
+    .results-section {
+        /* No padding/background needed - using grid-quadrant styles */
+    }
+
+    .results-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.9em;
+    }
+
+    .results-table thead {
+        background: var(--bg-tertiary);
+    }
+
+    .results-table th {
+        padding: 12px 10px;
+        text-align: left;
+        font-weight: 600;
+        border-bottom: 2px solid var(--border-color);
+    }
+
+    .results-table th.num {
+        text-align: right;
+    }
+
+    .results-table td {
+        padding: 12px 10px;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .results-table td.num {
+        text-align: right;
+        font-weight: 600;
+    }
+
+    .results-table td.positive { color: var(--success); }
+    .results-table td.negative { color: var(--error); }
+
+    .results-table tbody tr:hover {
+        background: var(--bg-tertiary);
+    }
+
+    .results-table tbody tr.best {
+        background: rgba(76, 175, 80, 0.15);
+    }
+
+    /* Legend */
+    .chart-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 15px;
+        margin-bottom: 10px;
+        font-size: 0.85em;
+    }
+
+    .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .legend-color {
+        width: 20px;
+        height: 3px;
+        border-radius: 2px;
+    }
+
+    /* Simulation status */
+    .simulation-status {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 15px;
+        background: var(--bg-tertiary);
+        border-radius: 6px;
+        margin-bottom: 20px;
+    }
+
+    .status-indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+    }
+
+    .status-ready { background: var(--success); }
+    .status-running { background: var(--warning); animation: pulse 1s infinite; }
+    .status-none { background: var(--text-secondary); }
+
+    .hidden {
+        display: none !important;
+    }
+
+    @media (max-width: 768px) {
+        .config-grid {
+            grid-template-columns: 1fr;
+        }
+        .overrides-panel {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        .override-group {
+            justify-content: space-between;
+        }
+    }
+</style>
+
+<div class="container">
+    <!-- Header -->
+    <div class="simulator-header">
+        <h1>
+            <i class="mdi mdi-flask-outline"></i>
+            Strategy Simulator
+        </h1>
+        <div class="nav-buttons">
+            <a href="{{ ingress_path }}/" class="config-button">
+                <i class="mdi mdi-view-dashboard"></i>
+                Dashboard
+            </a>
+            <a href="{{ ingress_path }}/backtest" class="config-button">
+                <i class="mdi mdi-chart-timeline-variant"></i>
+                Backtest
+            </a>
+        </div>
+    </div>
+
+    <!-- Simulation Status -->
+    <div class="simulation-status" id="simulation-status">
+        <span class="status-indicator status-none" id="status-dot"></span>
+        <span id="status-text">No simulation active. Configure and create one below.</span>
+    </div>
+
+    <!-- 2-Column Grid Layout (2x4 grid) -->
+    <div class="simulator-grid">
+        <!-- Row 1, Column 1: Configuration Panel -->
+        <div class="grid-quadrant config-section">
+            <h3><i class="mdi mdi-cog"></i> Configuration</h3>
+            <div class="config-panel" id="config-panel">
+                <div class="config-grid">
+                    <div class="config-group">
+                        <label>Consumption Profile</label>
+                        <select id="consumption-profile">
+                            <option value="peak_based">Peak-Based (Default)</option>
+                            <option value="constant">Constant Load</option>
+                            <option value="residential">Residential Pattern</option>
+                        </select>
+                    </div>
+                    <div class="config-group">
+                        <label>Price Scenario</label>
+                        <select id="price-scenario">
+                            <option value="usual_day">Usual Day</option>
+                            <option value="elevated_day">Elevated Day</option>
+                            <option value="volatile">Volatile</option>
+                            <option value="negative_prices">Negative Prices</option>
+                            <option value="hdo_optimized">HDO Optimized</option>
+                        </select>
+                    </div>
+                    <div class="config-group">
+                        <label>Initial SOC</label>
+                        <input type="range" id="initial-soc" min="0" max="100" value="50">
+                        <span class="range-value" id="initial-soc-value">50%</span>
+                    </div>
+                    <div class="config-group">
+                        <label>Battery Capacity (kWh)</label>
+                        <input type="number" id="battery-capacity" value="10.0" min="1" max="50" step="0.5">
+                    </div>
+                </div>
+
+                <div class="config-group" style="margin-bottom: 20px;">
+                    <label>Strategies to Compare</label>
+                    <div class="strategy-checkboxes" id="strategy-checkboxes">
+                        <label class="strategy-checkbox">
+                            <input type="checkbox" value="v4_global" checked>
+                            <span>V4 Global</span>
+                        </label>
+                        <label class="strategy-checkbox">
+                            <input type="checkbox" value="v3_hdo" checked>
+                            <span>V3 HDO</span>
+                        </label>
+                        <label class="strategy-checkbox">
+                            <input type="checkbox" value="v2_advanced">
+                            <span>V2 Advanced</span>
+                        </label>
+                        <label class="strategy-checkbox">
+                            <input type="checkbox" value="v1_winter">
+                            <span>V1 Winter</span>
+                        </label>
+                        <label class="strategy-checkbox">
+                            <input type="checkbox" value="naive" checked>
+                            <span>Naive Self-Use</span>
+                        </label>
+                        <label class="strategy-checkbox">
+                            <input type="checkbox" value="no_battery" checked>
+                            <span>No Battery</span>
+                        </label>
+                    </div>
+                </div>
+
+                <button class="create-btn" id="create-btn">
+                    <i class="mdi mdi-play-circle"></i>
+                    Create Simulation
+                </button>
+            </div>
+        </div>
+
+        <!-- Row 1, Column 2: Results Table -->
+        <div class="grid-quadrant results-panel">
+            <h3><i class="mdi mdi-table"></i> Results</h3>
+            <div class="results-section hidden" id="results-section">
+                <table class="results-table">
+                    <thead>
+                        <tr>
+                            <th>Strategy</th>
+                            <th class="num">Net Cost</th>
+                            <th class="num">Grid Import</th>
+                            <th class="num">Grid Export</th>
+                            <th class="num">Cycles</th>
+                            <th class="num">Savings</th>
+                            <th class="num">vs No Battery</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-body">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Row 2, Column 1: Price & Consumption Chart -->
+        <div class="grid-quadrant price-chart-section">
+            <div class="charts-container hidden" id="price-chart-container">
+                <div class="chart-section">
+            <div class="chart-title">
+                <i class="mdi mdi-chart-bar"></i>
+                Price & Consumption
+            </div>
+                    <div class="chart-container">
+                        <canvas id="price-consumption-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 2, Column 2: SOC Trajectories Chart -->
+        <div class="grid-quadrant soc-chart-section">
+            <div class="charts-container hidden" id="soc-chart-container">
+                <div class="chart-section">
+            <div class="chart-title">
+                <i class="mdi mdi-battery-charging"></i>
+                SOC Trajectories
+            </div>
+                    <div class="chart-legend" id="soc-legend"></div>
+                    <div class="chart-container">
+                        <canvas id="soc-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 3, Column 1: Cumulative Cost Chart -->
+        <div class="grid-quadrant cost-chart-section">
+            <div class="charts-container hidden" id="cost-chart-container">
+                <div class="chart-section">
+                    <div class="chart-title">
+                        <i class="mdi mdi-currency-eur"></i>
+                        Cumulative Cost
+                    </div>
+                    <div class="chart-legend" id="cost-legend"></div>
+                    <div class="chart-container">
+                        <canvas id="cost-chart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 3, Column 2: Time Controls -->
+        <div class="grid-quadrant time-controls-section">
+            <h3><i class="mdi mdi-clock-outline"></i> Time Controls</h3>
+            <div class="time-controls hidden" id="time-controls">
+        <div class="current-time" id="current-time">00:00</div>
+
+        <div class="time-slider-container">
+            <input type="range" class="time-slider" id="time-slider" min="0" max="95" value="0">
+            <div class="time-labels">
+                <span>00:00</span>
+                <span>06:00</span>
+                <span>12:00</span>
+                <span>18:00</span>
+                <span>23:45</span>
+            </div>
+        </div>
+
+        <div class="playback-controls">
+            <button class="playback-btn" id="btn-start" title="Jump to start">
+                <i class="mdi mdi-skip-previous"></i>
+            </button>
+            <button class="playback-btn" id="btn-step-back" title="Step back">
+                <i class="mdi mdi-step-backward"></i>
+            </button>
+            <button class="playback-btn primary" id="btn-play" title="Play/Pause">
+                <i class="mdi mdi-play"></i>
+            </button>
+            <button class="playback-btn" id="btn-step" title="Step forward">
+                <i class="mdi mdi-step-forward"></i>
+            </button>
+            <button class="playback-btn" id="btn-run" title="Run to end">
+                <i class="mdi mdi-skip-next"></i>
+            </button>
+            <button class="playback-btn" id="btn-reset" title="Reset simulation">
+                <i class="mdi mdi-refresh"></i>
+            </button>
+        </div>
+
+                <div class="block-info">
+                    Block <span id="current-block">0</span> / 96
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 4, Column 1: Overrides Panel -->
+        <div class="grid-quadrant overrides-section">
+            <h3><i class="mdi mdi-tune"></i> Overrides</h3>
+            <div class="overrides-panel hidden" id="overrides-panel">
+                <div class="override-group">
+                    <label>Override SOC:</label>
+                    <input type="number" id="override-soc" min="0" max="100" placeholder="%">
+                    <button class="override-btn" id="apply-soc">Apply</button>
+                </div>
+                <div class="override-group">
+                    <label>Override Load:</label>
+                    <input type="number" id="override-load" min="0" max="20" step="0.1" placeholder="kWh">
+                    <button class="override-btn" id="apply-load">Apply</button>
+                </div>
+                <div class="override-group">
+                    <label>Override Price:</label>
+                    <input type="number" id="override-price" min="-5" max="20" step="0.01" placeholder="CZK">
+                    <button class="override-btn" id="apply-price">Apply</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Row 4, Column 2: Current Block Decisions -->
+        <div class="grid-quadrant analytics-panel">
+            <h3><i class="mdi mdi-lightbulb-on"></i> Current Block Decisions</h3>
+            <div class="decisions-panel hidden" id="decisions-panel">
+                <div class="decision-list" id="decision-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// Strategy colors for consistent chart styling
+const STRATEGY_COLORS = {
+    'v4_global': { border: '#4caf50', bg: 'rgba(76, 175, 80, 0.2)' },
+    'v3_hdo': { border: '#2196f3', bg: 'rgba(33, 150, 243, 0.2)' },
+    'v2_advanced': { border: '#9c27b0', bg: 'rgba(156, 39, 176, 0.2)' },
+    'v1_winter': { border: '#ff9800', bg: 'rgba(255, 152, 0, 0.2)' },
+    'naive': { border: '#607d8b', bg: 'rgba(96, 125, 139, 0.2)' },
+    'no_battery': { border: '#f44336', bg: 'rgba(244, 67, 54, 0.2)' }
+};
+
+const STRATEGY_NAMES = {
+    'v4_global': 'V4 Global',
+    'v3_hdo': 'V3 HDO',
+    'v2_advanced': 'V2 Advanced',
+    'v1_winter': 'V1 Winter',
+    'naive': 'Naive Self-Use',
+    'no_battery': 'No Battery'
+};
+
+// Application state
+const state = {
+    simulationId: null,
+    currentBlock: 0,
+    isPlaying: false,
+    playInterval: null,
+    data: null,
+    charts: {
+        priceConsumption: null,
+        soc: null,
+        cost: null
+    }
+};
+
+// API functions
+const api = {
+    baseUrl: '{{ ingress_path }}',
+
+    async getPresets() {
+        const response = await fetch(`${this.baseUrl}/api/simulator/presets`);
+        if (!response.ok) throw new Error('Failed to fetch presets');
+        return response.json();
+    },
+
+    async createSimulation(config) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/create`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config)
+        });
+        if (!response.ok) throw new Error('Failed to create simulation');
+        return response.json();
+    },
+
+    async step(id, blocks = 1) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}/step`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ blocks })
+        });
+        if (!response.ok) throw new Error('Step failed');
+        return response.json();
+    },
+
+    async run(id) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}/run`, {
+            method: 'POST'
+        });
+        if (!response.ok) throw new Error('Run failed');
+        return response.json();
+    },
+
+    async reset(id) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}/reset`, {
+            method: 'POST'
+        });
+        if (!response.ok) throw new Error('Reset failed');
+        return response.json();
+    },
+
+    async overrideSoc(id, block, soc) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}/override/soc`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ block_index: block, soc_percent: soc })
+        });
+        if (!response.ok) throw new Error('SOC override failed');
+        return response.json();
+    },
+
+    async overrideLoad(id, block, load) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}/override/load`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ block_index: block, load_kwh: load })
+        });
+        if (!response.ok) throw new Error('Load override failed');
+        return response.json();
+    },
+
+    async overridePrice(id, block, price) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}/override/price`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ block_index: block, price_czk: price })
+        });
+        if (!response.ok) throw new Error('Price override failed');
+        return response.json();
+    },
+
+    async getState(id) {
+        const response = await fetch(`${this.baseUrl}/api/simulator/${id}`);
+        if (!response.ok) throw new Error('Failed to fetch state');
+        return response.json();
+    }
+};
+
+// Utility functions
+function blockToTime(block) {
+    const hours = Math.floor(block / 4);
+    const minutes = (block % 4) * 15;
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+}
+
+function getSelectedStrategies() {
+    const checkboxes = document.querySelectorAll('#strategy-checkboxes input:checked');
+    return Array.from(checkboxes).map(cb => cb.value);
+}
+
+// UI Update functions
+function updateStatus(status, text) {
+    const dot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+
+    dot.className = 'status-indicator';
+    if (status === 'ready') dot.classList.add('status-ready');
+    else if (status === 'running') dot.classList.add('status-running');
+    else dot.classList.add('status-none');
+
+    statusText.textContent = text;
+}
+
+function updateTimeDisplay(block) {
+    document.getElementById('current-time').textContent = blockToTime(block);
+    document.getElementById('current-block').textContent = block;
+    document.getElementById('time-slider').value = block;
+}
+
+function showSimulationUI() {
+    document.getElementById('time-controls').classList.remove('hidden');
+    document.getElementById('overrides-panel').classList.remove('hidden');
+    document.getElementById('price-chart-container').classList.remove('hidden');
+    document.getElementById('soc-chart-container').classList.remove('hidden');
+    document.getElementById('cost-chart-container').classList.remove('hidden');
+    document.getElementById('decisions-panel').classList.remove('hidden');
+    document.getElementById('results-section').classList.remove('hidden');
+}
+
+function updateDecisions(data) {
+    const list = document.getElementById('decision-list');
+    if (!data || !data.strategy_results) {
+        list.innerHTML = '<div class="decision-item">No data available</div>';
+        return;
+    }
+
+    const currentBlock = data.current_block;
+    list.innerHTML = '';
+
+    for (const [strategyId, result] of Object.entries(data.strategy_results)) {
+        if (strategyId === 'no_battery') continue; // No battery has no decisions
+
+        const evaluation = result.evaluations && result.evaluations[currentBlock];
+        const mode = result.current_mode || 'SelfUse';
+        const reason = evaluation ? evaluation.reason : 'No evaluation data';
+
+        const modeClass = mode.toLowerCase().replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+
+        const item = document.createElement('div');
+        item.className = 'decision-item';
+        item.innerHTML = `
+            <span class="decision-strategy">${STRATEGY_NAMES[strategyId] || strategyId}</span>
+            <span class="decision-mode ${modeClass}">${mode}</span>
+            <span class="decision-reason">${reason}</span>
+        `;
+        list.appendChild(item);
+    }
+}
+
+function updateResultsTable(data) {
+    const tbody = document.getElementById('results-body');
+    if (!data || !data.strategy_results) {
+        tbody.innerHTML = '<tr><td colspan="7">No results available</td></tr>';
+        return;
+    }
+
+    // Find the best (lowest) cost and no-battery baseline
+    let bestCost = Infinity;
+    let noBatteryCost = 0;
+
+    for (const [strategyId, result] of Object.entries(data.strategy_results)) {
+        if (strategyId === 'no_battery') {
+            noBatteryCost = result.net_cost_czk;
+        }
+        if (result.net_cost_czk < bestCost) {
+            bestCost = result.net_cost_czk;
+        }
+    }
+
+    // Build table rows
+    const rows = [];
+    for (const [strategyId, result] of Object.entries(data.strategy_results)) {
+        const savings = noBatteryCost > 0
+            ? ((noBatteryCost - result.net_cost_czk) / noBatteryCost * 100).toFixed(1)
+            : '0.0';
+        const vsNoBattery = noBatteryCost - result.net_cost_czk;
+        const cycles = result.total_grid_import_kwh > 0
+            ? (result.total_grid_import_kwh / (data.config?.battery_capacity_kwh || 10)).toFixed(1)
+            : '0.0';
+
+        rows.push({
+            strategyId,
+            name: STRATEGY_NAMES[strategyId] || strategyId,
+            netCost: result.net_cost_czk,
+            gridImport: result.total_grid_import_kwh,
+            gridExport: result.total_grid_export_kwh,
+            cycles,
+            savings,
+            vsNoBattery,
+            isBest: Math.abs(result.net_cost_czk - bestCost) < 0.01
+        });
+    }
+
+    // Sort by net cost
+    rows.sort((a, b) => a.netCost - b.netCost);
+
+    tbody.innerHTML = rows.map(row => `
+        <tr class="${row.isBest ? 'best' : ''}">
+            <td>${row.name}</td>
+            <td class="num">${row.netCost.toFixed(2)} CZK</td>
+            <td class="num">${row.gridImport.toFixed(1)} kWh</td>
+            <td class="num">${row.gridExport.toFixed(1)} kWh</td>
+            <td class="num">${row.cycles}</td>
+            <td class="num ${row.strategyId === 'no_battery' ? '' : 'positive'}">${row.savings}%</td>
+            <td class="num ${row.vsNoBattery > 0 ? 'positive' : row.vsNoBattery < 0 ? 'negative' : ''}">
+                ${row.strategyId === 'no_battery' ? '-' : (row.vsNoBattery > 0 ? '+' : '') + row.vsNoBattery.toFixed(2)}
+            </td>
+        </tr>
+    `).join('');
+}
+
+// Chart functions
+function initCharts() {
+    // Destroy existing charts
+    Object.values(state.charts).forEach(chart => {
+        if (chart) chart.destroy();
+    });
+
+    const chartOptions = {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {
+            mode: 'index',
+            intersect: false
+        },
+        plugins: {
+            legend: {
+                display: false
+            },
+            tooltip: {
+                backgroundColor: 'rgba(0, 0, 0, 0.9)',
+                titleColor: '#fff',
+                bodyColor: '#e0e0e0'
+            }
+        },
+        scales: {
+            x: {
+                ticks: {
+                    color: '#999',
+                    maxRotation: 0,
+                    autoSkip: true,
+                    maxTicksLimit: 12
+                },
+                grid: { display: false }
+            },
+            y: {
+                ticks: { color: '#999' },
+                grid: { color: 'rgba(255, 255, 255, 0.1)' }
+            }
+        }
+    };
+
+    // Price & Consumption chart
+    const priceCtx = document.getElementById('price-consumption-chart').getContext('2d');
+    state.charts.priceConsumption = new Chart(priceCtx, {
+        type: 'bar',
+        data: { labels: [], datasets: [] },
+        options: {
+            ...chartOptions,
+            scales: {
+                ...chartOptions.scales,
+                'y-price': {
+                    type: 'linear',
+                    position: 'left',
+                    title: { display: true, text: 'Price (CZK/kWh)', color: '#ffd700' },
+                    ticks: { color: '#ffd700' },
+                    grid: { color: 'rgba(255, 255, 255, 0.1)' }
+                },
+                'y-load': {
+                    type: 'linear',
+                    position: 'right',
+                    title: { display: true, text: 'Load (kWh)', color: '#f44336' },
+                    ticks: { color: '#f44336' },
+                    grid: { display: false }
+                }
+            },
+            plugins: {
+                ...chartOptions.plugins,
+                annotation: {
+                    annotations: {
+                        currentBlock: {
+                            type: 'line',
+                            xMin: 0,
+                            xMax: 0,
+                            borderColor: 'rgba(255, 255, 255, 0.8)',
+                            borderWidth: 2,
+                            borderDash: [5, 5]
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // SOC chart
+    const socCtx = document.getElementById('soc-chart').getContext('2d');
+    state.charts.soc = new Chart(socCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [] },
+        options: {
+            ...chartOptions,
+            scales: {
+                ...chartOptions.scales,
+                y: {
+                    ...chartOptions.scales.y,
+                    min: 0,
+                    max: 100,
+                    title: { display: true, text: 'SOC (%)', color: '#e0e0e0' }
+                }
+            },
+            plugins: {
+                ...chartOptions.plugins,
+                annotation: {
+                    annotations: {
+                        currentBlock: {
+                            type: 'line',
+                            xMin: 0,
+                            xMax: 0,
+                            borderColor: 'rgba(255, 255, 255, 0.8)',
+                            borderWidth: 2,
+                            borderDash: [5, 5]
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Cost chart
+    const costCtx = document.getElementById('cost-chart').getContext('2d');
+    state.charts.cost = new Chart(costCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [] },
+        options: {
+            ...chartOptions,
+            scales: {
+                ...chartOptions.scales,
+                y: {
+                    ...chartOptions.scales.y,
+                    title: { display: true, text: 'Cost (CZK)', color: '#e0e0e0' }
+                }
+            },
+            plugins: {
+                ...chartOptions.plugins,
+                annotation: {
+                    annotations: {
+                        currentBlock: {
+                            type: 'line',
+                            xMin: 0,
+                            xMax: 0,
+                            borderColor: 'rgba(255, 255, 255, 0.8)',
+                            borderWidth: 2,
+                            borderDash: [5, 5]
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+function updateCharts(data) {
+    if (!data || !data.day) return;
+
+    const labels = data.day.blocks.map((_, i) => blockToTime(i));
+    const currentBlock = data.current_block;
+
+    // Update Price & Consumption chart
+    const priceChart = state.charts.priceConsumption;
+    if (priceChart) {
+        priceChart.data.labels = labels;
+        priceChart.data.datasets = [
+            {
+                label: 'Price',
+                data: data.day.blocks.map(b => b.price_czk),
+                backgroundColor: 'rgba(255, 215, 0, 0.6)',
+                borderColor: 'rgba(255, 215, 0, 1)',
+                borderWidth: 1,
+                yAxisID: 'y-price',
+                order: 2
+            },
+            {
+                label: 'Consumption',
+                data: data.day.blocks.map(b => b.consumption_kwh),
+                type: 'line',
+                borderColor: '#f44336',
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 0,
+                yAxisID: 'y-load',
+                order: 1
+            }
+        ];
+        priceChart.options.plugins.annotation.annotations.currentBlock.xMin = currentBlock;
+        priceChart.options.plugins.annotation.annotations.currentBlock.xMax = currentBlock;
+        priceChart.update('none');
+    }
+
+    // Update SOC chart
+    const socChart = state.charts.soc;
+    if (socChart && data.strategy_results) {
+        socChart.data.labels = labels;
+        socChart.data.datasets = [];
+
+        const legendHtml = [];
+        for (const [strategyId, result] of Object.entries(data.strategy_results)) {
+            if (strategyId === 'no_battery') continue;
+
+            const colors = STRATEGY_COLORS[strategyId] || { border: '#999', bg: 'rgba(153,153,153,0.2)' };
+            socChart.data.datasets.push({
+                label: STRATEGY_NAMES[strategyId] || strategyId,
+                data: result.soc_history || [],
+                borderColor: colors.border,
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.1
+            });
+
+            legendHtml.push(`
+                <span class="legend-item">
+                    <span class="legend-color" style="background: ${colors.border}"></span>
+                    ${STRATEGY_NAMES[strategyId] || strategyId}
+                </span>
+            `);
+        }
+
+        document.getElementById('soc-legend').innerHTML = legendHtml.join('');
+        socChart.options.plugins.annotation.annotations.currentBlock.xMin = currentBlock;
+        socChart.options.plugins.annotation.annotations.currentBlock.xMax = currentBlock;
+        socChart.update('none');
+    }
+
+    // Update Cost chart
+    const costChart = state.charts.cost;
+    if (costChart && data.strategy_results) {
+        costChart.data.labels = labels;
+        costChart.data.datasets = [];
+
+        const legendHtml = [];
+        for (const [strategyId, result] of Object.entries(data.strategy_results)) {
+            const colors = STRATEGY_COLORS[strategyId] || { border: '#999', bg: 'rgba(153,153,153,0.2)' };
+            costChart.data.datasets.push({
+                label: STRATEGY_NAMES[strategyId] || strategyId,
+                data: result.cumulative_cost_czk || [],
+                borderColor: colors.border,
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 0,
+                tension: 0.1
+            });
+
+            legendHtml.push(`
+                <span class="legend-item">
+                    <span class="legend-color" style="background: ${colors.border}"></span>
+                    ${STRATEGY_NAMES[strategyId] || strategyId}
+                </span>
+            `);
+        }
+
+        document.getElementById('cost-legend').innerHTML = legendHtml.join('');
+        costChart.options.plugins.annotation.annotations.currentBlock.xMin = currentBlock;
+        costChart.options.plugins.annotation.annotations.currentBlock.xMax = currentBlock;
+        costChart.update('none');
+    }
+}
+
+// Main update function
+function updateUI(data) {
+    state.data = data;
+    state.currentBlock = data.current_block;
+
+    updateTimeDisplay(data.current_block);
+    updateCharts(data);
+    updateDecisions(data);
+    updateResultsTable(data);
+
+    const isComplete = data.current_block >= 95;
+    updateStatus(isComplete ? 'ready' : 'running',
+        isComplete ? 'Simulation complete' : `Simulating block ${data.current_block}/96`);
+}
+
+// Event handlers
+async function createSimulation() {
+    const btn = document.getElementById('create-btn');
+    btn.disabled = true;
+
+    try {
+        updateStatus('running', 'Creating simulation...');
+
+        const config = {
+            consumption_profile: document.getElementById('consumption-profile').value,
+            price_scenario: document.getElementById('price-scenario').value,
+            initial_soc: parseInt(document.getElementById('initial-soc').value),
+            battery_capacity_kwh: parseFloat(document.getElementById('battery-capacity').value),
+            strategies: getSelectedStrategies()
+        };
+
+        const result = await api.createSimulation(config);
+        state.simulationId = result.id;
+
+        // Initialize charts and show UI
+        initCharts();
+        showSimulationUI();
+
+        // Update with initial data
+        updateUI(result);
+
+        updateStatus('ready', 'Simulation ready. Use controls to step through time.');
+    } catch (error) {
+        console.error('Create simulation error:', error);
+        updateStatus('none', `Error: ${error.message}`);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function stepSimulation(blocks = 1) {
+    if (!state.simulationId) return;
+
+    try {
+        const result = await api.step(state.simulationId, blocks);
+        updateUI(result);
+    } catch (error) {
+        console.error('Step error:', error);
+        stopPlayback();
+    }
+}
+
+async function runSimulation() {
+    if (!state.simulationId) return;
+
+    try {
+        updateStatus('running', 'Running simulation to completion...');
+        const result = await api.run(state.simulationId);
+        updateUI(result);
+    } catch (error) {
+        console.error('Run error:', error);
+        updateStatus('none', `Error: ${error.message}`);
+    }
+}
+
+async function resetSimulation() {
+    if (!state.simulationId) return;
+
+    try {
+        stopPlayback();
+        const result = await api.reset(state.simulationId);
+        updateUI(result);
+        updateStatus('ready', 'Simulation reset to block 0');
+    } catch (error) {
+        console.error('Reset error:', error);
+    }
+}
+
+function startPlayback() {
+    if (state.isPlaying) return;
+
+    state.isPlaying = true;
+    document.querySelector('#btn-play i').className = 'mdi mdi-pause';
+
+    state.playInterval = setInterval(async () => {
+        if (state.currentBlock >= 95) {
+            stopPlayback();
+            return;
+        }
+        await stepSimulation(1);
+    }, 500);
+}
+
+function stopPlayback() {
+    state.isPlaying = false;
+    document.querySelector('#btn-play i').className = 'mdi mdi-play';
+
+    if (state.playInterval) {
+        clearInterval(state.playInterval);
+        state.playInterval = null;
+    }
+}
+
+function togglePlayback() {
+    if (state.isPlaying) {
+        stopPlayback();
+    } else {
+        startPlayback();
+    }
+}
+
+async function jumpToBlock(block) {
+    if (!state.simulationId) return;
+
+    stopPlayback();
+
+    // Reset and step to target block
+    await api.reset(state.simulationId);
+    if (block > 0) {
+        const result = await api.step(state.simulationId, block);
+        updateUI(result);
+    } else {
+        const result = await api.getState(state.simulationId);
+        updateUI(result);
+    }
+}
+
+async function applyOverride(type) {
+    if (!state.simulationId) return;
+
+    const currentBlock = state.currentBlock;
+
+    try {
+        let result;
+        if (type === 'soc') {
+            const soc = parseFloat(document.getElementById('override-soc').value);
+            if (isNaN(soc)) return;
+            result = await api.overrideSoc(state.simulationId, currentBlock, soc);
+        } else if (type === 'load') {
+            const load = parseFloat(document.getElementById('override-load').value);
+            if (isNaN(load)) return;
+            result = await api.overrideLoad(state.simulationId, currentBlock, load);
+        } else if (type === 'price') {
+            const price = parseFloat(document.getElementById('override-price').value);
+            if (isNaN(price)) return;
+            result = await api.overridePrice(state.simulationId, currentBlock, price);
+        }
+
+        if (result) {
+            updateUI(result);
+            updateStatus('ready', `Override applied at block ${currentBlock}`);
+        }
+    } catch (error) {
+        console.error('Override error:', error);
+        updateStatus('none', `Override failed: ${error.message}`);
+    }
+}
+
+// Event listeners setup
+document.addEventListener('DOMContentLoaded', () => {
+    // Initial SOC slider
+    const socSlider = document.getElementById('initial-soc');
+    const socValue = document.getElementById('initial-soc-value');
+    socSlider.addEventListener('input', () => {
+        socValue.textContent = `${socSlider.value}%`;
+    });
+
+    // Create button
+    document.getElementById('create-btn').addEventListener('click', createSimulation);
+
+    // Playback controls
+    document.getElementById('btn-start').addEventListener('click', () => jumpToBlock(0));
+    document.getElementById('btn-step-back').addEventListener('click', () => {
+        if (state.currentBlock > 0) jumpToBlock(state.currentBlock - 1);
+    });
+    document.getElementById('btn-play').addEventListener('click', togglePlayback);
+    document.getElementById('btn-step').addEventListener('click', () => stepSimulation(1));
+    document.getElementById('btn-run').addEventListener('click', runSimulation);
+    document.getElementById('btn-reset').addEventListener('click', resetSimulation);
+
+    // Time slider
+    document.getElementById('time-slider').addEventListener('input', (e) => {
+        const block = parseInt(e.target.value);
+        jumpToBlock(block);
+    });
+
+    // Override buttons
+    document.getElementById('apply-soc').addEventListener('click', () => applyOverride('soc'));
+    document.getElementById('apply-load').addEventListener('click', () => applyOverride('load'));
+    document.getElementById('apply-price').addEventListener('click', () => applyOverride('price'));
+});
+</script>
+{% endblock %}

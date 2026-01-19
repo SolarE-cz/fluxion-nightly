@@ -75,6 +75,18 @@ pub struct ChartData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub debug_info: Vec<Option<fluxion_core::strategy::BlockDebugInfo>>,
     pub is_historical: Vec<bool>, // True for past blocks (shows regenerated schedule, not actual history)
+
+    // Price breakdown for stacked bar chart
+    /// Base spot prices (same as prices, for clarity in stacked display)
+    pub spot_prices: Vec<f32>,
+    /// HDO grid fee for each block (varies by tariff period)
+    pub grid_fees: Vec<f32>,
+    /// Tariff type for each block: "low" or "high" (for coloring)
+    pub tariff_types: Vec<String>,
+    /// Spot buy fee for each block
+    pub buy_fees: Vec<f32>,
+    /// Total effective price: spot + grid_fee + buy_fees
+    pub effective_prices: Vec<f32>,
 }
 
 /// Live data template (for SSE updates only)
@@ -190,6 +202,17 @@ impl DashboardTemplate {
             let mut debug_info_vec = Vec::new();
             let mut is_historical_vec = Vec::new();
 
+            // Price breakdown for stacked bars
+            let mut spot_prices = Vec::new();
+            let mut grid_fees = Vec::new();
+            let mut tariff_types = Vec::new();
+            let mut buy_fees = Vec::new();
+            let mut effective_prices = Vec::new();
+
+            // Get HDO and pricing fee info from response
+            let hdo_schedule = response.hdo_schedule.as_ref();
+            let pricing_fees = response.pricing_fees.as_ref();
+
             // Get current time in the appropriate timezone for the "now" marker
             // Round to nearest 15-minute block to match chart data
             let now = chrono::Utc::now();
@@ -252,6 +275,56 @@ impl DashboardTemplate {
                     _ => "Self-Use",
                 };
                 modes.push(mode.to_owned());
+
+                // Calculate price breakdown for stacked bars
+                let spot_price = block.price;
+                spot_prices.push(spot_price);
+
+                // Determine if block is in low tariff period based on HDO schedule
+                let block_time_str = block.timestamp.format("%H:%M").to_string();
+                let (grid_fee, tariff_type) = if let Some(hdo) = hdo_schedule {
+                    // Log HDO info for first block only
+                    if labels.len() == 1 {
+                        tracing::debug!(
+                            "📊 HDO schedule has {} low tariff periods: {:?}",
+                            hdo.low_tariff_periods.len(),
+                            hdo.low_tariff_periods
+                        );
+                    }
+                    let is_low = is_time_in_low_tariff(&block_time_str, &hdo.low_tariff_periods);
+                    // Log tariff decision for a few sample blocks
+                    if labels.len() <= 5 || labels.len() % 20 == 0 {
+                        tracing::debug!(
+                            "📊 Block {} (time {}): is_low={}, periods_count={}",
+                            labels.len(),
+                            block_time_str,
+                            is_low,
+                            hdo.low_tariff_periods.len()
+                        );
+                    }
+                    if is_low {
+                        (hdo.low_tariff_czk, "low".to_owned())
+                    } else {
+                        (hdo.high_tariff_czk, "high".to_owned())
+                    }
+                } else {
+                    // Default to high tariff if no HDO data
+                    (0.0, "high".to_owned())
+                };
+                grid_fees.push(grid_fee);
+                tariff_types.push(tariff_type);
+
+                // Calculate buy fees (constant for all blocks)
+                let buy_fee = if let Some(fees) = pricing_fees {
+                    fees.buy_fee_czk
+                } else {
+                    0.0
+                };
+                buy_fees.push(buy_fee);
+
+                // Calculate effective price
+                let effective_price = spot_price + grid_fee + buy_fee;
+                effective_prices.push(effective_price);
             }
 
             // Convert battery SOC history to chart format
@@ -441,6 +514,12 @@ impl DashboardTemplate {
                     pv_generation_history,
                     debug_info: debug_info_vec,
                     is_historical: is_historical_vec,
+                    // Price breakdown for stacked bars
+                    spot_prices,
+                    grid_fees,
+                    tariff_types,
+                    buy_fees,
+                    effective_prices,
                 },
             }
         });
@@ -465,5 +544,184 @@ impl DashboardTemplate {
             ingress_path,
             consumption_stats: response.consumption_stats,
         }
+    }
+}
+
+/// Check if a time (HH:MM format) falls within any of the low tariff periods
+fn is_time_in_low_tariff(time_str: &str, periods: &[(String, String)]) -> bool {
+    // Parse the block time
+    let time_parts: Vec<&str> = time_str.split(':').collect();
+    if time_parts.len() != 2 {
+        tracing::warn!("HDO: Invalid time format (no colon): '{}'", time_str);
+        return false;
+    }
+    let Ok(time_hour) = time_parts[0].parse::<u32>() else {
+        tracing::warn!("HDO: Invalid hour in time: '{}'", time_str);
+        return false;
+    };
+    let Ok(time_minute) = time_parts[1].parse::<u32>() else {
+        tracing::warn!("HDO: Invalid minute in time: '{}'", time_str);
+        return false;
+    };
+    let time_minutes = time_hour * 60 + time_minute;
+
+    for (start, end) in periods {
+        // Parse start time
+        let start_parts: Vec<&str> = start.split(':').collect();
+        if start_parts.len() != 2 {
+            tracing::warn!("HDO: Invalid start time format: '{}'", start);
+            continue;
+        }
+        let Ok(start_hour) = start_parts[0].parse::<u32>() else {
+            tracing::warn!("HDO: Invalid start hour: '{}'", start);
+            continue;
+        };
+        let Ok(start_minute) = start_parts[1].parse::<u32>() else {
+            tracing::warn!("HDO: Invalid start minute: '{}'", start);
+            continue;
+        };
+        let start_minutes = start_hour * 60 + start_minute;
+
+        // Parse end time (handle "24:00" as 1440)
+        let end_parts: Vec<&str> = end.split(':').collect();
+        if end_parts.len() != 2 {
+            tracing::warn!("HDO: Invalid end time format: '{}'", end);
+            continue;
+        }
+        let Ok(end_hour) = end_parts[0].parse::<u32>() else {
+            tracing::warn!("HDO: Invalid end hour: '{}'", end);
+            continue;
+        };
+        let Ok(end_minute) = end_parts[1].parse::<u32>() else {
+            tracing::warn!("HDO: Invalid end minute: '{}'", end);
+            continue;
+        };
+        let end_minutes = if end_hour == 24 {
+            24 * 60 // 1440 minutes
+        } else {
+            end_hour * 60 + end_minute
+        };
+
+        // Check if time falls within this period
+        if start_minutes <= end_minutes {
+            // Normal range (e.g., 06:00-12:00)
+            if time_minutes >= start_minutes && time_minutes < end_minutes {
+                return true;
+            }
+        } else {
+            // Overnight range (e.g., 22:00-06:00)
+            if time_minutes >= start_minutes || time_minutes < end_minutes {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_time_in_low_tariff_cez_schedule() {
+        // CEZ HDO schedule: low tariff periods
+        let periods = vec![
+            ("00:00".to_owned(), "06:00".to_owned()),
+            ("07:00".to_owned(), "09:00".to_owned()),
+            ("10:00".to_owned(), "13:00".to_owned()),
+            ("14:00".to_owned(), "16:00".to_owned()),
+            ("17:00".to_owned(), "24:00".to_owned()),
+        ];
+
+        // Times that should be in LOW tariff
+        assert!(
+            is_time_in_low_tariff("00:00", &periods),
+            "00:00 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("03:30", &periods),
+            "03:30 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("05:59", &periods),
+            "05:59 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("07:00", &periods),
+            "07:00 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("08:30", &periods),
+            "08:30 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("10:00", &periods),
+            "10:00 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("12:45", &periods),
+            "12:45 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("14:00", &periods),
+            "14:00 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("15:30", &periods),
+            "15:30 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("17:00", &periods),
+            "17:00 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("20:00", &periods),
+            "20:00 should be low"
+        );
+        assert!(
+            is_time_in_low_tariff("23:59", &periods),
+            "23:59 should be low"
+        );
+
+        // Times that should be in HIGH tariff
+        assert!(
+            !is_time_in_low_tariff("06:00", &periods),
+            "06:00 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("06:30", &periods),
+            "06:30 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("09:00", &periods),
+            "09:00 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("09:45", &periods),
+            "09:45 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("13:00", &periods),
+            "13:00 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("13:30", &periods),
+            "13:30 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("16:00", &periods),
+            "16:00 should be high"
+        );
+        assert!(
+            !is_time_in_low_tariff("16:45", &periods),
+            "16:45 should be high"
+        );
+    }
+
+    #[test]
+    fn test_is_time_in_low_tariff_empty_periods() {
+        let periods: Vec<(String, String)> = vec![];
+        assert!(!is_time_in_low_tariff("12:00", &periods));
     }
 }

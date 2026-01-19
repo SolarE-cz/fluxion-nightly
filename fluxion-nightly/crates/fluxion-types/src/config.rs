@@ -101,8 +101,22 @@ pub struct PricingConfig {
     pub spot_buy_fee_czk: f32,
     #[serde(default = "default_spot_sell_fee")]
     pub spot_sell_fee_czk: f32,
-    #[serde(default = "default_grid_distribution_fee")]
-    pub grid_distribution_fee_czk: f32,
+
+    // ============= HDO Tariff Configuration (Czech Grid Fees) =============
+    /// Home Assistant entity for HDO tariff schedule (e.g., "sensor.cez_hdo_lowtariffstart")
+    /// This sensor provides low/high tariff time periods for accurate grid fee calculation
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+
+    /// Grid fee during HDO low tariff periods (CZK/kWh)
+    /// This is added to spot prices during low tariff hours to get effective buy price
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+
+    /// Grid fee during HDO high tariff periods (CZK/kWh)
+    /// This is added to spot prices during high tariff hours to get effective buy price
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
 }
 
 /// Control configuration
@@ -192,8 +206,17 @@ fn default_spot_buy_fee() -> f32 {
 fn default_spot_sell_fee() -> f32 {
     0.5
 }
-fn default_grid_distribution_fee() -> f32 {
-    1.2
+
+fn default_hdo_sensor_entity() -> String {
+    "sensor.cez_hdo_lowtariffstart".to_string()
+}
+
+fn default_hdo_low_tariff_czk() -> f32 {
+    0.50
+}
+
+fn default_hdo_high_tariff_czk() -> f32 {
+    1.80
 }
 
 impl Default for ControlConfig {
@@ -241,6 +264,14 @@ pub struct StrategiesConfigCore {
     pub winter_adaptive_v2: WinterAdaptiveV2ConfigCore,
     #[serde(default)]
     pub winter_adaptive_v3: WinterAdaptiveV3ConfigCore,
+    #[serde(default)]
+    pub winter_adaptive_v4: WinterAdaptiveV4ConfigCore,
+    #[serde(default)]
+    pub winter_adaptive_v5: WinterAdaptiveV5ConfigCore,
+    #[serde(default)]
+    pub winter_adaptive_v6: WinterAdaptiveV6ConfigCore,
+    #[serde(default)]
+    pub winter_adaptive_v7: WinterAdaptiveV7ConfigCore,
     #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfigCore,
     #[serde(default)]
@@ -384,7 +415,7 @@ fn default_charge_on_negative_even_if_full() -> bool {
 impl Default for WinterAdaptiveConfigCore {
     fn default() -> Self {
         Self {
-            enabled: false, // V3 is now the default strategy
+            enabled: false, // V4 is the default strategy
             priority: 100,  // Highest priority by default (main strategy)
             ema_period_days: 7,
             min_solar_percentage: 0.10,
@@ -425,7 +456,7 @@ fn default_winter_adaptive_v2_priority() -> u8 {
 impl Default for WinterAdaptiveV2ConfigCore {
     fn default() -> Self {
         Self {
-            enabled: false, // V3 is now the default strategy
+            enabled: false, // V4 is the default strategy
             priority: 100,
             daily_charging_target_soc: 90.0,
         }
@@ -472,18 +503,6 @@ fn default_v3_daily_charging_target_soc() -> f32 {
     90.0
 }
 
-fn default_hdo_sensor_entity() -> String {
-    "sensor.cez_hdo_lowtariffstart".to_string()
-}
-
-fn default_hdo_low_tariff_czk() -> f32 {
-    0.50
-}
-
-fn default_hdo_high_tariff_czk() -> f32 {
-    1.80
-}
-
 fn default_winter_discharge_min_soc() -> f32 {
     50.0
 }
@@ -499,7 +518,7 @@ fn default_discharge_arbitrage_buffer() -> f32 {
 impl Default for WinterAdaptiveV3ConfigCore {
     fn default() -> Self {
         Self {
-            enabled: true, // V3 is the default strategy
+            enabled: false, // V3 is deprecated, V4 is the default
             priority: 100,
             daily_charging_target_soc: 90.0,
             hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
@@ -512,6 +531,359 @@ impl Default for WinterAdaptiveV3ConfigCore {
     }
 }
 
+/// Winter Adaptive V4 Configuration - Global Price Optimization
+///
+/// V4 uses true global optimization: it ranks ALL blocks by price and selects
+/// the globally cheapest for charging and globally most expensive for discharge.
+/// This fixes the V3 bug where it would charge at 3.73 CZK when 2.31 CZK blocks
+/// were available later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV4ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v4_priority")]
+    pub priority: u8,
+    /// Target battery SOC for charging (default: 100%)
+    #[serde(default = "default_v4_target_battery_soc")]
+    pub target_battery_soc: f32,
+    /// Home Assistant entity for HDO tariff schedule
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    /// Grid fee during HDO low tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    /// Grid fee during HDO high tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    /// Number of top expensive blocks per day for discharge (default: 4)
+    #[serde(default = "default_v4_discharge_blocks_per_day")]
+    pub discharge_blocks_per_day: usize,
+    /// Minimum price spread for discharge to be worthwhile (CZK)
+    #[serde(default = "default_v4_min_discharge_spread")]
+    pub min_discharge_spread_czk: f32,
+}
+
+fn default_winter_adaptive_v4_priority() -> u8 {
+    100
+}
+
+fn default_v4_target_battery_soc() -> f32 {
+    100.0
+}
+
+fn default_v4_discharge_blocks_per_day() -> usize {
+    4
+}
+
+fn default_v4_min_discharge_spread() -> f32 {
+    0.50
+}
+
+impl Default for WinterAdaptiveV4ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V5 is now the default strategy
+            priority: 100,
+            target_battery_soc: 100.0,
+            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            discharge_blocks_per_day: 4,
+            min_discharge_spread_czk: 0.50,
+        }
+    }
+}
+
+/// Configuration for Winter Adaptive V5 strategy
+/// V5 combines the best logic from V2, V3, and V4 to maximize cost savings:
+/// - Global price ranking (from V4)
+/// - Reserve SOC protection (from V3)
+/// - Grid avoidance during expensive blocks (NEW)
+/// - Aggressive charging during cheap blocks (NEW)
+/// - Safety margins (from V2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV5ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v5_priority")]
+    pub priority: u8,
+    /// Target battery SOC for charging (default: 100%)
+    #[serde(default = "default_v5_target_battery_soc")]
+    pub target_battery_soc: f32,
+    /// Minimum SOC before allowing discharge (default: 40%)
+    #[serde(default = "default_v5_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    /// Home Assistant entity for HDO tariff schedule
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    /// Grid fee during HDO low tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    /// Grid fee during HDO high tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    /// Percentile threshold for "cheap" blocks (default: 30%)
+    #[serde(default = "default_v5_cheap_block_percentile")]
+    pub cheap_block_percentile: f32,
+    /// Percentile threshold for "expensive" blocks (default: 70%)
+    #[serde(default = "default_v5_expensive_block_percentile")]
+    pub expensive_block_percentile: f32,
+    /// Minimum price spread for discharge (CZK)
+    #[serde(default = "default_v5_min_discharge_spread")]
+    pub min_discharge_spread_czk: f32,
+    /// Safety margin for energy needs calculation (default: 0.15 = 15%)
+    #[serde(default = "default_v5_safety_margin")]
+    pub safety_margin_pct: f32,
+}
+
+fn default_winter_adaptive_v5_priority() -> u8 {
+    95
+}
+
+fn default_v5_target_battery_soc() -> f32 {
+    100.0
+}
+
+fn default_v5_min_discharge_soc() -> f32 {
+    40.0
+}
+
+fn default_v5_cheap_block_percentile() -> f32 {
+    30.0
+}
+
+fn default_v5_expensive_block_percentile() -> f32 {
+    70.0
+}
+
+fn default_v5_min_discharge_spread() -> f32 {
+    0.50
+}
+
+fn default_v5_safety_margin() -> f32 {
+    0.15
+}
+
+impl Default for WinterAdaptiveV5ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V7 is now the default strategy
+            priority: 95,
+            target_battery_soc: 100.0,
+            min_discharge_soc: 40.0,
+            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            cheap_block_percentile: 30.0,
+            expensive_block_percentile: 70.0,
+            min_discharge_spread_czk: 0.50,
+            safety_margin_pct: 0.15,
+        }
+    }
+}
+
+/// Winter Adaptive V6 configuration - Adaptive Hybrid Optimizer
+/// Combines best aspects of V3, V4, V5 with adaptive pattern detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV6ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v6_priority")]
+    pub priority: u8,
+    /// Target battery SOC for charging (default: 90%)
+    #[serde(default = "default_v6_target_battery_soc")]
+    pub target_battery_soc: f32,
+    /// Minimum SOC before allowing discharge (default: 10%)
+    #[serde(default = "default_v6_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    /// Volatility threshold (CV) for volatile mode (default: 0.4)
+    #[serde(default = "default_v6_volatility_cv_threshold")]
+    pub volatility_cv_threshold: f32,
+    /// Day/night spread ratio for simple arbitrage (default: 2.5)
+    #[serde(default = "default_v6_simple_arbitrage_spread_ratio")]
+    pub simple_arbitrage_spread_ratio: f32,
+    /// Percentile for cheap blocks (default: 25%)
+    #[serde(default = "default_v6_cheap_block_percentile")]
+    pub cheap_block_percentile: f32,
+    /// Percentile for expensive blocks (default: 75%)
+    #[serde(default = "default_v6_expensive_block_percentile")]
+    pub expensive_block_percentile: f32,
+    /// Minimum price spread for discharge (CZK/kWh)
+    #[serde(default = "default_v6_min_discharge_spread_czk")]
+    pub min_discharge_spread_czk: f32,
+    /// Number of most expensive blocks to discharge (default: 12)
+    #[serde(default = "default_v6_discharge_blocks_per_day")]
+    pub discharge_blocks_per_day: usize,
+    /// Safety margin for SOC targets (%)
+    #[serde(default = "default_v6_safety_margin_pct")]
+    pub safety_margin_pct: f32,
+    /// Enable negative price handling
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    /// Planning horizon in hours (default: 24)
+    #[serde(default = "default_v6_planning_horizon_hours")]
+    pub planning_horizon_hours: usize,
+    /// Minimum savings per cycle to justify wear (CZK)
+    #[serde(default = "default_zero_f32")]
+    pub min_savings_per_cycle_czk: f32,
+}
+
+fn default_winter_adaptive_v6_priority() -> u8 {
+    100 // Highest priority - experimental
+}
+fn default_v6_target_battery_soc() -> f32 {
+    90.0
+}
+fn default_v6_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v6_volatility_cv_threshold() -> f32 {
+    0.4
+}
+fn default_v6_simple_arbitrage_spread_ratio() -> f32 {
+    2.5
+}
+fn default_v6_cheap_block_percentile() -> f32 {
+    0.25
+}
+fn default_v6_expensive_block_percentile() -> f32 {
+    0.75
+}
+fn default_v6_min_discharge_spread_czk() -> f32 {
+    0.50
+}
+fn default_v6_discharge_blocks_per_day() -> usize {
+    12
+}
+fn default_v6_safety_margin_pct() -> f32 {
+    5.0
+}
+fn default_v6_planning_horizon_hours() -> usize {
+    24
+}
+fn default_zero_f32() -> f32 {
+    0.0
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for WinterAdaptiveV6ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V5 is still default
+            priority: 100,
+            target_battery_soc: 90.0,
+            min_discharge_soc: 10.0,
+            volatility_cv_threshold: 0.4,
+            simple_arbitrage_spread_ratio: 2.5,
+            cheap_block_percentile: 0.25,
+            expensive_block_percentile: 0.75,
+            min_discharge_spread_czk: 0.50,
+            discharge_blocks_per_day: 12,
+            safety_margin_pct: 5.0,
+            negative_price_handling_enabled: true,
+            planning_horizon_hours: 24,
+            min_savings_per_cycle_czk: 0.0,
+        }
+    }
+}
+
+/// Winter Adaptive V7 configuration - Unconstrained Multi-Cycle Arbitrage Optimizer
+/// V7 removes all artificial limitations and uses pure economic decision-making:
+/// - No "top N blocks" limits
+/// - No "below median only" constraints
+/// - Multiple charge/discharge cycles per day
+/// - 3 CZK minimum spread for profitability
+/// - Home-first export policy (SOC >50% after export)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV7ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v7_priority")]
+    pub priority: u8,
+    /// Target battery SOC for charging (default: 95%)
+    #[serde(default = "default_v7_target_battery_soc")]
+    pub target_battery_soc: f32,
+    /// Minimum SOC before allowing discharge (default: 10%)
+    #[serde(default = "default_v7_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    /// Minimum profit per cycle (CZK) - discharge_value - charge_cost >= this
+    #[serde(default = "default_v7_min_cycle_profit_czk")]
+    pub min_cycle_profit_czk: f32,
+    /// Valley detection threshold (std devs below mean)
+    #[serde(default = "default_v7_valley_threshold")]
+    pub valley_threshold_std_dev: f32,
+    /// Peak detection threshold (std devs above mean)
+    #[serde(default = "default_v7_peak_threshold")]
+    pub peak_threshold_std_dev: f32,
+    /// Minimum spread for grid export (CZK)
+    #[serde(default = "default_v7_min_export_spread")]
+    pub min_export_spread_czk: f32,
+    /// Minimum SOC after export (%)
+    #[serde(default = "default_v7_min_soc_after_export")]
+    pub min_soc_after_export: f32,
+    /// Average consumption per block (kWh)
+    #[serde(default = "default_v7_avg_consumption")]
+    pub avg_consumption_per_block_kwh: f32,
+    /// Enable negative price handling
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    /// Round-trip battery efficiency
+    #[serde(default = "default_v7_efficiency")]
+    pub battery_round_trip_efficiency: f32,
+}
+
+fn default_winter_adaptive_v7_priority() -> u8 {
+    100
+}
+fn default_v7_target_battery_soc() -> f32 {
+    95.0
+}
+fn default_v7_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v7_min_cycle_profit_czk() -> f32 {
+    3.0
+}
+fn default_v7_valley_threshold() -> f32 {
+    0.5
+}
+fn default_v7_peak_threshold() -> f32 {
+    0.5
+}
+fn default_v7_min_export_spread() -> f32 {
+    5.0
+}
+fn default_v7_min_soc_after_export() -> f32 {
+    50.0
+}
+fn default_v7_avg_consumption() -> f32 {
+    0.25
+}
+fn default_v7_efficiency() -> f32 {
+    0.90
+}
+
+impl Default for WinterAdaptiveV7ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: true, // V7 is the default strategy
+            priority: 100,
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            min_cycle_profit_czk: 3.0,
+            valley_threshold_std_dev: 0.5,
+            peak_threshold_std_dev: 0.5,
+            min_export_spread_czk: 5.0,
+            min_soc_after_export: 50.0,
+            avg_consumption_per_block_kwh: 0.25,
+            negative_price_handling_enabled: true,
+            battery_round_trip_efficiency: 0.90,
+        }
+    }
+}
+
 /// All available strategy types - add new strategies here to ensure they're tracked
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -519,6 +891,10 @@ pub enum StrategyType {
     WinterAdaptive,
     WinterAdaptiveV2,
     WinterAdaptiveV3,
+    WinterAdaptiveV4,
+    WinterAdaptiveV5,
+    WinterAdaptiveV6,
+    WinterAdaptiveV7,
     WinterPeakDischarge,
     SolarAwareCharging,
     MorningPrecharge,
@@ -536,6 +912,10 @@ impl StrategyType {
             StrategyType::WinterAdaptive,
             StrategyType::WinterAdaptiveV2,
             StrategyType::WinterAdaptiveV3,
+            StrategyType::WinterAdaptiveV4,
+            StrategyType::WinterAdaptiveV5,
+            StrategyType::WinterAdaptiveV6,
+            StrategyType::WinterAdaptiveV7,
             StrategyType::WinterPeakDischarge,
             StrategyType::SolarAwareCharging,
             StrategyType::MorningPrecharge,
@@ -553,6 +933,10 @@ impl StrategyType {
             StrategyType::WinterAdaptive => "Winter Adaptive",
             StrategyType::WinterAdaptiveV2 => "Winter Adaptive V2",
             StrategyType::WinterAdaptiveV3 => "Winter Adaptive V3",
+            StrategyType::WinterAdaptiveV4 => "Winter Adaptive V4",
+            StrategyType::WinterAdaptiveV5 => "Winter Adaptive V5",
+            StrategyType::WinterAdaptiveV6 => "Winter Adaptive V6",
+            StrategyType::WinterAdaptiveV7 => "Winter Adaptive V7",
             StrategyType::WinterPeakDischarge => "Winter Peak Discharge",
             StrategyType::SolarAwareCharging => "Solar Aware Charging",
             StrategyType::MorningPrecharge => "Morning Precharge",

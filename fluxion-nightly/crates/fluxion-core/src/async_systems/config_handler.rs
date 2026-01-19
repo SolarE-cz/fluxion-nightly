@@ -109,6 +109,7 @@ pub struct ConfigEventParams<'w, 's> {
     _battery_query: Query<'w, 's, &'static BatteryStatus>,
     commands: Commands<'w, 's>,
     backup_soc: Option<Res<'w, BackupDischargeMinSoc>>,
+    hdo_data: Option<Res<'w, super::HdoScheduleData>>,
     consumption_history: Res<'w, crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
     plugin_manager_res: Res<'w, PluginManagerResource>,
@@ -278,6 +279,7 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
 
             // Generate new schedule with updated config using shared plugin manager
             let plugin_manager = params.plugin_manager_res.0.read();
+            let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
@@ -288,6 +290,7 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
+                hdo_raw_data,
             );
 
             // Update schedule

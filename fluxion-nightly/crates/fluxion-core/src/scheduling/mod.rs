@@ -18,15 +18,68 @@ use fluxion_plugins::{
     BatteryState, BlockDecision, EvaluationRequest, ForecastData, HistoricalData, OperationMode,
     PluginManager, PriceBlock,
 };
-use fluxion_types::config::{ControlConfig, Currency};
+use fluxion_types::config::{ControlConfig, Currency, PricingConfig};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Check if debug logging is enabled based on log level
 fn is_debug_enabled() -> bool {
     tracing::enabled!(tracing::Level::DEBUG)
+}
+
+/// Calculate effective prices (spot price + grid fees) for all time blocks
+///
+/// Uses the GlobalHdoCache to determine whether each block is in low or high tariff period,
+/// then adds the appropriate grid fee from PricingConfig to the spot price.
+///
+/// # Arguments
+/// * `time_block_prices` - Mutable slice of price blocks to update
+/// * `hdo_cache` - Optional global HDO cache for tariff period lookup
+/// * `pricing_config` - Pricing configuration with grid fee amounts
+///
+/// # Note
+/// If HDO cache is not available or returns None, falls back to spot_buy_fee_czk
+pub fn calculate_effective_prices(
+    time_block_prices: &mut [TimeBlockPrice],
+    hdo_cache: Option<&crate::resources::GlobalHdoCache>,
+    pricing_config: &PricingConfig,
+) {
+    for block in time_block_prices.iter_mut() {
+        let grid_fee = if let Some(cache) = hdo_cache {
+            // Try to get HDO tariff period from cache
+            match cache.is_low_tariff(block.block_start) {
+                Some(true) => {
+                    // Low tariff period
+                    pricing_config.hdo_low_tariff_czk
+                }
+                Some(false) => {
+                    // High tariff period
+                    pricing_config.hdo_high_tariff_czk
+                }
+                None => {
+                    // HDO data not available for this time, use fallback
+                    warn!(
+                        "HDO tariff data not available for {}, using fallback spot_buy_fee",
+                        block.block_start
+                    );
+                    pricing_config.spot_buy_fee_czk
+                }
+            }
+        } else {
+            // No HDO cache available, use fallback
+            pricing_config.spot_buy_fee_czk
+        };
+
+        // Calculate effective price = spot price + grid fee
+        block.effective_price_czk_per_kwh = block.price_czk_per_kwh + grid_fee;
+    }
+
+    debug!(
+        "Calculated effective prices for {} blocks using HDO tariff data",
+        time_block_prices.len()
+    );
 }
 
 /// Configuration for schedule generation
@@ -90,6 +143,7 @@ pub fn generate_schedule_with_optimizer(
     backup_discharge_min_soc: f32,
     grid_import_today_kwh: Option<f32>,
     plugin_manager: &PluginManager,
+    hdo_raw_data: Option<String>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
@@ -162,6 +216,7 @@ pub fn generate_schedule_with_optimizer(
             export_price,
             backup_discharge_min_soc,
             grid_import_today_kwh,
+            hdo_raw_data.clone(),
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -235,6 +290,7 @@ pub fn generate_schedule_with_optimizer(
             export_price,
             backup_discharge_min_soc,
             grid_import_today_kwh,
+            hdo_raw_data.clone(),
         );
 
         // Get decision from plugin manager
@@ -640,12 +696,14 @@ fn create_evaluation_request(
     export_price: f32,
     backup_discharge_min_soc: f32,
     grid_import_today_kwh: Option<f32>,
+    hdo_raw_data: Option<String>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
             block_start: price_block.block_start,
             duration_minutes: price_block.duration_minutes,
             price_czk_per_kwh: price_block.price_czk_per_kwh,
+            effective_price_czk_per_kwh: price_block.effective_price_czk_per_kwh,
         },
         battery: BatteryState {
             current_soc_percent: current_soc,
@@ -667,6 +725,7 @@ fn create_evaluation_request(
                 block_start: b.block_start,
                 duration_minutes: b.duration_minutes,
                 price_czk_per_kwh: b.price_czk_per_kwh,
+                effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
             })
             .collect(),
         historical: HistoricalData {
@@ -674,6 +733,7 @@ fn create_evaluation_request(
             consumption_today_kwh: None, // TODO: Track actual consumption
         },
         backup_discharge_min_soc,
+        hdo_raw_data,
     }
 }
 

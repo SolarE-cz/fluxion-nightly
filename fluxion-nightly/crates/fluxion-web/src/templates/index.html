@@ -693,6 +693,8 @@
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
                 <span><div class="legend-box backup"></div> Back Up Mode</span>
                 <span><div class="legend-box self-use"></div> Self-Use</span>
+                <span><div class="legend-box hdo-low"></div> HDO Low Tariff</span>
+                <span><div class="legend-box hdo-high"></div> HDO High Tariff</span>
                 {% if let Some(inv) = inverters.first() %}
                 <span><div class="legend-box battery-soc"></div> Battery SOC ({{ inv.battery_soc }}%)</span>
                 <span><div class="legend-box pv-generation"></div> PV Generation ({{ inv.pv_power_w }} W)</span>
@@ -734,18 +736,46 @@
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
                 
-                // Prepare datasets
-                const datasets = [{
-                    label: 'Price (Kč/kWh)',
-                    data: chartData.prices,
+                // Prepare datasets - use stacked bars if price breakdown available
+                const hasStackedData = chartData.spot_prices && chartData.spot_prices.length > 0;
+                const datasets = [];
+
+                // Base dataset: Spot Price (mode-colored bars)
+                datasets.push({
+                    label: 'Spot Price',
+                    data: hasStackedData ? chartData.spot_prices : chartData.prices,
                     backgroundColor: colors,
                     borderColor: borderColors,
                     borderWidth: 1,
                     hoverBackgroundColor: colors.map(c => c.replace('0.8', '1')),
                     hoverBorderColor: borderColors.map(c => c + 'FF'),
                     hoverBorderWidth: 3,
+                    stack: 'price',
                     order: 2
-                }];
+                });
+
+                // HDO Grid Fee dataset (yellow for low tariff, red for high tariff)
+                if (hasStackedData && chartData.grid_fees && chartData.grid_fees.length > 0) {
+                    const gridFeeColors = chartData.tariff_types.map((type, idx) => {
+                        const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                        const opacity = isHistorical ? 0.4 : 0.8;
+                        return type === 'low'
+                            ? `rgba(255, 235, 59, ${opacity})`   // Yellow for low tariff
+                            : `rgba(244, 67, 54, ${opacity})`;   // Red for high tariff
+                    });
+
+                    datasets.push({
+                        label: 'Grid Fee (HDO)',
+                        data: chartData.grid_fees,
+                        backgroundColor: gridFeeColors,
+                        borderColor: gridFeeColors.map(c => c.replace(/[\d.]+\)$/, '1)')),
+                        borderWidth: 1,
+                        stack: 'price',
+                        order: 3
+                    });
+                }
+
+                // Buy/Distribution Fees dataset removed - now included in HDO grid fee display
                 
                 // Add historical battery SOC line if available
                 console.log('📊 [CHART] Battery SOC history:', chartData.battery_soc_history);
@@ -933,40 +963,68 @@
                                 callbacks: {
                                     title: (items) => items[0].label,
                                     label: (context) => {
+                                        // Skip HDO grid fee dataset in tooltip (shown in main price tooltip)
+                                        if (context.dataset.label === 'Grid Fee (HDO)') {
+                                            return null; // Will be shown in the main price tooltip
+                                        }
                                         if (context.dataset.label.includes('Battery') || context.dataset.label.includes('SOC') || context.dataset.label.includes('Predicted')) {
                                             return `${context.dataset.label}: ${context.parsed.y.toFixed(1)}%`;
                                         }
                                         if (context.dataset.label.includes('PV')) {
                                             return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} kW`;
                                         }
-                                        const mode = chartData.modes[context.dataIndex];
-                                        const targetSoc = chartData.target_socs[context.dataIndex];
-                                        const strategy = chartData.strategies[context.dataIndex];
-                                        const profit = chartData.profits[context.dataIndex];
-                                        const debugInfo = chartData.debug_info ? chartData.debug_info[context.dataIndex] : null;
-                                        const isHistorical = chartData.is_historical && chartData.is_historical[context.dataIndex];
-                                        
+                                        const idx = context.dataIndex;
+                                        const mode = chartData.modes[idx];
+                                        const targetSoc = chartData.target_socs[idx];
+                                        const strategy = chartData.strategies[idx];
+                                        const profit = chartData.profits[idx];
+                                        const debugInfo = chartData.debug_info ? chartData.debug_info[idx] : null;
+                                        const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+
                                         const lines = [];
-                                        
+
                                         // Warning for historical blocks
                                         if (isHistorical) {
                                             lines.push('⚠️ PAST BLOCK - Regenerated Schedule');
                                             lines.push('(Not actual execution history)');
                                             lines.push('');
                                         }
-                                        
-                                        lines.push(`Price: ${context.parsed.y.toFixed(4)} Kč/kWh`);
+
+                                        // Show price breakdown if stacked data available
+                                        if (chartData.spot_prices && chartData.spot_prices.length > 0) {
+                                            const spotPrice = chartData.spot_prices[idx];
+                                            const gridFee = chartData.grid_fees ? chartData.grid_fees[idx] : 0;
+                                            const buyFee = chartData.buy_fees ? chartData.buy_fees[idx] : 0;
+                                            const tariffType = chartData.tariff_types ? chartData.tariff_types[idx] : 'unknown';
+                                            const effectivePrice = chartData.effective_prices ? chartData.effective_prices[idx] : spotPrice;
+
+                                            lines.push('═══ Price Breakdown ═══');
+                                            lines.push(`  Spot Price: ${spotPrice.toFixed(3)} Kč`);
+                                            if (gridFee > 0) {
+                                                const tariffLabel = tariffType === 'low' ? '🟡 Low' : '🔴 High';
+                                                lines.push(`  Grid Fee: ${gridFee.toFixed(2)} Kč (${tariffLabel})`);
+                                            }
+                                            if (buyFee > 0) {
+                                                lines.push(`  Buy/Dist: ${buyFee.toFixed(2)} Kč`);
+                                            }
+                                            lines.push('  ─────────────────');
+                                            lines.push(`  Total: ${effectivePrice.toFixed(3)} Kč/kWh`);
+                                            lines.push('');
+                                        } else {
+                                            lines.push(`Price: ${context.parsed.y.toFixed(4)} Kč/kWh`);
+                                        }
+
                                         lines.push(`Mode: ${mode}`);
-                                        
+
                                         if (strategy) {
                                             lines.push(`Strategy: ${strategy}`);
                                         }
-                                        
+
                                         if (profit !== null && profit !== undefined) {
                                             const profitColor = profit >= 0 ? '✓' : '✗';
                                             lines.push(`${profitColor} Expected Profit: ${profit.toFixed(2)} CZK`);
                                         }
-                                        
+
                                         if (targetSoc !== null && targetSoc !== undefined) {
                                             if (mode === 'Force Charge') {
                                                 lines.push(`Target SOC: ${targetSoc.toFixed(1)}% (max)`);
@@ -974,7 +1032,7 @@
                                                 lines.push(`Target SOC: ${targetSoc.toFixed(1)}% (min)`);
                                             }
                                         }
-                                        
+
                                         // Add debug information if available
                                         if (debugInfo) {
                                             lines.push('');
@@ -994,7 +1052,7 @@
                                                 });
                                             }
                                         }
-                                        
+
                                         return lines;
                                     }
                                 }
@@ -1027,16 +1085,25 @@
                         },
                         scales: {
                             y: {
+                                stacked: true,  // Enable stacking for price breakdown
                                 beginAtZero: false,
                                 min: (() => {
-                                    const minPrice = Math.min(...chartData.prices);
-                                    const maxPrice = Math.max(...chartData.prices);
+                                    // Use effective prices for min/max when stacked data available
+                                    const priceData = (chartData.effective_prices && chartData.effective_prices.length > 0)
+                                        ? chartData.effective_prices
+                                        : chartData.prices;
+                                    const minPrice = Math.min(...chartData.prices); // Use spot prices for min
+                                    const maxPrice = Math.max(...priceData);
                                     const priceRange = maxPrice - minPrice;
                                     return minPrice - priceRange * 0.1;
                                 })(),
                                 max: (() => {
+                                    // Use effective prices for max when stacked data available
+                                    const priceData = (chartData.effective_prices && chartData.effective_prices.length > 0)
+                                        ? chartData.effective_prices
+                                        : chartData.prices;
                                     const minPrice = Math.min(...chartData.prices);
-                                    const maxPrice = Math.max(...chartData.prices);
+                                    const maxPrice = Math.max(...priceData);
                                     const priceRange = maxPrice - minPrice;
                                     return maxPrice + priceRange * 0.1;
                                 })(),
@@ -1081,6 +1148,7 @@
                                 offset: true
                             },
                             x: {
+                                stacked: true,  // Enable stacking for price breakdown
                                 title: {
                                     display: true,
                                     text: 'Time',
@@ -1117,21 +1185,59 @@
                 .then(response => response.json())
                 .then(data => {
                     if (window.priceChartInstance && data) {
-                        // Update chart data
+                        // Update chart labels
                         window.priceChartInstance.data.labels = data.labels;
-                        window.priceChartInstance.data.datasets[0].data = data.prices;
-                        
-                        // Update battery SOC if present
-                        if (window.priceChartInstance.data.datasets.length > 1 && data.current_battery_soc) {
-                            window.priceChartInstance.data.datasets[1].data = data.labels.map(() => data.current_battery_soc);
+
+                        // Helper to find dataset by label
+                        const findDataset = (label) => window.priceChartInstance.data.datasets.find(d => d.label === label);
+
+                        // Update Spot Price dataset (base bars) - use spot_prices when stacked data available
+                        const spotDataset = findDataset('Spot Price');
+                        if (spotDataset) {
+                            const hasStackedData = data.spot_prices && data.spot_prices.length > 0;
+                            spotDataset.data = hasStackedData ? data.spot_prices : data.prices;
+
+                            // Update colors based on mode
+                            if (data.modes) {
+                                spotDataset.backgroundColor = data.modes.map((mode, idx) => {
+                                    const isHistorical = data.is_historical && data.is_historical[idx];
+                                    const opacity = isHistorical ? 0.4 : 0.8;
+                                    if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                                    if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    return `rgba(33, 150, 243, ${opacity})`;
+                                });
+                            }
                         }
-                        
+
+                        // Update Grid Fee (HDO) dataset if present
+                        const hdoDataset = findDataset('Grid Fee (HDO)');
+                        if (hdoDataset && data.grid_fees && data.grid_fees.length > 0) {
+                            hdoDataset.data = data.grid_fees;
+                            // Update HDO colors based on tariff type
+                            if (data.tariff_types) {
+                                hdoDataset.backgroundColor = data.tariff_types.map((type, idx) => {
+                                    const isHistorical = data.is_historical && data.is_historical[idx];
+                                    const opacity = isHistorical ? 0.4 : 0.8;
+                                    return type === 'low'
+                                        ? `rgba(255, 235, 59, ${opacity})`
+                                        : `rgba(244, 67, 54, ${opacity})`;
+                                });
+                            }
+                        }
+
+                        // Update Current SOC line if present
+                        const currentSocDataset = findDataset('Current SOC (%)');
+                        if (currentSocDataset && data.current_battery_soc) {
+                            currentSocDataset.data = data.labels.map(() => data.current_battery_soc);
+                        }
+
                         // Update NOW line
                         if (data.current_time_label) {
                             window.priceChartInstance.options.plugins.annotation.annotations.nowLine.xMin = data.current_time_label;
                             window.priceChartInstance.options.plugins.annotation.annotations.nowLine.xMax = data.current_time_label;
                         }
-                        
+
                         window.priceChartInstance.update('none'); // Update without animation
                     }
                 })
@@ -1528,11 +1634,6 @@
                             <input type="number" id="pricing_sell_fee" class="config-form-input" step="0.01" min="0">
                             <span class="config-form-help">Additional fee when selling to grid</span>
                         </div>
-                        <div class="config-form-group">
-                            <label class="config-form-label" for="pricing_dist_fee">Distribution Fee (CZK/kWh)</label>
-                            <input type="number" id="pricing_dist_fee" class="config-form-input" step="0.01" min="0">
-                            <span class="config-form-help">Grid distribution/transmission fee</span>
-                        </div>
                     </div>
                 </div>
 
@@ -1591,7 +1692,6 @@ async function loadConfigToSidebar() {
         if (data.config.pricing) {
             document.getElementById('pricing_buy_fee').value = data.config.pricing.spot_buy_fee_czk || 0;
             document.getElementById('pricing_sell_fee').value = data.config.pricing.spot_sell_fee_czk || 0;
-            document.getElementById('pricing_dist_fee').value = data.config.pricing.grid_distribution_fee_czk || 0;
         }
     } catch (error) {
         console.error('Failed to load config:', error);
@@ -1642,7 +1742,6 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
 
         data.config.pricing.spot_buy_fee_czk = parseFloat(document.getElementById('pricing_buy_fee').value);
         data.config.pricing.spot_sell_fee_czk = parseFloat(document.getElementById('pricing_sell_fee').value);
-        data.config.pricing.grid_distribution_fee_czk = parseFloat(document.getElementById('pricing_dist_fee').value);
 
         // Update config
         const updateResponse = await fetch('{{ ingress_path }}/api/config/update', {
@@ -1670,25 +1769,60 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                     const chartData = await chartResponse.json();
 
                     if (window.priceChartInstance && chartData) {
-                        // Update all chart datasets
+                        // Update chart labels
                         window.priceChartInstance.data.labels = chartData.labels;
-                        window.priceChartInstance.data.datasets[0].data = chartData.prices;
-                        window.priceChartInstance.data.datasets[0].backgroundColor = chartData.modes.map((mode, idx) => {
-                            const isHistorical = chartData.is_historical && chartData.is_historical[idx];
-                            const opacity = isHistorical ? 0.4 : 0.8;
-                            if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
-                            if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                            if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
-                            return `rgba(33, 150, 243, ${opacity})`;
-                        });
-                        window.priceChartInstance.data.datasets[0].borderColor = chartData.modes.map((mode, idx) => {
-                            const isHistorical = chartData.is_historical && chartData.is_historical[idx];
-                            const opacity = isHistorical ? 0.5 : 1.0;
-                            if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
-                            if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                            if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
-                            return `rgba(33, 150, 243, ${opacity})`;
-                        });
+
+                        // Helper to find dataset by label
+                        const findDataset = (label) => window.priceChartInstance.data.datasets.find(d => d.label === label);
+
+                        // Update Spot Price dataset (base bars) - use spot_prices when stacked data available
+                        const spotDataset = findDataset('Spot Price');
+                        if (spotDataset) {
+                            const hasStackedData = chartData.spot_prices && chartData.spot_prices.length > 0;
+                            spotDataset.data = hasStackedData ? chartData.spot_prices : chartData.prices;
+
+                            // Update colors based on mode
+                            if (chartData.modes) {
+                                spotDataset.backgroundColor = chartData.modes.map((mode, idx) => {
+                                    const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                                    const opacity = isHistorical ? 0.4 : 0.8;
+                                    if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                                    if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    return `rgba(33, 150, 243, ${opacity})`;
+                                });
+                                spotDataset.borderColor = chartData.modes.map((mode, idx) => {
+                                    const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                                    const opacity = isHistorical ? 0.5 : 1.0;
+                                    if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
+                                    if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
+                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    return `rgba(33, 150, 243, ${opacity})`;
+                                });
+                            }
+                        }
+
+                        // Update Grid Fee (HDO) dataset if present
+                        const hdoDataset = findDataset('Grid Fee (HDO)');
+                        if (hdoDataset && chartData.grid_fees && chartData.grid_fees.length > 0) {
+                            hdoDataset.data = chartData.grid_fees;
+                            // Update HDO colors based on tariff type
+                            if (chartData.tariff_types) {
+                                hdoDataset.backgroundColor = chartData.tariff_types.map((type, idx) => {
+                                    const isHistorical = chartData.is_historical && chartData.is_historical[idx];
+                                    const opacity = isHistorical ? 0.4 : 0.8;
+                                    return type === 'low'
+                                        ? `rgba(255, 235, 59, ${opacity})`
+                                        : `rgba(244, 67, 54, ${opacity})`;
+                                });
+                            }
+                        }
+
+                        // Update Current SOC line if present
+                        const currentSocDataset = findDataset('Current SOC (%)');
+                        if (currentSocDataset && chartData.current_battery_soc) {
+                            currentSocDataset.data = chartData.labels.map(() => chartData.current_battery_soc);
+                        }
 
                         // Update NOW line
                         if (chartData.current_time_label) {

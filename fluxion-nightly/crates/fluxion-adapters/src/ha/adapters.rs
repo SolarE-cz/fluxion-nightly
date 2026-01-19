@@ -12,6 +12,8 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono_tz::Tz;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -379,6 +381,9 @@ pub struct CzSpotPriceAdapter {
     client: Arc<HomeAssistantClient>,
     entity_id: String,
     tomorrow_entity_id: Option<String>,
+    /// Shared timezone for price parsing, synchronized from Home Assistant
+    /// Using RwLock for thread-safe read/write access
+    timezone: Arc<RwLock<Option<Tz>>>,
 }
 
 impl CzSpotPriceAdapter {
@@ -388,6 +393,7 @@ impl CzSpotPriceAdapter {
             client,
             entity_id: entity_id.into(),
             tomorrow_entity_id: None,
+            timezone: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -401,14 +407,47 @@ impl CzSpotPriceAdapter {
             client,
             entity_id: today_entity_id.into(),
             tomorrow_entity_id: Some(tomorrow_entity_id.into()),
+            timezone: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Update the timezone used for price parsing
+    /// This should be called when the Home Assistant timezone is synchronized
+    pub fn set_timezone(&self, tz: Option<Tz>) {
+        let mut timezone = self.timezone.write();
+        if *timezone != tz {
+            let old_tz = timezone.map(|t| t.name().to_string());
+            let new_tz = tz.map(|t| t.name().to_string());
+            info!(
+                "🌍 [CzSpotPriceAdapter] Timezone updated: {:?} -> {:?}",
+                old_tz, new_tz
+            );
+        }
+        *timezone = tz;
+    }
+
+    /// Get a clone of the shared timezone Arc for external synchronization
+    pub fn timezone_handle(&self) -> Arc<RwLock<Option<Tz>>> {
+        self.timezone.clone()
+    }
+
+    /// Get the current timezone (for internal use)
+    fn get_timezone(&self) -> Option<Tz> {
+        *self.timezone.read()
     }
 }
 
 #[async_trait]
 impl PriceDataSource for CzSpotPriceAdapter {
     async fn read_prices(&self) -> Result<SpotPriceData> {
-        debug!("💰 [ADAPTER] Reading spot prices from: {}", self.entity_id);
+        let timezone = self.get_timezone();
+        let tz_name = timezone
+            .map(|tz| tz.name().to_string())
+            .unwrap_or_else(|| "UTC (not set)".to_string());
+        debug!(
+            "💰 [ADAPTER] Reading spot prices from: {} (timezone: {})",
+            self.entity_id, tz_name
+        );
 
         let state = self
             .client
@@ -448,9 +487,9 @@ impl PriceDataSource for CzSpotPriceAdapter {
             "last_updated": state.last_updated,
         });
 
-        // Parse using existing fluxion_core::pricing::parse_spot_price_response
-        let price_data =
-            parse_spot_price_response(&entity_json).context("Failed to parse spot price data")?;
+        // Parse using fluxion_core::pricing::parse_spot_price_response with timezone
+        let price_data = parse_spot_price_response(&entity_json, timezone)
+            .context("Failed to parse spot price data")?;
 
         debug!(
             "✅ [ADAPTER] Parsed {} price blocks",
@@ -509,10 +548,12 @@ impl CzSpotPriceAdapter {
             .and_then(|v| v.as_array())
             .context("Tomorrow sensor missing 'today' array attribute")?;
 
+        let timezone = self.get_timezone();
         debug!(
-            "   Merging: {} today blocks + {} tomorrow blocks",
+            "   Merging: {} today blocks + {} tomorrow blocks (timezone: {})",
             today_array.len(),
-            tomorrow_array.len()
+            tomorrow_array.len(),
+            timezone.map(|tz| tz.name()).unwrap_or("UTC (not set)")
         );
 
         // Use the existing parse_price_arrays function from fluxion_core
@@ -524,7 +565,7 @@ impl CzSpotPriceAdapter {
             "last_updated": today_state.last_updated,
         });
 
-        let price_data = parse_spot_price_response(&merged_json)
+        let price_data = parse_spot_price_response(&merged_json, timezone)
             .context("Failed to merge today/tomorrow price data")?;
 
         info!(
@@ -621,6 +662,8 @@ impl ConfigurablePriceDataSource {
                     block_start,
                     duration_minutes: 15,
                     price_czk_per_kwh: hour_price,
+                    // Effective price will be calculated by scheduler with HDO fees
+                    effective_price_czk_per_kwh: hour_price,
                 });
             }
         }

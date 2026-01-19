@@ -89,6 +89,11 @@ fixed_sell_prices = [
   0.08, # 18:00 - 23:59
 ]
 
+# Spot market fees (CZK/kWh)
+# These fees are added to spot prices when buying/selling
+spot_buy_fee_czk = 0.5  # Fee added when buying from grid
+spot_sell_fee_czk = 0.5 # Fee deducted when selling to grid
+
 # Control Configuration
 [control]
 maximum_export_power_w = 5000 # Maximum grid export power in watts
@@ -124,3 +129,45 @@ display_currency = "CZK"  # Display currency for web UI: EUR, USD, or CZK
 # For development/testing outside HA addon, uncomment and set these:
 # ha_base_url = "http://homeassistant.local:8123"
 # ha_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."  # Your long-lived access token
+
+# Strategy Configuration
+# FluxION uses strategies to determine when to charge/discharge the battery
+# V7 is the recommended default - unconstrained multi-cycle arbitrage optimizer
+
+# V7: Unconstrained Multi-Cycle Arbitrage Optimizer (RECOMMENDED - DEFAULT)
+# - No artificial limitations (no "top N blocks" or "below median only")
+# - Multiple charge/discharge cycles per day when profitable
+# - Valley-peak detection for volatile days, percentile-based for stable days
+# - Minimum 3 CZK profit threshold for discharge cycles
+# - Home-first export policy (keeps power for home use unless big spread)
+[strategies.winter_adaptive_v7]
+enabled = true                         # V7 is enabled by default
+priority = 100                         # Highest priority
+target_battery_soc = 95.0              # Charge to 95% during cheap periods
+min_discharge_soc = 10.0               # Minimum SOC before discharge
+min_cycle_profit_czk = 3.0             # Min profit per cycle (CZK)
+valley_threshold_std_dev = 0.3         # Valley detection threshold
+peak_threshold_std_dev = 0.3           # Peak detection threshold
+min_export_spread_czk = 5.0            # Min spread for grid export
+min_soc_after_export = 50.0            # Min SOC after export (%)
+avg_consumption_per_block_kwh = 0.25   # Avg consumption per 15min block
+negative_price_handling_enabled = true # Charge during negative prices
+battery_round_trip_efficiency = 0.90   # Round-trip efficiency (90%)
+
+# Legacy strategies (disabled by default - use V7 instead)
+# Uncomment and set enabled = true to use these instead
+
+# [strategies.winter_adaptive_v4]
+# enabled = false
+# target_battery_soc = 100.0
+
+# [strategies.winter_adaptive_v3]
+# enabled = false
+# target_battery_soc = 100.0
+
+# [strategies.winter_adaptive_v2]
+# enabled = false
+# daily_charging_target_soc = 100.0
+
+# [strategies.winter_adaptive]
+# enabled = false

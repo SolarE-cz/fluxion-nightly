@@ -122,6 +122,8 @@ pub fn update_prices_system(
     _battery_query: Query<&BatteryStatus>,
     config: Res<SystemConfig>,
     backup_soc: Option<Res<BackupDischargeMinSoc>>,
+    hdo_data: Option<Res<super::HdoScheduleData>>,
+    hdo_cache: Option<Res<crate::resources::GlobalHdoCache>>,
     consumption_history: Res<crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<&RawInverterState>,
     plugin_manager_res: Res<PluginManagerResource>,
@@ -134,13 +136,20 @@ pub fn update_prices_system(
     debug!("💰 Checking for updated price data...");
 
     // Fetch prices using the cache (will return cached data if fresh)
-    let new_prices = match price_cache.get_or_fetch() {
+    let mut new_prices = match price_cache.get_or_fetch() {
         Ok(prices) => prices,
         Err(e) => {
             error!("❌ Failed to fetch prices: {}", e);
             return;
         }
     };
+
+    // Calculate effective prices (spot + grid fees) using HDO tariff data
+    crate::scheduling::calculate_effective_prices(
+        &mut new_prices.time_block_prices,
+        hdo_cache.as_deref(),
+        &config.pricing_config,
+    );
 
     let new_block_count = new_prices.time_block_prices.len();
     let new_hours = new_block_count as f32 / 4.0;
@@ -251,6 +260,7 @@ pub fn update_prices_system(
 
     // Use economic optimizer for schedule generation with shared plugin manager
     let plugin_manager = plugin_manager_res.0.read();
+    let hdo_raw_data = hdo_data.as_ref().and_then(|h| h.raw_data.clone());
     let new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
@@ -261,6 +271,7 @@ pub fn update_prices_system(
         backup_discharge_min_soc,
         grid_import_today_kwh,
         &plugin_manager,
+        hdo_raw_data,
     );
 
     // Update or create PriceAnalysis entity

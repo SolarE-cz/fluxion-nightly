@@ -23,7 +23,8 @@ pub use fluxion_types::config::{
     ControlConfig, Currency, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
     SolarAwareChargingConfigCore, StrategiesConfigCore, StrategyEnabledConfigCore, SystemConfig,
     SystemSettingsConfig, WinterAdaptiveConfigCore, WinterAdaptiveV2ConfigCore,
-    WinterAdaptiveV3ConfigCore, WinterPeakDischargeConfigCore,
+    WinterAdaptiveV3ConfigCore, WinterAdaptiveV4ConfigCore, WinterAdaptiveV5ConfigCore,
+    WinterAdaptiveV6ConfigCore, WinterAdaptiveV7ConfigCore, WinterPeakDischargeConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 
@@ -168,6 +169,41 @@ mod tests {
 pub struct ConsumptionHistoryDataSourceResource(
     pub Arc<dyn crate::traits::ConsumptionHistoryDataSource>,
 );
+
+// ============= HDO (Czech Grid Tariff) Cache Resource =============
+
+/// Global HDO cache resource for centralized grid fee calculation
+/// This cache is shared by all strategies to ensure consistent pricing
+#[derive(Resource)]
+pub struct GlobalHdoCache(pub crate::strategy::pricing::HdoCache);
+
+impl GlobalHdoCache {
+    /// Create a new global HDO cache with specified TTL in seconds
+    pub fn new(ttl_secs: u64) -> Self {
+        Self(crate::strategy::pricing::HdoCache::new(ttl_secs))
+    }
+
+    /// Check if cache needs refresh based on TTL
+    pub fn needs_refresh(&self) -> bool {
+        self.0.needs_refresh()
+    }
+
+    /// Update cache with new HDO schedules
+    pub fn update(&self, schedules: Vec<crate::strategy::pricing::HdoDaySchedule>) {
+        self.0.update(schedules)
+    }
+
+    /// Check if a given time is in low tariff period
+    pub fn is_low_tariff(&self, dt: chrono::DateTime<chrono::Utc>) -> Option<bool> {
+        self.0.is_low_tariff(dt)
+    }
+}
+
+impl Default for GlobalHdoCache {
+    fn default() -> Self {
+        Self::new(3600) // 1 hour default TTL
+    }
+}
 
 // ============= Async Cache Resources =============
 

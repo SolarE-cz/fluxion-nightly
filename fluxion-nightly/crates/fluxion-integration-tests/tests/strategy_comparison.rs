@@ -46,6 +46,7 @@ fn load_data() -> TestData {
             Ok(TimeBlockPrice {
                 block_start: Utc.timestamp_opt(ts, 0).unwrap(),
                 price_czk_per_kwh: price as f32,
+                effective_price_czk_per_kwh: price as f32,
                 duration_minutes: 15, // Default assumption
             })
         })

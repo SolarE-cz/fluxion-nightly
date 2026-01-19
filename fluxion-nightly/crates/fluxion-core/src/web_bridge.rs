@@ -14,7 +14,7 @@ use bevy_ecs::prelude::*;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::utils::calculate_ema;
 use crate::{
@@ -148,6 +148,28 @@ pub struct ConsumptionStats {
     pub yesterday_import_kwh: Option<f32>,
 }
 
+/// HDO (High/Low tariff) schedule information for chart display
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HdoScheduleInfo {
+    /// Low tariff periods for today: (start "HH:MM", end "HH:MM")
+    pub low_tariff_periods: Vec<(String, String)>,
+    /// Low tariff grid fee in CZK/kWh
+    pub low_tariff_czk: f32,
+    /// High tariff grid fee in CZK/kWh
+    pub high_tariff_czk: f32,
+    /// Last update timestamp (ISO 8601)
+    pub last_updated: Option<String>,
+}
+
+/// Pricing fees configuration for chart display
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PricingFees {
+    /// Spot buy fee in CZK/kWh
+    pub buy_fee_czk: f32,
+    /// Spot sell fee in CZK/kWh
+    pub sell_fee_czk: f32,
+}
+
 /// Response containing ECS component data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebQueryResponse {
@@ -163,6 +185,10 @@ pub struct WebQueryResponse {
     pub pv_generation_history: Option<Vec<PvGenerationHistoryPoint>>,
     /// Aggregated consumption statistics (EMA, imports)
     pub consumption_stats: Option<ConsumptionStats>,
+    /// HDO (grid tariff) schedule for chart display
+    pub hdo_schedule: Option<HdoScheduleInfo>,
+    /// Pricing fees from config for chart display
+    pub pricing_fees: Option<PricingFees>,
 }
 
 /// Inverter component data bundle
@@ -370,6 +396,7 @@ pub fn web_query_system(
     pv_history: Res<PvHistory>,
     consumption_history: Option<Res<ConsumptionHistory>>,
     consumption_history_config: Option<Res<ConsumptionHistoryConfig>>,
+    hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -391,6 +418,7 @@ pub fn web_query_system(
                 &pv_history,
                 consumption_history.as_deref(),
                 consumption_history_config.as_deref(),
+                hdo_data.as_deref(),
             ),
         };
 
@@ -413,6 +441,7 @@ fn build_dashboard_response(
     pv_history: &PvHistory,
     consumption_history: Option<&ConsumptionHistory>,
     consumption_history_config: Option<&ConsumptionHistoryConfig>,
+    hdo_data: Option<&crate::async_systems::HdoScheduleData>,
 ) -> WebQueryResponse {
     let now = Utc::now();
 
@@ -919,6 +948,36 @@ fn build_dashboard_response(
         }
     });
 
+    // Build HDO schedule info for chart display
+    let hdo_schedule = hdo_data.map(|hdo| {
+        // Log HDO data being sent to web
+        if hdo.low_tariff_periods.is_empty() {
+            warn!(
+                "⚠️ HDO schedule has 0 low tariff periods! last_updated: {:?}",
+                hdo.last_updated
+            );
+        } else {
+            debug!(
+                "📊 HDO schedule for web: {} periods, low={:.2} CZK, high={:.2} CZK",
+                hdo.low_tariff_periods.len(),
+                hdo.low_tariff_czk,
+                hdo.high_tariff_czk
+            );
+        }
+        HdoScheduleInfo {
+            low_tariff_periods: hdo.low_tariff_periods.clone(),
+            low_tariff_czk: hdo.low_tariff_czk,
+            high_tariff_czk: hdo.high_tariff_czk,
+            last_updated: hdo.last_updated.map(|t| t.to_rfc3339()),
+        }
+    });
+
+    // Build pricing fees from config
+    let pricing_fees = Some(PricingFees {
+        buy_fee_czk: system_config.pricing_config.spot_buy_fee_czk,
+        sell_fee_czk: system_config.pricing_config.spot_sell_fee_czk,
+    });
+
     WebQueryResponse {
         timestamp: now,
         debug_mode: debug_config.is_enabled(),
@@ -933,6 +992,8 @@ fn build_dashboard_response(
         battery_soc_prediction,
         pv_generation_history,
         consumption_stats,
+        hdo_schedule,
+        pricing_fees,
     }
 }
 

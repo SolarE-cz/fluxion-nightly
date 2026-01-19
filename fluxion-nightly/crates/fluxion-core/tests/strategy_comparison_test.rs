@@ -25,6 +25,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
+            effective_price_czk_per_kwh: 1.5,
         });
     }
 
@@ -34,6 +35,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
+            effective_price_czk_per_kwh: 3.0,
         });
     }
 
@@ -43,6 +45,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 4.5,
+            effective_price_czk_per_kwh: 4.5,
         });
     }
 
@@ -52,6 +55,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
+            effective_price_czk_per_kwh: 2.0,
         });
     }
 
@@ -61,6 +65,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.5,
+            effective_price_czk_per_kwh: 3.5,
         });
     }
 
@@ -70,6 +75,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
+            effective_price_czk_per_kwh: 5.0,
         });
     }
 
@@ -79,6 +85,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
+            effective_price_czk_per_kwh: 2.5,
         });
     }
 
@@ -302,6 +309,7 @@ fn test_v2_spike_detection() {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
+            effective_price_czk_per_kwh: 3.0,
         });
     }
 
@@ -311,6 +319,7 @@ fn test_v2_spike_detection() {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 9.5, // Above 8.0 threshold
+            effective_price_czk_per_kwh: 9.5,
         });
     }
 
@@ -320,6 +329,7 @@ fn test_v2_spike_detection() {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
+            effective_price_czk_per_kwh: 3.0,
         });
     }
 
@@ -543,6 +553,7 @@ fn load_scenario_from_export(path: &str, name: &str) -> Option<TestScenario> {
             block_start: DateTime::from_timestamp(b.ts, 0).unwrap_or_else(Utc::now),
             duration_minutes: 15,
             price_czk_per_kwh: b.p,
+            effective_price_czk_per_kwh: b.p,
         })
         .collect();
 
@@ -777,12 +788,6 @@ fn print_block_breakdown(results: &[SimulationResult], hours: &[u32]) {
     }
 }
 
-/// Create mock HDO data for V3 strategy
-fn mock_hdo_data_jan14() -> String {
-    // HDO schedule: Low tariff 00:00-06:00 and 14:00-17:00
-    r#"{"data":{"signals":[{"signal":"EVV1","datum":"14.01.2026","casy":"00:00-06:00; 14:00-17:00"}]}}"#.to_string()
-}
-
 #[test]
 fn test_v1_v2_v3_comparison_site1() {
     // Try to load real data, fall back to synthetic if not found
@@ -838,11 +843,10 @@ fn test_v1_v2_v3_comparison_site1() {
     let v2 = WinterAdaptiveV2Strategy::new(v2_config);
     let v2_result = simulate_strategy(&v2, &scenario, "V2 Winter-Adaptive");
 
-    // Create and run V3 (with HDO)
+    // Create and run V3
     let v3_config = WinterAdaptiveV3Config::default();
     let v3 = WinterAdaptiveV3Strategy::new(v3_config);
-    v3.update_hdo_cache(&mock_hdo_data_jan14());
-    let v3_result = simulate_strategy(&v3, &scenario, "V3 Winter-HDO");
+    let v3_result = simulate_strategy(&v3, &scenario, "V3 Winter-Adaptive");
 
     // Print comparison
     let results = vec![v1_result, v2_result, v3_result];
@@ -898,8 +902,7 @@ fn test_v1_v2_v3_comparison_site2() {
     let v2_result = simulate_strategy(&v2, &scenario, "V2 Winter-Adaptive");
 
     let v3 = WinterAdaptiveV3Strategy::new(WinterAdaptiveV3Config::default());
-    v3.update_hdo_cache(&mock_hdo_data_jan14());
-    let v3_result = simulate_strategy(&v3, &scenario, "V3 Winter-HDO");
+    let v3_result = simulate_strategy(&v3, &scenario, "V3 Winter-Adaptive");
 
     // Print comparison
     let results = vec![v1_result, v2_result, v3_result];
@@ -907,52 +910,4 @@ fn test_v1_v2_v3_comparison_site2() {
     print_block_breakdown(&results, &[0, 2, 4, 8, 12, 15, 18, 20, 22]);
 }
 
-#[test]
-fn test_v3_hdo_benefit() {
-    // Test that V3 benefits from HDO-aware charging
-    // Compare V3 with different HDO fee configurations
-
-    let blocks = create_czech_price_pattern();
-    let scenario = TestScenario {
-        name: "HDO Benefit Test".to_string(),
-        battery_capacity_kwh: 15.0,
-        daily_consumption_kwh: 20.0,
-        blocks,
-        initial_soc: 30.0, // Start low to force charging
-    };
-
-    let baseline = calculate_baseline(&scenario);
-
-    // V3 with default HDO fees (Low: 0.50, High: 1.80)
-    let v3_default = WinterAdaptiveV3Strategy::new(WinterAdaptiveV3Config::default());
-    v3_default.update_hdo_cache(&mock_hdo_data_jan14());
-    let result_default = simulate_strategy(&v3_default, &scenario, "V3 (HDO default)");
-
-    // V3 with no grid fees (to see pure spot optimization)
-    let v3_no_fee_config = WinterAdaptiveV3Config {
-        hdo_low_tariff_czk: 0.0,
-        hdo_high_tariff_czk: 0.0,
-        ..WinterAdaptiveV3Config::default()
-    };
-    let v3_no_fee = WinterAdaptiveV3Strategy::new(v3_no_fee_config);
-    let result_no_fee = simulate_strategy(&v3_no_fee, &scenario, "V3 (no grid fee)");
-
-    println!("\n=== HDO Fee Impact Analysis ===");
-    println!("Baseline: {:.2} CZK", baseline);
-    println!();
-    println!(
-        "V3 with HDO fees (0.50/1.80): {:.2} CZK (savings: {:.2} CZK, {:.1}%)",
-        result_default.total_grid_import_cost_czk,
-        baseline - result_default.total_grid_import_cost_czk,
-        (baseline - result_default.total_grid_import_cost_czk) / baseline * 100.0
-    );
-    println!(
-        "V3 without grid fees:        {:.2} CZK (savings: {:.2} CZK, {:.1}%)",
-        result_no_fee.total_grid_import_cost_czk,
-        baseline - result_no_fee.total_grid_import_cost_czk,
-        (baseline - result_no_fee.total_grid_import_cost_czk) / baseline * 100.0
-    );
-
-    // The baseline includes grid fees, so V3 with HDO should show benefit
-    // from charging during low-tariff periods
-}
+// test_v3_hdo_benefit removed - V3 no longer has HDO-specific configuration

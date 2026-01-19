@@ -35,7 +35,9 @@ options:
   pricing:
     fixed_buy_prices: []
     fixed_sell_prices: []
+    spot_buy_fee_czk: 0.5
     spot_price_entity: sensor.current_spot_electricity_price_15min
+    spot_sell_fee_czk: 0.5
     use_spot_prices_to_buy: true
     use_spot_prices_to_sell: true
   strategies:
@@ -84,12 +86,32 @@ options:
     winter_adaptive_v3:
       daily_charging_target_soc: 90.0
       discharge_arbitrage_buffer: 1.0
-      enabled: true
+      enabled: false
       hdo_high_tariff_czk: 1.8
       hdo_low_tariff_czk: 0.5
       hdo_sensor_entity: sensor.cez_hdo_lowtariffstart
       top_discharge_blocks_per_day: 4
       winter_discharge_min_soc: 50.0
+    winter_adaptive_v4:
+      discharge_blocks_per_day: 4
+      enabled: false
+      hdo_high_tariff_czk: 1.8
+      hdo_low_tariff_czk: 0.5
+      hdo_sensor_entity: sensor.cez_hdo_lowtariffstart
+      min_discharge_spread_czk: 0.5
+      target_battery_soc: 100.0
+    winter_adaptive_v7:
+      avg_consumption_per_block_kwh: 0.25
+      battery_round_trip_efficiency: 0.9
+      enabled: true
+      min_cycle_profit_czk: 3.0
+      min_discharge_soc: 10.0
+      min_export_spread_czk: 5.0
+      min_soc_after_export: 50.0
+      negative_price_handling_enabled: true
+      peak_threshold_std_dev: 0.3
+      target_battery_soc: 95.0
+      valley_threshold_std_dev: 0.3
     winter_peak_discharge:
       enabled: false
       min_hours_to_solar: 4
@@ -172,7 +194,9 @@ schema:
     - float?
     - float?
     - float?
+    spot_buy_fee_czk: float(0,)?
     spot_price_entity: str?
+    spot_sell_fee_czk: float(0,)?
     use_spot_prices_to_buy: bool?
     use_spot_prices_to_sell: bool?
   strategies:
@@ -227,6 +251,26 @@ schema:
       hdo_sensor_entity: str?
       top_discharge_blocks_per_day: int(1,96)?
       winter_discharge_min_soc: float(0,100)?
+    winter_adaptive_v4:
+      discharge_blocks_per_day: int(1,96)?
+      enabled: bool?
+      hdo_high_tariff_czk: float?
+      hdo_low_tariff_czk: float?
+      hdo_sensor_entity: str?
+      min_discharge_spread_czk: float?
+      target_battery_soc: float(0,100)?
+    winter_adaptive_v7:
+      avg_consumption_per_block_kwh: float?
+      battery_round_trip_efficiency: float(0,1)?
+      enabled: bool?
+      min_cycle_profit_czk: float?
+      min_discharge_soc: float(0,100)?
+      min_export_spread_czk: float?
+      min_soc_after_export: float(0,100)?
+      negative_price_handling_enabled: bool?
+      peak_threshold_std_dev: float?
+      target_battery_soc: float(0,100)?
+      valley_threshold_std_dev: float?
     winter_peak_discharge:
       enabled: bool?
       min_hours_to_solar: int(0,24)?
@@ -242,4 +286,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.31
+version: 0.2.32

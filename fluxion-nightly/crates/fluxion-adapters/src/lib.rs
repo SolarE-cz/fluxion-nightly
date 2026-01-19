@@ -17,7 +17,7 @@ pub mod solax;
 pub use ha::{
     ConfigurablePriceDataSource, CzSpotPriceAdapter, HaClientResource, HaConsumptionHistoryAdapter,
     HaEntityState, HaError, HaHistoryState, HaPlugin, HaResult, HistoryDataPoint,
-    HomeAssistantClient, HomeAssistantInverterAdapter,
+    HomeAssistantClient, HomeAssistantInverterAdapter, PriceAdapterTimezoneHandle,
 };
 
 pub use solax::{

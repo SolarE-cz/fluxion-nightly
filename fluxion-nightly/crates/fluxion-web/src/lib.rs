@@ -14,12 +14,14 @@ mod backtest;
 mod config_api;
 mod plugin_api;
 mod routes;
+mod simulator;
 mod validation;
 
 pub use backtest::BacktestState;
 pub use config_api::ConfigApiState;
 pub use plugin_api::PluginApiState;
 use routes::{DashboardTemplate, LiveDataTemplate};
+pub use simulator::SimulatorState;
 
 use askama::Template;
 use axum::{
@@ -31,10 +33,12 @@ use axum::{
     },
     routing::get,
 };
+use chrono::{Local, NaiveTime};
 use fluxion_core::{ConfigUpdateSender, WebQueryResponse, WebQuerySender};
 use fluxion_i18n::I18n;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::{StreamExt, wrappers::IntervalStream};
@@ -46,6 +50,137 @@ use tracing::{debug, error, info, trace};
 pub struct AppState {
     pub query_sender: WebQuerySender,
     pub i18n: Arc<I18n>,
+}
+
+/// Configuration for scheduled daily data export
+/// Exports full day's data at a specified time for debugging purposes
+#[derive(Clone, Debug)]
+pub struct ScheduledExportConfig {
+    /// Directory to save export files (e.g., "/data/exports")
+    pub export_dir: PathBuf,
+    /// Time of day to run the export (default: 23:55)
+    pub export_time: NaiveTime,
+}
+
+impl Default for ScheduledExportConfig {
+    fn default() -> Self {
+        Self {
+            // Use relative path for portability (works in both dev and HA addon)
+            export_dir: PathBuf::from("./data/exports"),
+            // 23:55 - 5 minutes before midnight to capture full day's data
+            export_time: NaiveTime::from_hms_opt(23, 55, 0).expect("valid time"),
+        }
+    }
+}
+
+/// Spawn background task for scheduled daily data export
+/// Runs at the configured time each day and saves export data to a file
+#[expect(clippy::integer_division)]
+fn spawn_scheduled_export_task(query_sender: WebQuerySender, config: ScheduledExportConfig) {
+    tokio::spawn(async move {
+        info!(
+            "📅 Scheduled export enabled: will export at {} to {:?}",
+            config.export_time.format("%H:%M"),
+            config.export_dir
+        );
+
+        // Create export directory if it doesn't exist
+        if let Err(e) = tokio::fs::create_dir_all(&config.export_dir).await {
+            error!(
+                "❌ Failed to create export directory {:?}: {}",
+                config.export_dir, e
+            );
+            return;
+        }
+
+        loop {
+            // Calculate time until next scheduled export
+            let now = Local::now();
+            let today_export_time = now
+                .date_naive()
+                .and_time(config.export_time)
+                .and_local_timezone(Local)
+                .single();
+
+            let next_export = if let Some(today_time) = today_export_time {
+                if now.time() < config.export_time {
+                    // Export time is still ahead today
+                    today_time
+                } else {
+                    // Export time has passed today, schedule for tomorrow
+                    let tomorrow = now.date_naive() + chrono::Duration::days(1);
+                    tomorrow
+                        .and_time(config.export_time)
+                        .and_local_timezone(Local)
+                        .single()
+                        .expect("valid tomorrow time")
+                }
+            } else {
+                // Fallback: try tomorrow if today's time conversion fails
+                let tomorrow = now.date_naive() + chrono::Duration::days(1);
+                tomorrow
+                    .and_time(config.export_time)
+                    .and_local_timezone(Local)
+                    .single()
+                    .expect("valid tomorrow time")
+            };
+
+            let duration_until_export = (next_export - now)
+                .to_std()
+                .unwrap_or(Duration::from_secs(60));
+
+            info!(
+                "📅 Next scheduled export at {} (in {} hours {} minutes)",
+                next_export.format("%Y-%m-%d %H:%M:%S"),
+                duration_until_export.as_secs() / 3600,
+                (duration_until_export.as_secs() % 3600) / 60
+            );
+
+            // Sleep until export time
+            tokio::time::sleep(duration_until_export).await;
+
+            // Perform the export
+            info!("📦 Starting scheduled daily export...");
+
+            match query_sender.query_dashboard().await {
+                Ok(response) => {
+                    // Generate filename with date
+                    let filename = format!(
+                        "fluxion_daily_{}.json",
+                        Local::now().format("%Y%m%d_%H%M%S")
+                    );
+                    let filepath = config.export_dir.join(&filename);
+
+                    // Create compact export data (reusing existing function)
+                    let export_data = create_compact_export(&response);
+
+                    match serde_json::to_string_pretty(&export_data) {
+                        Ok(json_string) => match tokio::fs::write(&filepath, &json_string).await {
+                            Ok(()) => {
+                                info!(
+                                    "✅ Daily export saved: {} ({} bytes)",
+                                    filepath.display(),
+                                    json_string.len()
+                                );
+                            }
+                            Err(e) => {
+                                error!("❌ Failed to write export file: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("❌ Failed to serialize export data: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Failed to query dashboard for scheduled export: {}", e);
+                }
+            }
+
+            // Small delay to avoid potential double-execution edge cases
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
 }
 
 /// Extract ingress path from request headers
@@ -77,6 +212,7 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 /// * `config_update_sender` - Optional channel for config updates
 /// * `backtest_db_path` - Optional path to backtest database
 /// * `plugin_api_state` - Optional plugin API state for plugin management
+/// * `scheduled_export_config` - Optional config for daily scheduled exports (for debugging)
 ///
 /// # HA Ingress Support
 /// When running as HA addon, routes are accessible via:
@@ -89,6 +225,8 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 ///
 /// # Errors
 /// Returns error if server fails to bind or serve
+#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_lines)]
 pub async fn start_web_server(
     query_sender: WebQuerySender,
     i18n: Arc<I18n>,
@@ -97,7 +235,13 @@ pub async fn start_web_server(
     config_update_sender: Option<ConfigUpdateSender>,
     backtest_db_path: Option<std::path::PathBuf>,
     plugin_api_state: Option<PluginApiState>,
+    scheduled_export_config: Option<ScheduledExportConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Spawn scheduled export task if configured
+    if let Some(export_config) = scheduled_export_config {
+        spawn_scheduled_export_task(query_sender.clone(), export_config);
+    }
+
     let app_state = AppState {
         query_sender,
         i18n: i18n.clone(),
@@ -188,6 +332,69 @@ pub async fn start_web_server(
             .route(
                 "/api/plugins/{name}/enabled",
                 axum::routing::put(plugin_api::update_enabled_handler).with_state(plugin_state),
+            );
+    }
+
+    // Add strategy simulator routes
+    {
+        info!("🧪 Strategy Simulator API enabled");
+        let simulator_state = simulator::SimulatorState::new();
+        app = app
+            // Simulator page
+            .route("/simulator", get(simulator::simulator_page_handler))
+            // API endpoints
+            .route(
+                "/api/simulator/presets",
+                get(simulator::presets_handler).with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/create",
+                axum::routing::post(simulator::create_simulation_handler)
+                    .with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}",
+                get(simulator::get_simulation_handler).with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/step",
+                axum::routing::post(simulator::step_handler).with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/run",
+                axum::routing::post(simulator::run_handler).with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/results",
+                get(simulator::results_handler).with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/override/soc",
+                axum::routing::put(simulator::override_soc_handler)
+                    .with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/override/load",
+                axum::routing::put(simulator::override_load_handler)
+                    .with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/override/price",
+                axum::routing::put(simulator::override_price_handler)
+                    .with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}/reset",
+                axum::routing::post(simulator::reset_handler).with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/{id}",
+                axum::routing::delete(simulator::delete_handler)
+                    .with_state(simulator_state.clone()),
+            )
+            .route(
+                "/api/simulator/blocks/{id}/{block}",
+                get(simulator::block_detail_handler).with_state(simulator_state),
             );
     }
 
@@ -302,6 +509,11 @@ struct ChartDataJson {
     profits: Vec<Option<f32>>,
     current_time_label: Option<String>,
     current_battery_soc: Option<f32>,
+    // Stacked bar data for HDO display
+    spot_prices: Vec<f32>,
+    grid_fees: Vec<f32>,
+    tariff_types: Vec<String>,
+    is_historical: Vec<bool>,
 }
 
 /// Chart data endpoint - returns JSON for chart updates (once per minute)
@@ -327,6 +539,11 @@ async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoRespo
                     profits: prices.chart_data.profits,
                     current_time_label: prices.chart_data.current_time_label,
                     current_battery_soc,
+                    // Stacked bar data
+                    spot_prices: prices.chart_data.spot_prices,
+                    grid_fees: prices.chart_data.grid_fees,
+                    tariff_types: prices.chart_data.tariff_types,
+                    is_historical: prices.chart_data.is_historical,
                 };
                 Json(chart_json).into_response()
             } else {

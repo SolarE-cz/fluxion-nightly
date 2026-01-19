@@ -118,6 +118,7 @@ impl<S: EconomicStrategy + Debug + 'static> Plugin for RustStrategyAdapter<S> {
             block_start: request.block.block_start,
             duration_minutes: request.block.duration_minutes,
             price_czk_per_kwh: request.block.price_czk_per_kwh,
+            effective_price_czk_per_kwh: request.block.effective_price_czk_per_kwh,
         };
 
         let all_blocks: Vec<TimeBlockPrice> = request
@@ -127,6 +128,7 @@ impl<S: EconomicStrategy + Debug + 'static> Plugin for RustStrategyAdapter<S> {
                 block_start: b.block_start,
                 duration_minutes: b.duration_minutes,
                 price_czk_per_kwh: b.price_czk_per_kwh,
+                effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
             })
             .collect();
 
@@ -171,6 +173,7 @@ impl From<&EvaluationRequest> for Vec<TimeBlockPrice> {
                 block_start: b.block_start,
                 duration_minutes: b.duration_minutes,
                 price_czk_per_kwh: b.price_czk_per_kwh,
+                effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
             })
             .collect()
     }

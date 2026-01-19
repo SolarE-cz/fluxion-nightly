@@ -13,7 +13,8 @@
 pub mod ote;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use fluxion_types::pricing::{
     FixedPriceData, PriceAnalysis, PriceRange, SpotPriceData, TimeBlockPrice,
 };
@@ -37,8 +38,22 @@ pub struct PriceSourceConfig {
 }
 
 /// Parse spot price data from HA entity response
-pub fn parse_spot_price_response(entity_state: &serde_json::Value) -> Result<SpotPriceData> {
-    debug!("🔍 Parsing spot price entity state");
+///
+/// # Arguments
+/// * `entity_state` - The JSON entity state from Home Assistant
+/// * `timezone` - Optional timezone for interpreting index-based price arrays.
+///   If None, defaults to UTC. This is important for sensors that provide
+///   price arrays without timestamps (e.g., "today"/"tomorrow" arrays).
+///   Sensors with explicit timestamps in the data are parsed correctly
+///   regardless of this parameter.
+pub fn parse_spot_price_response(
+    entity_state: &serde_json::Value,
+    timezone: Option<Tz>,
+) -> Result<SpotPriceData> {
+    let tz_name = timezone
+        .map(|tz| tz.name().to_string())
+        .unwrap_or_else(|| "UTC (default)".to_string());
+    debug!("🔍 Parsing spot price entity state (timezone: {})", tz_name);
 
     let last_updated = entity_state
         .get("last_updated")
@@ -76,14 +91,14 @@ pub fn parse_spot_price_response(entity_state: &serde_json::Value) -> Result<Spo
     if let (Some(today), Some(tomorrow)) = (attributes.get("today"), attributes.get("tomorrow"))
         && let (Some(today_arr), Some(tomorrow_arr)) = (today.as_array(), tomorrow.as_array())
     {
-        return parse_price_arrays(today_arr, tomorrow_arr, ha_last_updated);
+        return parse_price_arrays(today_arr, tomorrow_arr, ha_last_updated, timezone);
     }
 
     // Check for single "today" array only (new 15-minute format)
     if let Some(today) = attributes.get("today")
         && let Some(today_arr) = today.as_array()
     {
-        return parse_single_day_array(today_arr, ha_last_updated);
+        return parse_single_day_array(today_arr, ha_last_updated, timezone);
     }
 
     // Check for timestamp-keyed attributes (common Czech integration format)
@@ -155,6 +170,8 @@ fn parse_forecast_sensor(
             block_start,
             duration_minutes,
             price_czk_per_kwh: price,
+            // Effective price will be calculated by scheduler with HDO fees
+            effective_price_czk_per_kwh: price,
         });
     }
 
@@ -192,6 +209,7 @@ fn convert_to_15min_blocks(blocks: Vec<TimeBlockPrice>) -> Vec<TimeBlockPrice> {
                     block_start: block.block_start + chrono::Duration::minutes(i * 15),
                     duration_minutes: 15,
                     price_czk_per_kwh: block.price_czk_per_kwh,
+                    effective_price_czk_per_kwh: block.effective_price_czk_per_kwh,
                 });
             }
         } else {
@@ -208,14 +226,32 @@ fn convert_to_15min_blocks(blocks: Vec<TimeBlockPrice>) -> Vec<TimeBlockPrice> {
 }
 
 /// Parse single day array (new 15-minute format with only "today" attribute)
+///
+/// # Arguments
+/// * `today` - Array of price values for today
+/// * `ha_last_updated` - Last updated timestamp from HA
+/// * `timezone` - Optional timezone for interpreting block times. If None, defaults to UTC.
 fn parse_single_day_array(
     today: &[serde_json::Value],
     ha_last_updated: DateTime<Utc>,
+    timezone: Option<Tz>,
 ) -> Result<SpotPriceData> {
-    debug!("Parsing single-day price data: {} blocks", today.len());
+    let tz_name = timezone
+        .map(|tz| tz.name().to_string())
+        .unwrap_or_else(|| "UTC".to_string());
+    debug!(
+        "Parsing single-day price data: {} blocks (timezone: {})",
+        today.len(),
+        tz_name
+    );
 
+    // Get current date in the specified timezone
     let now = Utc::now();
-    let today_date = now.date_naive();
+    let today_date = if let Some(tz) = timezone {
+        now.with_timezone(&tz).date_naive()
+    } else {
+        now.date_naive()
+    };
 
     // Detect if this is hourly (24 entries) or 15-minute (96 entries)
     let is_15min = today.len() == 96;
@@ -234,32 +270,46 @@ fn parse_single_day_array(
         let block_start = if is_15min {
             // 96 blocks per day, 15 minutes each
             let minutes_offset = idx * 15;
-            today_date
+            let naive_time = today_date
                 .and_hms_opt(
                     (minutes_offset / 60) as u32,
                     (minutes_offset % 60) as u32,
                     0,
                 )
-                .context("Invalid time calculation")?
-                .and_local_timezone(chrono::Local)
-                .single()
-                .context("Ambiguous time")?
-                .with_timezone(&Utc)
+                .context("Invalid time calculation")?;
+
+            // Convert using the specified timezone or default to UTC
+            if let Some(tz) = timezone {
+                tz.from_local_datetime(&naive_time)
+                    .single()
+                    .context("Ambiguous time in specified timezone")?
+                    .with_timezone(&Utc)
+            } else {
+                Utc.from_utc_datetime(&naive_time)
+            }
         } else {
             // 24 blocks per day, 60 minutes each
-            today_date
+            let naive_time = today_date
                 .and_hms_opt(idx as u32, 0, 0)
-                .context("Invalid hour")?
-                .and_local_timezone(chrono::Local)
-                .single()
-                .context("Ambiguous time")?
-                .with_timezone(&Utc)
+                .context("Invalid hour")?;
+
+            // Convert using the specified timezone or default to UTC
+            if let Some(tz) = timezone {
+                tz.from_local_datetime(&naive_time)
+                    .single()
+                    .context("Ambiguous time in specified timezone")?
+                    .with_timezone(&Utc)
+            } else {
+                Utc.from_utc_datetime(&naive_time)
+            }
         };
 
         time_block_prices.push(TimeBlockPrice {
             block_start,
             duration_minutes: block_duration,
             price_czk_per_kwh: price,
+            // Effective price will be calculated by scheduler with HDO fees
+            effective_price_czk_per_kwh: price,
         });
     }
 
@@ -270,6 +320,41 @@ fn parse_single_day_array(
         convert_to_15min_blocks(time_block_prices)
     };
 
+    // Log first and last parsed blocks for debugging timezone issues
+    if !time_block_prices.is_empty() {
+        let first = &time_block_prices[0];
+        let last = time_block_prices.last().unwrap();
+        debug!(
+            "   First block: {} UTC ({} {}) at {:.4} CZK/kWh",
+            first.block_start.format("%Y-%m-%d %H:%M"),
+            if let Some(tz) = timezone {
+                first
+                    .block_start
+                    .with_timezone(&tz)
+                    .format("%H:%M")
+                    .to_string()
+            } else {
+                first.block_start.format("%H:%M").to_string()
+            },
+            tz_name,
+            first.price_czk_per_kwh
+        );
+        debug!(
+            "   Last block:  {} UTC ({} {}) at {:.4} CZK/kWh",
+            last.block_start.format("%Y-%m-%d %H:%M"),
+            if let Some(tz) = timezone {
+                last.block_start
+                    .with_timezone(&tz)
+                    .format("%H:%M")
+                    .to_string()
+            } else {
+                last.block_start.format("%H:%M").to_string()
+            },
+            tz_name,
+            last.price_czk_per_kwh
+        );
+    }
+
     let data = SpotPriceData {
         time_block_prices,
         block_duration_minutes: 15,
@@ -278,8 +363,9 @@ fn parse_single_day_array(
     };
 
     info!(
-        "✅ Parsed single-day price data: {} total 15-min blocks",
+        "✅ Parsed single-day price data: {} total 15-min blocks (timezone: {})",
         data.time_block_prices.len(),
+        tz_name,
     );
 
     Ok(data)
@@ -287,24 +373,41 @@ fn parse_single_day_array(
 
 /// Parse price arrays (Czech spot price format with "today" and "tomorrow" attributes)
 /// Supports both hourly (24 entries) and 15-minute (96 entries) formats
+///
+/// # Arguments
+/// * `today` - Array of price values for today
+/// * `tomorrow` - Array of price values for tomorrow
+/// * `ha_last_updated` - Last updated timestamp from HA
+/// * `timezone` - Optional timezone for interpreting block times. If None, defaults to UTC.
 fn parse_price_arrays(
     today: &[serde_json::Value],
     tomorrow: &[serde_json::Value],
     ha_last_updated: DateTime<Utc>,
+    timezone: Option<Tz>,
 ) -> Result<SpotPriceData> {
     // Detect if this is hourly or 15-minute format
     let is_15min = today.len() == 96;
     let block_duration = if is_15min { 15 } else { 60 };
 
+    let tz_name = timezone
+        .map(|tz| tz.name().to_string())
+        .unwrap_or_else(|| "UTC".to_string());
+
     debug!(
-        "Parsing price data: {} today, {} tomorrow ({} min blocks)",
+        "Parsing price data: {} today, {} tomorrow ({} min blocks, timezone: {})",
         today.len(),
         tomorrow.len(),
-        block_duration
+        block_duration,
+        tz_name
     );
 
+    // Get current date in the specified timezone
     let now = Utc::now();
-    let today_date = now.date_naive();
+    let today_date = if let Some(tz) = timezone {
+        now.with_timezone(&tz).date_naive()
+    } else {
+        now.date_naive()
+    };
 
     let mut time_block_prices = Vec::new();
 
@@ -318,32 +421,46 @@ fn parse_price_arrays(
         let block_start = if is_15min {
             // 96 blocks per day, 15 minutes each
             let minutes_offset = idx * 15;
-            today_date
+            let naive_time = today_date
                 .and_hms_opt(
                     (minutes_offset / 60) as u32,
                     (minutes_offset % 60) as u32,
                     0,
                 )
-                .context("Invalid time calculation")?
-                .and_local_timezone(chrono::Local)
-                .single()
-                .context("Ambiguous time")?
-                .with_timezone(&Utc)
+                .context("Invalid time calculation")?;
+
+            // Convert using the specified timezone or default to UTC
+            if let Some(tz) = timezone {
+                tz.from_local_datetime(&naive_time)
+                    .single()
+                    .context("Ambiguous time in specified timezone")?
+                    .with_timezone(&Utc)
+            } else {
+                Utc.from_utc_datetime(&naive_time)
+            }
         } else {
             // 24 blocks per day, hourly
-            today_date
+            let naive_time = today_date
                 .and_hms_opt(idx as u32, 0, 0)
-                .context("Invalid hour")?
-                .and_local_timezone(chrono::Local)
-                .single()
-                .context("Ambiguous time")?
-                .with_timezone(&Utc)
+                .context("Invalid hour")?;
+
+            // Convert using the specified timezone or default to UTC
+            if let Some(tz) = timezone {
+                tz.from_local_datetime(&naive_time)
+                    .single()
+                    .context("Ambiguous time in specified timezone")?
+                    .with_timezone(&Utc)
+            } else {
+                Utc.from_utc_datetime(&naive_time)
+            }
         };
 
         time_block_prices.push(TimeBlockPrice {
             block_start,
             duration_minutes: block_duration,
             price_czk_per_kwh: price,
+            // Effective price will be calculated by scheduler with HDO fees
+            effective_price_czk_per_kwh: price,
         });
     }
 
@@ -358,32 +475,46 @@ fn parse_price_arrays(
         let block_start = if is_15min {
             // 96 blocks per day, 15 minutes each
             let minutes_offset = idx * 15;
-            tomorrow_date
+            let naive_time = tomorrow_date
                 .and_hms_opt(
                     (minutes_offset / 60) as u32,
                     (minutes_offset % 60) as u32,
                     0,
                 )
-                .context("Invalid time calculation")?
-                .and_local_timezone(chrono::Local)
-                .single()
-                .context("Ambiguous time")?
-                .with_timezone(&Utc)
+                .context("Invalid time calculation")?;
+
+            // Convert using the specified timezone or default to UTC
+            if let Some(tz) = timezone {
+                tz.from_local_datetime(&naive_time)
+                    .single()
+                    .context("Ambiguous time in specified timezone")?
+                    .with_timezone(&Utc)
+            } else {
+                Utc.from_utc_datetime(&naive_time)
+            }
         } else {
             // 24 blocks per day, hourly
-            tomorrow_date
+            let naive_time = tomorrow_date
                 .and_hms_opt(idx as u32, 0, 0)
-                .context("Invalid hour")?
-                .and_local_timezone(chrono::Local)
-                .single()
-                .context("Ambiguous time")?
-                .with_timezone(&Utc)
+                .context("Invalid hour")?;
+
+            // Convert using the specified timezone or default to UTC
+            if let Some(tz) = timezone {
+                tz.from_local_datetime(&naive_time)
+                    .single()
+                    .context("Ambiguous time in specified timezone")?
+                    .with_timezone(&Utc)
+            } else {
+                Utc.from_utc_datetime(&naive_time)
+            }
         };
 
         time_block_prices.push(TimeBlockPrice {
             block_start,
             duration_minutes: block_duration,
             price_czk_per_kwh: price,
+            // Effective price will be calculated by scheduler with HDO fees
+            effective_price_czk_per_kwh: price,
         });
     }
 
@@ -394,6 +525,41 @@ fn parse_price_arrays(
         convert_to_15min_blocks(time_block_prices)
     };
 
+    // Log first and last parsed blocks for debugging timezone issues
+    if !time_block_prices.is_empty() {
+        let first = &time_block_prices[0];
+        let last = time_block_prices.last().unwrap();
+        debug!(
+            "   First block: {} UTC ({} {}) at {:.4} CZK/kWh",
+            first.block_start.format("%Y-%m-%d %H:%M"),
+            if let Some(tz) = timezone {
+                first
+                    .block_start
+                    .with_timezone(&tz)
+                    .format("%H:%M")
+                    .to_string()
+            } else {
+                first.block_start.format("%H:%M").to_string()
+            },
+            tz_name,
+            first.price_czk_per_kwh
+        );
+        debug!(
+            "   Last block:  {} UTC ({} {}) at {:.4} CZK/kWh",
+            last.block_start.format("%Y-%m-%d %H:%M"),
+            if let Some(tz) = timezone {
+                last.block_start
+                    .with_timezone(&tz)
+                    .format("%H:%M")
+                    .to_string()
+            } else {
+                last.block_start.format("%H:%M").to_string()
+            },
+            tz_name,
+            last.price_czk_per_kwh
+        );
+    }
+
     let data = SpotPriceData {
         time_block_prices,
         block_duration_minutes: 15,
@@ -403,9 +569,10 @@ fn parse_price_arrays(
 
     // Always 96 blocks per day after conversion to 15-minute intervals
     info!(
-        "✅ Parsed price data: {} total 15-min blocks (96 today + {} tomorrow)",
+        "✅ Parsed price data: {} total 15-min blocks (96 today + {} tomorrow, timezone: {})",
         data.time_block_prices.len(),
-        data.time_block_prices.len() - 96
+        data.time_block_prices.len().saturating_sub(96),
+        tz_name
     );
 
     Ok(data)
@@ -437,6 +604,8 @@ fn parse_timestamp_keyed_attributes(
                     block_start: timestamp.with_timezone(&Utc),
                     duration_minutes: 0, // Will be calculated below
                     price_czk_per_kwh: price as f32,
+                    // Effective price will be calculated by scheduler with HDO fees
+                    effective_price_czk_per_kwh: price as f32,
                 });
             } else {
                 warn!(

@@ -12,274 +12,25 @@
 
 //! Winter Adaptive Strategy V3
 //!
-//! A simplified battery optimization strategy with HDO tariff integration.
+//! A simplified battery optimization strategy using centralized price calculation.
 //!
 //! ## Key Features
 //!
-//! 1. **HDO Tariff Integration**: Uses dynamic grid fees from HDO sensor data
-//! 2. **Effective Price Calculation**: total_price = spot_price + grid_fee
-//! 3. **Winter Discharge Restriction**: SOC >= 50% AND top 4 expensive blocks today
+//! 1. **Centralized Pricing**: Uses pre-calculated effective prices (spot + grid fees) from scheduler
+//! 2. **Winter Discharge Restriction**: SOC >= 50% AND top 4 expensive blocks today
+//! 3. **Arbitrage Efficiency Check**: Only discharge when price exceeds median + buffer
 //! 4. **Simplified Algorithm**: No arbitrage, P90, spikes, or feed-in complexity
-//!
-//! ## HDO Sensor Format
-//!
-//! The strategy parses HDO data from Home Assistant sensors in this format:
-//! ```yaml
-//! data:
-//!   signals:
-//!     - signal: EVV1
-//!       datum: 14.01.2026
-//!       casy: 00:00-06:00; 07:00-09:00; 10:00-13:00; 14:00-16:00; 17:00-24:00
-//! ```
 
 use crate::strategy::{
     Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics,
+    locking::{LockedBlock, ScheduleLockState},
+    seasonal::SeasonalMode,
 };
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::Utc;
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::TimeBlockPrice;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::RwLock;
-
-// Re-export SeasonalMode from V2 for consistency
-pub use crate::strategy::winter_adaptive_v2::{DayEnergyBalance, SeasonalMode};
-
-// ============================================================================
-// HDO Parsing and Caching
-// ============================================================================
-
-/// Parsed HDO time range for low tariff periods
-#[derive(Debug, Clone)]
-pub struct HdoTimeRange {
-    pub start: NaiveTime,
-    pub end: NaiveTime,
-}
-
-/// Cached HDO schedule for a specific date
-#[derive(Debug, Clone)]
-pub struct HdoDaySchedule {
-    /// Date this schedule is for
-    pub date: NaiveDate,
-    /// Low tariff time ranges for this day
-    pub low_tariff_ranges: Vec<HdoTimeRange>,
-}
-
-/// Cache for HDO schedules with TTL
-#[derive(Debug)]
-pub struct HdoCache {
-    /// Cached schedules by date
-    schedules: RwLock<HashMap<NaiveDate, HdoDaySchedule>>,
-    /// Last refresh timestamp
-    last_refresh: RwLock<Option<DateTime<Utc>>>,
-    /// Cache TTL in seconds
-    ttl_secs: u64,
-}
-
-impl HdoCache {
-    /// Create a new HDO cache with specified TTL
-    pub fn new(ttl_secs: u64) -> Self {
-        Self {
-            schedules: RwLock::new(HashMap::new()),
-            last_refresh: RwLock::new(None),
-            ttl_secs,
-        }
-    }
-
-    /// Check if cache needs refresh
-    pub fn needs_refresh(&self) -> bool {
-        let last = self.last_refresh.read().unwrap();
-        match *last {
-            None => true,
-            Some(ts) => {
-                let elapsed = Utc::now().signed_duration_since(ts).num_seconds() as u64;
-                elapsed > self.ttl_secs
-            }
-        }
-    }
-
-    /// Update cache with parsed HDO data
-    pub fn update(&self, schedules: Vec<HdoDaySchedule>) {
-        let mut cache = self.schedules.write().unwrap();
-        cache.clear();
-        for schedule in schedules {
-            cache.insert(schedule.date, schedule);
-        }
-        *self.last_refresh.write().unwrap() = Some(Utc::now());
-    }
-
-    /// Check if a given time is in low tariff period
-    /// Returns None if no data available for that date (fallback to high tariff)
-    pub fn is_low_tariff(&self, dt: DateTime<Utc>) -> Option<bool> {
-        let date = dt.date_naive();
-        let time = dt.time();
-
-        let cache = self.schedules.read().unwrap();
-        let schedule = cache.get(&date)?;
-
-        Some(schedule.low_tariff_ranges.iter().any(|range| {
-            if range.start <= range.end {
-                // Normal range: e.g., 06:00-12:00
-                time >= range.start && time < range.end
-            } else {
-                // Overnight range: e.g., 22:00-06:00 (spans midnight)
-                time >= range.start || time < range.end
-            }
-        }))
-    }
-}
-
-impl Default for HdoCache {
-    fn default() -> Self {
-        Self::new(3600) // 1 hour default TTL
-    }
-}
-
-/// Parse Czech date format "DD.MM.YYYY"
-pub fn parse_czech_date(s: &str) -> Option<NaiveDate> {
-    let parts: Vec<&str> = s.trim().split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-
-    let day: u32 = parts[0].parse().ok()?;
-    let month: u32 = parts[1].parse().ok()?;
-    let year: i32 = parts[2].parse().ok()?;
-
-    NaiveDate::from_ymd_opt(year, month, day)
-}
-
-/// Parse time ranges from HDO format "HH:MM-HH:MM; HH:MM-HH:MM"
-pub fn parse_time_ranges(s: &str) -> Vec<HdoTimeRange> {
-    let mut ranges = Vec::new();
-
-    for range_str in s.split(';') {
-        let range_str = range_str.trim();
-        if range_str.is_empty() {
-            continue;
-        }
-
-        if let Some(range) = parse_single_time_range(range_str) {
-            ranges.push(range);
-        }
-    }
-
-    ranges
-}
-
-/// Parse a single time range "HH:MM-HH:MM"
-fn parse_single_time_range(s: &str) -> Option<HdoTimeRange> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let start = parse_time(parts[0])?;
-    let end = parse_time(parts[1])?;
-
-    Some(HdoTimeRange { start, end })
-}
-
-/// Parse time "HH:MM"
-fn parse_time(s: &str) -> Option<NaiveTime> {
-    let s = s.trim();
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let hour: u32 = parts[0].parse().ok()?;
-    let minute: u32 = parts[1].parse().ok()?;
-
-    // Handle 24:00 as end-of-day (convert to 23:59:59)
-    if hour == 24 && minute == 0 {
-        return NaiveTime::from_hms_opt(23, 59, 59);
-    }
-
-    NaiveTime::from_hms_opt(hour, minute, 0)
-}
-
-/// Parse HDO sensor data from raw JSON/YAML-like format
-/// Expected format:
-/// ```yaml
-/// data:
-///   signals:
-///     - signal: EVV1
-///       datum: 14.01.2026
-///       casy: 00:00-06:00; 07:00-09:00; ...
-/// ```
-pub fn parse_hdo_sensor_data(raw_data: &str) -> Vec<HdoDaySchedule> {
-    let mut schedules = Vec::new();
-
-    // Try to parse as JSON first
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(raw_data)
-        && let Some(data) = json.get("data")
-        && let Some(signals) = data.get("signals").and_then(|s| s.as_array())
-    {
-        for signal in signals {
-            if let (Some(datum), Some(casy)) = (
-                signal.get("datum").and_then(|d| d.as_str()),
-                signal.get("casy").and_then(|c| c.as_str()),
-            ) && let Some(date) = parse_czech_date(datum)
-            {
-                let ranges = parse_time_ranges(casy);
-                if !ranges.is_empty() {
-                    schedules.push(HdoDaySchedule {
-                        date,
-                        low_tariff_ranges: ranges,
-                    });
-                }
-            }
-        }
-    }
-
-    schedules
-}
-
-// ============================================================================
-// Locked Block State (from V2)
-// ============================================================================
-
-/// A locked schedule entry - mode decision that should not change
-#[derive(Debug, Clone)]
-pub struct LockedBlock {
-    pub block_start: DateTime<Utc>,
-    pub mode: InverterOperationMode,
-    pub reason: String,
-}
-
-/// State for schedule locking to prevent oscillation
-#[derive(Debug, Clone, Default)]
-pub struct ScheduleLockState {
-    pub locked_blocks: Vec<LockedBlock>,
-}
-
-impl ScheduleLockState {
-    pub fn get_locked_mode(
-        &self,
-        block_start: DateTime<Utc>,
-    ) -> Option<(InverterOperationMode, String)> {
-        self.locked_blocks
-            .iter()
-            .find(|b| b.block_start == block_start)
-            .map(|b| (b.mode, format!("LOCKED: {}", b.reason)))
-    }
-
-    pub fn lock_blocks(&mut self, blocks: Vec<LockedBlock>) {
-        let now = Utc::now();
-        self.locked_blocks.retain(|b| b.block_start >= now);
-
-        for block in blocks {
-            if !self
-                .locked_blocks
-                .iter()
-                .any(|b| b.block_start == block.block_start)
-            {
-                self.locked_blocks.push(block);
-            }
-        }
-    }
-}
 
 // ============================================================================
 // Configuration
@@ -296,15 +47,6 @@ pub struct WinterAdaptiveV3Config {
 
     /// Target battery SOC for charging (default: 90%)
     pub daily_charging_target_soc: f32,
-
-    /// Home Assistant entity for HDO tariff schedule
-    pub hdo_sensor_entity: String,
-
-    /// Grid fee during HDO low tariff periods (CZK/kWh)
-    pub hdo_low_tariff_czk: f32,
-
-    /// Grid fee during HDO high tariff periods (CZK/kWh)
-    pub hdo_high_tariff_czk: f32,
 
     /// Minimum SOC for winter discharge (default: 50%)
     pub winter_discharge_min_soc: f32,
@@ -328,9 +70,6 @@ pub struct WinterAdaptiveV3Config {
 
     /// Current seasonal mode
     pub seasonal_mode: SeasonalMode,
-
-    /// HDO cache TTL in seconds (default: 3600)
-    pub hdo_cache_ttl_secs: u64,
 }
 
 impl Default for WinterAdaptiveV3Config {
@@ -339,9 +78,6 @@ impl Default for WinterAdaptiveV3Config {
             enabled: false,
             priority: 100,
             daily_charging_target_soc: 90.0,
-            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
-            hdo_low_tariff_czk: 0.50,
-            hdo_high_tariff_czk: 1.80,
             winter_discharge_min_soc: 50.0,
             top_discharge_blocks_per_day: 4,
             discharge_arbitrage_buffer: 1.0, // 1.0 CZK, use 0.05 for EUR
@@ -349,151 +85,7 @@ impl Default for WinterAdaptiveV3Config {
             charge_price_tolerance_percent: 15.0,
             negative_price_handling_enabled: true,
             seasonal_mode: SeasonalMode::Winter,
-            hdo_cache_ttl_secs: 3600,
         }
-    }
-}
-
-// ============================================================================
-// Simplified Scheduling (adapted from V2)
-// ============================================================================
-
-mod scheduling {
-    /// Select cheapest consecutive blocks
-    pub fn select_cheapest_blocks(
-        blocks_with_prices: &[(usize, f32)],
-        count_needed: usize,
-        min_consecutive: usize,
-        price_tolerance_percent: Option<f32>,
-    ) -> Vec<usize> {
-        if blocks_with_prices.is_empty() || count_needed == 0 {
-            return Vec::new();
-        }
-
-        let price_map: std::collections::HashMap<usize, f32> =
-            blocks_with_prices.iter().copied().collect();
-
-        let mut by_idx = blocks_with_prices.to_vec();
-        by_idx.sort_by_key(|(idx, _)| *idx);
-
-        // Find consecutive ranges
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        if !by_idx.is_empty() {
-            let mut range_start = by_idx[0].0;
-            let mut prev_idx = by_idx[0].0;
-
-            for (curr_idx, _) in by_idx.iter().skip(1) {
-                if *curr_idx != prev_idx + 1 {
-                    ranges.push((range_start, prev_idx + 1));
-                    range_start = *curr_idx;
-                }
-                prev_idx = *curr_idx;
-            }
-            ranges.push((range_start, prev_idx + 1));
-        }
-
-        let cheapest_price = by_idx
-            .iter()
-            .map(|(_, p)| *p)
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(0.0);
-
-        let max_acceptable = if let Some(tolerance_pct) = price_tolerance_percent {
-            cheapest_price * (1.0 + tolerance_pct / 100.0)
-        } else {
-            f32::MAX
-        };
-
-        // Find best consecutive window
-        let mut best_window: Option<(f32, Vec<usize>)> = None;
-
-        for (range_start, range_end) in &ranges {
-            let range_len = range_end - range_start;
-            if range_len >= count_needed {
-                for window_start in *range_start..=(range_end - count_needed) {
-                    let window: Vec<usize> = (window_start..window_start + count_needed).collect();
-                    let avg: f32 = window
-                        .iter()
-                        .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
-                        .sum::<f32>()
-                        / count_needed as f32;
-
-                    let blocks_within_tolerance = window
-                        .iter()
-                        .filter(|idx| {
-                            price_map.get(*idx).copied().unwrap_or(f32::MAX) <= max_acceptable
-                        })
-                        .count();
-
-                    let tolerance_score = blocks_within_tolerance as f32 / count_needed as f32;
-
-                    if let Some((best_avg, _)) = &best_window {
-                        let current_tolerance_score = best_window
-                            .as_ref()
-                            .map(|(_, w)| {
-                                w.iter()
-                                    .filter(|idx| {
-                                        price_map.get(*idx).copied().unwrap_or(f32::MAX)
-                                            <= max_acceptable
-                                    })
-                                    .count() as f32
-                                    / count_needed as f32
-                            })
-                            .unwrap_or(0.0);
-
-                        if tolerance_score > current_tolerance_score
-                            || (tolerance_score == current_tolerance_score && avg < *best_avg)
-                        {
-                            best_window = Some((avg, window));
-                        }
-                    } else {
-                        best_window = Some((avg, window));
-                    }
-                }
-            }
-        }
-
-        if let Some((_, window)) = best_window {
-            return window;
-        }
-
-        // Fallback: combine smaller windows
-        let mut all_windows: Vec<(f32, Vec<usize>)> = Vec::new();
-        for (range_start, range_end) in &ranges {
-            let range_len = range_end - range_start;
-            if range_len >= min_consecutive {
-                for window_start in *range_start..=(range_end - min_consecutive) {
-                    let window: Vec<usize> =
-                        (window_start..window_start + min_consecutive).collect();
-                    let avg: f32 = window
-                        .iter()
-                        .map(|idx| price_map.get(idx).copied().unwrap_or(f32::MAX))
-                        .sum::<f32>()
-                        / min_consecutive as f32;
-                    all_windows.push((avg, window));
-                }
-            }
-        }
-
-        all_windows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut selected: Vec<usize> = Vec::new();
-        for (_, window) in &all_windows {
-            if selected.len() >= count_needed {
-                break;
-            }
-            if window.iter().any(|idx| selected.contains(idx)) {
-                continue;
-            }
-            for &idx in window {
-                if selected.len() < count_needed {
-                    selected.push(idx);
-                }
-            }
-        }
-
-        selected.sort();
-        selected
     }
 }
 
@@ -504,37 +96,15 @@ mod scheduling {
 #[derive(Debug)]
 pub struct WinterAdaptiveV3Strategy {
     config: WinterAdaptiveV3Config,
-    hdo_cache: HdoCache,
     lock_state: RwLock<ScheduleLockState>,
 }
 
 impl WinterAdaptiveV3Strategy {
     pub fn new(config: WinterAdaptiveV3Config) -> Self {
-        let hdo_cache = HdoCache::new(config.hdo_cache_ttl_secs);
         Self {
             config,
-            hdo_cache,
             lock_state: RwLock::new(ScheduleLockState::default()),
         }
-    }
-
-    /// Update HDO cache with new sensor data
-    pub fn update_hdo_cache(&self, raw_data: &str) {
-        let schedules = parse_hdo_sensor_data(raw_data);
-        if !schedules.is_empty() {
-            let count = schedules.len();
-            self.hdo_cache.update(schedules);
-            tracing::debug!("V3: Updated HDO cache with {} day schedules", count);
-        }
-    }
-
-    /// Calculate effective price = spot_price + grid_fee
-    fn calculate_effective_price(&self, spot_price: f32, block_time: DateTime<Utc>) -> f32 {
-        let grid_fee = match self.hdo_cache.is_low_tariff(block_time) {
-            Some(true) => self.config.hdo_low_tariff_czk,
-            Some(false) | None => self.config.hdo_high_tariff_czk, // Default to high if unknown
-        };
-        spot_price + grid_fee
     }
 
     /// Check if discharge is allowed based on SOC, block ranking, and arbitrage efficiency
@@ -564,16 +134,12 @@ impl WinterAdaptiveV3Strategy {
         let current_block = &all_blocks[current_idx];
         let today = current_block.block_start.date_naive();
 
-        // Filter blocks for today and calculate effective prices
+        // Filter blocks for today using pre-calculated effective prices
         let mut today_blocks: Vec<(usize, f32)> = all_blocks
             .iter()
             .enumerate()
             .filter(|(_, b)| b.block_start.date_naive() == today)
-            .map(|(idx, b)| {
-                let effective_price =
-                    self.calculate_effective_price(b.price_czk_per_kwh, b.block_start);
-                (idx, effective_price)
-            })
+            .map(|(idx, b)| (idx, b.effective_price_czk_per_kwh))
             .collect();
 
         // Sort by effective price descending (most expensive first)
@@ -586,8 +152,7 @@ impl WinterAdaptiveV3Strategy {
             .map(|(idx, _)| *idx)
             .collect();
 
-        let current_effective_price = self
-            .calculate_effective_price(current_block.price_czk_per_kwh, current_block.block_start);
+        let current_effective_price = current_block.effective_price_czk_per_kwh;
 
         // Check if in top N expensive blocks
         if !top_n.contains(&current_idx) {
@@ -601,29 +166,27 @@ impl WinterAdaptiveV3Strategy {
         }
 
         // =====================================================================
-        // NEW: Arbitrage efficiency check
-        // Only discharge if: effective_price > (median_spot + high_grid_fee + buffer)
+        // Arbitrage efficiency check
+        // Only discharge if: effective_price > (median_effective_price + buffer)
         // This ensures discharge is worthwhile vs. just using grid directly
         // =====================================================================
-        let today_spot_prices: Vec<f32> = all_blocks
+        let today_effective_prices: Vec<f32> = all_blocks
             .iter()
             .filter(|b| b.block_start.date_naive() == today)
-            .map(|b| b.price_czk_per_kwh)
+            .map(|b| b.effective_price_czk_per_kwh)
             .collect();
 
-        let median_spot = Self::calculate_median(&today_spot_prices);
-        let arbitrage_threshold =
-            median_spot + self.config.hdo_high_tariff_czk + self.config.discharge_arbitrage_buffer;
+        let median_effective_price = Self::calculate_median(&today_effective_prices);
+        let arbitrage_threshold = median_effective_price + self.config.discharge_arbitrage_buffer;
 
         if current_effective_price <= arbitrage_threshold {
             return (
                 false,
                 format!(
-                    "Arbitrage not efficient: eff {:.3} <= threshold {:.3} (median {:.3} + high fee {:.3} + buffer {:.3})",
+                    "Arbitrage not efficient: eff {:.3} <= threshold {:.3} (median {:.3} + buffer {:.3})",
                     current_effective_price,
                     arbitrage_threshold,
-                    median_spot,
-                    self.config.hdo_high_tariff_czk,
+                    median_effective_price,
                     self.config.discharge_arbitrage_buffer
                 ),
             );
@@ -662,57 +225,80 @@ impl WinterAdaptiveV3Strategy {
         }
     }
 
-    /// Select charge blocks based on effective prices
+    /// Select cheapest consecutive blocks for charging using "super block" approach
+    ///
+    /// Algorithm:
+    /// 1. Create overlapping "super blocks" of N consecutive blocks (N = min_consecutive_charge_blocks)
+    /// 2. Calculate average effective price for each super block
+    /// 3. Sort by average price (cheapest first)
+    /// 4. Select cheapest super blocks until we have enough blocks for target SOC
     fn select_charge_blocks(
         &self,
         all_blocks: &[TimeBlockPrice],
         current_idx: usize,
         blocks_needed: usize,
     ) -> Vec<usize> {
-        // Calculate effective prices for remaining blocks
-        let blocks_with_eff_prices: Vec<(usize, f32)> = all_blocks
+        let min_consecutive = self.config.min_consecutive_charge_blocks;
+
+        // Step 1: Use pre-calculated effective prices for all remaining blocks
+        let blocks_with_prices: Vec<(usize, f32)> = all_blocks
             .iter()
             .enumerate()
             .skip(current_idx)
-            .map(|(idx, b)| {
-                let effective_price =
-                    self.calculate_effective_price(b.price_czk_per_kwh, b.block_start);
-                (idx, effective_price)
-            })
+            .map(|(idx, b)| (idx, b.effective_price_czk_per_kwh))
             .collect();
 
-        // Calculate median effective price
-        let mut prices: Vec<f32> = blocks_with_eff_prices.iter().map(|(_, p)| *p).collect();
-        prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = if prices.is_empty() {
-            0.0
-        } else if prices.len().is_multiple_of(2) {
-            let mid = prices.len() / 2;
-            (prices[mid - 1] + prices[mid]) / 2.0
-        } else {
-            prices[prices.len() / 2]
-        };
+        if blocks_with_prices.len() < min_consecutive {
+            return Vec::new();
+        }
 
-        // Filter to affordable blocks (below median)
-        let affordable_blocks: Vec<(usize, f32)> = blocks_with_eff_prices
-            .iter()
-            .filter(|(_, price)| *price < median)
-            .copied()
-            .collect();
+        // Step 2: Create overlapping "super blocks" of N consecutive blocks
+        // Each super block is (window_start_in_vec, avg_effective_price, block_indices)
+        let mut super_blocks: Vec<(usize, f32, Vec<usize>)> = Vec::new();
+
+        for i in 0..=(blocks_with_prices.len() - min_consecutive) {
+            let window: Vec<(usize, f32)> = blocks_with_prices[i..i + min_consecutive].to_vec();
+            let avg_price: f32 =
+                window.iter().map(|(_, p)| *p).sum::<f32>() / min_consecutive as f32;
+            let indices: Vec<usize> = window.iter().map(|(idx, _)| *idx).collect();
+            super_blocks.push((i, avg_price, indices));
+        }
+
+        // Step 3: Sort by average effective price (cheapest first)
+        super_blocks.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Step 4: Select cheapest super blocks until we have enough blocks
+        let mut selected_indices: Vec<usize> = Vec::new();
+
+        for (_, avg_price, indices) in &super_blocks {
+            if selected_indices.len() >= blocks_needed {
+                break;
+            }
+
+            // Add all indices from this super block (overlapping is allowed)
+            for &idx in indices {
+                if !selected_indices.contains(&idx) && selected_indices.len() < blocks_needed {
+                    selected_indices.push(idx);
+                }
+            }
+
+            tracing::debug!(
+                "V3: Selected super block with avg price {:.3} CZK, indices {:?}",
+                avg_price,
+                indices
+            );
+        }
+
+        // Sort by index for consistent ordering
+        selected_indices.sort();
 
         tracing::debug!(
-            "V3: Median eff price: {:.3} CZK, {} of {} blocks affordable",
-            median,
-            affordable_blocks.len(),
-            blocks_with_eff_prices.len()
+            "V3: Final charge schedule: {} blocks, indices {:?}",
+            selected_indices.len(),
+            selected_indices
         );
 
-        scheduling::select_cheapest_blocks(
-            &affordable_blocks,
-            blocks_needed,
-            self.config.min_consecutive_charge_blocks,
-            Some(self.config.charge_price_tolerance_percent),
-        )
+        selected_indices
     }
 
     /// Main decision logic
@@ -722,9 +308,9 @@ impl WinterAdaptiveV3Strategy {
         all_blocks: &[TimeBlockPrice],
         current_block_index: usize,
     ) -> (InverterOperationMode, String, String) {
-        let current_price = context.price_block.price_czk_per_kwh;
+        let current_price = context.price_block.price_czk_per_kwh; // For display/logging
         let current_block_start = context.price_block.block_start;
-        let effective_price = self.calculate_effective_price(current_price, current_block_start);
+        let effective_price = context.price_block.effective_price_czk_per_kwh;
 
         // =====================================================================
         // PRIORITY 0: Check locked blocks
@@ -949,11 +535,8 @@ impl EconomicStrategy for WinterAdaptiveV3Strategy {
                 let charge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
                 eval.energy_flows.battery_charge_kwh = charge_kwh;
                 eval.energy_flows.grid_import_kwh = charge_kwh;
-                // Use effective price for cost calculation
-                let effective_price = self.calculate_effective_price(
-                    context.price_block.price_czk_per_kwh,
-                    context.price_block.block_start,
-                );
+                // Use pre-calculated effective price for cost calculation
+                let effective_price = context.price_block.effective_price_czk_per_kwh;
                 eval.cost_czk = economics::grid_import_cost(charge_kwh, effective_price);
             }
             InverterOperationMode::ForceDischarge => {
@@ -972,17 +555,23 @@ impl EconomicStrategy for WinterAdaptiveV3Strategy {
                     / 100.0)
                     * context.control_config.battery_capacity_kwh;
 
-                let effective_price = self.calculate_effective_price(
-                    context.price_block.price_czk_per_kwh,
-                    context.price_block.block_start,
-                );
+                let effective_price = context.price_block.effective_price_czk_per_kwh;
 
-                if usable_battery_kwh >= context.consumption_forecast_kwh {
+                // Calculate how much battery will discharge to cover load
+                let battery_discharge = usable_battery_kwh.min(context.consumption_forecast_kwh);
+
+                eval.energy_flows.battery_discharge_kwh = battery_discharge;
+
+                if battery_discharge >= context.consumption_forecast_kwh {
+                    // Battery fully covers load
                     eval.revenue_czk = context.consumption_forecast_kwh * effective_price;
                 } else {
-                    eval.revenue_czk = usable_battery_kwh * effective_price;
+                    // Battery partially covers load, rest from grid
+                    eval.revenue_czk = battery_discharge * effective_price;
                     eval.cost_czk =
-                        (context.consumption_forecast_kwh - usable_battery_kwh) * effective_price;
+                        (context.consumption_forecast_kwh - battery_discharge) * effective_price;
+                    eval.energy_flows.grid_import_kwh =
+                        context.consumption_forecast_kwh - battery_discharge;
                 }
             }
         }
@@ -1001,102 +590,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    #[test]
-    fn test_parse_czech_date() {
-        assert_eq!(
-            parse_czech_date("14.01.2026"),
-            Some(NaiveDate::from_ymd_opt(2026, 1, 14).unwrap())
-        );
-        assert_eq!(
-            parse_czech_date("31.12.2025"),
-            Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap())
-        );
-        assert_eq!(parse_czech_date("invalid"), None);
-        assert_eq!(parse_czech_date("14-01-2026"), None);
-    }
-
-    #[test]
-    fn test_parse_time_ranges() {
-        let ranges = parse_time_ranges("00:00-06:00; 07:00-09:00; 10:00-13:00");
-        assert_eq!(ranges.len(), 3);
-
-        assert_eq!(ranges[0].start, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-        assert_eq!(ranges[0].end, NaiveTime::from_hms_opt(6, 0, 0).unwrap());
-
-        assert_eq!(ranges[1].start, NaiveTime::from_hms_opt(7, 0, 0).unwrap());
-        assert_eq!(ranges[1].end, NaiveTime::from_hms_opt(9, 0, 0).unwrap());
-
-        assert_eq!(ranges[2].start, NaiveTime::from_hms_opt(10, 0, 0).unwrap());
-        assert_eq!(ranges[2].end, NaiveTime::from_hms_opt(13, 0, 0).unwrap());
-    }
-
-    #[test]
-    fn test_parse_time_ranges_with_24_hour() {
-        let ranges = parse_time_ranges("17:00-24:00");
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].start, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
-        // 24:00 should be converted to 23:59:59
-        assert_eq!(ranges[0].end, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
-    }
-
-    #[test]
-    fn test_hdo_cache_is_low_tariff() {
-        let cache = HdoCache::new(3600);
-
-        let schedule = HdoDaySchedule {
-            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
-            low_tariff_ranges: vec![
-                HdoTimeRange {
-                    start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                    end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
-                },
-                HdoTimeRange {
-                    start: NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
-                    end: NaiveTime::from_hms_opt(14, 0, 0).unwrap(),
-                },
-            ],
-        };
-        cache.update(vec![schedule]);
-
-        // Test within first low tariff range
-        let dt1 = Utc.with_ymd_and_hms(2026, 1, 14, 3, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt1), Some(true));
-
-        // Test within second low tariff range
-        let dt2 = Utc.with_ymd_and_hms(2026, 1, 14, 12, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt2), Some(true));
-
-        // Test outside low tariff ranges (high tariff)
-        let dt3 = Utc.with_ymd_and_hms(2026, 1, 14, 8, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt3), Some(false));
-
-        // Test date not in cache
-        let dt4 = Utc.with_ymd_and_hms(2026, 1, 15, 3, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt4), None);
-    }
-
-    #[test]
-    fn test_parse_hdo_sensor_data() {
-        let json_data = r#"{
-            "data": {
-                "signals": [
-                    {
-                        "signal": "EVV1",
-                        "datum": "14.01.2026",
-                        "casy": "00:00-06:00; 07:00-09:00"
-                    }
-                ]
-            }
-        }"#;
-
-        let schedules = parse_hdo_sensor_data(json_data);
-        assert_eq!(schedules.len(), 1);
-        assert_eq!(
-            schedules[0].date,
-            NaiveDate::from_ymd_opt(2026, 1, 14).unwrap()
-        );
-        assert_eq!(schedules[0].low_tariff_ranges.len(), 2);
-    }
+    // NOTE: HDO parsing tests are in crate::strategy::pricing::tests
 
     #[test]
     fn test_seasonal_mode_from_date() {
@@ -1144,35 +638,89 @@ mod tests {
     #[test]
     fn test_arbitrage_threshold_calculation() {
         // Given:
-        // - median_spot = 2.0 CZK/kWh
-        // - high_grid_fee = 1.80 CZK/kWh
+        // - median_effective_price = 3.8 CZK/kWh (spot + grid fees pre-calculated)
         // - buffer = 1.0 CZK
-        // Threshold = 2.0 + 1.80 + 1.0 = 4.80 CZK/kWh
+        // Threshold = 3.8 + 1.0 = 4.8 CZK/kWh
         //
         // For discharge to be efficient:
-        // - effective_price must be > 4.80
+        // - effective_price must be > 4.8
 
         let config = WinterAdaptiveV3Config {
             enabled: true,
-            hdo_high_tariff_czk: 1.80,
             discharge_arbitrage_buffer: 1.0,
             ..Default::default()
         };
 
         let strategy = WinterAdaptiveV3Strategy::new(config);
 
-        // Test median calculation for threshold
-        let spot_prices = vec![1.0, 2.0, 3.0]; // median = 2.0
-        let median = WinterAdaptiveV3Strategy::calculate_median(&spot_prices);
-        assert_eq!(median, 2.0);
+        // Test median calculation for threshold using pre-calculated effective prices
+        let effective_prices = vec![3.0, 3.8, 4.5]; // median = 3.8
+        let median = WinterAdaptiveV3Strategy::calculate_median(&effective_prices);
+        assert_eq!(median, 3.8);
 
-        let threshold = median
-            + strategy.config.hdo_high_tariff_czk
-            + strategy.config.discharge_arbitrage_buffer;
-        assert!((threshold - 4.80).abs() < 0.001);
+        let threshold = median + strategy.config.discharge_arbitrage_buffer;
+        assert!((threshold - 4.8).abs() < 0.001);
 
-        // Effective price of 5.0 should pass (5.0 > 4.80)
-        // Effective price of 4.80 should fail (4.80 <= 4.80)
-        // Effective price of 4.0 should fail (4.0 <= 4.80)
+        // Effective price of 5.0 should pass (5.0 > 4.8)
+        // Effective price of 4.8 should fail (4.8 <= 4.8)
+        // Effective price of 4.0 should fail (4.0 <= 4.8)
+    }
+
+    #[test]
+    fn test_super_block_selection() {
+        // Simulates the export scenario:
+        // Early blocks (indices 0-3): expensive ~2.64 CZK
+        // Later blocks (indices 4-7): cheap ~2.29 CZK
+        // Algorithm should select the cheaper blocks
+
+        // Create mock effective prices (spot + grid fee + buy fee)
+        let prices: Vec<(usize, f32)> = vec![
+            // Early expensive blocks
+            (0, 2.48),
+            (1, 2.77),
+            (2, 2.67),
+            (3, 2.49),
+            // Later cheap blocks
+            (4, 2.25),
+            (5, 2.30),
+            (6, 2.31),
+            (7, 2.35),
+        ];
+
+        let min_consecutive = 2;
+
+        // Create overlapping super blocks
+        let mut super_blocks: Vec<(f32, Vec<usize>)> = Vec::new();
+        for i in 0..=(prices.len() - min_consecutive) {
+            let window: Vec<(usize, f32)> = prices[i..i + min_consecutive].to_vec();
+            let avg_price: f32 =
+                window.iter().map(|(_, p)| *p).sum::<f32>() / min_consecutive as f32;
+            let indices: Vec<usize> = window.iter().map(|(idx, _)| *idx).collect();
+            super_blocks.push((avg_price, indices));
+        }
+
+        // Sort by price (cheapest first)
+        super_blocks.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Cheapest super block should be from the cheap region (indices 4-7)
+        let (cheapest_avg, cheapest_indices) = &super_blocks[0];
+        assert!(
+            *cheapest_avg < 2.35,
+            "Cheapest avg should be < 2.35, got {:.3}",
+            cheapest_avg
+        );
+        assert!(
+            cheapest_indices.iter().all(|&i| i >= 4),
+            "Cheapest block indices should be >= 4, got {:?}",
+            cheapest_indices
+        );
+
+        // Verify the expensive blocks are sorted later
+        let (most_expensive_avg, _) = &super_blocks[super_blocks.len() - 1];
+        assert!(
+            *most_expensive_avg > 2.55,
+            "Most expensive avg should be > 2.55, got {:.3}",
+            most_expensive_avg
+        );
     }
 }

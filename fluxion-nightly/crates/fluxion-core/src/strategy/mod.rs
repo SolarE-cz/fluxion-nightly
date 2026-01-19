@@ -10,17 +10,38 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+pub mod locking;
+pub mod pricing;
+pub mod seasonal;
 pub mod utils;
 pub mod winter_adaptive;
 pub mod winter_adaptive_v2;
 pub mod winter_adaptive_v3;
+pub mod winter_adaptive_v4;
+pub mod winter_adaptive_v5;
+pub mod winter_adaptive_v6;
+pub mod winter_adaptive_v7;
+
+// Re-export shared locking utilities
+pub use locking::{LockedBlock, ScheduleLockState};
+
+// Re-export shared pricing utilities
+pub use pricing::{
+    HdoCache, HdoDaySchedule, HdoTimeRange, calculate_effective_price, parse_hdo_sensor_data,
+};
+
+// Re-export shared seasonal utilities
+pub use seasonal::{DayEnergyBalance, SeasonalMode};
 
 // Re-export strategies
-pub use winter_adaptive::{
-    DayEnergyBalance, PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy,
-};
+// Note: DayEnergyBalance is re-exported from seasonal module above
+pub use winter_adaptive::{PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy};
 pub use winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy};
 pub use winter_adaptive_v3::{WinterAdaptiveV3Config, WinterAdaptiveV3Strategy};
+pub use winter_adaptive_v4::{WinterAdaptiveV4Config, WinterAdaptiveV4Strategy};
+pub use winter_adaptive_v5::{WinterAdaptiveV5Config, WinterAdaptiveV5Strategy};
+pub use winter_adaptive_v6::{WinterAdaptiveV6Config, WinterAdaptiveV6Strategy};
+pub use winter_adaptive_v7::{WinterAdaptiveV7Config, WinterAdaptiveV7Strategy};
 
 use chrono::{DateTime, Utc};
 use fluxion_types::config::ControlConfig;

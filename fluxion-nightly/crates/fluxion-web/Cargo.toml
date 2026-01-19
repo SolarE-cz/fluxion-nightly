@@ -9,7 +9,9 @@ fluxion-backtest = { path = "../fluxion-backtest" }
 fluxion-core = { path = "../fluxion-core" }
 fluxion-i18n = { path = "../fluxion-i18n" }
 fluxion-plugins = { path = "../fluxion-plugins" }
+fluxion-strategy-simulator = { path = "../fluxion-strategy-simulator" }
 fluxion-types = { path = "../fluxion-types" }
+uuid = { version = "1.0", features = ["v4", "serde"] }
 axum.workspace = true
 askama.workspace = true
 tokio.workspace = true

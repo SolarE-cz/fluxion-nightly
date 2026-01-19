@@ -33,6 +33,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
+            effective_price_czk_per_kwh: 2.0,
         });
     }
 
@@ -42,6 +43,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
+            effective_price_czk_per_kwh: 1.5,
         });
     }
 
@@ -51,6 +53,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.0,
+            effective_price_czk_per_kwh: 1.0,
         });
     }
 
@@ -60,6 +63,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
+            effective_price_czk_per_kwh: 3.0,
         });
     }
 
@@ -69,6 +73,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
+            effective_price_czk_per_kwh: 5.0,
         });
     }
 
@@ -78,6 +83,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
+            effective_price_czk_per_kwh: 2.0,
         });
     }
 
@@ -87,6 +93,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 6.0,
+            effective_price_czk_per_kwh: 6.0,
         });
     }
 
@@ -96,6 +103,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
+            effective_price_czk_per_kwh: 2.5,
         });
     }
 

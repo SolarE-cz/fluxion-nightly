@@ -7,6 +7,7 @@ members = [
     "crates/fluxion-integration-tests",
     "crates/fluxion-main",
     "crates/fluxion-plugins",
+    "crates/fluxion-strategy-simulator",
     "crates/fluxion-types",
     "crates/fluxion-web",
     "crates/solax-csv-importer",

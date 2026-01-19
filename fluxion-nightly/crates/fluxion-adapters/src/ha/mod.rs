@@ -22,5 +22,5 @@ pub use adapters::{
 };
 pub use client::HomeAssistantClient;
 pub use errors::{HaError, HaResult};
-pub use plugin::{HaClientResource, HaPlugin};
+pub use plugin::{HaClientResource, HaPlugin, PriceAdapterTimezoneHandle};
 pub use types::{HaEntityState, HaHistoryState, HistoryDataPoint};

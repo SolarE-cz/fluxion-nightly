@@ -224,7 +224,9 @@ mod tests {
                 fixed_sell_price_czk: fluxion_core::resources::PriceSchedule::Flat(1.0),
                 spot_buy_fee_czk: 0.5,
                 spot_sell_fee_czk: 0.5,
-                grid_distribution_fee_czk: 1.0,
+                hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_owned(),
+                hdo_low_tariff_czk: 0.50,
+                hdo_high_tariff_czk: 1.80,
             },
             control_config: ControlConfig::default(),
             system_config: SystemSettingsConfig {

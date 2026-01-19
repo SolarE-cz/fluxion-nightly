@@ -35,6 +35,9 @@
 
 use crate::strategy::{
     Assumptions, BlockEvaluation, EconomicStrategy, EvaluationContext, economics,
+    locking::{LockedBlock, ScheduleLockState},
+    pricing::{HdoCache, calculate_effective_price, parse_hdo_sensor_data},
+    seasonal::{DayEnergyBalance, SeasonalMode},
 };
 use crate::utils::calculate_ema;
 use chrono::{DateTime, Datelike, Utc};
@@ -44,121 +47,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::RwLock;
 
-/// Seasonal operating mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SeasonalMode {
-    /// May-September: More solar, lower min SOC
-    Summer,
-    /// October-April: Less solar, higher min SOC
-    Winter,
-}
-
-impl SeasonalMode {
-    /// Determine the season from a UTC date
-    #[must_use]
-    pub fn from_date(date: DateTime<Utc>) -> Self {
-        match date.month() {
-            5..=9 => Self::Summer,
-            _ => Self::Winter,
-        }
-    }
-
-    /// Minimum SOC recommendation by season (percent)
-    #[must_use]
-    pub fn min_soc_percent(&self) -> f32 {
-        match self {
-            Self::Summer => 20.0,
-            Self::Winter => 50.0,
-        }
-    }
-
-    /// Minimum spread threshold for arbitrage (CZK/kWh)
-    #[must_use]
-    pub fn min_spread_threshold(&self) -> f32 {
-        match self {
-            Self::Summer => 2.0,
-            Self::Winter => 3.0,
-        }
-    }
-}
-
 // ============================================================================
 // Configuration
 // ============================================================================
-
-/// A locked schedule entry - mode decision that should not change
-#[derive(Debug, Clone)]
-pub struct LockedBlock {
-    /// Start time of this block
-    pub block_start: DateTime<Utc>,
-    /// The locked mode for this block
-    pub mode: InverterOperationMode,
-    /// Reason for this mode (for logging)
-    pub reason: String,
-}
-
-/// State for schedule locking to prevent oscillation
-#[derive(Debug, Clone, Default)]
-pub struct ScheduleLockState {
-    /// Locked blocks - mode decisions that should not be recalculated
-    pub locked_blocks: Vec<LockedBlock>,
-}
-
-impl ScheduleLockState {
-    /// Check if a block is locked and return its mode if so
-    pub fn get_locked_mode(
-        &self,
-        block_start: DateTime<Utc>,
-    ) -> Option<(InverterOperationMode, String)> {
-        self.locked_blocks
-            .iter()
-            .find(|b| b.block_start == block_start)
-            .map(|b| (b.mode, format!("LOCKED: {}", b.reason)))
-    }
-
-    /// Lock modes for the specified blocks
-    pub fn lock_blocks(&mut self, blocks: Vec<LockedBlock>) {
-        // Clear old locks (blocks in the past)
-        let now = Utc::now();
-        self.locked_blocks.retain(|b| b.block_start >= now);
-
-        // Add new locks, avoiding duplicates
-        for block in blocks {
-            if !self
-                .locked_blocks
-                .iter()
-                .any(|b| b.block_start == block.block_start)
-            {
-                self.locked_blocks.push(block);
-            }
-        }
-    }
-}
-
-/// Historical day data for seasonal mode detection
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DayEnergyBalance {
-    pub date: DateTime<Utc>,
-    pub solar_production_kwh: f32,
-    pub grid_import_kwh: f32,
-}
-
-impl DayEnergyBalance {
-    pub fn deficit_ratio(&self) -> f32 {
-        if self.grid_import_kwh == 0.0 {
-            return -1.0;
-        }
-        (self.grid_import_kwh - self.solar_production_kwh) / self.grid_import_kwh
-    }
-
-    pub fn is_deficit_day(&self) -> bool {
-        self.deficit_ratio() >= 0.20
-    }
-
-    pub fn is_surplus_day(&self) -> bool {
-        self.deficit_ratio() <= -0.20
-    }
-}
 
 /// Per-slot historical data for detailed forecasting
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +131,19 @@ pub struct WinterAdaptiveV2Config {
     /// Charge even when full on negative prices (default: false)
     pub charge_on_negative_even_if_full: bool,
 
+    // ---- HDO Tariff (for effective price calculation) ----
+    /// Grid fee during HDO low tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_low_tariff")]
+    pub hdo_low_tariff_czk: f32,
+
+    /// Grid fee during HDO high tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_high_tariff")]
+    pub hdo_high_tariff_czk: f32,
+
+    /// HDO cache TTL in seconds (default: 3600)
+    #[serde(default = "default_hdo_cache_ttl")]
+    pub hdo_cache_ttl_secs: u64,
+
     // ---- Historical Data ----
     /// Per-slot historical data (last N days, organized by day then by slot within day)
     #[serde(skip)]
@@ -265,6 +169,18 @@ fn default_deficit_median_relaxation() -> f32 {
     10.0 // 10% above median when deficit exists
 }
 
+fn default_hdo_low_tariff() -> f32 {
+    0.50 // CZK/kWh
+}
+
+fn default_hdo_high_tariff() -> f32 {
+    1.80 // CZK/kWh
+}
+
+fn default_hdo_cache_ttl() -> u64 {
+    3600 // 1 hour
+}
+
 impl Default for WinterAdaptiveV2Config {
     fn default() -> Self {
         Self {
@@ -288,6 +204,9 @@ impl Default for WinterAdaptiveV2Config {
             deficit_median_relaxation_percent: 10.0,
             negative_price_handling_enabled: true,
             charge_on_negative_even_if_full: false,
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            hdo_cache_ttl_secs: 3600,
             slot_history: VecDeque::new(),
             energy_balance_history: VecDeque::new(),
             seasonal_mode: SeasonalMode::Winter,
@@ -1052,14 +971,39 @@ pub struct WinterAdaptiveV2Strategy {
     config: WinterAdaptiveV2Config,
     /// Schedule lock state to prevent mode oscillation
     lock_state: RwLock<ScheduleLockState>,
+    /// HDO cache for effective price calculation
+    hdo_cache: HdoCache,
 }
 
 impl WinterAdaptiveV2Strategy {
     pub fn new(config: WinterAdaptiveV2Config) -> Self {
+        let hdo_cache = HdoCache::new(config.hdo_cache_ttl_secs);
         Self {
             config,
             lock_state: RwLock::new(ScheduleLockState::default()),
+            hdo_cache,
         }
+    }
+
+    /// Update HDO cache with new sensor data
+    pub fn update_hdo_cache(&self, raw_data: &str) {
+        let schedules = parse_hdo_sensor_data(raw_data);
+        if !schedules.is_empty() {
+            let count = schedules.len();
+            self.hdo_cache.update(schedules);
+            tracing::debug!("V2: Updated HDO cache with {} day schedules", count);
+        }
+    }
+
+    /// Calculate effective price = spot_price + grid_fee
+    fn calculate_effective_price(&self, spot_price: f32, block_time: DateTime<Utc>) -> f32 {
+        calculate_effective_price(
+            spot_price,
+            block_time,
+            &self.hdo_cache,
+            self.config.hdo_low_tariff_czk,
+            self.config.hdo_high_tariff_czk,
+        )
     }
 
     /// Main decision logic for current block - GLOBAL OPTIMIZATION ALGORITHM
@@ -1572,13 +1516,19 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
         eval.decision_uid = Some(decision_uid);
 
         // Calculate energy flows based on mode
+        // Use effective price (spot + grid fee) for accurate cost calculation
+        let effective_price = self.calculate_effective_price(
+            context.price_block.price_czk_per_kwh,
+            context.price_block.block_start,
+        );
+
         match mode {
             InverterOperationMode::ForceCharge => {
                 let charge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
                 eval.energy_flows.battery_charge_kwh = charge_kwh;
                 eval.energy_flows.grid_import_kwh = charge_kwh;
-                eval.cost_czk =
-                    economics::grid_import_cost(charge_kwh, context.price_block.price_czk_per_kwh);
+                // Use effective price for accurate cost reporting
+                eval.cost_czk = economics::grid_import_cost(charge_kwh, effective_price);
             }
             InverterOperationMode::ForceDischarge => {
                 let discharge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
@@ -1597,17 +1547,24 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
                     .max(0.0)
                     / 100.0)
                     * context.control_config.battery_capacity_kwh;
-                let price = context.price_block.price_czk_per_kwh;
 
-                if usable_battery_kwh >= context.consumption_forecast_kwh {
+                // Calculate how much battery will discharge to cover load
+                let battery_discharge = usable_battery_kwh.min(context.consumption_forecast_kwh);
+
+                eval.energy_flows.battery_discharge_kwh = battery_discharge;
+
+                if battery_discharge >= context.consumption_forecast_kwh {
                     // Battery can fully cover consumption - show as avoided grid import cost
-                    eval.revenue_czk = context.consumption_forecast_kwh * price;
+                    eval.revenue_czk = context.consumption_forecast_kwh * effective_price;
                 } else {
                     // Battery partially depleted - split between battery and grid
                     // Battery covers what it can (avoided cost = profit)
-                    eval.revenue_czk = usable_battery_kwh * price;
+                    eval.revenue_czk = battery_discharge * effective_price;
                     // Grid must cover the rest (actual cost)
-                    eval.cost_czk = (context.consumption_forecast_kwh - usable_battery_kwh) * price;
+                    eval.cost_czk =
+                        (context.consumption_forecast_kwh - battery_discharge) * effective_price;
+                    eval.energy_flows.grid_import_kwh =
+                        context.consumption_forecast_kwh - battery_discharge;
                 }
             }
         }
@@ -1636,6 +1593,7 @@ mod tests {
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.5,
+                effective_price_czk_per_kwh: 1.5,
             });
         }
 
@@ -1645,6 +1603,7 @@ mod tests {
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 4.5,
+                effective_price_czk_per_kwh: 4.5,
             });
         }
 
@@ -1654,6 +1613,7 @@ mod tests {
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.0,
             });
         }
 
@@ -1663,6 +1623,7 @@ mod tests {
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.0,
+                effective_price_czk_per_kwh: 5.0,
             });
         }
 
@@ -1698,6 +1659,7 @@ mod tests {
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.0,
             });
         }
 
@@ -1706,6 +1668,7 @@ mod tests {
             block_start: base + chrono::Duration::minutes(10 * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 10.0,
+            effective_price_czk_per_kwh: 10.0,
         });
 
         // More normal prices
@@ -1714,6 +1677,7 @@ mod tests {
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.0,
             });
         }
 

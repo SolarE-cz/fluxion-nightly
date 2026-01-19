@@ -17,6 +17,9 @@ use crate::strategy::{
     winter_adaptive::{WinterAdaptiveConfig, WinterAdaptiveStrategy},
     winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy},
     winter_adaptive_v3::{WinterAdaptiveV3Config, WinterAdaptiveV3Strategy},
+    winter_adaptive_v4::{WinterAdaptiveV4Config, WinterAdaptiveV4Strategy},
+    winter_adaptive_v5::{WinterAdaptiveV5Config, WinterAdaptiveV5Strategy},
+    winter_adaptive_v7::{WinterAdaptiveV7Config, WinterAdaptiveV7Strategy},
 };
 use fluxion_plugins::{BlockDecision, EvaluationRequest, Plugin, PluginManager};
 use fluxion_types::config::ControlConfig;
@@ -81,6 +84,13 @@ impl Plugin for WinterAdaptivePlugin {
         let eval = self.strategy.evaluate(&context);
         let strategy_name = self.strategy.name().to_owned();
 
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
         Ok(BlockDecision {
             block_start: eval.block_start,
             duration_minutes: eval.duration_minutes,
@@ -89,7 +99,7 @@ impl Plugin for WinterAdaptivePlugin {
             priority: self.priority,
             strategy_name: Some(strategy_name),
             confidence: None,
-            expected_profit_czk: Some(eval.net_profit_czk),
+            expected_profit_czk: Some(net_profit),
             decision_uid: eval.decision_uid,
         })
     }
@@ -153,6 +163,13 @@ impl Plugin for WinterAdaptiveV2Plugin {
         let eval = self.strategy.evaluate(&context);
         let strategy_name = self.strategy.name().to_owned();
 
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
         Ok(BlockDecision {
             block_start: eval.block_start,
             duration_minutes: eval.duration_minutes,
@@ -161,7 +178,7 @@ impl Plugin for WinterAdaptiveV2Plugin {
             priority: self.priority,
             strategy_name: Some(strategy_name),
             confidence: None,
-            expected_profit_czk: Some(eval.net_profit_czk),
+            expected_profit_czk: Some(net_profit),
             decision_uid: eval.decision_uid,
         })
     }
@@ -207,6 +224,8 @@ impl Plugin for WinterAdaptiveV3Plugin {
     }
 
     fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        // HDO cache is now managed centrally, no need to update per-strategy caches
+
         let (price_block, all_blocks) = convert_request(request);
 
         let context = EvaluationContext {
@@ -225,6 +244,13 @@ impl Plugin for WinterAdaptiveV3Plugin {
         let eval = self.strategy.evaluate(&context);
         let strategy_name = self.strategy.name().to_owned();
 
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
         Ok(BlockDecision {
             block_start: eval.block_start,
             duration_minutes: eval.duration_minutes,
@@ -233,7 +259,256 @@ impl Plugin for WinterAdaptiveV3Plugin {
             priority: self.priority,
             strategy_name: Some(strategy_name),
             confidence: None,
-            expected_profit_czk: Some(eval.net_profit_czk),
+            expected_profit_czk: Some(net_profit),
+            decision_uid: eval.decision_uid,
+        })
+    }
+}
+
+/// Adapter that wraps WinterAdaptiveV4Strategy as a Plugin
+pub struct WinterAdaptiveV4Plugin {
+    strategy: WinterAdaptiveV4Strategy,
+    priority: u8,
+    control_config: ControlConfig,
+}
+
+impl std::fmt::Debug for WinterAdaptiveV4Plugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinterAdaptiveV4Plugin")
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl WinterAdaptiveV4Plugin {
+    /// Create a new Winter Adaptive V4 plugin
+    pub fn new(config: WinterAdaptiveV4Config, control_config: ControlConfig) -> Self {
+        Self {
+            priority: config.priority,
+            strategy: WinterAdaptiveV4Strategy::new(config),
+            control_config,
+        }
+    }
+}
+
+impl Plugin for WinterAdaptiveV4Plugin {
+    fn name(&self) -> &str {
+        self.strategy.name()
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        // HDO cache is now managed centrally, no need to update per-strategy caches
+
+        let (price_block, all_blocks) = convert_request(request);
+
+        let context = EvaluationContext {
+            price_block: &price_block,
+            control_config: &self.control_config,
+            current_battery_soc: request.battery.current_soc_percent,
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+            all_price_blocks: Some(&all_blocks),
+            backup_discharge_min_soc: request.backup_discharge_min_soc,
+            grid_import_today_kwh: request.historical.grid_import_today_kwh,
+            consumption_today_kwh: request.historical.consumption_today_kwh,
+        };
+
+        let eval = self.strategy.evaluate(&context);
+        let strategy_name = self.strategy.name().to_owned();
+
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
+        Ok(BlockDecision {
+            block_start: eval.block_start,
+            duration_minutes: eval.duration_minutes,
+            mode: eval.mode.into(),
+            reason: eval.reason,
+            priority: self.priority,
+            strategy_name: Some(strategy_name),
+            confidence: None,
+            expected_profit_czk: Some(net_profit),
+            decision_uid: eval.decision_uid,
+        })
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V5 Plugin
+// ============================================================================
+
+/// Adapter that wraps WinterAdaptiveV5Strategy as a Plugin
+pub struct WinterAdaptiveV5Plugin {
+    strategy: WinterAdaptiveV5Strategy,
+    priority: u8,
+    control_config: ControlConfig,
+}
+
+impl std::fmt::Debug for WinterAdaptiveV5Plugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinterAdaptiveV5Plugin")
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl WinterAdaptiveV5Plugin {
+    /// Create a new Winter Adaptive V5 plugin
+    pub fn new(config: WinterAdaptiveV5Config, control_config: ControlConfig) -> Self {
+        Self {
+            priority: config.priority,
+            strategy: WinterAdaptiveV5Strategy::new(config),
+            control_config,
+        }
+    }
+}
+
+impl Plugin for WinterAdaptiveV5Plugin {
+    fn name(&self) -> &str {
+        self.strategy.name()
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        // HDO cache is now managed centrally, no need to update per-strategy caches
+
+        let (price_block, all_blocks) = convert_request(request);
+
+        let context = EvaluationContext {
+            price_block: &price_block,
+            control_config: &self.control_config,
+            current_battery_soc: request.battery.current_soc_percent,
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+            all_price_blocks: Some(&all_blocks),
+            backup_discharge_min_soc: request.backup_discharge_min_soc,
+            grid_import_today_kwh: request.historical.grid_import_today_kwh,
+            consumption_today_kwh: request.historical.consumption_today_kwh,
+        };
+
+        let eval = self.strategy.evaluate(&context);
+        let strategy_name = self.strategy.name().to_owned();
+
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
+        Ok(BlockDecision {
+            block_start: eval.block_start,
+            duration_minutes: eval.duration_minutes,
+            mode: eval.mode.into(),
+            reason: eval.reason,
+            priority: self.priority,
+            strategy_name: Some(strategy_name),
+            confidence: None,
+            expected_profit_czk: Some(net_profit),
+            decision_uid: eval.decision_uid,
+        })
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V7 Plugin
+// ============================================================================
+
+/// Adapter that wraps WinterAdaptiveV7Strategy as a Plugin
+pub struct WinterAdaptiveV7Plugin {
+    strategy: WinterAdaptiveV7Strategy,
+    priority: u8,
+    control_config: ControlConfig,
+}
+
+impl std::fmt::Debug for WinterAdaptiveV7Plugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinterAdaptiveV7Plugin")
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl WinterAdaptiveV7Plugin {
+    /// Create a new Winter Adaptive V7 plugin
+    pub fn new(config: WinterAdaptiveV7Config, control_config: ControlConfig) -> Self {
+        Self {
+            priority: config.priority,
+            strategy: WinterAdaptiveV7Strategy::new(config),
+            control_config,
+        }
+    }
+}
+
+impl Plugin for WinterAdaptiveV7Plugin {
+    fn name(&self) -> &str {
+        self.strategy.name()
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        let (price_block, all_blocks) = convert_request(request);
+
+        let context = EvaluationContext {
+            price_block: &price_block,
+            control_config: &self.control_config,
+            current_battery_soc: request.battery.current_soc_percent,
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+            all_price_blocks: Some(&all_blocks),
+            backup_discharge_min_soc: request.backup_discharge_min_soc,
+            grid_import_today_kwh: request.historical.grid_import_today_kwh,
+            consumption_today_kwh: request.historical.consumption_today_kwh,
+        };
+
+        let eval = self.strategy.evaluate(&context);
+        let strategy_name = self.strategy.name().to_owned();
+
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
+        Ok(BlockDecision {
+            block_start: eval.block_start,
+            duration_minutes: eval.duration_minutes,
+            mode: eval.mode.into(),
+            reason: eval.reason,
+            priority: self.priority,
+            strategy_name: Some(strategy_name),
+            confidence: None,
+            expected_profit_czk: Some(net_profit),
             decision_uid: eval.decision_uid,
         })
     }
@@ -245,6 +520,7 @@ fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBloc
         block_start: request.block.block_start,
         duration_minutes: request.block.duration_minutes,
         price_czk_per_kwh: request.block.price_czk_per_kwh,
+        effective_price_czk_per_kwh: request.block.effective_price_czk_per_kwh,
     };
 
     let all_blocks: Vec<TimeBlockPrice> = request
@@ -254,10 +530,36 @@ fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBloc
             block_start: b.block_start,
             duration_minutes: b.duration_minutes,
             price_czk_per_kwh: b.price_czk_per_kwh,
+            effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
         })
         .collect();
 
     (price_block, all_blocks)
+}
+
+/// Calculate net profit from energy flows and pricing (centralized cost calculation).
+///
+/// This ensures all strategies are evaluated with identical cost logic.
+/// Only uses real measurable costs (grid import/export at spot/tariff prices).
+/// Does NOT include battery degradation or other estimated costs.
+///
+/// Net profit = export revenue - import cost
+///
+/// # Arguments
+/// * `eval` - The block evaluation containing energy flows
+/// * `import_price_czk_per_kwh` - Grid import price for this block
+/// * `export_price_czk_per_kwh` - Grid export price for this block
+///
+/// # Returns
+/// Net profit in CZK (positive = profit, negative = cost)
+fn calculate_net_profit(
+    eval: &crate::strategy::BlockEvaluation,
+    import_price_czk_per_kwh: f32,
+    export_price_czk_per_kwh: f32,
+) -> f32 {
+    let import_cost = eval.energy_flows.grid_import_kwh * import_price_czk_per_kwh;
+    let export_revenue = eval.energy_flows.grid_export_kwh * export_price_czk_per_kwh;
+    export_revenue - import_cost
 }
 
 /// Initialize a PluginManager with the default built-in strategies.
@@ -310,11 +612,34 @@ pub fn init_plugin_manager(
         v3_config.enabled = sc.winter_adaptive_v3.enabled;
         v3_config.priority = sc.winter_adaptive_v3.priority;
         v3_config.daily_charging_target_soc = sc.winter_adaptive_v3.daily_charging_target_soc;
-        v3_config.hdo_sensor_entity = sc.winter_adaptive_v3.hdo_sensor_entity.clone();
-        v3_config.hdo_low_tariff_czk = sc.winter_adaptive_v3.hdo_low_tariff_czk;
-        v3_config.hdo_high_tariff_czk = sc.winter_adaptive_v3.hdo_high_tariff_czk;
+        // HDO configuration is now global in PricingConfig, not per-strategy
         v3_config.winter_discharge_min_soc = sc.winter_adaptive_v3.winter_discharge_min_soc;
         v3_config.top_discharge_blocks_per_day = sc.winter_adaptive_v3.top_discharge_blocks_per_day;
+    }
+
+    // Create Winter Adaptive V4 config from core config or defaults
+    // HDO configuration is now global in PricingConfig, not per-strategy
+    let mut v4_config = WinterAdaptiveV4Config::default();
+    if let Some(sc) = strategies_config {
+        v4_config.enabled = sc.winter_adaptive_v4.enabled;
+        v4_config.priority = sc.winter_adaptive_v4.priority;
+        v4_config.target_battery_soc = sc.winter_adaptive_v4.target_battery_soc;
+        v4_config.discharge_blocks_per_day = sc.winter_adaptive_v4.discharge_blocks_per_day;
+        v4_config.min_discharge_spread_czk = sc.winter_adaptive_v4.min_discharge_spread_czk;
+    }
+
+    // Create Winter Adaptive V5 config from core config or defaults
+    // HDO configuration is now global in PricingConfig, not per-strategy
+    let mut v5_config = WinterAdaptiveV5Config::default();
+    if let Some(sc) = strategies_config {
+        v5_config.enabled = sc.winter_adaptive_v5.enabled;
+        v5_config.priority = sc.winter_adaptive_v5.priority;
+        v5_config.target_battery_soc = sc.winter_adaptive_v5.target_battery_soc;
+        v5_config.min_discharge_soc = sc.winter_adaptive_v5.min_discharge_soc;
+        v5_config.cheap_block_percentile = sc.winter_adaptive_v5.cheap_block_percentile;
+        v5_config.expensive_block_percentile = sc.winter_adaptive_v5.expensive_block_percentile;
+        v5_config.min_discharge_spread_czk = sc.winter_adaptive_v5.min_discharge_spread_czk;
+        v5_config.safety_margin_pct = sc.winter_adaptive_v5.safety_margin_pct;
     }
 
     // Register Winter Adaptive V1
@@ -328,6 +653,38 @@ pub fn init_plugin_manager(
     // Register Winter Adaptive V3
     let v3_plugin = WinterAdaptiveV3Plugin::new(v3_config, control_config.clone());
     manager.register(Arc::new(v3_plugin));
+
+    // Register Winter Adaptive V4
+    let v4_plugin = WinterAdaptiveV4Plugin::new(v4_config, control_config.clone());
+    manager.register(Arc::new(v4_plugin));
+
+    // Register Winter Adaptive V5
+    let v5_plugin = WinterAdaptiveV5Plugin::new(v5_config, control_config.clone());
+    manager.register(Arc::new(v5_plugin));
+
+    // Create Winter Adaptive V7 config from core config or defaults
+    let mut v7_config = WinterAdaptiveV7Config::default();
+    if let Some(sc) = strategies_config {
+        v7_config.enabled = sc.winter_adaptive_v7.enabled;
+        v7_config.priority = sc.winter_adaptive_v7.priority;
+        v7_config.target_battery_soc = sc.winter_adaptive_v7.target_battery_soc;
+        v7_config.min_discharge_soc = sc.winter_adaptive_v7.min_discharge_soc;
+        v7_config.min_cycle_profit_czk = sc.winter_adaptive_v7.min_cycle_profit_czk;
+        v7_config.valley_threshold_std_dev = sc.winter_adaptive_v7.valley_threshold_std_dev;
+        v7_config.peak_threshold_std_dev = sc.winter_adaptive_v7.peak_threshold_std_dev;
+        v7_config.min_export_spread_czk = sc.winter_adaptive_v7.min_export_spread_czk;
+        v7_config.min_soc_after_export = sc.winter_adaptive_v7.min_soc_after_export;
+        v7_config.avg_consumption_per_block_kwh =
+            sc.winter_adaptive_v7.avg_consumption_per_block_kwh;
+        v7_config.negative_price_handling_enabled =
+            sc.winter_adaptive_v7.negative_price_handling_enabled;
+        v7_config.battery_round_trip_efficiency =
+            sc.winter_adaptive_v7.battery_round_trip_efficiency;
+    }
+
+    // Register Winter Adaptive V7
+    let v7_plugin = WinterAdaptiveV7Plugin::new(v7_config, control_config.clone());
+    manager.register(Arc::new(v7_plugin));
 }
 
 /// Create a PluginManager with the default strategies registered.

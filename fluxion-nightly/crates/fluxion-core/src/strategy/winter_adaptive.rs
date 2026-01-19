@@ -1502,15 +1502,22 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
                     * context.control_config.battery_capacity_kwh;
                 let price = context.price_block.price_czk_per_kwh;
 
-                if usable_battery_kwh >= context.consumption_forecast_kwh {
+                // Calculate how much battery will discharge to cover load
+                let battery_discharge = usable_battery_kwh.min(context.consumption_forecast_kwh);
+
+                eval.energy_flows.battery_discharge_kwh = battery_discharge;
+
+                if battery_discharge >= context.consumption_forecast_kwh {
                     // Battery can fully cover consumption - show as avoided grid import cost
                     eval.revenue_czk = context.consumption_forecast_kwh * price;
                 } else {
                     // Battery partially depleted - split between battery and grid
                     // Battery covers what it can (avoided cost = profit)
-                    eval.revenue_czk = usable_battery_kwh * price;
+                    eval.revenue_czk = battery_discharge * price;
                     // Grid must cover the rest (actual cost)
-                    eval.cost_czk = (context.consumption_forecast_kwh - usable_battery_kwh) * price;
+                    eval.cost_czk = (context.consumption_forecast_kwh - battery_discharge) * price;
+                    eval.energy_flows.grid_import_kwh =
+                        context.consumption_forecast_kwh - battery_discharge;
                 }
             }
         }
@@ -1555,6 +1562,7 @@ mod tests {
                 block_start: base_time + chrono::Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 4.5, // Expensive
+                effective_price_czk_per_kwh: 4.5,
             });
         }
 
@@ -1564,6 +1572,7 @@ mod tests {
                 block_start: base_time + chrono::Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.2, // Very cheap
+                effective_price_czk_per_kwh: 1.2,
             });
         }
 
@@ -1573,6 +1582,7 @@ mod tests {
                 block_start: base_time + chrono::Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 6.0, // Even more expensive (>20% higher than today)
+                effective_price_czk_per_kwh: 6.0,
             });
         }
 
@@ -1654,6 +1664,7 @@ mod tests {
                 block_start: base_time + chrono::Duration::minutes(15 * i as i64),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
+                effective_price_czk_per_kwh: price,
             })
             .collect();
 
