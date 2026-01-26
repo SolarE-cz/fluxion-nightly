@@ -246,6 +246,10 @@ fn compare_strategies() {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: Some(cumulative_consumption_kwh),
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         };
 
         let evaluation = winter_strategy.evaluate(&context);

@@ -51,6 +51,9 @@ fn run_command(args: RunArgs) -> Result<()> {
             .map(|s| {
                 let trimmed = s.trim().to_lowercase();
                 match trimmed.as_str() {
+                    "v9" => "winter_adaptive_v9".to_string(),
+                    "v8" => "winter_adaptive_v8".to_string(),
+                    "v7" => "winter_adaptive_v7".to_string(),
                     "v6" => "winter_adaptive_v6".to_string(),
                     "v5" => "winter_adaptive_v5".to_string(),
                     "v4" => "winter_adaptive_v4".to_string(),
@@ -114,10 +117,17 @@ fn run_command(args: RunArgs) -> Result<()> {
             }
         };
 
+        // Parse solar profile from CLI
+        let solar_profile = match args.solar.to_lowercase().as_str() {
+            "moderate" => SolarProfile::moderate(),
+            "high" => SolarProfile::high(),
+            _ => SolarProfile::none(),
+        };
+
         let day_config = SyntheticDayConfig {
             date: chrono::Utc::now().date_naive(),
             consumption: ConsumptionProfile::default(),
-            solar: SolarProfile::None, // Winter testing
+            solar: solar_profile,
             price_scenario,
             initial_soc: args.initial_soc,
             battery_capacity_kwh: args.battery_capacity,
@@ -217,6 +227,7 @@ fn compare_command(args: CompareArgs) -> Result<()> {
         date: args.date,
         output: args.output,
         csv_path: args.csv_path,
+        solar: args.solar,
     };
 
     // Run the simulation
@@ -330,6 +341,7 @@ fn build_run_args_from_scenario(
         date,
         output,
         csv_path,
+        solar: "none".to_string(), // Batch mode uses scenario-defined solar (TODO: add to batch config)
     })
 }
 

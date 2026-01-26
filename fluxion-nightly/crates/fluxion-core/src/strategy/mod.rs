@@ -21,6 +21,8 @@ pub mod winter_adaptive_v4;
 pub mod winter_adaptive_v5;
 pub mod winter_adaptive_v6;
 pub mod winter_adaptive_v7;
+pub mod winter_adaptive_v8;
+pub mod winter_adaptive_v9;
 
 // Re-export shared locking utilities
 pub use locking::{LockedBlock, ScheduleLockState};
@@ -42,6 +44,8 @@ pub use winter_adaptive_v4::{WinterAdaptiveV4Config, WinterAdaptiveV4Strategy};
 pub use winter_adaptive_v5::{WinterAdaptiveV5Config, WinterAdaptiveV5Strategy};
 pub use winter_adaptive_v6::{WinterAdaptiveV6Config, WinterAdaptiveV6Strategy};
 pub use winter_adaptive_v7::{WinterAdaptiveV7Config, WinterAdaptiveV7Strategy};
+pub use winter_adaptive_v8::{WinterAdaptiveV8Config, WinterAdaptiveV8Strategy};
+pub use winter_adaptive_v9::{WinterAdaptiveV9Config, WinterAdaptiveV9Strategy};
 
 use chrono::{DateTime, Utc};
 use fluxion_types::config::ControlConfig;
@@ -163,6 +167,11 @@ pub struct BlockEvaluation {
 
     /// Debug information (only populated when log_level = debug)
     pub debug_info: Option<BlockDebugInfo>,
+
+    /// Profit from battery arbitrage (CZK)
+    /// Calculated as (current_price - avg_charge_price) * discharge_kwh
+    /// Only populated when battery discharges and avg_charge_price is available
+    pub arbitrage_profit_czk: f32,
 }
 
 impl BlockEvaluation {
@@ -186,6 +195,7 @@ impl BlockEvaluation {
             strategy_name,
             decision_uid: None,
             debug_info: None,
+            arbitrage_profit_czk: 0.0,
         }
     }
 
@@ -236,6 +246,23 @@ pub struct EvaluationContext<'a> {
     /// Total household consumption today (kWh)
     /// Used to track progress against daily predicted consumption
     pub consumption_today_kwh: Option<f32>,
+
+    /// Total solar production forecast for today (kWh)
+    /// Sum of all matching solar forecast sensors
+    pub solar_forecast_total_today_kwh: f32,
+
+    /// Remaining solar production forecast for today (kWh)
+    /// Helps strategies know if more solar is coming
+    pub solar_forecast_remaining_today_kwh: f32,
+
+    /// Solar production forecast for tomorrow (kWh)
+    /// Enables forward-looking decisions
+    pub solar_forecast_tomorrow_kwh: f32,
+
+    /// Weighted average price the battery was charged at (CZK/kWh)
+    /// Used to calculate arbitrage profit during discharge
+    /// Tracks cost basis of energy currently stored in battery
+    pub battery_avg_charge_price_czk_per_kwh: f32,
 }
 
 /// Trait for economic battery operation strategies

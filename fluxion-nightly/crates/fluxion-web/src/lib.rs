@@ -15,6 +15,7 @@ mod config_api;
 mod plugin_api;
 mod routes;
 mod simulator;
+mod user_control_api;
 mod validation;
 
 pub use backtest::BacktestState;
@@ -22,6 +23,7 @@ pub use config_api::ConfigApiState;
 pub use plugin_api::PluginApiState;
 use routes::{DashboardTemplate, LiveDataTemplate};
 pub use simulator::SimulatorState;
+pub use user_control_api::{UserControlApiState, UserControlUpdateSender};
 
 use askama::Template;
 use axum::{
@@ -36,6 +38,8 @@ use axum::{
 use chrono::{Local, NaiveTime};
 use fluxion_core::{ConfigUpdateSender, WebQueryResponse, WebQuerySender};
 use fluxion_i18n::I18n;
+use fluxion_types::UserControlState;
+use parking_lot::RwLock;
 use serde::Serialize;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -46,10 +50,22 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, trace};
 
 /// Application state for web handlers
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AppState {
     pub query_sender: WebQuerySender,
     pub i18n: Arc<I18n>,
+    /// User control state for dashboard rendering
+    pub user_control_state: Option<Arc<RwLock<UserControlState>>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("query_sender", &"<WebQuerySender>")
+            .field("i18n", &self.i18n)
+            .field("user_control_state", &self.user_control_state.is_some())
+            .finish()
+    }
 }
 
 /// Configuration for scheduled daily data export
@@ -213,6 +229,7 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 /// * `backtest_db_path` - Optional path to backtest database
 /// * `plugin_api_state` - Optional plugin API state for plugin management
 /// * `scheduled_export_config` - Optional config for daily scheduled exports (for debugging)
+/// * `user_control_api_state` - Optional user control API state for user override features
 ///
 /// # HA Ingress Support
 /// When running as HA addon, routes are accessible via:
@@ -236,15 +253,22 @@ pub async fn start_web_server(
     backtest_db_path: Option<std::path::PathBuf>,
     plugin_api_state: Option<PluginApiState>,
     scheduled_export_config: Option<ScheduledExportConfig>,
+    user_control_api_state: Option<UserControlApiState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn scheduled export task if configured
     if let Some(export_config) = scheduled_export_config {
         spawn_scheduled_export_task(query_sender.clone(), export_config);
     }
 
+    // Extract user control state from API state for dashboard rendering
+    let user_control_state = user_control_api_state
+        .as_ref()
+        .map(|uc| Arc::clone(&uc.state));
+
     let app_state = AppState {
         query_sender,
         i18n: i18n.clone(),
+        user_control_state,
     };
     let config_state =
         config_api::ConfigApiState::new(config_json, "/data/config.json", config_update_sender);
@@ -398,6 +422,36 @@ pub async fn start_web_server(
             );
     }
 
+    // Add user control API routes if state is provided
+    if let Some(uc_state) = user_control_api_state {
+        info!("🎛️ User Control API enabled");
+        app = app
+            .route(
+                "/api/user-control",
+                get(user_control_api::get_user_control).with_state(uc_state.clone()),
+            )
+            .route(
+                "/api/user-control/enabled",
+                axum::routing::put(user_control_api::set_enabled).with_state(uc_state.clone()),
+            )
+            .route(
+                "/api/user-control/restrictions",
+                axum::routing::put(user_control_api::set_restrictions).with_state(uc_state.clone()),
+            )
+            .route(
+                "/api/user-control/slots",
+                axum::routing::post(user_control_api::create_slot).with_state(uc_state.clone()),
+            )
+            .route(
+                "/api/user-control/slots/{id}",
+                axum::routing::put(user_control_api::update_slot).with_state(uc_state.clone()),
+            )
+            .route(
+                "/api/user-control/slots/{id}",
+                axum::routing::delete(user_control_api::delete_slot).with_state(uc_state),
+            );
+    }
+
     let app = app
         .layer(CorsLayer::permissive()) // Allow HA Ingress
         .with_state(app_state);
@@ -421,12 +475,19 @@ async fn index_handler(
     debug!("Dashboard page requested");
     let ingress_path = extract_ingress_path(&headers);
 
+    // Get user control state for dashboard rendering
+    let user_control = app_state
+        .user_control_state
+        .as_ref()
+        .map(|uc| uc.read().clone());
+
     match app_state.query_sender.query_dashboard().await {
         Ok(response) => {
             let template = DashboardTemplate::from_query_response(
                 response,
                 app_state.i18n.clone(),
                 ingress_path,
+                user_control,
             );
             // Askama 0.14: use .render() and convert to axum Html response
             match template.render() {
@@ -465,10 +526,12 @@ async fn stream_handler(
                 Ok(response) => {
                     // SSE doesn't have access to headers, use empty ingress path
                     // (live data template doesn't use URLs anyway)
+                    // User control state not needed for live data updates (fetched separately via JS)
                     let dashboard = DashboardTemplate::from_query_response(
                         response,
                         app_state.i18n.clone(),
                         String::new(),
+                        None,
                     );
 
                     // Create live data template from dashboard (without chart)
@@ -481,6 +544,8 @@ async fn stream_handler(
                         i18n: dashboard.i18n,
                         last_update_formatted: dashboard.last_update_formatted,
                         next_change_formatted: dashboard.next_change_formatted,
+                        consumption_stats: dashboard.consumption_stats,
+                        solar_forecast: dashboard.solar_forecast,
                     };
 
                     let html = live_template.render().unwrap_or_else(|e| {
@@ -520,10 +585,12 @@ struct ChartDataJson {
 async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoResponse {
     match app_state.query_sender.query_dashboard().await {
         Ok(response) => {
+            // User control state not needed for chart data
             let template = DashboardTemplate::from_query_response(
                 response.clone(),
                 app_state.i18n.clone(),
                 String::new(), // JSON endpoint doesn't need ingress path
+                None,
             );
 
             // Extract battery SOC from first inverter

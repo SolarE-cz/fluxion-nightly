@@ -200,6 +200,31 @@ pub enum SolarProfile {
 }
 
 impl SolarProfile {
+    /// No solar generation (winter/cloudy day)
+    pub fn none() -> Self {
+        SolarProfile::None
+    }
+
+    /// Moderate solar - typical spring/fall day
+    /// ~3 kW peak, 7am-6pm, ~12 kWh/day total
+    pub fn moderate() -> Self {
+        SolarProfile::Typical {
+            peak_kw: 3.0,
+            sunrise_hour: 7,
+            sunset_hour: 18,
+        }
+    }
+
+    /// High solar - summer day
+    /// ~5 kW peak, 5am-9pm, ~25 kWh/day total
+    pub fn high() -> Self {
+        SolarProfile::Typical {
+            peak_kw: 5.0,
+            sunrise_hour: 5,
+            sunset_hour: 21,
+        }
+    }
+
     /// Generate solar production for a specific block (in kWh for 15-minute period)
     pub fn generation_for_block(&self, block_index: usize) -> f32 {
         match self {

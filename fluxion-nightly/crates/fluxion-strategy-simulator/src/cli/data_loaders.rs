@@ -75,17 +75,21 @@ impl DataLoader for SqliteLoader {
         let start_ts = Utc.from_utc_datetime(&start_of_day).timestamp();
         let end_ts = Utc.from_utc_datetime(&end_of_day).timestamp();
 
-        // Load consumption data (house_load_w from historical_plant_data)
+        // Load consumption and solar data (house_load_w, pv_power_w from historical_plant_data)
         let mut stmt = conn.prepare(
-            "SELECT timestamp, house_load_w
+            "SELECT timestamp, house_load_w, pv_power_w
              FROM historical_plant_data
              WHERE timestamp >= ?1 AND timestamp <= ?2
              ORDER BY timestamp ASC",
         )?;
 
-        let consumption_records: Vec<(i64, f32)> = stmt
+        let plant_records: Vec<(i64, f32, f32)> = stmt
             .query_map([start_ts, end_ts], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)? as f32,
+                    row.get::<_, f64>(2).unwrap_or(0.0) as f32,
+                ))
             })?
             .filter_map(std::result::Result::ok)
             .collect();
@@ -107,6 +111,7 @@ impl DataLoader for SqliteLoader {
         // Aggregate into 96 15-minute blocks
         let mut blocks = Vec::with_capacity(96);
         let mut total_consumption = 0.0;
+        let mut total_solar = 0.0;
         let base_dt = Utc.from_utc_datetime(&start_of_day);
 
         for i in 0..96 {
@@ -116,21 +121,28 @@ impl DataLoader for SqliteLoader {
             let block_end_ts = block_end.timestamp();
             let hour = i / 4;
 
-            // Aggregate consumption (5-min samples -> 15-min block)
-            // house_load_w is in watts, need to convert to kWh for 5-min interval
-            let consumption_samples: Vec<f32> = consumption_records
+            // Aggregate consumption and solar (5-min samples -> 15-min block)
+            // Watts to kWh for 5-min interval: W / 1000 * (5/60) = kWh
+            let samples_in_block: Vec<(f32, f32)> = plant_records
                 .iter()
-                .filter(|(ts, _)| *ts >= block_start_ts && *ts < block_end_ts)
-                .map(|(_, load_w)| load_w / 1000.0 * (5.0 / 60.0)) // W -> kW, 5 min -> hours
+                .filter(|(ts, _, _)| *ts >= block_start_ts && *ts < block_end_ts)
+                .map(|(_, load_w, pv_w)| {
+                    let consumption = load_w / 1000.0 * (5.0 / 60.0);
+                    let solar = pv_w / 1000.0 * (5.0 / 60.0);
+                    (consumption, solar)
+                })
                 .collect();
 
-            let consumption_kwh = if consumption_samples.is_empty() {
-                0.25 // Default: 1kW base load
+            let (consumption_kwh, solar_kwh) = if samples_in_block.is_empty() {
+                (0.25, 0.0) // Default: 1kW base load, no solar
             } else {
-                consumption_samples.iter().sum::<f32>()
+                let consumption: f32 = samples_in_block.iter().map(|(c, _)| c).sum();
+                let solar: f32 = samples_in_block.iter().map(|(_, s)| s).sum();
+                (consumption, solar)
             };
 
             total_consumption += consumption_kwh;
+            total_solar += solar_kwh;
 
             // Find price for this block (prices are already in 15-min blocks)
             let price_czk_per_kwh = price_records
@@ -156,7 +168,7 @@ impl DataLoader for SqliteLoader {
                 index: i,
                 timestamp: block_start,
                 consumption_kwh,
-                solar_kwh: 0.0, // Will be zero for historical data (already netted out)
+                solar_kwh,
                 price_czk_per_kwh,
                 grid_fee_czk_per_kwh,
                 effective_price_czk_per_kwh,
@@ -169,7 +181,7 @@ impl DataLoader for SqliteLoader {
             blocks,
             price_scenario_name: format!("Historical ({})", date),
             total_consumption_kwh: total_consumption,
-            total_solar_kwh: 0.0,
+            total_solar_kwh: total_solar,
             initial_soc: self.initial_soc,
             battery_capacity_kwh: self.battery_capacity_kwh,
         })

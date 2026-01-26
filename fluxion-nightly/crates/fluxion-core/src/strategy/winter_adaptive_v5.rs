@@ -273,7 +273,7 @@ impl WinterAdaptiveV5Strategy {
         let charge_per_block_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
         let blocks_needed = (total_energy_needed / charge_per_block_kwh).ceil() as usize;
 
-        tracing::info!(
+        tracing::debug!(
             "V5: Energy needs - SOC: {:.2} kWh, expensive blocks: {:.2} kWh, reserve: {:.2} kWh, total: {:.2} kWh ({} blocks)",
             soc_energy_kwh,
             expensive_energy_kwh,
@@ -302,7 +302,7 @@ impl WinterAdaptiveV5Strategy {
             selected.insert(block.index);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "V5: Selected {} charge blocks from {} cheap blocks available",
             selected.len(),
             cheap_blocks.len()
@@ -368,7 +368,7 @@ impl WinterAdaptiveV5Strategy {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "V5: Selected {} discharge blocks (avg charge price {:.3}, min spread {:.3})",
             selected.len(),
             avg_charge_price,

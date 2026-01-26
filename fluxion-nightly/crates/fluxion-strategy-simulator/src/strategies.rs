@@ -15,7 +15,8 @@ use fluxion_core::strategy::{
     WinterAdaptiveV3Config, WinterAdaptiveV3Strategy, WinterAdaptiveV4Config,
     WinterAdaptiveV4Strategy, WinterAdaptiveV5Config, WinterAdaptiveV5Strategy,
     WinterAdaptiveV6Config, WinterAdaptiveV6Strategy, WinterAdaptiveV7Config,
-    WinterAdaptiveV7Strategy,
+    WinterAdaptiveV7Strategy, WinterAdaptiveV8Config, WinterAdaptiveV8Strategy,
+    WinterAdaptiveV9Config, WinterAdaptiveV9Strategy,
 };
 use fluxion_types::inverter::InverterOperationMode;
 use serde::{Deserialize, Serialize};
@@ -119,6 +120,22 @@ impl StrategyRegistry {
             )),
         );
 
+        // V8 - Winter Adaptive V8 (Solar-Aware Multi-Cycle Optimizer)
+        strategies.insert(
+            "winter_adaptive_v8".to_string(),
+            Arc::new(WinterAdaptiveV8Strategy::new(
+                WinterAdaptiveV8Config::default(),
+            )),
+        );
+
+        // V9 - Winter Adaptive V9 (Solar-Aware Morning Peak Optimizer)
+        strategies.insert(
+            "winter_adaptive_v9".to_string(),
+            Arc::new(WinterAdaptiveV9Strategy::new(
+                WinterAdaptiveV9Config::default(),
+            )),
+        );
+
         // Baselines
         strategies.insert("no_battery".to_string(), Arc::new(NoBatteryBaseline));
 
@@ -172,6 +189,20 @@ impl StrategyRegistry {
                 name: "Winter Adaptive V7".to_string(),
                 description: "Unconstrained Multi-Cycle Arbitrage Optimizer - maximum cost savings with no artificial limits".to_string(),
                 version: "V7".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
+                id: "winter_adaptive_v8".to_string(),
+                name: "Winter Adaptive V8".to_string(),
+                description: "Solar-Aware Multi-Cycle Optimizer - V7 enhanced with solar forecast integration".to_string(),
+                version: "V8".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
+                id: "winter_adaptive_v9".to_string(),
+                name: "Winter Adaptive V9".to_string(),
+                description: "Solar-Aware Morning Peak Optimizer - minimal grid charging on sunny days, covers morning peak only".to_string(),
+                version: "V9".to_string(),
                 is_baseline: false,
             },
             StrategyInfo {
@@ -401,6 +432,10 @@ mod tests {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         }
     }
 

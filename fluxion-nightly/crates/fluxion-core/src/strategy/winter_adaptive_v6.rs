@@ -246,7 +246,7 @@ impl WinterAdaptiveV6Strategy {
             );
         }
 
-        // Extract effective prices
+        // Extract effective prices for statistics
         let prices: Vec<f32> = all_blocks
             .iter()
             .map(|b| b.effective_price_czk_per_kwh)
@@ -270,7 +270,10 @@ impl WinterAdaptiveV6Strategy {
             0.0
         };
 
-        let has_negative_prices = min_price < 0.0;
+        // Check for negative SPOT prices (before grid fees)
+        // Even if effective price is positive due to fees, negative spot prices
+        // indicate the market is paying to take power - worth exploiting
+        let has_negative_prices = all_blocks.iter().any(|b| b.price_czk_per_kwh < 0.0);
 
         let day_night_spread_ratio = if min_price.abs() > 0.01 {
             max_price / min_price.abs().max(0.01) // Avoid division by zero
@@ -421,15 +424,17 @@ impl WinterAdaptiveV6Strategy {
         let effective_price = context.price_block.effective_price_czk_per_kwh;
 
         // PRIORITY 1: Negative price exploitation (if enabled)
+        // Check SPOT price for negativity - even with grid fees, negative spot means
+        // the market is paying to take power, which is always worth exploiting
         if self.config.negative_price_handling_enabled
-            && effective_price < 0.0
+            && current_price < 0.0
             && context.current_battery_soc < self.config.target_battery_soc
         {
             return (
                 InverterOperationMode::ForceCharge,
                 format!(
-                    "NEGATIVE PRICE EXPLOIT: effective price {:.3} CZK/kWh (getting paid to charge!) [mode: {}]",
-                    effective_price,
+                    "NEGATIVE PRICE EXPLOIT: spot price {:.3} CZK/kWh (getting paid to charge!) [mode: {}]",
+                    current_price,
                     mode.name()
                 ),
                 "winter_adaptive_v6:negative_exploit".to_string(),
@@ -534,10 +539,10 @@ impl EconomicStrategy for WinterAdaptiveV6Strategy {
                 self.get_percentile_charge_blocks(&ranked_blocks)
             }
             OptimizationMode::NegativeExploit => {
-                // Charge during all negative price blocks + cheapest positive blocks
+                // Charge during all negative SPOT price blocks + cheapest positive blocks
                 let negative_blocks: Vec<usize> = ranked_blocks
                     .iter()
-                    .filter(|b| b.effective_price < 0.0)
+                    .filter(|b| b.spot_price < 0.0)
                     .map(|b| b.index)
                     .collect();
 
@@ -732,6 +737,10 @@ mod tests {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         };
 
         let eval = strategy.evaluate(&context);

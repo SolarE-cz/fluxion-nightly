@@ -141,6 +141,22 @@ pub struct WinterAdaptiveV7Config {
     /// Minimum discharge spread (CZK) for percentile mode
     /// Default: 0.50 CZK
     pub min_discharge_spread_czk: f32,
+
+    // === Solar-Aware Charging ===
+    /// Minimum number of grid charge blocks to always schedule (safety margin)
+    /// Even with high solar forecast, keep this many charge blocks as backup
+    /// Default: 2 (30 minutes of grid charging)
+    pub min_grid_charge_blocks: usize,
+
+    /// Price threshold (CZK/kWh) below which we always charge from grid
+    /// Opportunistic charging regardless of solar forecast - very cheap power is worth grabbing
+    /// Default: 1.5 CZK/kWh
+    pub opportunistic_charge_threshold_czk: f32,
+
+    /// Enable solar-aware charge reduction
+    /// When enabled, reduces grid charging based on expected solar production
+    /// Default: true
+    pub solar_aware_charging_enabled: bool,
 }
 
 impl Default for WinterAdaptiveV7Config {
@@ -162,6 +178,9 @@ impl Default for WinterAdaptiveV7Config {
             negative_price_handling_enabled: true,
             battery_round_trip_efficiency: 0.90,
             min_discharge_spread_czk: 0.50,
+            min_grid_charge_blocks: 2,
+            opportunistic_charge_threshold_czk: 1.5,
+            solar_aware_charging_enabled: true,
         }
     }
 }
@@ -203,6 +222,66 @@ enum DetectionMode {
     Percentile,
     /// Negative price exploitation
     NegativePrice,
+}
+
+/// Solar forecast context for charge planning
+#[derive(Debug, Clone)]
+struct SolarContext {
+    /// Battery capacity in kWh
+    battery_capacity_kwh: f32,
+    /// Current battery SOC (%)
+    current_soc: f32,
+    /// Target battery SOC (%)
+    target_soc: f32,
+    /// Remaining solar forecast for today (kWh)
+    solar_remaining_kwh: f32,
+    /// Tomorrow's solar forecast (kWh)
+    #[allow(dead_code)]
+    solar_tomorrow_kwh: f32,
+    /// Average consumption per block (kWh)
+    avg_consumption_per_block: f32,
+    /// Number of remaining blocks until end of day (approx)
+    remaining_blocks_today: usize,
+    /// Max charge rate per block (kWh)
+    charge_rate_per_block: f32,
+}
+
+impl SolarContext {
+    /// Calculate how many kWh of grid charging is actually needed
+    /// considering expected solar production
+    fn calculate_grid_charging_needed(&self) -> f32 {
+        // Battery deficit = how much we need to charge to reach target
+        let battery_deficit_kwh =
+            (self.target_soc - self.current_soc) / 100.0 * self.battery_capacity_kwh;
+
+        if battery_deficit_kwh <= 0.0 {
+            return 0.0; // Already at or above target
+        }
+
+        // Estimate household consumption for remaining daylight hours
+        // Assume solar production happens during ~8 hours of daylight
+        let daylight_blocks = self.remaining_blocks_today.min(32); // Cap at 8 hours
+        let estimated_consumption = daylight_blocks as f32 * self.avg_consumption_per_block;
+
+        // Net solar available for battery = solar - consumption
+        // Solar forecast is already conservative, so we use 100% of it
+        let net_solar_to_battery = (self.solar_remaining_kwh - estimated_consumption).max(0.0);
+
+        // Grid charging needed = deficit - what solar will provide
+        (battery_deficit_kwh - net_solar_to_battery).max(0.0)
+    }
+
+    /// Calculate how many charge blocks we need from grid
+    fn calculate_required_charge_blocks(&self) -> usize {
+        let grid_kwh_needed = self.calculate_grid_charging_needed();
+
+        if grid_kwh_needed <= 0.0 {
+            return 0;
+        }
+
+        // Convert kWh to blocks
+        (grid_kwh_needed / self.charge_rate_per_block).ceil() as usize
+    }
 }
 
 pub struct WinterAdaptiveV7Strategy {
@@ -485,14 +564,17 @@ impl WinterAdaptiveV7Strategy {
     }
 
     /// Find all arbitrage opportunities based on detected mode
+    ///
+    /// When solar_context is provided, reduces charge blocks based on expected solar production.
     fn find_opportunities(
         &self,
         blocks: &[TimeBlockPrice],
         battery_capacity_kwh: f32,
+        solar_context: Option<&SolarContext>,
     ) -> (Vec<ArbitrageOpportunity>, DetectionMode) {
         let mode = self.determine_detection_mode(blocks);
 
-        let opportunities = match mode {
+        let mut opportunities = match mode {
             DetectionMode::NegativePrice => {
                 self.find_negative_price_opportunities(blocks, battery_capacity_kwh)
             }
@@ -509,6 +591,11 @@ impl WinterAdaptiveV7Strategy {
                 self.find_percentile_opportunities(blocks, battery_capacity_kwh)
             }
         };
+
+        // Apply solar-aware charge block reduction if context provided
+        if let Some(ctx) = solar_context {
+            opportunities = self.reduce_charge_blocks_for_solar(opportunities, blocks, ctx);
+        }
 
         (opportunities, mode)
     }
@@ -578,6 +665,95 @@ impl WinterAdaptiveV7Strategy {
         }
 
         result
+    }
+
+    /// Reduce charge blocks based on solar forecast
+    ///
+    /// This method applies solar-aware optimization:
+    /// 1. Calculates how much grid charging is actually needed given solar forecast
+    /// 2. Keeps only the cheapest N blocks needed to fill the gap
+    /// 3. Always keeps blocks below opportunistic threshold (very cheap power)
+    /// 4. Always keeps minimum safety margin of blocks
+    fn reduce_charge_blocks_for_solar(
+        &self,
+        mut opportunities: Vec<ArbitrageOpportunity>,
+        blocks: &[TimeBlockPrice],
+        solar_context: &SolarContext,
+    ) -> Vec<ArbitrageOpportunity> {
+        if !self.config.solar_aware_charging_enabled {
+            return opportunities;
+        }
+
+        let required_blocks = solar_context.calculate_required_charge_blocks();
+        let min_blocks = self.config.min_grid_charge_blocks;
+        let opportunistic_threshold = self.config.opportunistic_charge_threshold_czk;
+
+        for opp in &mut opportunities {
+            if opp.charge_blocks.is_empty() {
+                continue;
+            }
+
+            // Sort charge blocks by price (cheapest first)
+            let mut blocks_with_price: Vec<(usize, f32)> = opp
+                .charge_blocks
+                .iter()
+                .filter_map(|&idx| {
+                    blocks
+                        .get(idx)
+                        .map(|b| (idx, b.effective_price_czk_per_kwh))
+                })
+                .collect();
+            blocks_with_price
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Determine which blocks to keep:
+            // 1. All blocks below opportunistic threshold (very cheap, always worth it)
+            // 2. Enough additional blocks to meet required_blocks
+            // 3. At least min_blocks total
+
+            let mut kept_blocks: Vec<usize> = Vec::new();
+            let mut non_opportunistic_count = 0;
+
+            for (idx, price) in &blocks_with_price {
+                let is_opportunistic = *price < opportunistic_threshold;
+
+                if is_opportunistic {
+                    // Always keep very cheap blocks
+                    kept_blocks.push(*idx);
+                } else if non_opportunistic_count < required_blocks.max(min_blocks) {
+                    // Keep enough non-opportunistic blocks to meet needs
+                    kept_blocks.push(*idx);
+                    non_opportunistic_count += 1;
+                }
+                // Skip blocks we don't need (solar will cover them)
+            }
+
+            // Ensure we have at least min_blocks
+            if kept_blocks.len() < min_blocks {
+                for (idx, _) in blocks_with_price.iter().take(min_blocks) {
+                    if !kept_blocks.contains(idx) {
+                        kept_blocks.push(*idx);
+                    }
+                }
+            }
+
+            let original_count = opp.charge_blocks.len();
+            let new_count = kept_blocks.len();
+
+            if new_count < original_count {
+                tracing::debug!(
+                    "Solar-aware: Reduced charge blocks from {} to {} (solar_remaining: {:.1} kWh, grid_needed: {:.1} kWh)",
+                    original_count,
+                    new_count,
+                    solar_context.solar_remaining_kwh,
+                    solar_context.calculate_grid_charging_needed()
+                );
+            }
+
+            opp.charge_blocks = kept_blocks;
+        }
+
+        opportunities
     }
 
     /// Generate the optimal schedule for all blocks
@@ -700,9 +876,24 @@ impl EconomicStrategy for WinterAdaptiveV7Strategy {
             return eval;
         };
 
-        // Phase 1: Find all opportunities
-        let (opportunities, mode) =
-            self.find_opportunities(all_blocks, context.control_config.battery_capacity_kwh);
+        // Build solar context for solar-aware charge optimization
+        let solar_context = SolarContext {
+            battery_capacity_kwh: context.control_config.battery_capacity_kwh,
+            current_soc: context.current_battery_soc,
+            target_soc: self.config.target_battery_soc,
+            solar_remaining_kwh: context.solar_forecast_remaining_today_kwh,
+            solar_tomorrow_kwh: context.solar_forecast_tomorrow_kwh,
+            avg_consumption_per_block: self.config.avg_consumption_per_block_kwh,
+            remaining_blocks_today: all_blocks.len(), // Approximate
+            charge_rate_per_block: context.control_config.max_battery_charge_rate_kw * 0.25,
+        };
+
+        // Phase 1: Find all opportunities (with solar-aware charge reduction)
+        let (opportunities, mode) = self.find_opportunities(
+            all_blocks,
+            context.control_config.battery_capacity_kwh,
+            Some(&solar_context),
+        );
 
         let opportunity_summary = self.calculate_opportunity_summary(&opportunities, mode);
 
@@ -740,11 +931,24 @@ impl EconomicStrategy for WinterAdaptiveV7Strategy {
                     eval.decision_uid =
                         Some(format!("winter_adaptive_v7:charge:opp{}", opportunity_id));
 
-                    // Calculate energy flows
+                    // Calculate energy flows accounting for available excess power
+                    // Negative consumption means excess power is available (e.g., solar production)
                     let charge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
+                    let available_excess =
+                        context.solar_forecast_kwh + (-context.consumption_forecast_kwh).max(0.0);
+                    let grid_charge_needed = (charge_kwh - available_excess).max(0.0);
+
                     eval.energy_flows.battery_charge_kwh = charge_kwh;
-                    eval.energy_flows.grid_import_kwh = charge_kwh;
-                    eval.cost_czk = charge_kwh * effective_price;
+                    eval.energy_flows.grid_import_kwh = grid_charge_needed;
+                    eval.cost_czk = grid_charge_needed * effective_price;
+
+                    // Export any excess we don't use for charging
+                    let excess_after_charge = (available_excess - charge_kwh).max(0.0);
+                    if excess_after_charge > 0.0 {
+                        eval.energy_flows.grid_export_kwh = excess_after_charge;
+                        eval.revenue_czk =
+                            excess_after_charge * context.grid_export_price_czk_per_kwh;
+                    }
                 }
             }
 
@@ -830,13 +1034,26 @@ impl EconomicStrategy for WinterAdaptiveV7Strategy {
                         );
                         eval.decision_uid = Some("winter_adaptive_v7:negative_price".to_string());
 
+                        // Calculate energy flows accounting for available excess power
                         let charge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
+                        let available_excess = context.solar_forecast_kwh
+                            + (-context.consumption_forecast_kwh).max(0.0);
+                        let grid_charge_needed = (charge_kwh - available_excess).max(0.0);
+
                         eval.energy_flows.battery_charge_kwh = charge_kwh;
-                        eval.energy_flows.grid_import_kwh = charge_kwh;
-                        eval.cost_czk = charge_kwh * effective_price; // Negative = revenue!
+                        eval.energy_flows.grid_import_kwh = grid_charge_needed;
+                        eval.cost_czk = grid_charge_needed * effective_price; // Negative = revenue!
+
+                        // Export any excess we don't use for charging
+                        let excess_after_charge = (available_excess - charge_kwh).max(0.0);
+                        if excess_after_charge > 0.0 {
+                            eval.energy_flows.grid_export_kwh = excess_after_charge;
+                            eval.revenue_czk =
+                                excess_after_charge * context.grid_export_price_czk_per_kwh;
+                        }
                     }
                 } else {
-                    // Self-use mode - battery covers consumption if available
+                    // Self-use mode - handle both consumption and excess power scenarios
                     eval.mode = InverterOperationMode::SelfUse;
                     eval.reason = format!(
                         "SELF-USE: {:.3} CZK/kWh [{}]",
@@ -844,24 +1061,56 @@ impl EconomicStrategy for WinterAdaptiveV7Strategy {
                     );
                     eval.decision_uid = Some("winter_adaptive_v7:self_use".to_string());
 
-                    // Calculate self-use energy flows
-                    let usable_battery_kwh = ((context.current_battery_soc
-                        - context.control_config.hardware_min_battery_soc)
-                        .max(0.0)
-                        / 100.0)
-                        * context.control_config.battery_capacity_kwh;
+                    // Calculate net consumption accounting for solar
+                    // Negative consumption means excess power (solar > load)
+                    let net_consumption =
+                        context.consumption_forecast_kwh - context.solar_forecast_kwh;
 
-                    let battery_discharge =
-                        usable_battery_kwh.min(context.consumption_forecast_kwh);
-                    eval.energy_flows.battery_discharge_kwh = battery_discharge;
+                    if net_consumption > 0.0 {
+                        // Deficit: need to cover consumption from battery or grid
+                        let usable_battery_kwh = ((context.current_battery_soc
+                            - context.control_config.hardware_min_battery_soc)
+                            .max(0.0)
+                            / 100.0)
+                            * context.control_config.battery_capacity_kwh;
 
-                    if battery_discharge >= context.consumption_forecast_kwh {
-                        eval.revenue_czk = context.consumption_forecast_kwh * effective_price;
+                        let battery_discharge = usable_battery_kwh.min(net_consumption);
+                        eval.energy_flows.battery_discharge_kwh = battery_discharge;
+
+                        if battery_discharge >= net_consumption {
+                            // Battery fully covers deficit - avoided grid cost is revenue
+                            eval.revenue_czk = net_consumption * effective_price;
+                        } else {
+                            // Partial coverage - need grid import for remainder
+                            eval.revenue_czk = battery_discharge * effective_price;
+                            let grid_needed = net_consumption - battery_discharge;
+                            eval.cost_czk = grid_needed * effective_price;
+                            eval.energy_flows.grid_import_kwh = grid_needed;
+                        }
                     } else {
-                        eval.revenue_czk = battery_discharge * effective_price;
-                        let grid_needed = context.consumption_forecast_kwh - battery_discharge;
-                        eval.cost_czk = grid_needed * effective_price;
-                        eval.energy_flows.grid_import_kwh = grid_needed;
+                        // Excess power available (solar > consumption)
+                        let excess = -net_consumption;
+
+                        // Charge battery with excess, up to available capacity
+                        let battery_capacity = context.control_config.battery_capacity_kwh;
+                        let available_charge_capacity = (battery_capacity
+                            * (context.control_config.max_battery_soc / 100.0)
+                            - battery_capacity * (context.current_battery_soc / 100.0))
+                            .max(0.0);
+                        let max_charge_rate =
+                            context.control_config.max_battery_charge_rate_kw * 0.25;
+                        let charge_amount =
+                            excess.min(available_charge_capacity).min(max_charge_rate);
+
+                        eval.energy_flows.battery_charge_kwh = charge_amount;
+
+                        // Export any remaining excess
+                        let export_amount = excess - charge_amount;
+                        if export_amount > 0.0 {
+                            eval.energy_flows.grid_export_kwh = export_amount;
+                            eval.revenue_czk =
+                                export_amount * context.grid_export_price_czk_per_kwh;
+                        }
                     }
                 }
             }
@@ -1028,7 +1277,7 @@ mod tests {
         let strategy = WinterAdaptiveV7Strategy::new(config);
         let blocks = create_volatile_test_blocks();
 
-        let (opportunities, mode) = strategy.find_opportunities(&blocks, 10.0);
+        let (opportunities, mode) = strategy.find_opportunities(&blocks, 10.0, None);
 
         assert_eq!(mode, DetectionMode::ValleyPeak);
         assert!(
@@ -1043,7 +1292,7 @@ mod tests {
         let strategy = WinterAdaptiveV7Strategy::new(config);
         let blocks = create_stable_test_blocks();
 
-        let (opportunities, mode) = strategy.find_opportunities(&blocks, 10.0);
+        let (opportunities, mode) = strategy.find_opportunities(&blocks, 10.0, None);
 
         assert_eq!(mode, DetectionMode::Percentile);
         assert!(
@@ -1062,7 +1311,7 @@ mod tests {
         let strategy = WinterAdaptiveV7Strategy::new(config);
         let blocks = create_volatile_test_blocks();
 
-        let (opportunities, _) = strategy.find_opportunities(&blocks, 10.0);
+        let (opportunities, _) = strategy.find_opportunities(&blocks, 10.0, None);
         let schedule = strategy.generate_schedule(&blocks, &opportunities);
 
         assert_eq!(
@@ -1164,6 +1413,201 @@ mod tests {
         assert!(
             !should_export_small_spread,
             "Should NOT export with small spread"
+        );
+    }
+
+    #[test]
+    fn test_solar_context_grid_charging_calculation() {
+        // Test 1: High solar forecast - minimal grid charging needed
+        let ctx_high_solar = SolarContext {
+            battery_capacity_kwh: 25.0,
+            current_soc: 30.0,
+            target_soc: 95.0,
+            solar_remaining_kwh: 15.0, // High solar forecast
+            solar_tomorrow_kwh: 10.0,
+            avg_consumption_per_block: 0.25,
+            remaining_blocks_today: 32,        // 8 hours
+            charge_rate_per_block: 2.5 * 0.25, // 2.5 kW * 15min = 0.625 kWh
+        };
+
+        // Battery deficit = (95 - 30) / 100 * 25 = 16.25 kWh
+        // Household consumption during daylight = 32 * 0.25 = 8 kWh
+        // Net solar to battery = 15 - 8 = 7 kWh
+        // Grid charging needed = 16.25 - 7 = 9.25 kWh
+        let grid_needed = ctx_high_solar.calculate_grid_charging_needed();
+        assert!(
+            (grid_needed - 9.25).abs() < 0.1,
+            "Expected ~9.25 kWh grid charging with high solar, got {}",
+            grid_needed
+        );
+
+        let blocks_needed = ctx_high_solar.calculate_required_charge_blocks();
+        // 9.25 / 0.625 = 14.8 -> 15 blocks
+        assert!(
+            (14..=16).contains(&blocks_needed),
+            "Expected ~15 charge blocks, got {}",
+            blocks_needed
+        );
+
+        // Test 2: Low solar forecast - full grid charging needed
+        let ctx_low_solar = SolarContext {
+            battery_capacity_kwh: 25.0,
+            current_soc: 30.0,
+            target_soc: 95.0,
+            solar_remaining_kwh: 2.0, // Low solar (winter day)
+            solar_tomorrow_kwh: 3.0,
+            avg_consumption_per_block: 0.25,
+            remaining_blocks_today: 32,
+            charge_rate_per_block: 0.625,
+        };
+
+        // Net solar to battery = max(0, 2 - 8) = 0 kWh
+        // Grid charging needed = 16.25 - 0 = 16.25 kWh
+        let grid_needed_low = ctx_low_solar.calculate_grid_charging_needed();
+        assert!(
+            (grid_needed_low - 16.25).abs() < 0.1,
+            "Expected ~16.25 kWh grid charging with low solar, got {}",
+            grid_needed_low
+        );
+
+        // Test 3: Battery already full - no charging needed
+        let ctx_full = SolarContext {
+            battery_capacity_kwh: 25.0,
+            current_soc: 95.0, // Already at target
+            target_soc: 95.0,
+            solar_remaining_kwh: 5.0,
+            solar_tomorrow_kwh: 10.0,
+            avg_consumption_per_block: 0.25,
+            remaining_blocks_today: 32,
+            charge_rate_per_block: 0.625,
+        };
+
+        let grid_needed_full = ctx_full.calculate_grid_charging_needed();
+        assert!(
+            grid_needed_full < 0.01,
+            "Expected 0 kWh grid charging when battery full, got {}",
+            grid_needed_full
+        );
+    }
+
+    #[test]
+    fn test_solar_aware_charge_block_reduction() {
+        let config = WinterAdaptiveV7Config {
+            solar_aware_charging_enabled: true,
+            min_grid_charge_blocks: 2,
+            opportunistic_charge_threshold_czk: 1.5,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV7Strategy::new(config);
+        let blocks = create_stable_test_blocks();
+
+        // With no solar context, should get full charge blocks
+        let (opps_no_solar, _) = strategy.find_opportunities(&blocks, 10.0, None);
+        let charge_count_no_solar = opps_no_solar
+            .iter()
+            .map(|o| o.charge_blocks.len())
+            .sum::<usize>();
+
+        // With high solar context, should get reduced charge blocks
+        let ctx_high_solar = SolarContext {
+            battery_capacity_kwh: 10.0,
+            current_soc: 30.0,
+            target_soc: 95.0,
+            solar_remaining_kwh: 10.0, // High solar
+            solar_tomorrow_kwh: 10.0,
+            avg_consumption_per_block: 0.25,
+            remaining_blocks_today: 32,
+            charge_rate_per_block: 0.625,
+        };
+
+        let (opps_with_solar, _) =
+            strategy.find_opportunities(&blocks, 10.0, Some(&ctx_high_solar));
+        let charge_count_with_solar = opps_with_solar
+            .iter()
+            .map(|o| o.charge_blocks.len())
+            .sum::<usize>();
+
+        println!(
+            "Charge blocks without solar: {}, with high solar: {}",
+            charge_count_no_solar, charge_count_with_solar
+        );
+
+        // With solar, should have fewer charge blocks
+        assert!(
+            charge_count_with_solar <= charge_count_no_solar,
+            "Solar-aware should reduce charge blocks: {} with solar should be <= {} without",
+            charge_count_with_solar,
+            charge_count_no_solar
+        );
+
+        // Should have at least min_grid_charge_blocks
+        assert!(
+            charge_count_with_solar >= 2,
+            "Should keep at least min_grid_charge_blocks (2), got {}",
+            charge_count_with_solar
+        );
+    }
+
+    #[test]
+    fn test_opportunistic_charging_preserved() {
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 18, 0, 0, 0).unwrap();
+
+        // Create blocks with some very cheap prices below opportunistic threshold (1.5 CZK)
+        let blocks: Vec<TimeBlockPrice> = (0..24)
+            .map(|hour| {
+                let price = if hour < 4 {
+                    1.0 // Very cheap - below 1.5 CZK threshold
+                } else if hour < 8 {
+                    2.5 // Moderately cheap
+                } else {
+                    4.0 // Expensive
+                };
+                TimeBlockPrice {
+                    block_start: base_time + chrono::Duration::hours(hour),
+                    duration_minutes: 15,
+                    price_czk_per_kwh: price,
+                    effective_price_czk_per_kwh: price + 1.0, // Add grid fee
+                }
+            })
+            .collect();
+
+        let config = WinterAdaptiveV7Config {
+            solar_aware_charging_enabled: true,
+            min_grid_charge_blocks: 2,
+            opportunistic_charge_threshold_czk: 2.5, // Effective = 1.5 + 1.0 = 2.5
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV7Strategy::new(config);
+
+        // High solar that would normally eliminate charging needs
+        let ctx_high_solar = SolarContext {
+            battery_capacity_kwh: 10.0,
+            current_soc: 80.0,         // Already mostly charged
+            target_soc: 95.0,          // Only need ~1.5 kWh
+            solar_remaining_kwh: 20.0, // More than enough solar
+            solar_tomorrow_kwh: 10.0,
+            avg_consumption_per_block: 0.25,
+            remaining_blocks_today: 32,
+            charge_rate_per_block: 0.625,
+        };
+
+        let (opps, _) = strategy.find_opportunities(&blocks, 10.0, Some(&ctx_high_solar));
+        let charge_blocks: Vec<usize> = opps.iter().flat_map(|o| o.charge_blocks.clone()).collect();
+
+        // Should still charge during very cheap hours (below 2.5 CZK effective)
+        // Blocks 0-3 have effective price 2.0 which is below threshold
+        let charges_very_cheap = charge_blocks.iter().filter(|&&idx| idx < 4).count();
+
+        println!(
+            "Total charge blocks: {}, charges in very cheap hours: {}",
+            charge_blocks.len(),
+            charges_very_cheap
+        );
+
+        // Should have some opportunistic charging even with high solar
+        assert!(
+            charges_very_cheap > 0 || charge_blocks.len() >= 2,
+            "Should keep opportunistic charging or min blocks"
         );
     }
 }

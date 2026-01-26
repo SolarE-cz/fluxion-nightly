@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ha::client::HomeAssistantClient;
+use crate::ha::solar_forecast_fetcher;
 
 /// Resource: configuration for Home Assistant API access
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -107,11 +108,16 @@ impl Plugin for HaPlugin {
             // resources like HdoSender/BackupSocSender aren't available until PostStartup.
             .add_systems(PostStartup, spawn_backup_soc_fetcher)
             .add_systems(PostStartup, spawn_hdo_fetcher)
+            .add_systems(
+                PostStartup,
+                solar_forecast_fetcher::spawn_solar_forecast_fetcher,
+            )
             .add_systems(Update, ha_poll_select_manual_mode_system)
             .add_systems(Update, ha_write_select_system)
             .add_systems(Update, timezone_sync_system)
             .add_systems(Update, poll_backup_soc_channel)
-            .add_systems(Update, poll_hdo_channel);
+            .add_systems(Update, poll_hdo_channel)
+            .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel);
     }
 }
 
@@ -591,8 +597,9 @@ fn parse_hdo_periods_from_state(state: &crate::ha::types::HaEntityState) -> Vec<
     if periods.is_empty() {
         // List of possible paths to the signals array
         let signals_paths: Vec<Vec<&str>> = vec![
+            vec!["raw_json", "data", "data", "signals"], // new cez_hdo_raw_data sensor
             vec!["data", "signals"],
-            vec!["response_json", "data", "signals"],
+            vec!["response_json", "data", "signals"], // legacy cez_hdo_lowtariffstart sensor
         ];
 
         for path in signals_paths {
@@ -736,7 +743,7 @@ mod tests {
         });
 
         let state = crate::ha::types::HaEntityState {
-            entity_id: "sensor.cez_hdo_lowtariffstart".to_string(),
+            entity_id: "sensor.cez_hdo_raw_data".to_string(),
             state: "14:00:00".to_string(),
             attributes,
             last_changed: "2026-01-15T12:46:26.269979+00:00".to_string(),
@@ -747,6 +754,58 @@ mod tests {
 
         // Should find 5 low tariff periods
         assert_eq!(periods.len(), 5, "Expected 5 low tariff periods");
+
+        // Verify the parsed periods
+        assert_eq!(periods[0], ("00:00".to_string(), "06:00".to_string()));
+        assert_eq!(periods[1], ("07:00".to_string(), "09:00".to_string()));
+        assert_eq!(periods[2], ("10:00".to_string(), "13:00".to_string()));
+        assert_eq!(periods[3], ("14:00".to_string(), "16:00".to_string()));
+        assert_eq!(periods[4], ("17:00".to_string(), "24:00".to_string()));
+    }
+
+    /// Test parsing new CEZ HDO raw_data sensor format with raw_json.data.data.signals structure
+    #[test]
+    fn test_parse_cez_hdo_raw_data_format() {
+        // Simulate the new CEZ HDO raw_data sensor response
+        let attributes = serde_json::json!({
+            "raw_json": {
+                "timestamp": "2026-01-21T19:34:57.476005",
+                "data": {
+                    "data": {
+                        "signals": [
+                            {
+                                "signal": "EVV1",
+                                "den": "Středa",
+                                "datum": chrono::Local::now().format("%d.%m.%Y").to_string(),
+                                "casy": "00:00-06:00;   07:00-09:00;   10:00-13:00;   14:00-16:00;   17:00-24:00"
+                            }
+                        ],
+                        "amm": false,
+                        "switchClock": false
+                    },
+                    "statusCode": 200
+                }
+            },
+            "icon": "mdi:home-clock",
+            "friendly_name": "ČEZ HDO surová data"
+        });
+
+        let state = crate::ha::types::HaEntityState {
+            entity_id: "sensor.cez_hdo_raw_data".to_string(),
+            state: "21.01.2026 19:34".to_string(),
+            attributes,
+            last_changed: "2026-01-21T18:34:57.485535+00:00".to_string(),
+            last_updated: "2026-01-21T18:34:57.485535+00:00".to_string(),
+        };
+
+        let periods = parse_hdo_periods_from_state(&state);
+
+        // Should find 5 low tariff periods
+        assert_eq!(
+            periods.len(),
+            5,
+            "Expected 5 low tariff periods from raw_data format"
+        );
 
         // Verify the parsed periods
         assert_eq!(periods[0], ("00:00".to_string(), "06:00".to_string()));

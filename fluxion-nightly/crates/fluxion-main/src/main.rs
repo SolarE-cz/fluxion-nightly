@@ -25,10 +25,11 @@ use fluxion_adapters::{
 };
 use fluxion_core::{
     ConfigUpdateSender, FluxionCorePlugin, PluginManagerResource, SystemConfig, TimezoneConfig,
-    WebQuerySender, plugin_adapters::create_plugin_manager,
+    UserControlPersistence, UserControlResource, UserControlUpdateSender, WebQuerySender,
+    plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::I18n;
-use fluxion_web::PluginApiState;
+use fluxion_web::{PluginApiState, UserControlApiState};
 use parking_lot::RwLock;
 
 fn main() -> Result<()> {
@@ -221,6 +222,41 @@ fn initialize_and_run() -> Result<()> {
     // Create message passing channel for config updates
     let (config_update_sender, config_update_channel) = ConfigUpdateSender::new();
 
+    // Load user control state from persistence
+    let user_control_persistence = UserControlPersistence::default_production();
+    let user_control_state = match user_control_persistence.load() {
+        Ok(state) => {
+            info!(
+                "🎛️ Loaded user control state: enabled={}, disallow_charge={}, disallow_discharge={}, {} fixed slots",
+                state.enabled,
+                state.disallow_charge,
+                state.disallow_discharge,
+                state.fixed_time_slots.len()
+            );
+            state
+        }
+        Err(e) => {
+            warn!(
+                "⚠️ Failed to load user control state, using defaults: {}",
+                e
+            );
+            Default::default()
+        }
+    };
+
+    // Create channel for user control updates from web to ECS
+    let (user_control_update_sender, user_control_update_channel) = UserControlUpdateSender::new();
+
+    // Create user control API state for web server
+    let user_control_api_state = UserControlApiState::new(
+        user_control_state.clone(),
+        user_control_persistence
+            .path()
+            .to_string_lossy()
+            .to_string(),
+        Some(user_control_update_sender),
+    );
+
     // Initialize i18n with configured language from config
     let language = config.system.language;
     let i18n = Arc::new(I18n::new(language).expect("Failed to initialize i18n"));
@@ -250,6 +286,7 @@ fn initialize_and_run() -> Result<()> {
             Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
+            Some(user_control_api_state), // User control API state
         )
         .await
         {
@@ -282,6 +319,8 @@ fn initialize_and_run() -> Result<()> {
             history_source,
         ))
         .insert_resource(PluginManagerResource(plugin_manager))
+        .insert_resource(UserControlResource::new(user_control_state))
+        .insert_resource(user_control_update_channel)
         .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>()
         .init_resource::<fluxion_core::async_systems::HdoScheduleData>();
 

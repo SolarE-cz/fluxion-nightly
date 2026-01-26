@@ -314,3 +314,82 @@
     <div class="loading" style="margin-top: 10px;"></div>
 </div>
 {% endif %}
+
+<!-- Consumption History / EMA -->
+{% if let Some(stats) = consumption_stats %}
+<div class="card">
+    <h2>📊 Consumption</h2>
+    <div class="stat">
+        <span class="stat-label">Historical EMA ({{ stats.ema_days }} days)</span>
+        <span class="stat-value">
+            {% match stats.ema_kwh %}
+            {% when Some with (ema) %}
+            {{ ema }} kWh/day
+            {% when None %}
+            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+            {% endmatch %}
+        </span>
+    </div>
+    <div class="stat">
+        <span class="stat-label">Grid import today</span>
+        <span class="stat-value">
+            {% match stats.today_import_kwh %}
+            {% when Some with (today) %}
+            {{ today }} kWh
+            {% when None %}
+            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+            {% endmatch %}
+        </span>
+    </div>
+    <div class="stat">
+        <span class="stat-label">Grid import yesterday</span>
+        <span class="stat-value">
+            {% match stats.yesterday_import_kwh %}
+            {% when Some with (yest) %}
+            {{ yest }} kWh
+            {% when None %}
+            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+            {% endmatch %}
+        </span>
+    </div>
+</div>
+{% endif %}
+
+<!-- Solar Forecast -->
+{% if let Some(forecast) = solar_forecast %}
+{% if forecast.available %}
+<div class="card">
+    <h2>☀️ Solar Forecast</h2>
+    <div class="stat">
+        <span class="stat-label">Predicted Today</span>
+        <span class="stat-value">{{ format!("{:.1}", forecast.total_today_kwh) }} kWh</span>
+    </div>
+    {% if let Some(actual) = forecast.actual_today_kwh %}
+    <div class="stat">
+        <span class="stat-label">Actual Today</span>
+        <span class="stat-value">
+            {{ format!("{:.1}", actual) }} kWh
+            {% if let Some(accuracy) = forecast.accuracy_percent %}
+            <span style="font-size: 0.85em; margin-left: 6px; {% if *accuracy >= 0.0 %}color: var(--success-color, #4caf50);{% else %}color: var(--warning-color, #ff9800);{% endif %}">
+                ({% if *accuracy >= 0.0 %}+{% endif %}{{ format!("{:.1}", accuracy) }}%)
+            </span>
+            {% endif %}
+        </span>
+    </div>
+    {% endif %}
+    <div class="stat">
+        <span class="stat-label">Remaining Today</span>
+        <span class="stat-value">{{ format!("{:.1}", forecast.remaining_today_kwh) }} kWh</span>
+    </div>
+    <div class="stat">
+        <span class="stat-label">Tomorrow</span>
+        <span class="stat-value">{{ format!("{:.1}", forecast.tomorrow_kwh) }} kWh</span>
+    </div>
+</div>
+{% else %}
+<div class="card warning">
+    <h2>☀️ Solar Forecast</h2>
+    <p>No solar forecast data available. Check sensor configuration.</p>
+</div>
+{% endif %}
+{% endif %}

@@ -15,6 +15,7 @@ use chrono::Timelike;
 use chrono_tz::Tz;
 use fluxion_core::{InverterData, ScheduleData, SystemHealthData, WebQueryResponse};
 use fluxion_i18n::I18n;
+use fluxion_types::UserControlState;
 use std::sync::Arc;
 
 /// Price data for Chart.js rendering
@@ -105,6 +106,10 @@ pub struct LiveDataTemplate {
     pub i18n: Arc<I18n>,
     pub last_update_formatted: String,
     pub next_change_formatted: Option<String>,
+    /// Aggregated consumption statistics (EMA, imports)
+    pub consumption_stats: Option<fluxion_core::web_bridge::ConsumptionStats>,
+    /// Solar forecast data
+    pub solar_forecast: Option<fluxion_core::web_bridge::SolarForecastInfo>,
 }
 
 impl LiveDataTemplate {
@@ -133,6 +138,10 @@ pub struct DashboardTemplate {
     pub ingress_path: String,
     /// Aggregated consumption statistics (EMA, imports)
     pub consumption_stats: Option<fluxion_core::web_bridge::ConsumptionStats>,
+    /// Solar forecast data
+    pub solar_forecast: Option<fluxion_core::web_bridge::SolarForecastInfo>,
+    /// User control state for dashboard panel
+    pub user_control: Option<UserControlState>,
 }
 
 impl DashboardTemplate {
@@ -150,6 +159,7 @@ impl DashboardTemplate {
         response: WebQueryResponse,
         i18n: Arc<I18n>,
         ingress_path: String,
+        user_control: Option<UserControlState>,
     ) -> Self {
         let timezone = response.timezone.clone();
 
@@ -543,6 +553,8 @@ impl DashboardTemplate {
             next_change_formatted,
             ingress_path,
             consumption_stats: response.consumption_stats,
+            solar_forecast: response.solar_forecast,
+            user_control,
         }
     }
 }

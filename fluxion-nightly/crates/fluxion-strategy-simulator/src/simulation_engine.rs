@@ -281,6 +281,17 @@ impl SimulationEngine {
         // Calculate export price
         let export_price = price * state.config.export_price_ratio;
 
+        // Calculate solar forecast values
+        let solar_forecast_total_today_kwh: f32 =
+            state.day.blocks.iter().map(|b| b.solar_kwh).sum();
+        let solar_forecast_remaining_today_kwh: f32 = state
+            .day
+            .blocks
+            .iter()
+            .skip(block_idx)
+            .map(|b| b.solar_kwh)
+            .sum();
+
         // Get strategy IDs to iterate (clone to avoid borrow issues)
         let strategy_ids: Vec<String> = state.strategy_results.keys().cloned().collect();
 
@@ -324,6 +335,10 @@ impl SimulationEngine {
                     .strategy_results
                     .get(&strategy_id)
                     .map(|r| r.total_grid_import_kwh + r.total_battery_discharge_kwh),
+                solar_forecast_total_today_kwh,
+                solar_forecast_remaining_today_kwh,
+                solar_forecast_tomorrow_kwh: 0.0, // Single-day simulation, no tomorrow data
+                battery_avg_charge_price_czk_per_kwh: 0.0, // Not tracked in simulator
             };
 
             // Get strategy and evaluate

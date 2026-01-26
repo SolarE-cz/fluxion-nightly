@@ -20,6 +20,8 @@ use crate::strategy::{
     winter_adaptive_v4::{WinterAdaptiveV4Config, WinterAdaptiveV4Strategy},
     winter_adaptive_v5::{WinterAdaptiveV5Config, WinterAdaptiveV5Strategy},
     winter_adaptive_v7::{WinterAdaptiveV7Config, WinterAdaptiveV7Strategy},
+    winter_adaptive_v8::{WinterAdaptiveV8Config, WinterAdaptiveV8Strategy},
+    winter_adaptive_v9::{WinterAdaptiveV9Config, WinterAdaptiveV9Strategy},
 };
 use fluxion_plugins::{BlockDecision, EvaluationRequest, Plugin, PluginManager};
 use fluxion_types::config::ControlConfig;
@@ -79,6 +81,10 @@ impl Plugin for WinterAdaptivePlugin {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -158,6 +164,10 @@ impl Plugin for WinterAdaptiveV2Plugin {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -239,6 +249,10 @@ impl Plugin for WinterAdaptiveV3Plugin {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -320,6 +334,10 @@ impl Plugin for WinterAdaptiveV4Plugin {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -405,6 +423,10 @@ impl Plugin for WinterAdaptiveV5Plugin {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -488,6 +510,184 @@ impl Plugin for WinterAdaptiveV7Plugin {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+        };
+
+        let eval = self.strategy.evaluate(&context);
+        let strategy_name = self.strategy.name().to_owned();
+
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
+        Ok(BlockDecision {
+            block_start: eval.block_start,
+            duration_minutes: eval.duration_minutes,
+            mode: eval.mode.into(),
+            reason: eval.reason,
+            priority: self.priority,
+            strategy_name: Some(strategy_name),
+            confidence: None,
+            expected_profit_czk: Some(net_profit),
+            decision_uid: eval.decision_uid,
+        })
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V8 Plugin
+// ============================================================================
+
+/// Adapter that wraps WinterAdaptiveV8Strategy as a Plugin
+pub struct WinterAdaptiveV8Plugin {
+    strategy: WinterAdaptiveV8Strategy,
+    priority: u8,
+    control_config: ControlConfig,
+}
+
+impl std::fmt::Debug for WinterAdaptiveV8Plugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinterAdaptiveV8Plugin")
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl WinterAdaptiveV8Plugin {
+    /// Create a new Winter Adaptive V8 plugin
+    pub fn new(config: WinterAdaptiveV8Config, control_config: ControlConfig) -> Self {
+        Self {
+            priority: config.priority,
+            strategy: WinterAdaptiveV8Strategy::new(config),
+            control_config,
+        }
+    }
+}
+
+impl Plugin for WinterAdaptiveV8Plugin {
+    fn name(&self) -> &str {
+        self.strategy.name()
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        let (price_block, all_blocks) = convert_request(request);
+
+        let context = EvaluationContext {
+            price_block: &price_block,
+            control_config: &self.control_config,
+            current_battery_soc: request.battery.current_soc_percent,
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+            all_price_blocks: Some(&all_blocks),
+            backup_discharge_min_soc: request.backup_discharge_min_soc,
+            grid_import_today_kwh: request.historical.grid_import_today_kwh,
+            consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+        };
+
+        let eval = self.strategy.evaluate(&context);
+        let strategy_name = self.strategy.name().to_owned();
+
+        // Calculate net profit from energy flows (centralized cost calculation)
+        let net_profit = calculate_net_profit(
+            &eval,
+            price_block.price_czk_per_kwh,
+            request.forecast.grid_export_price_czk_per_kwh,
+        );
+
+        Ok(BlockDecision {
+            block_start: eval.block_start,
+            duration_minutes: eval.duration_minutes,
+            mode: eval.mode.into(),
+            reason: eval.reason,
+            priority: self.priority,
+            strategy_name: Some(strategy_name),
+            confidence: None,
+            expected_profit_czk: Some(net_profit),
+            decision_uid: eval.decision_uid,
+        })
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V9 Plugin
+// ============================================================================
+
+/// Adapter that wraps WinterAdaptiveV9Strategy as a Plugin
+pub struct WinterAdaptiveV9Plugin {
+    strategy: WinterAdaptiveV9Strategy,
+    priority: u8,
+    control_config: ControlConfig,
+}
+
+impl std::fmt::Debug for WinterAdaptiveV9Plugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinterAdaptiveV9Plugin")
+            .field("priority", &self.priority)
+            .finish()
+    }
+}
+
+impl WinterAdaptiveV9Plugin {
+    /// Create a new Winter Adaptive V9 plugin
+    pub fn new(config: WinterAdaptiveV9Config, control_config: ControlConfig) -> Self {
+        Self {
+            priority: config.priority,
+            strategy: WinterAdaptiveV9Strategy::new(config),
+            control_config,
+        }
+    }
+}
+
+impl Plugin for WinterAdaptiveV9Plugin {
+    fn name(&self) -> &str {
+        self.strategy.name()
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.strategy.is_enabled()
+    }
+
+    fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+        let (price_block, all_blocks) = convert_request(request);
+
+        let context = EvaluationContext {
+            price_block: &price_block,
+            control_config: &self.control_config,
+            current_battery_soc: request.battery.current_soc_percent,
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+            all_price_blocks: Some(&all_blocks),
+            backup_discharge_min_soc: request.backup_discharge_min_soc,
+            grid_import_today_kwh: request.historical.grid_import_today_kwh,
+            consumption_today_kwh: request.historical.consumption_today_kwh,
+            solar_forecast_total_today_kwh: request.solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
+            battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -680,11 +880,80 @@ pub fn init_plugin_manager(
             sc.winter_adaptive_v7.negative_price_handling_enabled;
         v7_config.battery_round_trip_efficiency =
             sc.winter_adaptive_v7.battery_round_trip_efficiency;
+        v7_config.solar_aware_charging_enabled = sc.winter_adaptive_v7.solar_aware_charging_enabled;
+        v7_config.min_grid_charge_blocks = sc.winter_adaptive_v7.min_grid_charge_blocks;
+        v7_config.opportunistic_charge_threshold_czk =
+            sc.winter_adaptive_v7.opportunistic_charge_threshold_czk;
     }
 
     // Register Winter Adaptive V7
     let v7_plugin = WinterAdaptiveV7Plugin::new(v7_config, control_config.clone());
     manager.register(Arc::new(v7_plugin));
+
+    // Create Winter Adaptive V8 config from core config or defaults
+    let mut v8_config = WinterAdaptiveV8Config::default();
+    if let Some(sc) = strategies_config {
+        v8_config.enabled = sc.winter_adaptive_v8.enabled;
+        v8_config.priority = sc.winter_adaptive_v8.priority;
+        v8_config.target_battery_soc = sc.winter_adaptive_v8.target_battery_soc;
+        v8_config.min_discharge_soc = sc.winter_adaptive_v8.min_discharge_soc;
+        v8_config.top_discharge_blocks_count = sc.winter_adaptive_v8.top_discharge_blocks_count;
+        v8_config.min_discharge_spread_czk = sc.winter_adaptive_v8.min_discharge_spread_czk;
+        v8_config.battery_round_trip_efficiency =
+            sc.winter_adaptive_v8.battery_round_trip_efficiency;
+        v8_config.cheap_block_percentile = sc.winter_adaptive_v8.cheap_block_percentile;
+        v8_config.avg_consumption_per_block_kwh =
+            sc.winter_adaptive_v8.avg_consumption_per_block_kwh;
+        v8_config.min_export_spread_czk = sc.winter_adaptive_v8.min_export_spread_czk;
+        v8_config.min_soc_after_export = sc.winter_adaptive_v8.min_soc_after_export;
+        v8_config.negative_price_handling_enabled =
+            sc.winter_adaptive_v8.negative_price_handling_enabled;
+        // Solar-aware charging config
+        v8_config.solar_aware_charging_enabled = sc.winter_adaptive_v8.solar_aware_charging_enabled;
+        v8_config.min_grid_charge_blocks = sc.winter_adaptive_v8.min_grid_charge_blocks;
+        v8_config.opportunistic_charge_threshold_czk =
+            sc.winter_adaptive_v8.opportunistic_charge_threshold_czk;
+        v8_config.solar_capacity_reservation_factor =
+            sc.winter_adaptive_v8.solar_capacity_reservation_factor;
+        v8_config.min_solar_for_reduction_kwh = sc.winter_adaptive_v8.min_solar_for_reduction_kwh;
+    }
+
+    // Register Winter Adaptive V8
+    let v8_plugin = WinterAdaptiveV8Plugin::new(v8_config, control_config.clone());
+    manager.register(Arc::new(v8_plugin));
+
+    // Create Winter Adaptive V9 config from core config or defaults
+    let mut v9_config = WinterAdaptiveV9Config::default();
+    if let Some(sc) = strategies_config {
+        v9_config.enabled = sc.winter_adaptive_v9.enabled;
+        v9_config.priority = sc.winter_adaptive_v9.priority;
+        v9_config.target_battery_soc = sc.winter_adaptive_v9.target_battery_soc;
+        v9_config.min_discharge_soc = sc.winter_adaptive_v9.min_discharge_soc;
+        v9_config.morning_peak_start_hour = sc.winter_adaptive_v9.morning_peak_start_hour;
+        v9_config.morning_peak_end_hour = sc.winter_adaptive_v9.morning_peak_end_hour;
+        v9_config.target_soc_after_morning_peak =
+            sc.winter_adaptive_v9.target_soc_after_morning_peak;
+        v9_config.morning_peak_consumption_per_block_kwh =
+            sc.winter_adaptive_v9.morning_peak_consumption_per_block_kwh;
+        v9_config.solar_threshold_kwh = sc.winter_adaptive_v9.solar_threshold_kwh;
+        v9_config.solar_confidence_factor = sc.winter_adaptive_v9.solar_confidence_factor;
+        v9_config.min_arbitrage_spread_czk = sc.winter_adaptive_v9.min_arbitrage_spread_czk;
+        v9_config.cheap_block_percentile = sc.winter_adaptive_v9.cheap_block_percentile;
+        v9_config.top_discharge_blocks_count = sc.winter_adaptive_v9.top_discharge_blocks_count;
+        v9_config.min_export_spread_czk = sc.winter_adaptive_v9.min_export_spread_czk;
+        v9_config.min_soc_after_export = sc.winter_adaptive_v9.min_soc_after_export;
+        v9_config.battery_round_trip_efficiency =
+            sc.winter_adaptive_v9.battery_round_trip_efficiency;
+        v9_config.negative_price_handling_enabled =
+            sc.winter_adaptive_v9.negative_price_handling_enabled;
+        v9_config.min_overnight_charge_blocks = sc.winter_adaptive_v9.min_overnight_charge_blocks;
+        v9_config.opportunistic_charge_threshold_czk =
+            sc.winter_adaptive_v9.opportunistic_charge_threshold_czk;
+    }
+
+    // Register Winter Adaptive V9
+    let v9_plugin = WinterAdaptiveV9Plugin::new(v9_config, control_config.clone());
+    manager.register(Arc::new(v9_plugin));
 }
 
 /// Create a PluginManager with the default strategies registered.

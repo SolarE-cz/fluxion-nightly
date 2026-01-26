@@ -206,14 +206,23 @@ pub fn parse_hdo_sensor_data(raw_data: &str) -> Vec<HdoDaySchedule> {
     };
 
     // Try multiple paths to find the signals array:
-    // 1. attributes.response_json.data.signals (actual HA sensor structure)
-    // 2. data.signals (direct structure from some sensors)
+    // 1. attributes.raw_json.data.data.signals (new cez_hdo_raw_data sensor)
+    // 2. attributes.response_json.data.signals (legacy cez_hdo_lowtariffstart sensor)
+    // 3. data.signals (direct structure from some sensors)
     let signals = json
         .get("attributes")
-        .and_then(|a| a.get("response_json"))
+        .and_then(|a| a.get("raw_json"))
         .and_then(|r| r.get("data"))
+        .and_then(|d| d.get("data"))
         .and_then(|d| d.get("signals"))
         .and_then(|s| s.as_array())
+        .or_else(|| {
+            json.get("attributes")
+                .and_then(|a| a.get("response_json"))
+                .and_then(|r| r.get("data"))
+                .and_then(|d| d.get("signals"))
+                .and_then(|s| s.as_array())
+        })
         .or_else(|| {
             json.get("data")
                 .and_then(|d| d.get("signals"))
@@ -398,7 +407,7 @@ mod tests {
     fn test_parse_hdo_sensor_data_ha_structure() {
         // Test the actual Home Assistant sensor structure
         let json_data = r#"{
-            "entity_id": "sensor.cez_hdo_lowtariffstart",
+            "entity_id": "sensor.cez_hdo_raw_data",
             "state": "17:00:00",
             "attributes": {
                 "response_json": {
@@ -433,6 +442,56 @@ mod tests {
         assert_eq!(
             schedules[1].date,
             NaiveDate::from_ymd_opt(2026, 1, 16).unwrap()
+        );
+        assert_eq!(schedules[1].low_tariff_ranges.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_hdo_sensor_data_raw_json_structure() {
+        // Test the new cez_hdo_raw_data sensor structure (raw_json.data.data.signals)
+        let json_data = r#"{
+            "entity_id": "sensor.cez_hdo_raw_data",
+            "state": "21.01.2026 19:34",
+            "attributes": {
+                "raw_json": {
+                    "timestamp": "2026-01-21T19:34:57.476005",
+                    "data": {
+                        "data": {
+                            "signals": [
+                                {
+                                    "signal": "EVV1",
+                                    "den": "Středa",
+                                    "datum": "21.01.2026",
+                                    "casy": "00:00-06:00;   07:00-09:00;   10:00-13:00;   14:00-16:00;   17:00-24:00"
+                                },
+                                {
+                                    "signal": "EVV1",
+                                    "den": "Čtvrtek",
+                                    "datum": "22.01.2026",
+                                    "casy": "00:00-06:00;   07:00-09:00"
+                                }
+                            ],
+                            "amm": false,
+                            "switchClock": false
+                        },
+                        "statusCode": 200
+                    }
+                },
+                "icon": "mdi:home-clock",
+                "friendly_name": "ČEZ HDO surová data"
+            }
+        }"#;
+
+        let schedules = parse_hdo_sensor_data(json_data);
+        assert_eq!(schedules.len(), 2);
+        assert_eq!(
+            schedules[0].date,
+            NaiveDate::from_ymd_opt(2026, 1, 21).unwrap()
+        );
+        assert_eq!(schedules[0].low_tariff_ranges.len(), 5);
+        assert_eq!(
+            schedules[1].date,
+            NaiveDate::from_ymd_opt(2026, 1, 22).unwrap()
         );
         assert_eq!(schedules[1].low_tariff_ranges.len(), 2);
     }

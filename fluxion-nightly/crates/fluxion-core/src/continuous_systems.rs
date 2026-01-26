@@ -61,6 +61,7 @@ pub struct InitialModeSyncTracker {
 ///
 /// On initial startup, compares against ACTUAL inverter mode and applies immediately.
 /// After initial sync, uses debounce interval between mode changes.
+#[expect(clippy::too_many_arguments)]
 pub fn schedule_execution_system(
     schedule_query: Query<&OperationSchedule>,
     async_writer: Res<crate::resources::AsyncInverterWriter>,
@@ -74,8 +75,37 @@ pub fn schedule_execution_system(
     debug: Res<DebugModeConfig>,
     system_config: Res<crate::resources::SystemConfig>,
     mut sync_tracker: ResMut<InitialModeSyncTracker>,
+    user_control: Option<Res<crate::resources::UserControlResource>>,
 ) {
     let now = Utc::now();
+
+    // Check if FluxION is disabled by user
+    // When disabled: set all inverters to SelfUse and stop sending mode commands
+    if let Some(ref uc) = user_control
+        && !uc.state.enabled
+    {
+        for (mut current_mode, inverter, _, _) in current_mode_query.iter_mut() {
+            if current_mode.mode != InverterOperationMode::SelfUse {
+                if debug.enabled {
+                    info!(
+                        "🔧 [DEBUG] FluxION disabled - would set {} to SelfUse (currently {:?})",
+                        inverter.id, current_mode.mode
+                    );
+                } else {
+                    info!(
+                        "⏸️ FluxION disabled by user - setting {} to SelfUse",
+                        inverter.id
+                    );
+                    let command = InverterCommand::SetMode(InverterOperationMode::SelfUse);
+                    async_writer.write_command_async(inverter.id.clone(), command);
+                }
+                current_mode.mode = InverterOperationMode::SelfUse;
+                current_mode.set_at = now;
+                current_mode.reason = "FluxION disabled by user".to_string();
+            }
+        }
+        return; // Stop - no more mode commands while disabled
+    }
 
     // Get the current schedule
     let schedule = match schedule_query.single() {
@@ -115,10 +145,33 @@ pub fn schedule_execution_system(
 
             // Get current scheduled mode
             if let Some(scheduled_mode) = schedule.get_current_mode(now) {
+                // Clone the scheduled mode so we can potentially modify it
+                let mut effective_mode = scheduled_mode.clone();
+
+                // Check if user has a fixed slot override active RIGHT NOW
+                // This ensures newly created slots take effect immediately
+                if let Some(ref uc) = user_control
+                    && let Some(fixed_slot) = uc.state.get_fixed_slot_at(now)
+                    && effective_mode.mode != fixed_slot.mode
+                {
+                    info!(
+                        "🔒 Fixed slot override active: {} -> {:?} (slot: {})",
+                        effective_mode.mode, fixed_slot.mode, fixed_slot.id
+                    );
+                    effective_mode.mode = fixed_slot.mode;
+                    effective_mode.reason = format!(
+                        "Fixed slot: {}",
+                        fixed_slot.note.as_deref().unwrap_or("User override")
+                    );
+                }
+
                 // Check if this scheduled mode applies to this inverter
-                if !should_execute_for_inverter(scheduled_mode, &inverter.id) {
+                if !should_execute_for_inverter(&effective_mode, &inverter.id) {
                     continue;
                 }
+
+                // Use effective_mode (with potential fixed slot override) for the rest
+                let scheduled_mode = &effective_mode;
 
                 // Check if this is the initial sync for this inverter
                 let is_initial_sync = !sync_tracker.synced_inverters.contains(&inverter.id);
@@ -414,6 +467,7 @@ impl Plugin for ContinuousSystemsPlugin {
                 (
                     crate::async_systems::poll_consumption_history_channel,
                     crate::async_systems::config_event_handler,
+                    crate::async_systems::user_control_event_handler,
                     crate::async_systems::check_health_system,
                     // poll_command_results removed - using direct AsyncInverterWriter
                     crate::async_systems::read_inverter_states_system,

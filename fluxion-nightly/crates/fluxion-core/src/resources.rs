@@ -21,10 +21,11 @@ use std::time::Duration;
 // ============= System Configuration (Imported from fluxion-types) =============
 pub use fluxion_types::config::{
     ControlConfig, Currency, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
-    SolarAwareChargingConfigCore, StrategiesConfigCore, StrategyEnabledConfigCore, SystemConfig,
-    SystemSettingsConfig, WinterAdaptiveConfigCore, WinterAdaptiveV2ConfigCore,
-    WinterAdaptiveV3ConfigCore, WinterAdaptiveV4ConfigCore, WinterAdaptiveV5ConfigCore,
-    WinterAdaptiveV6ConfigCore, WinterAdaptiveV7ConfigCore, WinterPeakDischargeConfigCore,
+    SolarAwareChargingConfigCore, SolarForecastConfigCore, StrategiesConfigCore,
+    StrategyEnabledConfigCore, SystemConfig, SystemSettingsConfig, WinterAdaptiveConfigCore,
+    WinterAdaptiveV2ConfigCore, WinterAdaptiveV3ConfigCore, WinterAdaptiveV4ConfigCore,
+    WinterAdaptiveV5ConfigCore, WinterAdaptiveV6ConfigCore, WinterAdaptiveV7ConfigCore,
+    WinterAdaptiveV8ConfigCore, WinterAdaptiveV9ConfigCore, WinterPeakDischargeConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 
@@ -481,5 +482,42 @@ impl StateReadTimer {
     /// Mark that a read has been performed
     pub fn mark_read(&self) {
         *self.last_read.lock() = std::time::Instant::now();
+    }
+}
+
+// ============= User Control Resource =============
+
+pub use fluxion_types::{FixedTimeSlot, UserControlState};
+
+/// Resource for user control state.
+///
+/// This resource holds the runtime state for user control features:
+/// - Enable/disable FluxION mode changes
+/// - Disallow charge/discharge modes
+/// - Fixed time slots that override the schedule
+#[derive(Resource, Debug, Clone, Default)]
+pub struct UserControlResource {
+    pub state: UserControlState,
+}
+
+impl UserControlResource {
+    /// Create a new resource with the given state.
+    pub fn new(state: UserControlState) -> Self {
+        Self { state }
+    }
+
+    /// Check if FluxION is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.state.enabled
+    }
+
+    /// Check if a mode is allowed given current restrictions.
+    pub fn is_mode_allowed(&self, mode: fluxion_types::InverterOperationMode) -> bool {
+        self.state.is_mode_allowed(mode)
+    }
+
+    /// Get the fixed slot for a specific time, if any.
+    pub fn get_fixed_slot_at(&self, time: DateTime<Utc>) -> Option<&FixedTimeSlot> {
+        self.state.get_fixed_slot_at(time)
     }
 }

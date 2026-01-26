@@ -32,7 +32,7 @@ mod price_fetcher;
 mod state_reader;
 
 // Re-export public functions and types
-pub use config_handler::{ConfigEventParams, config_event_handler};
+pub use config_handler::{ConfigEventParams, config_event_handler, user_control_event_handler};
 pub use health_checker::{check_health_system, setup_health_checker};
 pub use history_fetcher::{poll_consumption_history_channel, spawn_history_fetcher_worker};
 pub use inverter_writer::setup_async_inverter_writer;
@@ -177,5 +177,68 @@ pub fn setup_async_workers(
     commands.spawn(HdoChannel { receiver: hdo_rx });
     commands.insert_resource(HdoSender { sender: hdo_tx });
 
+    // ============= Solar Forecast Fetcher Worker =============
+    // Note: This fetcher requires HaClientResource which is inserted by main.rs
+    // The actual worker will be spawned in a separate startup system
+    info!("☀️ Solar forecast fetcher will be initialized after HaClientResource is available");
+
+    let (solar_forecast_tx, solar_forecast_rx) = crossbeam_channel::bounded(10);
+    commands.spawn(SolarForecastChannel {
+        receiver: solar_forecast_rx,
+    });
+    commands.insert_resource(SolarForecastSender {
+        sender: solar_forecast_tx,
+    });
+    commands.init_resource::<SolarForecastData>();
+
     info!("🎉 All async workers initialized successfully");
+}
+
+// ============================================================================
+// Solar Forecast Resources
+// ============================================================================
+
+use std::time::Instant;
+
+#[derive(Resource)]
+pub struct SolarForecastData {
+    /// Total solar production forecast for today (kWh)
+    pub total_today_kwh: f32,
+
+    /// Remaining solar production forecast for today (kWh)
+    pub remaining_today_kwh: f32,
+
+    /// Solar production forecast for tomorrow (kWh)
+    pub tomorrow_kwh: f32,
+
+    /// Last successful update timestamp
+    pub last_updated: Instant,
+}
+
+impl Default for SolarForecastData {
+    fn default() -> Self {
+        Self {
+            total_today_kwh: 0.0,
+            remaining_today_kwh: 0.0,
+            tomorrow_kwh: 0.0,
+            last_updated: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SolarForecastUpdate {
+    pub total_today_kwh: f32,
+    pub remaining_today_kwh: f32,
+    pub tomorrow_kwh: f32,
+}
+
+#[derive(Resource)]
+pub struct SolarForecastSender {
+    pub sender: crossbeam_channel::Sender<SolarForecastUpdate>,
+}
+
+#[derive(Component)]
+pub struct SolarForecastChannel {
+    pub receiver: crossbeam_channel::Receiver<SolarForecastUpdate>,
 }

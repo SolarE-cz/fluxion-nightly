@@ -132,29 +132,78 @@ display_currency = "CZK"  # Display currency for web UI: EUR, USD, or CZK
 
 # Strategy Configuration
 # FluxION uses strategies to determine when to charge/discharge the battery
-# V7 is the recommended default - unconstrained multi-cycle arbitrage optimizer
+# V9 is the recommended default - solar-aware morning peak optimizer
 
-# V7: Unconstrained Multi-Cycle Arbitrage Optimizer (RECOMMENDED - DEFAULT)
+# V9: Solar-Aware Morning Peak Optimizer (RECOMMENDED - DEFAULT)
+# - On sunny days: minimal grid charging, only covers morning peak (6-9 AM)
+# - Target ~20% SOC by end of morning peak, let solar charge battery during day
+# - On low-solar days: falls back to full arbitrage mode
+# - 3 CZK minimum arbitrage spread
+# - 40% savings on winter days, optimal solar utilization on sunny days
+[strategies.winter_adaptive_v9]
+enabled = true                              # V9 is enabled by default
+priority = 100                              # Highest priority
+target_battery_soc = 95.0                   # Max charge level (%)
+min_discharge_soc = 10.0                    # Minimum SOC before discharge
+morning_peak_start_hour = 6                 # Morning peak start (6 AM)
+morning_peak_end_hour = 9                   # Morning peak end (9 AM)
+target_soc_after_morning_peak = 20.0        # Target SOC after morning peak (%)
+morning_peak_consumption_per_block_kwh = 0.5 # Expected consumption per 15min block in morning
+solar_threshold_kwh = 5.0                   # Minimum solar forecast to trigger solar-first mode
+solar_confidence_factor = 0.7               # Conservative factor for solar forecast (70%)
+min_arbitrage_spread_czk = 3.0              # Minimum spread for arbitrage (CZK)
+cheap_block_percentile = 0.25               # Bottom 25% of prices are "cheap"
+top_discharge_blocks_count = 8              # Top expensive blocks for discharge (8 = 2 hours)
+min_export_spread_czk = 5.0                 # Min spread for grid export
+min_soc_after_export = 50.0                 # Min SOC after export (%)
+battery_round_trip_efficiency = 0.90        # Round-trip efficiency (90%)
+negative_price_handling_enabled = true      # Charge during negative prices
+min_overnight_charge_blocks = 4             # Minimum overnight charge blocks (safety margin)
+opportunistic_charge_threshold_czk = 1.5    # Always charge below this price (CZK/kWh)
+
+# V7: Unconstrained Multi-Cycle Arbitrage Optimizer
 # - No artificial limitations (no "top N blocks" or "below median only")
 # - Multiple charge/discharge cycles per day when profitable
 # - Valley-peak detection for volatile days, percentile-based for stable days
 # - Minimum 3 CZK profit threshold for discharge cycles
 # - Home-first export policy (keeps power for home use unless big spread)
-[strategies.winter_adaptive_v7]
-enabled = true                         # V7 is enabled by default
-priority = 100                         # Highest priority
-target_battery_soc = 95.0              # Charge to 95% during cheap periods
-min_discharge_soc = 10.0               # Minimum SOC before discharge
-min_cycle_profit_czk = 3.0             # Min profit per cycle (CZK)
-valley_threshold_std_dev = 0.3         # Valley detection threshold
-peak_threshold_std_dev = 0.3           # Peak detection threshold
-min_export_spread_czk = 5.0            # Min spread for grid export
-min_soc_after_export = 50.0            # Min SOC after export (%)
-avg_consumption_per_block_kwh = 0.25   # Avg consumption per 15min block
-negative_price_handling_enabled = true # Charge during negative prices
-battery_round_trip_efficiency = 0.90   # Round-trip efficiency (90%)
+# - Solar-aware charging: reduces grid charging when solar is expected
+# [strategies.winter_adaptive_v7]
+# enabled = false                        # Disabled by default (V9 is recommended)
+# priority = 100                         # Highest priority
+# target_battery_soc = 95.0              # Charge to 95% during cheap periods
+# min_discharge_soc = 10.0               # Minimum SOC before discharge
+# min_cycle_profit_czk = 3.0             # Min profit per cycle (CZK)
+# valley_threshold_std_dev = 0.3         # Valley detection threshold
+# peak_threshold_std_dev = 0.3           # Peak detection threshold
+# min_export_spread_czk = 5.0            # Min spread for grid export
+# min_soc_after_export = 50.0            # Min SOC after export (%)
+# avg_consumption_per_block_kwh = 0.25   # Avg consumption per 15min block
+# negative_price_handling_enabled = true # Charge during negative prices
+# battery_round_trip_efficiency = 0.90   # Round-trip efficiency (90%)
+# solar_aware_charging_enabled = true    # Enable solar-aware charge reduction
+# min_grid_charge_blocks = 2             # Minimum grid charge blocks (safety margin)
+# opportunistic_charge_threshold_czk = 1.5 # Always charge below this price (CZK/kWh)
 
-# Legacy strategies (disabled by default - use V7 instead)
+# V8: Simplified Arbitrage Strategy
+# - Straightforward charging/discharging with configurable parameters
+# - Uses percentile-based cheap block detection
+# - Configurable discharge block count
+# [strategies.winter_adaptive_v8]
+# enabled = false                         # Disabled by default (V9 is recommended)
+# priority = 100                          # Highest priority
+# target_battery_soc = 95.0               # Charge to 95% during cheap periods
+# min_discharge_soc = 10.0                # Minimum SOC before discharge
+# top_discharge_blocks_count = 8          # Number of expensive blocks to discharge (8 = 2 hours)
+# min_discharge_spread_czk = 3.0          # Min spread for discharge (CZK)
+# battery_round_trip_efficiency = 0.90    # Round-trip efficiency (90%)
+# cheap_block_percentile = 0.25           # Bottom 25% of prices are "cheap"
+# avg_consumption_per_block_kwh = 0.25    # Avg consumption per 15min block
+# min_export_spread_czk = 5.0             # Min spread for grid export
+# min_soc_after_export = 50.0             # Min SOC after export (%)
+# negative_price_handling_enabled = true  # Charge during negative prices
+
+# Legacy strategies (disabled by default - use V9 instead)
 # Uncomment and set enabled = true to use these instead
 
 # [strategies.winter_adaptive_v4]
@@ -171,3 +220,33 @@ battery_round_trip_efficiency = 0.90   # Round-trip efficiency (90%)
 
 # [strategies.winter_adaptive]
 # enabled = false
+
+# ============================================================================
+# Solar Production Forecast
+# ============================================================================
+# Fetches solar production forecasts from Home Assistant sensors (e.g., Open-Meteo integration)
+# and makes them available to strategies for better planning decisions.
+
+[solar_forecast]
+# Enable solar forecast fetching
+enabled = true
+
+# Sensor name patterns for solar forecast data
+# Supports multiple PV arrays - will sum all sensors matching the pattern with optional suffixes
+# e.g., "sensor.energy_production_today" matches:
+#   - sensor.energy_production_today (exact match)
+#   - sensor.energy_production_today_1 (first PV array)
+#   - sensor.energy_production_today_2 (second PV array)
+
+# Total solar production forecast for today (kWh)
+sensor_total_today_pattern = "sensor.energy_production_today"
+
+# Remaining solar production forecast for today (kWh)
+sensor_remaining_today_pattern = "sensor.energy_production_today_remaining"
+
+# Solar production forecast for tomorrow (kWh)
+sensor_tomorrow_pattern = "sensor.energy_production_tomorrow"
+
+# How often to fetch solar forecast data (seconds)
+# Default: 60 (1 minute)
+fetch_interval_seconds = 60

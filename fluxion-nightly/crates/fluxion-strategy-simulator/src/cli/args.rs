@@ -170,6 +170,20 @@ pub struct RunArgs {
           \nExample: --csv-path results.csv"
     )]
     pub csv_path: Option<String>,
+
+    /// Solar generation profile (none, moderate, high)
+    #[arg(
+        long,
+        default_value = "none",
+        value_parser = ["none", "moderate", "high"],
+        help = "Solar generation profile for synthetic scenarios",
+        long_help = "Solar generation profiles:\n  \
+          - none: No solar (winter/cloudy day testing)\n  \
+          - moderate: Spring/fall typical (~3kW peak, 7am-6pm, ~12 kWh/day)\n  \
+          - high: Summer day (~5kW peak, 5am-9pm, ~25 kWh/day)\n\
+          \nIgnored when using --from-db or --from-json"
+    )]
+    pub solar: String,
 }
 
 #[derive(Parser)]
@@ -243,6 +257,20 @@ pub struct CompareArgs {
           value_parser = ["cost", "cycles", "import", "export"],
           help = "Sort strategies by: cost, cycles, import, or export")]
     pub rank_by: String,
+
+    /// Solar generation profile (none, moderate, high)
+    #[arg(
+        long,
+        default_value = "none",
+        value_parser = ["none", "moderate", "high"],
+        help = "Solar generation profile for synthetic scenarios",
+        long_help = "Solar generation profiles:\n  \
+          - none: No solar (winter/cloudy day testing)\n  \
+          - moderate: Spring/fall typical (~3kW peak, 7am-6pm, ~12 kWh/day)\n  \
+          - high: Summer day (~5kW peak, 5am-9pm, ~25 kWh/day)\n\
+          \nIgnored when using --from-db or --from-json"
+    )]
+    pub solar: String,
 }
 
 #[derive(Parser)]

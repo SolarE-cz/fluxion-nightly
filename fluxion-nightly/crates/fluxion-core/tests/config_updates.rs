@@ -43,7 +43,7 @@ fn test_config_update_flow() {
             fixed_sell_price_czk: fluxion_core::PriceSchedule::Flat(2.0),
             spot_buy_fee_czk: 0.5,
             spot_sell_fee_czk: 0.5,
-            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
             hdo_low_tariff_czk: 0.50,
             hdo_high_tariff_czk: 1.80,
         },
@@ -63,6 +63,7 @@ fn test_config_update_flow() {
         },
         strategies_config: Default::default(),
         history: Default::default(),
+        solar_forecast: Default::default(),
     };
 
     // Create config update channel
@@ -161,7 +162,7 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
             fixed_sell_price_czk: fluxion_core::PriceSchedule::Flat(2.0),
             spot_buy_fee_czk: 0.5,
             spot_sell_fee_czk: 0.5,
-            hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
             hdo_low_tariff_czk: 0.50,
             hdo_high_tariff_czk: 1.80,
         },
@@ -175,6 +176,7 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
         },
         strategies_config: Default::default(),
         history: Default::default(),
+        solar_forecast: Default::default(),
     };
 
     // Create config update channel

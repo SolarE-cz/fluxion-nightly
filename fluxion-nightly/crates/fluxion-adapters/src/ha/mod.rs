@@ -14,6 +14,7 @@ pub mod adapters;
 pub mod client;
 pub mod errors;
 pub mod plugin;
+pub mod solar_forecast_fetcher;
 pub mod types;
 
 pub use adapters::{

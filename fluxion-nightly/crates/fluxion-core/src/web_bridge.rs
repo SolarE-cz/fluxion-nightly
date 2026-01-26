@@ -19,7 +19,7 @@ use tracing::{debug, trace, warn};
 use crate::utils::calculate_ema;
 use crate::{
     components::*,
-    config_events::ConfigUpdateEvent,
+    config_events::{ConfigUpdateEvent, UserControlUpdateEvent},
     debug::DebugModeConfig,
     resources::{SystemConfig, TimezoneConfig},
 };
@@ -36,6 +36,12 @@ pub struct ConfigUpdateChannel {
     pub receiver: mpsc::UnboundedReceiver<ConfigUpdateEvent>,
 }
 
+/// Channel for user control update events
+#[derive(Resource)]
+pub struct UserControlUpdateChannel {
+    pub receiver: mpsc::UnboundedReceiver<UserControlUpdateEvent>,
+}
+
 /// Clonable sender for web queries
 #[derive(Clone)]
 pub struct WebQuerySender {
@@ -48,6 +54,12 @@ pub struct ConfigUpdateSender {
     sender: mpsc::UnboundedSender<ConfigUpdateEvent>,
 }
 
+/// Clonable sender for user control updates
+#[derive(Clone)]
+pub struct UserControlUpdateSender {
+    sender: mpsc::UnboundedSender<UserControlUpdateEvent>,
+}
+
 impl std::fmt::Debug for WebQuerySender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebQuerySender").finish_non_exhaustive()
@@ -57,6 +69,13 @@ impl std::fmt::Debug for WebQuerySender {
 impl std::fmt::Debug for ConfigUpdateSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigUpdateSender").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for UserControlUpdateSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserControlUpdateSender")
+            .finish_non_exhaustive()
     }
 }
 
@@ -100,6 +119,37 @@ impl ConfigUpdateSender {
         self.sender
             .send(event)
             .map_err(|_| ConfigUpdateError::ChannelClosed)
+    }
+}
+
+impl UserControlUpdateSender {
+    /// Create a new sender/receiver pair
+    pub fn new() -> (Self, UserControlUpdateChannel) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (Self { sender }, UserControlUpdateChannel { receiver })
+    }
+
+    /// Send a user control update event
+    pub fn send(&self, event: UserControlUpdateEvent) -> Result<(), UserControlUpdateError> {
+        self.sender
+            .send(event)
+            .map_err(|_| UserControlUpdateError::ChannelClosed)
+    }
+}
+
+/// Error when sending user control update fails
+#[derive(Debug, Clone)]
+pub enum UserControlUpdateError {
+    ChannelClosed,
+}
+
+impl std::fmt::Display for UserControlUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserControlUpdateError::ChannelClosed => {
+                write!(f, "user control update channel closed")
+            }
+        }
     }
 }
 
@@ -170,6 +220,24 @@ pub struct PricingFees {
     pub sell_fee_czk: f32,
 }
 
+/// Solar forecast data for dashboard display
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SolarForecastInfo {
+    /// Total solar production forecast for today (kWh)
+    pub total_today_kwh: f32,
+    /// Remaining solar production forecast for today (kWh)
+    pub remaining_today_kwh: f32,
+    /// Solar production forecast for tomorrow (kWh)
+    pub tomorrow_kwh: f32,
+    /// Actual solar energy generated today (kWh) - from inverter
+    pub actual_today_kwh: Option<f32>,
+    /// Accuracy: actual vs predicted (e.g., +5.2% means actual is 5.2% higher than predicted)
+    /// Only available if both actual and predicted > 0
+    pub accuracy_percent: Option<f32>,
+    /// Whether data is available (sensors discovered)
+    pub available: bool,
+}
+
 /// Response containing ECS component data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebQueryResponse {
@@ -189,6 +257,8 @@ pub struct WebQueryResponse {
     pub hdo_schedule: Option<HdoScheduleInfo>,
     /// Pricing fees from config for chart display
     pub pricing_fees: Option<PricingFees>,
+    /// Solar forecast data
+    pub solar_forecast: Option<SolarForecastInfo>,
 }
 
 /// Inverter component data bundle
@@ -397,6 +467,7 @@ pub fn web_query_system(
     consumption_history: Option<Res<ConsumptionHistory>>,
     consumption_history_config: Option<Res<ConsumptionHistoryConfig>>,
     hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
+    solar_forecast: Option<Res<crate::async_systems::SolarForecastData>>,
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -419,6 +490,7 @@ pub fn web_query_system(
                 consumption_history.as_deref(),
                 consumption_history_config.as_deref(),
                 hdo_data.as_deref(),
+                solar_forecast.as_deref(),
             ),
         };
 
@@ -442,6 +514,7 @@ fn build_dashboard_response(
     consumption_history: Option<&ConsumptionHistory>,
     consumption_history_config: Option<&ConsumptionHistoryConfig>,
     hdo_data: Option<&crate::async_systems::HdoScheduleData>,
+    solar_forecast_data: Option<&crate::async_systems::SolarForecastData>,
 ) -> WebQueryResponse {
     let now = Utc::now();
 
@@ -978,6 +1051,50 @@ fn build_dashboard_response(
         sell_fee_czk: system_config.pricing_config.spot_sell_fee_czk,
     });
 
+    // Build solar forecast info
+    // Get actual solar energy today from inverters (sum all inverters)
+    let actual_solar_today: Option<f32> = {
+        let sum: f32 = inverter_data
+            .iter()
+            .filter_map(|inv| inv.today_solar_energy_kwh)
+            .sum();
+        if sum > 0.0 { Some(sum) } else { None }
+    };
+
+    let solar_forecast = solar_forecast_data.map(|sf| {
+        let has_data = sf.total_today_kwh > 0.0
+            || sf.remaining_today_kwh > 0.0
+            || sf.tomorrow_kwh > 0.0;
+
+        // Calculate accuracy: (actual - predicted) / predicted * 100
+        // Positive = actual is higher than predicted, negative = actual is lower
+        let accuracy_percent = match (actual_solar_today, sf.total_today_kwh > 0.0) {
+            (Some(actual), true) => {
+                let diff_percent = ((actual - sf.total_today_kwh) / sf.total_today_kwh) * 100.0;
+                Some(diff_percent)
+            }
+            _ => None,
+        };
+
+        debug!(
+            "☀️ Solar forecast for web: predicted={:.1} kWh, actual={:?} kWh, remaining={:.1} kWh, tomorrow={:.1} kWh, accuracy={:?}%",
+            sf.total_today_kwh, actual_solar_today, sf.remaining_today_kwh, sf.tomorrow_kwh, accuracy_percent
+        );
+
+        SolarForecastInfo {
+            total_today_kwh: sf.total_today_kwh,
+            remaining_today_kwh: sf.remaining_today_kwh,
+            tomorrow_kwh: sf.tomorrow_kwh,
+            actual_today_kwh: actual_solar_today,
+            accuracy_percent,
+            available: has_data,
+        }
+    });
+
+    if solar_forecast.is_none() {
+        debug!("☀️ Solar forecast resource not available in ECS");
+    }
+
     WebQueryResponse {
         timestamp: now,
         debug_mode: debug_config.is_enabled(),
@@ -994,6 +1111,7 @@ fn build_dashboard_response(
         consumption_stats,
         hdo_schedule,
         pricing_fees,
+        solar_forecast,
     }
 }
 

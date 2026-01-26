@@ -1524,11 +1524,27 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
 
         match mode {
             InverterOperationMode::ForceCharge => {
+                // Calculate energy flows accounting for available excess power
+                // Negative consumption means excess power is available (e.g., solar production)
                 let charge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
+                let available_excess =
+                    context.solar_forecast_kwh + (-context.consumption_forecast_kwh).max(0.0);
+                let grid_charge_needed = (charge_kwh - available_excess).max(0.0);
+
                 eval.energy_flows.battery_charge_kwh = charge_kwh;
-                eval.energy_flows.grid_import_kwh = charge_kwh;
+                eval.energy_flows.grid_import_kwh = grid_charge_needed;
                 // Use effective price for accurate cost reporting
-                eval.cost_czk = economics::grid_import_cost(charge_kwh, effective_price);
+                eval.cost_czk = economics::grid_import_cost(grid_charge_needed, effective_price);
+
+                // Export any excess we don't use for charging
+                let excess_after_charge = (available_excess - charge_kwh).max(0.0);
+                if excess_after_charge > 0.0 {
+                    eval.energy_flows.grid_export_kwh = excess_after_charge;
+                    eval.revenue_czk = economics::grid_export_revenue(
+                        excess_after_charge,
+                        context.grid_export_price_czk_per_kwh,
+                    );
+                }
             }
             InverterOperationMode::ForceDischarge => {
                 let discharge_kwh = context.control_config.max_battery_charge_rate_kw * 0.25;
@@ -1540,31 +1556,55 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
                 );
             }
             InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
-                // Estimate profit based on usable battery capacity vs consumption
-                // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
-                let usable_battery_kwh = ((context.current_battery_soc
-                    - context.control_config.hardware_min_battery_soc)
-                    .max(0.0)
-                    / 100.0)
-                    * context.control_config.battery_capacity_kwh;
+                // Calculate net consumption accounting for solar
+                // Negative consumption means excess power (solar > load)
+                let net_consumption = context.consumption_forecast_kwh - context.solar_forecast_kwh;
 
-                // Calculate how much battery will discharge to cover load
-                let battery_discharge = usable_battery_kwh.min(context.consumption_forecast_kwh);
+                if net_consumption > 0.0 {
+                    // Deficit: need to cover consumption from battery or grid
+                    let usable_battery_kwh = ((context.current_battery_soc
+                        - context.control_config.hardware_min_battery_soc)
+                        .max(0.0)
+                        / 100.0)
+                        * context.control_config.battery_capacity_kwh;
 
-                eval.energy_flows.battery_discharge_kwh = battery_discharge;
+                    let battery_discharge = usable_battery_kwh.min(net_consumption);
+                    eval.energy_flows.battery_discharge_kwh = battery_discharge;
 
-                if battery_discharge >= context.consumption_forecast_kwh {
-                    // Battery can fully cover consumption - show as avoided grid import cost
-                    eval.revenue_czk = context.consumption_forecast_kwh * effective_price;
+                    if battery_discharge >= net_consumption {
+                        // Battery fully covers deficit - avoided grid cost is revenue
+                        eval.revenue_czk = net_consumption * effective_price;
+                    } else {
+                        // Partial coverage - need grid import for remainder
+                        eval.revenue_czk = battery_discharge * effective_price;
+                        let grid_needed = net_consumption - battery_discharge;
+                        eval.cost_czk = grid_needed * effective_price;
+                        eval.energy_flows.grid_import_kwh = grid_needed;
+                    }
                 } else {
-                    // Battery partially depleted - split between battery and grid
-                    // Battery covers what it can (avoided cost = profit)
-                    eval.revenue_czk = battery_discharge * effective_price;
-                    // Grid must cover the rest (actual cost)
-                    eval.cost_czk =
-                        (context.consumption_forecast_kwh - battery_discharge) * effective_price;
-                    eval.energy_flows.grid_import_kwh =
-                        context.consumption_forecast_kwh - battery_discharge;
+                    // Excess power available (solar > consumption)
+                    let excess = -net_consumption;
+
+                    // Charge battery with excess, up to available capacity
+                    let battery_capacity = context.control_config.battery_capacity_kwh;
+                    let available_charge_capacity = (battery_capacity
+                        * (context.control_config.max_battery_soc / 100.0)
+                        - battery_capacity * (context.current_battery_soc / 100.0))
+                        .max(0.0);
+                    let max_charge_rate = context.control_config.max_battery_charge_rate_kw * 0.25;
+                    let charge_amount = excess.min(available_charge_capacity).min(max_charge_rate);
+
+                    eval.energy_flows.battery_charge_kwh = charge_amount;
+
+                    // Export any remaining excess
+                    let export_amount = excess - charge_amount;
+                    if export_amount > 0.0 {
+                        eval.energy_flows.grid_export_kwh = export_amount;
+                        eval.revenue_czk = economics::grid_export_revenue(
+                            export_amount,
+                            context.grid_export_price_czk_per_kwh,
+                        );
+                    }
                 }
             }
         }

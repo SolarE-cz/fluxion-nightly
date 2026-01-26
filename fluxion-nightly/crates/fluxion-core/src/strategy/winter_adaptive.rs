@@ -1605,6 +1605,10 @@ mod tests {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(15.0),
             consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         };
 
         // Evaluate
@@ -1684,6 +1688,10 @@ mod tests {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(12.0),
             consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         };
 
         // Evaluate

@@ -127,6 +127,7 @@ pub fn update_prices_system(
     consumption_history: Res<crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<&RawInverterState>,
     plugin_manager_res: Res<PluginManagerResource>,
+    user_control: Option<Res<crate::resources::UserControlResource>>,
 ) {
     // Only fetch if cache is stale (non-blocking check)
     if !price_cache.is_stale() {
@@ -261,6 +262,7 @@ pub fn update_prices_system(
     // Use economic optimizer for schedule generation with shared plugin manager
     let plugin_manager = plugin_manager_res.0.read();
     let hdo_raw_data = hdo_data.as_ref().and_then(|h| h.raw_data.clone());
+    let user_control_state = user_control.as_ref().map(|uc| &uc.state);
     let new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
@@ -272,6 +274,10 @@ pub fn update_prices_system(
         grid_import_today_kwh,
         &plugin_manager,
         hdo_raw_data,
+        0.0, // TODO: Wire up solar_forecast_total_today_kwh from SolarForecastData resource
+        0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
+        0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
+        user_control_state,
     );
 
     // Update or create PriceAnalysis entity

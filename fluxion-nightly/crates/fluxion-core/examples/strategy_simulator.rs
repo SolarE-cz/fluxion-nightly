@@ -370,7 +370,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fixed_sell_price_czk: PriceSchedule::Flat(0.0),
         spot_buy_fee_czk: 0.5,
         spot_sell_fee_czk: 0.5,
-        hdo_sensor_entity: "sensor.cez_hdo_lowtariffstart".to_string(),
+        hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
         hdo_low_tariff_czk: 0.50,
         hdo_high_tariff_czk: 1.80,
     };
@@ -414,6 +414,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 backup_discharge_min_soc: config.hardware_min_battery_soc,
                 grid_import_today_kwh: None, // Not tracked in simulation
                 consumption_today_kwh: None, // Not tracked in simulation
+                solar_forecast_total_today_kwh: 0.0,
+                solar_forecast_remaining_today_kwh: 0.0,
+                solar_forecast_tomorrow_kwh: 0.0,
+                battery_avg_charge_price_czk_per_kwh: 0.0,
             };
 
             let evaluation = state.strategy.evaluate(&context);

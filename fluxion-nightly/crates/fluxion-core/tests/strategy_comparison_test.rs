@@ -145,6 +145,10 @@ fn compare_v1_v2_on_czech_pattern() {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(5.0),
             consumption_today_kwh: Some(8.0),
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         };
 
         let v1_eval = v1_strategy.evaluate(&context);
@@ -387,6 +391,10 @@ fn compare_cost_overnight_charging() {
         backup_discharge_min_soc: 10.0,
         grid_import_today_kwh: Some(2.0),
         consumption_today_kwh: Some(4.0),
+        solar_forecast_total_today_kwh: 0.0,
+        solar_forecast_remaining_today_kwh: 0.0,
+        solar_forecast_tomorrow_kwh: 0.0,
+        battery_avg_charge_price_czk_per_kwh: 0.0,
     };
 
     let v1_overnight = v1_strategy.evaluate(&context_overnight);
@@ -434,6 +442,10 @@ fn compare_peak_discharge_behavior() {
         backup_discharge_min_soc: 10.0,
         grid_import_today_kwh: Some(5.0),
         consumption_today_kwh: Some(8.0),
+        solar_forecast_total_today_kwh: 0.0,
+        solar_forecast_remaining_today_kwh: 0.0,
+        solar_forecast_tomorrow_kwh: 0.0,
+        battery_avg_charge_price_czk_per_kwh: 0.0,
     };
 
     let v1_peak = v1_strategy.evaluate(&context_peak);
@@ -627,6 +639,10 @@ fn simulate_strategy<S: EconomicStrategy>(
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(total_grid_import_kwh),
             consumption_today_kwh: Some(idx as f32 * consumption_per_block),
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
         };
 
         // Get strategy decision

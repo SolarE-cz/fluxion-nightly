@@ -287,6 +287,378 @@
         font-style: italic;
     }
 
+    /* User Control Panel Styles */
+    .user-control-panel {
+        background: linear-gradient(135deg, var(--bg-secondary) 0%, var(--bg-tertiary) 100%);
+        border-radius: 12px;
+        padding: 20px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        border: 1px solid var(--border-color);
+    }
+
+    .user-control-panel.disabled {
+        border-color: #f44336;
+        box-shadow: 0 4px 20px rgba(244, 67, 54, 0.2);
+    }
+
+    .user-control-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    .user-control-header h2 {
+        margin: 0;
+        font-size: 1.3em;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .user-control-main-toggle {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+    }
+
+    .toggle-switch-large {
+        position: relative;
+        display: inline-block;
+        width: 70px;
+        height: 36px;
+    }
+
+    .toggle-switch-large input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+
+    .toggle-slider-large {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: #f44336;
+        transition: .4s;
+        border-radius: 36px;
+    }
+
+    .toggle-slider-large:before {
+        position: absolute;
+        content: "";
+        height: 28px;
+        width: 28px;
+        left: 4px;
+        bottom: 4px;
+        background-color: white;
+        transition: .4s;
+        border-radius: 50%;
+    }
+
+    .toggle-switch-large input:checked + .toggle-slider-large {
+        background-color: #4caf50;
+    }
+
+    .toggle-switch-large input:checked + .toggle-slider-large:before {
+        transform: translateX(34px);
+    }
+
+    .toggle-status {
+        font-size: 1.1em;
+        font-weight: 600;
+    }
+
+    .toggle-status.active { color: #4caf50; }
+    .toggle-status.inactive { color: #f44336; }
+
+    .user-control-restrictions {
+        display: flex;
+        gap: 20px;
+        flex-wrap: wrap;
+        margin: 15px 0;
+        padding: 15px;
+        background: rgba(0,0,0,0.2);
+        border-radius: 8px;
+    }
+
+    .restriction-toggle {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+
+    .restriction-toggle label {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    .restriction-toggle .label-text {
+        font-weight: 500;
+    }
+
+    .restriction-toggle .label-help {
+        font-size: 0.8em;
+        color: var(--text-secondary);
+    }
+
+    .user-control-slots {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 15px;
+        padding-top: 15px;
+        border-top: 1px solid var(--border-color);
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    .slots-info {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .slots-count {
+        font-size: 1.1em;
+        font-weight: 500;
+    }
+
+    .manage-slots-btn {
+        background: var(--info);
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 500;
+        transition: all 0.2s;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }
+
+    .manage-slots-btn:hover {
+        background: #1976d2;
+        transform: translateY(-1px);
+    }
+
+    /* Slot Dialog Modal */
+    .slot-dialog-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.7);
+        z-index: 2000;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        opacity: 0;
+        visibility: hidden;
+        transition: all 0.3s;
+    }
+
+    .slot-dialog-overlay.show {
+        opacity: 1;
+        visibility: visible;
+    }
+
+    .slot-dialog {
+        background: var(--bg-secondary);
+        border-radius: 12px;
+        width: 90%;
+        max-width: 500px;
+        max-height: 90vh;
+        overflow-y: auto;
+        box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        transform: translateY(20px);
+        transition: transform 0.3s;
+    }
+
+    .slot-dialog-overlay.show .slot-dialog {
+        transform: translateY(0);
+    }
+
+    .slot-dialog-header {
+        background: var(--bg-tertiary);
+        padding: 20px;
+        border-bottom: 1px solid var(--border-color);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .slot-dialog-header h3 {
+        margin: 0;
+        font-size: 1.2em;
+    }
+
+    .slot-dialog-close {
+        background: none;
+        border: none;
+        color: var(--text-primary);
+        font-size: 1.5em;
+        cursor: pointer;
+        padding: 5px;
+        line-height: 1;
+    }
+
+    .slot-dialog-body {
+        padding: 20px;
+    }
+
+    .slot-form-group {
+        margin-bottom: 20px;
+    }
+
+    .slot-form-group label {
+        display: block;
+        font-weight: 500;
+        margin-bottom: 6px;
+    }
+
+    .slot-form-group input,
+    .slot-form-group select,
+    .slot-form-group textarea {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        font-size: 1em;
+        box-sizing: border-box;
+    }
+
+    .slot-form-group input:focus,
+    .slot-form-group select:focus,
+    .slot-form-group textarea:focus {
+        outline: none;
+        border-color: var(--info);
+    }
+
+    .slot-dialog-actions {
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+        padding: 20px;
+        border-top: 1px solid var(--border-color);
+        flex-wrap: wrap;
+    }
+
+    .slot-dialog-actions button {
+        padding: 10px 20px;
+        border-radius: 6px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.2s;
+        border: none;
+    }
+
+    .slot-save-btn {
+        background: var(--success);
+        color: white;
+    }
+
+    .slot-save-btn:hover {
+        background: #45a049;
+    }
+
+    .slot-delete-btn {
+        background: var(--error);
+        color: white;
+    }
+
+    .slot-delete-btn:hover {
+        background: #d32f2f;
+    }
+
+    .slot-cancel-btn {
+        background: #666;
+        color: white;
+    }
+
+    .slot-cancel-btn:hover {
+        background: #555;
+    }
+
+    /* Slots list in dialog */
+    .slots-list {
+        margin-bottom: 20px;
+    }
+
+    .slot-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px;
+        background: rgba(0,0,0,0.2);
+        border-radius: 6px;
+        margin-bottom: 8px;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .slot-item-info {
+        flex: 1;
+        min-width: 200px;
+    }
+
+    .slot-item-time {
+        font-weight: 500;
+    }
+
+    .slot-item-mode {
+        font-size: 0.85em;
+        color: var(--text-secondary);
+    }
+
+    .slot-item-actions {
+        display: flex;
+        gap: 6px;
+    }
+
+    .slot-item-btn {
+        padding: 6px 12px;
+        font-size: 0.85em;
+        border-radius: 4px;
+        cursor: pointer;
+        border: none;
+    }
+
+    .slot-edit-btn {
+        background: var(--info);
+        color: white;
+    }
+
+    .slot-remove-btn {
+        background: var(--error);
+        color: white;
+    }
+
+    /* Locked schedule row indicator */
+    .schedule-row-locked {
+        background: rgba(255, 193, 7, 0.15) !important;
+    }
+
+    .locked-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 0.75em;
+        color: #ffc107;
+        margin-left: 6px;
+    }
+
     /* Apply Plan button */
     .apply-plan-btn {
         background: #28a745;
@@ -336,10 +708,69 @@
                     </a>
                 </div>
             </div>
-    
-    <div id="live-data" 
-         hx-ext="sse" 
-         sse-connect="{{ ingress_path }}/stream" 
+
+    <!-- User Control Panel -->
+    {% if let Some(uc) = user_control %}
+    <div class="user-control-panel {% if !uc.enabled %}disabled{% endif %}" id="user-control-panel">
+        <div class="user-control-header">
+            <h2>🎛️ User Control</h2>
+            <div class="user-control-main-toggle">
+                <label class="toggle-switch-large">
+                    <input type="checkbox" id="fluxion-enabled-toggle" {% if uc.enabled %}checked{% endif %} onchange="setFluxionEnabled(this.checked)">
+                    <span class="toggle-slider-large"></span>
+                </label>
+                <span class="toggle-status {% if uc.enabled %}active{% else %}inactive{% endif %}" id="fluxion-status">
+                    {% if uc.enabled %}FluxION Active{% else %}FluxION Paused{% endif %}
+                </span>
+            </div>
+        </div>
+
+        {% if !uc.enabled %}
+        <div style="background: rgba(244, 67, 54, 0.2); padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; color: #f44336;">
+            FluxION is paused. Inverter is set to Self-Use mode. No automatic mode changes will occur.
+        </div>
+        {% endif %}
+
+        <div class="user-control-restrictions">
+            <div class="restriction-toggle">
+                <label class="config-toggle-switch">
+                    <input type="checkbox" class="config-toggle-input" id="disallow-charge-toggle" {% if uc.disallow_charge %}checked{% endif %} onchange="updateRestrictions()">
+                    <span class="config-toggle-slider"></span>
+                </label>
+                <label for="disallow-charge-toggle">
+                    <span class="label-text">Disallow Charge</span>
+                    <span class="label-help">Prevents ForceCharge mode</span>
+                </label>
+            </div>
+            <div class="restriction-toggle">
+                <label class="config-toggle-switch">
+                    <input type="checkbox" class="config-toggle-input" id="disallow-discharge-toggle" {% if uc.disallow_discharge %}checked{% endif %} onchange="updateRestrictions()">
+                    <span class="config-toggle-slider"></span>
+                </label>
+                <label for="disallow-discharge-toggle">
+                    <span class="label-text">Disallow Discharge</span>
+                    <span class="label-help">Prevents ForceDischarge mode</span>
+                </label>
+            </div>
+        </div>
+
+        <div class="user-control-slots">
+            <div class="slots-info">
+                <span class="slots-count" id="slots-count">{{ uc.fixed_time_slots.len() }} fixed time slot(s)</span>
+            </div>
+            <button class="manage-slots-btn" onclick="openSlotDialog()">
+                <span>📅</span>
+                <span>Manage Slots</span>
+            </button>
+        </div>
+    </div>
+    {% else %}
+    <!-- User control not available (API not configured) -->
+    {% endif %}
+
+    <div id="live-data"
+         hx-ext="sse"
+         sse-connect="{{ ingress_path }}/stream"
          sse-swap="update"
          hx-swap="innerHTML">
 
@@ -679,6 +1110,45 @@
             </span>
         </div>
     </div>
+    {% endif %}
+
+    <!-- Solar Forecast -->
+    {% if let Some(forecast) = solar_forecast %}
+    {% if forecast.available %}
+    <div class="card">
+        <h2>☀️ Solar Forecast</h2>
+        <div class="stat">
+            <span class="stat-label">Predicted Today</span>
+            <span class="stat-value">{{ format!("{:.1}", forecast.total_today_kwh) }} kWh</span>
+        </div>
+        {% if let Some(actual) = forecast.actual_today_kwh %}
+        <div class="stat">
+            <span class="stat-label">Actual Today</span>
+            <span class="stat-value">
+                {{ format!("{:.1}", actual) }} kWh
+                {% if let Some(accuracy) = forecast.accuracy_percent %}
+                <span style="font-size: 0.85em; margin-left: 6px; {% if *accuracy >= 0.0 %}color: var(--success-color, #4caf50);{% else %}color: var(--warning-color, #ff9800);{% endif %}">
+                    ({% if *accuracy >= 0.0 %}+{% endif %}{{ format!("{:.1}", accuracy) }}%)
+                </span>
+                {% endif %}
+            </span>
+        </div>
+        {% endif %}
+        <div class="stat">
+            <span class="stat-label">Remaining Today</span>
+            <span class="stat-value">{{ format!("{:.1}", forecast.remaining_today_kwh) }} kWh</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label">Tomorrow</span>
+            <span class="stat-value">{{ format!("{:.1}", forecast.tomorrow_kwh) }} kWh</span>
+        </div>
+    </div>
+    {% else %}
+    <div class="card warning">
+        <h2>☀️ Solar Forecast</h2>
+        <p>No solar forecast data available. Check sensor configuration.</p>
+    </div>
+    {% endif %}
     {% endif %}
     </div><!-- End of #live-data -->
     
@@ -1867,5 +2337,336 @@ document.getElementById('dashboard-wrapper').addEventListener('click', function(
         wrapper.classList.remove('config-open');
     }
 });
+
+// ============== User Control Functions ==============
+
+const USER_CONTROL_API = '{{ ingress_path }}/api/user-control';
+
+// Store current slots for editing
+let currentSlots = [];
+let editingSlotId = null;
+
+// Set FluxION enabled/disabled
+async function setFluxionEnabled(enabled) {
+    try {
+        const response = await fetch(`${USER_CONTROL_API}/enabled`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Update UI
+            const panel = document.getElementById('user-control-panel');
+            const status = document.getElementById('fluxion-status');
+
+            if (enabled) {
+                panel.classList.remove('disabled');
+                status.className = 'toggle-status active';
+                status.textContent = 'FluxION Active';
+            } else {
+                panel.classList.add('disabled');
+                status.className = 'toggle-status inactive';
+                status.textContent = 'FluxION Paused';
+            }
+
+            // Reload page to update paused message display
+            location.reload();
+        } else {
+            alert('Failed to update FluxION status');
+            // Revert toggle
+            document.getElementById('fluxion-enabled-toggle').checked = !enabled;
+        }
+    } catch (error) {
+        console.error('Error setting FluxION enabled:', error);
+        alert('Failed to update FluxION status: ' + error.message);
+        document.getElementById('fluxion-enabled-toggle').checked = !enabled;
+    }
+}
+
+// Update charge/discharge restrictions
+async function updateRestrictions() {
+    const disallowCharge = document.getElementById('disallow-charge-toggle').checked;
+    const disallowDischarge = document.getElementById('disallow-discharge-toggle').checked;
+
+    try {
+        const response = await fetch(`${USER_CONTROL_API}/restrictions`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                disallow_charge: disallowCharge,
+                disallow_discharge: disallowDischarge
+            })
+        });
+
+        const result = await response.json();
+
+        if (!result.success) {
+            alert('Failed to update restrictions');
+        }
+    } catch (error) {
+        console.error('Error updating restrictions:', error);
+        alert('Failed to update restrictions: ' + error.message);
+    }
+}
+
+// Load current user control state
+async function loadUserControlState() {
+    try {
+        const response = await fetch(USER_CONTROL_API);
+        const data = await response.json();
+
+        currentSlots = data.fixed_time_slots || [];
+        updateSlotsCount();
+        return data;
+    } catch (error) {
+        console.error('Error loading user control state:', error);
+        return null;
+    }
+}
+
+// Update slots count display
+function updateSlotsCount() {
+    const countEl = document.getElementById('slots-count');
+    if (countEl) {
+        countEl.textContent = `${currentSlots.length} fixed time slot(s)`;
+    }
+}
+
+// Open slot management dialog
+async function openSlotDialog(prefillData = null) {
+    await loadUserControlState();
+
+    const overlay = document.getElementById('slot-dialog-overlay');
+    const dialogTitle = document.getElementById('slot-dialog-title');
+    const slotsList = document.getElementById('slots-list');
+    const slotForm = document.getElementById('slot-form');
+    const deleteBtn = document.getElementById('slot-delete-btn');
+
+    // Reset form
+    document.getElementById('slot-form').reset();
+    editingSlotId = null;
+
+    // Show existing slots
+    slotsList.innerHTML = '';
+    if (currentSlots.length > 0) {
+        currentSlots.forEach(slot => {
+            const fromTime = new Date(slot.from).toLocaleString();
+            const toTime = new Date(slot.to).toLocaleString();
+            const slotDiv = document.createElement('div');
+            slotDiv.className = 'slot-item';
+            slotDiv.innerHTML = `
+                <div class="slot-item-info">
+                    <div class="slot-item-time">${fromTime} - ${toTime}</div>
+                    <div class="slot-item-mode">${slot.mode}${slot.note ? ' - ' + slot.note : ''}</div>
+                </div>
+                <div class="slot-item-actions">
+                    <button class="slot-item-btn slot-edit-btn" onclick="editSlot('${slot.id}')">Edit</button>
+                    <button class="slot-item-btn slot-remove-btn" onclick="deleteSlot('${slot.id}')">Delete</button>
+                </div>
+            `;
+            slotsList.appendChild(slotDiv);
+        });
+    } else {
+        slotsList.innerHTML = '<div style="color: var(--text-secondary); padding: 10px;">No fixed time slots configured.</div>';
+    }
+
+    // Prefill if data provided (e.g., clicking on schedule row)
+    if (prefillData) {
+        dialogTitle.textContent = 'Create Fixed Time Slot';
+        document.getElementById('slot-from').value = prefillData.from || '';
+        document.getElementById('slot-to').value = prefillData.to || '';
+        document.getElementById('slot-mode').value = prefillData.mode || 'SelfUse';
+        document.getElementById('slot-note').value = prefillData.note || '';
+        deleteBtn.style.display = 'none';
+    } else {
+        dialogTitle.textContent = 'Manage Time Slots';
+        deleteBtn.style.display = 'none';
+
+        // Set default times (now + 15min, now + 1hr)
+        const now = new Date();
+        now.setMinutes(Math.ceil(now.getMinutes() / 15) * 15, 0, 0); // Round to next 15min
+        const later = new Date(now.getTime() + 60 * 60 * 1000); // +1 hour
+
+        document.getElementById('slot-from').value = formatDatetimeLocal(now);
+        document.getElementById('slot-to').value = formatDatetimeLocal(later);
+    }
+
+    overlay.classList.add('show');
+}
+
+// Format date for datetime-local input
+function formatDatetimeLocal(date) {
+    const pad = n => n.toString().padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+// Close slot dialog
+function closeSlotDialog() {
+    document.getElementById('slot-dialog-overlay').classList.remove('show');
+    editingSlotId = null;
+}
+
+// Edit existing slot
+function editSlot(slotId) {
+    const slot = currentSlots.find(s => s.id === slotId);
+    if (!slot) return;
+
+    editingSlotId = slotId;
+
+    document.getElementById('slot-dialog-title').textContent = 'Edit Time Slot';
+    document.getElementById('slot-from').value = formatDatetimeLocal(new Date(slot.from));
+    document.getElementById('slot-to').value = formatDatetimeLocal(new Date(slot.to));
+    document.getElementById('slot-mode').value = slot.mode;
+    document.getElementById('slot-note').value = slot.note || '';
+    document.getElementById('slot-delete-btn').style.display = 'inline-block';
+}
+
+// Save slot (create or update)
+async function saveSlot() {
+    const fromValue = document.getElementById('slot-from').value;
+    const toValue = document.getElementById('slot-to').value;
+    const mode = document.getElementById('slot-mode').value;
+    const note = document.getElementById('slot-note').value || null;
+
+    if (!fromValue || !toValue) {
+        alert('Please specify both From and To times');
+        return;
+    }
+
+    const from = new Date(fromValue).toISOString();
+    const to = new Date(toValue).toISOString();
+
+    if (new Date(from) >= new Date(to)) {
+        alert('End time must be after start time');
+        return;
+    }
+
+    try {
+        let response;
+        if (editingSlotId) {
+            // Update existing slot
+            response = await fetch(`${USER_CONTROL_API}/slots/${editingSlotId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ from, to, mode, note })
+            });
+        } else {
+            // Create new slot
+            response = await fetch(`${USER_CONTROL_API}/slots`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ from, to, mode, note })
+            });
+        }
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Reload to show updated state
+            await loadUserControlState();
+            closeSlotDialog();
+            openSlotDialog(); // Reopen to show updated list
+        } else {
+            alert('Failed to save slot: ' + (result.error || 'Unknown error'));
+        }
+    } catch (error) {
+        console.error('Error saving slot:', error);
+        alert('Failed to save slot: ' + error.message);
+    }
+}
+
+// Delete slot
+async function deleteSlot(slotId) {
+    if (!confirm('Are you sure you want to delete this time slot?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${USER_CONTROL_API}/slots/${slotId}`, {
+            method: 'DELETE'
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            await loadUserControlState();
+            if (document.getElementById('slot-dialog-overlay').classList.contains('show')) {
+                openSlotDialog(); // Refresh dialog
+            }
+        } else {
+            alert('Failed to delete slot');
+        }
+    } catch (error) {
+        console.error('Error deleting slot:', error);
+        alert('Failed to delete slot: ' + error.message);
+    }
+}
+
+// Delete currently editing slot (from form)
+function deleteCurrentSlot() {
+    if (editingSlotId) {
+        deleteSlot(editingSlotId);
+    }
+}
+
+// Initialize user control on page load
+document.addEventListener('DOMContentLoaded', function() {
+    loadUserControlState();
+});
 </script>
+
+<!-- Slot Management Dialog -->
+<div class="slot-dialog-overlay" id="slot-dialog-overlay" onclick="if(event.target === this) closeSlotDialog()">
+    <div class="slot-dialog">
+        <div class="slot-dialog-header">
+            <h3 id="slot-dialog-title">Manage Time Slots</h3>
+            <button class="slot-dialog-close" onclick="closeSlotDialog()">&times;</button>
+        </div>
+        <div class="slot-dialog-body">
+            <div class="slots-list" id="slots-list">
+                <!-- Existing slots populated by JS -->
+            </div>
+
+            <h4 style="margin-top: 20px; margin-bottom: 15px; border-top: 1px solid var(--border-color); padding-top: 15px;">
+                {% if let Some(_uc) = user_control %}Add New Slot{% endif %}
+            </h4>
+
+            <form id="slot-form" onsubmit="event.preventDefault(); saveSlot();">
+                <div class="slot-form-group">
+                    <label for="slot-from">From</label>
+                    <input type="datetime-local" id="slot-from" required>
+                </div>
+
+                <div class="slot-form-group">
+                    <label for="slot-to">To</label>
+                    <input type="datetime-local" id="slot-to" required>
+                </div>
+
+                <div class="slot-form-group">
+                    <label for="slot-mode">Mode</label>
+                    <select id="slot-mode">
+                        <option value="SelfUse">Self-Use</option>
+                        <option value="ForceCharge">Force Charge</option>
+                        <option value="ForceDischarge">Force Discharge</option>
+                        <option value="BackUpMode">Back Up Mode</option>
+                    </select>
+                </div>
+
+                <div class="slot-form-group">
+                    <label for="slot-note">Note (optional)</label>
+                    <textarea id="slot-note" rows="2" placeholder="e.g., Manual override for testing"></textarea>
+                </div>
+            </form>
+        </div>
+        <div class="slot-dialog-actions">
+            <button class="slot-delete-btn" id="slot-delete-btn" onclick="deleteCurrentSlot()" style="display: none;">Delete</button>
+            <button class="slot-cancel-btn" onclick="closeSlotDialog()">Cancel</button>
+            <button class="slot-save-btn" onclick="saveSlot()">Save Slot</button>
+        </div>
+    </div>
+</div>
+
 {% endblock %}

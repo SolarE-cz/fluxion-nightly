@@ -88,6 +88,23 @@ pub struct EvaluationRequest {
     /// Contains JSON with low/high tariff periods
     #[serde(default)]
     pub hdo_raw_data: Option<String>,
+    /// Total solar production forecast for today (kWh)
+    /// Sum of all matching solar forecast sensors
+    #[serde(default)]
+    pub solar_forecast_total_today_kwh: f32,
+    /// Remaining solar production forecast for today (kWh)
+    /// Helps strategies know if more solar is coming
+    #[serde(default)]
+    pub solar_forecast_remaining_today_kwh: f32,
+    /// Solar production forecast for tomorrow (kWh)
+    /// Enables forward-looking decisions
+    #[serde(default)]
+    pub solar_forecast_tomorrow_kwh: f32,
+
+    /// Weighted average price the battery was charged at (CZK/kWh)
+    /// Used to calculate arbitrage profit during discharge
+    #[serde(default)]
+    pub battery_avg_charge_price_czk_per_kwh: f32,
 }
 
 /// Operation mode decision
