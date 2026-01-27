@@ -141,25 +141,25 @@ display_currency = "CZK"  # Display currency for web UI: EUR, USD, or CZK
 # - 3 CZK minimum arbitrage spread
 # - 40% savings on winter days, optimal solar utilization on sunny days
 [strategies.winter_adaptive_v9]
-enabled = true                              # V9 is enabled by default
-priority = 100                              # Highest priority
-target_battery_soc = 95.0                   # Max charge level (%)
-min_discharge_soc = 10.0                    # Minimum SOC before discharge
-morning_peak_start_hour = 6                 # Morning peak start (6 AM)
-morning_peak_end_hour = 9                   # Morning peak end (9 AM)
-target_soc_after_morning_peak = 20.0        # Target SOC after morning peak (%)
+enabled = true                               # V9 is enabled by default
+priority = 100                               # Highest priority
+target_battery_soc = 95.0                    # Max charge level (%)
+min_discharge_soc = 10.0                     # Minimum SOC before discharge
+morning_peak_start_hour = 6                  # Morning peak start (6 AM)
+morning_peak_end_hour = 9                    # Morning peak end (9 AM)
+target_soc_after_morning_peak = 20.0         # Target SOC after morning peak (%)
 morning_peak_consumption_per_block_kwh = 0.5 # Expected consumption per 15min block in morning
-solar_threshold_kwh = 5.0                   # Minimum solar forecast to trigger solar-first mode
-solar_confidence_factor = 0.7               # Conservative factor for solar forecast (70%)
-min_arbitrage_spread_czk = 3.0              # Minimum spread for arbitrage (CZK)
-cheap_block_percentile = 0.25               # Bottom 25% of prices are "cheap"
-top_discharge_blocks_count = 8              # Top expensive blocks for discharge (8 = 2 hours)
-min_export_spread_czk = 5.0                 # Min spread for grid export
-min_soc_after_export = 50.0                 # Min SOC after export (%)
-battery_round_trip_efficiency = 0.90        # Round-trip efficiency (90%)
-negative_price_handling_enabled = true      # Charge during negative prices
-min_overnight_charge_blocks = 4             # Minimum overnight charge blocks (safety margin)
-opportunistic_charge_threshold_czk = 1.5    # Always charge below this price (CZK/kWh)
+solar_threshold_kwh = 5.0                    # Minimum solar forecast to trigger solar-first mode
+solar_confidence_factor = 0.7                # Conservative factor for solar forecast (70%)
+min_arbitrage_spread_czk = 3.0               # Minimum spread for arbitrage (CZK)
+cheap_block_percentile = 0.25                # Bottom 25% of prices are "cheap"
+top_discharge_blocks_count = 8               # Top expensive blocks for discharge (8 = 2 hours)
+min_export_spread_czk = 5.0                  # Min spread for grid export
+min_soc_after_export = 50.0                  # Min SOC after export (%)
+battery_round_trip_efficiency = 0.90         # Round-trip efficiency (90%)
+negative_price_handling_enabled = true       # Charge during negative prices
+min_overnight_charge_blocks = 4              # Minimum overnight charge blocks (safety margin)
+opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
 
 # V7: Unconstrained Multi-Cycle Arbitrage Optimizer
 # - No artificial limitations (no "top N blocks" or "below median only")

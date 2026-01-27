@@ -31,8 +31,10 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /build
 
 # Copy workspace configuration (flat structure)
+# Note: rust-toolchain.toml is intentionally NOT copied - it requests dev components
+# (clippy, rust-analyzer, rustfmt) that trigger a rustup update which fails in Docker
+# overlay fs with "Cross-device link (os error 18)".
 COPY Cargo.toml ./
-COPY rust-toolchain.toml ./
 COPY crates/ ./crates/
 
 # Build release binary
@@ -61,7 +63,7 @@ RUN chmod a+x /run.sh
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.33" \
+    io.hass.version="0.2.34" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 
