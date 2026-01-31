@@ -205,6 +205,7 @@ pub fn generate_schedule_with_optimizer(
     solar_forecast_remaining_today_kwh: f32,
     solar_forecast_tomorrow_kwh: f32,
     user_control: Option<&UserControlState>,
+    hourly_consumption_profile: Option<&[f32; 24]>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
@@ -301,6 +302,7 @@ pub fn generate_schedule_with_optimizer(
             solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh,
             avg_charge_price,
+            hourly_consumption_profile,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -435,6 +437,7 @@ pub fn generate_schedule_with_optimizer(
             solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh,
             avg_charge_price,
+            hourly_consumption_profile,
         );
 
         // Get decision from plugin manager
@@ -909,6 +912,7 @@ fn create_evaluation_request(
     solar_forecast_remaining_today_kwh: f32,
     solar_forecast_tomorrow_kwh: f32,
     battery_avg_charge_price_czk_per_kwh: f32,
+    hourly_consumption_profile: Option<&[f32; 24]>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -943,6 +947,7 @@ fn create_evaluation_request(
         historical: HistoricalData {
             grid_import_today_kwh,
             consumption_today_kwh: None, // TODO: Track actual consumption
+            hourly_consumption_profile: hourly_consumption_profile.map(|p| p.to_vec()),
         },
         backup_discharge_min_soc,
         hdo_raw_data,

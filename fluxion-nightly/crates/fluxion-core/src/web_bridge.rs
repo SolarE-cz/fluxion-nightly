@@ -196,6 +196,9 @@ pub struct ConsumptionStats {
     pub today_import_kwh: Option<f32>,
     /// Total grid import yesterday (kWh), if available
     pub yesterday_import_kwh: Option<f32>,
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Averaged over last 7 days of historical data
+    pub hourly_consumption_profile: Option<Vec<f32>>,
 }
 
 /// HDO (High/Low tariff) schedule information for chart display
@@ -554,6 +557,11 @@ fn build_dashboard_response(
             }
         }
 
+        // Extract hourly profile if available
+        let hourly_consumption_profile = consumption_history
+            .and_then(|h| h.hourly_profile())
+            .map(|p| p.hourly_avg_kwh.to_vec());
+
         // Only include stats if we have at least some meaningful data
         if ema_kwh.is_some() || today_import_kwh.is_some() || yesterday_import_kwh.is_some() {
             Some(ConsumptionStats {
@@ -561,6 +569,7 @@ fn build_dashboard_response(
                 ema_days,
                 today_import_kwh,
                 yesterday_import_kwh,
+                hourly_consumption_profile,
             })
         } else {
             None

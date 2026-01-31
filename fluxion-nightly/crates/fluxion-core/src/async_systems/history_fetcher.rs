@@ -99,20 +99,25 @@ pub fn poll_consumption_history_channel(
     };
 
     // NON-BLOCKING: try to receive from channel
-    while let Ok(summaries) = channel.receiver.try_recv() {
-        if summaries.is_empty() {
+    while let Ok(update) = channel.receiver.try_recv() {
+        if update.daily_summaries.is_empty() {
             debug!("⚠️ Received empty consumption history");
             continue;
         }
 
         info!(
             "📊 Updating consumption history: {} daily summaries",
-            summaries.len()
+            update.daily_summaries.len()
         );
 
         // Add all summaries to the history
-        for summary in summaries {
+        for summary in update.daily_summaries {
             consumption_history.add_summary(summary);
+        }
+
+        // Set the hourly consumption profile if available
+        if let Some(profile) = update.hourly_profile {
+            consumption_history.set_hourly_profile(profile);
         }
 
         info!(
@@ -126,7 +131,7 @@ pub fn poll_consumption_history_channel(
 async fn fetch_consumption_history(
     source: &Arc<dyn crate::traits::ConsumptionHistoryDataSource>,
     config: &ConsumptionHistoryConfig,
-    tx: &crossbeam_channel::Sender<Vec<crate::components::DailyEnergySummary>>,
+    tx: &crossbeam_channel::Sender<ConsumptionHistoryUpdate>,
 ) -> Result<()> {
     info!(
         "📊 Fetching consumption history for last {} days",
@@ -173,11 +178,23 @@ async fn fetch_consumption_history(
     let summaries =
         crate::components::aggregate_daily_consumption(&consumption_history, &solar_history);
 
-    info!("✅ Aggregated {} daily summaries", summaries.len());
+    // Compute hourly consumption profile
+    let hourly_profile =
+        crate::components::aggregate_hourly_consumption(&consumption_history);
+
+    info!(
+        "✅ Aggregated {} daily summaries, hourly profile: {}",
+        summaries.len(),
+        if hourly_profile.is_some() { "computed" } else { "none" }
+    );
 
     // Send to channel
-    if let Err(e) = tx.send(summaries) {
-        error!("❌ Failed to send history summaries to channel: {e}");
+    let update = ConsumptionHistoryUpdate {
+        daily_summaries: summaries,
+        hourly_profile,
+    };
+    if let Err(e) = tx.send(update) {
+        error!("❌ Failed to send history update to channel: {e}");
     }
 
     Ok(())

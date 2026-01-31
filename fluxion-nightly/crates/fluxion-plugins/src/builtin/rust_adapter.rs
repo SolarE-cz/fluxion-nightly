@@ -55,6 +55,8 @@ pub struct EvaluationContext<'a> {
     pub grid_import_today_kwh: Option<f32>,
     /// Consumption today (kWh)
     pub consumption_today_kwh: Option<f32>,
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    pub hourly_consumption_profile: Option<&'a [f32; 24]>,
 }
 
 /// Block evaluation result (matches fluxion-core::strategy::BlockEvaluation)
@@ -143,6 +145,7 @@ impl<S: EconomicStrategy + Debug + 'static> Plugin for RustStrategyAdapter<S> {
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
+            hourly_consumption_profile: None,
         };
 
         // Call the strategy

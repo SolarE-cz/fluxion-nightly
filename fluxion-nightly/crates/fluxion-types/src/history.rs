@@ -11,7 +11,7 @@
 // For commercial licensing, please contact: info@solare.cz
 
 use bevy_ecs::prelude::Resource;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -89,6 +89,15 @@ impl DailyEnergySummary {
     }
 }
 
+/// Average hourly consumption profile computed from historical data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyConsumptionProfile {
+    /// Average consumption per hour (kWh). Index 0 = 00:00-01:00, index 23 = 23:00-00:00
+    pub hourly_avg_kwh: [f32; 24],
+    /// Number of days used to compute the average
+    pub days_averaged: usize,
+}
+
 /// Resource storing historical consumption and energy balance data
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumptionHistory {
@@ -100,6 +109,9 @@ pub struct ConsumptionHistory {
 
     /// Last time history was updated from HA
     last_update: Option<DateTime<Utc>>,
+
+    /// Hourly consumption profile computed from historical data
+    hourly_profile: Option<HourlyConsumptionProfile>,
 }
 
 impl Default for ConsumptionHistory {
@@ -115,6 +127,7 @@ impl ConsumptionHistory {
             daily_summaries: VecDeque::with_capacity(max_days),
             max_days,
             last_update: None,
+            hourly_profile: None,
         }
     }
 
@@ -175,6 +188,16 @@ impl ConsumptionHistory {
             }
             None => true, // Never updated
         }
+    }
+
+    /// Get the hourly consumption profile
+    pub fn hourly_profile(&self) -> Option<&HourlyConsumptionProfile> {
+        self.hourly_profile.as_ref()
+    }
+
+    /// Set the hourly consumption profile
+    pub fn set_hourly_profile(&mut self, profile: HourlyConsumptionProfile) {
+        self.hourly_profile = Some(profile);
     }
 
     /// Clear all history
@@ -246,4 +269,149 @@ pub fn aggregate_daily_consumption(
     summaries.sort_by(|a, b| b.date.cmp(&a.date));
 
     summaries
+}
+
+/// Compute average hourly consumption from raw HA history data points.
+///
+/// The sensor is cumulative (resets at midnight), so we compute hourly deltas
+/// by finding the max value in each hour and subtracting the previous hour's max.
+///
+/// Returns None if insufficient data (no points).
+pub fn aggregate_hourly_consumption(
+    history_points: &[HistoryDataPoint],
+) -> Option<HourlyConsumptionProfile> {
+    use std::collections::HashMap;
+
+    if history_points.is_empty() {
+        return None;
+    }
+
+    // Group points by date (YYYY-MM-DD string key)
+    let mut by_date: HashMap<String, Vec<&HistoryDataPoint>> = HashMap::new();
+    for point in history_points {
+        let date_key = point.timestamp.format("%Y-%m-%d").to_string();
+        by_date.entry(date_key).or_default().push(point);
+    }
+
+    // For each hour across all days, collect deltas
+    let mut hour_deltas: Vec<Vec<f32>> = vec![Vec::new(); 24];
+    let mut total_days = 0usize;
+
+    for points in by_date.values() {
+        // Group points by hour within this day
+        let mut by_hour: HashMap<u32, f32> = HashMap::new();
+        for point in points {
+            let hour = point.timestamp.hour();
+            by_hour
+                .entry(hour)
+                .and_modify(|max| *max = max.max(point.value))
+                .or_insert(point.value);
+        }
+
+        if by_hour.is_empty() {
+            continue;
+        }
+        total_days += 1;
+
+        // Compute deltas for each hour
+        for h in 0..24u32 {
+            if let Some(&max_this_hour) = by_hour.get(&h) {
+                let delta = if h == 0 {
+                    // Sensor starts at 0 after midnight reset
+                    max_this_hour
+                } else {
+                    // Find the previous hour that has data
+                    let mut prev_max = None;
+                    for prev_h in (0..h).rev() {
+                        if let Some(&val) = by_hour.get(&prev_h) {
+                            prev_max = Some(val);
+                            break;
+                        }
+                    }
+                    match prev_max {
+                        Some(prev) => max_this_hour - prev,
+                        None => max_this_hour, // No previous hour data, treat like hour 0
+                    }
+                };
+
+                // Only include non-negative deltas (cumulative sensor should only go up)
+                if delta >= 0.0 {
+                    hour_deltas[h as usize].push(delta);
+                }
+            }
+        }
+    }
+
+    // Average each hour's deltas
+    let mut hourly_avg_kwh = [0.0f32; 24];
+    for (h, deltas) in hour_deltas.iter().enumerate() {
+        if !deltas.is_empty() {
+            let sum: f32 = deltas.iter().sum();
+            hourly_avg_kwh[h] = sum / deltas.len() as f32;
+        }
+    }
+
+    Some(HourlyConsumptionProfile {
+        hourly_avg_kwh,
+        days_averaged: total_days,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_aggregate_hourly_consumption_basic() {
+        // Simulate 2 days of cumulative sensor data
+        // Day 1: sensor goes 0 -> 0.5 -> 1.2 -> 2.0 over hours 0,1,2
+        // Day 2: sensor goes 0 -> 0.8 -> 1.5 -> 2.5 over hours 0,1,2
+        let points = vec![
+            // Day 1 (2026-01-25)
+            HistoryDataPoint {
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 25, 0, 30, 0).unwrap(),
+                value: 0.5,
+            },
+            HistoryDataPoint {
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 25, 1, 30, 0).unwrap(),
+                value: 1.2,
+            },
+            HistoryDataPoint {
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 25, 2, 30, 0).unwrap(),
+                value: 2.0,
+            },
+            // Day 2 (2026-01-26)
+            HistoryDataPoint {
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 26, 0, 30, 0).unwrap(),
+                value: 0.8,
+            },
+            HistoryDataPoint {
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 26, 1, 30, 0).unwrap(),
+                value: 1.5,
+            },
+            HistoryDataPoint {
+                timestamp: Utc.with_ymd_and_hms(2026, 1, 26, 2, 30, 0).unwrap(),
+                value: 2.5,
+            },
+        ];
+
+        let profile = aggregate_hourly_consumption(&points).unwrap();
+        assert_eq!(profile.days_averaged, 2);
+        // Hour 0: avg of (0.5, 0.8) = 0.65
+        assert!((profile.hourly_avg_kwh[0] - 0.65).abs() < 0.01);
+        // Hour 1: avg of (1.2-0.5, 1.5-0.8) = avg of (0.7, 0.7) = 0.7
+        assert!((profile.hourly_avg_kwh[1] - 0.7).abs() < 0.01);
+        // Hour 2: avg of (2.0-1.2, 2.5-1.5) = avg of (0.8, 1.0) = 0.9
+        assert!((profile.hourly_avg_kwh[2] - 0.9).abs() < 0.01);
+        // Hours 3-23 should be 0.0 (no data)
+        for h in 3..24 {
+            assert_eq!(profile.hourly_avg_kwh[h], 0.0);
+        }
+    }
+
+    #[test]
+    fn test_aggregate_hourly_consumption_empty() {
+        assert!(aggregate_hourly_consumption(&[]).is_none());
+    }
 }

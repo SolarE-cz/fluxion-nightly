@@ -418,6 +418,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 solar_forecast_remaining_today_kwh: 0.0,
                 solar_forecast_tomorrow_kwh: 0.0,
                 battery_avg_charge_price_czk_per_kwh: 0.0,
+                hourly_consumption_profile: None,
             };
 
             let evaluation = state.strategy.evaluate(&context);

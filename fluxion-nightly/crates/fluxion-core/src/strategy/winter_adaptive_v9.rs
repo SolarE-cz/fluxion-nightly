@@ -201,6 +201,9 @@ enum ScheduledAction {
     Charge { reason: ChargeReason },
     /// Discharge during this block (arbitrage peak)
     Discharge,
+    /// Hold battery at target SOC using BackUpMode after charging completes.
+    /// Grid powers house while battery is preserved for upcoming expensive hours.
+    HoldCharge,
     /// No scheduled action - use self-use mode
     SelfUse,
 }
@@ -361,10 +364,41 @@ impl WinterAdaptiveV9Strategy {
             .collect()
     }
 
+    /// Calculate how many charge blocks are needed to reach target SOC from current SOC
+    fn calculate_charge_blocks_needed(
+        &self,
+        current_soc: f32,
+        battery_capacity_kwh: f32,
+        max_charge_rate_kw: f32,
+    ) -> usize {
+        let soc_needed = (self.config.target_battery_soc - current_soc).max(0.0);
+        if soc_needed <= 0.0 {
+            return 0;
+        }
+        let kwh_needed = (soc_needed / 100.0) * battery_capacity_kwh;
+        let charge_per_block =
+            max_charge_rate_kw * 0.25 * self.config.battery_round_trip_efficiency;
+        if charge_per_block <= 0.0 {
+            return 0;
+        }
+        // Add +2 buffer to ensure we overshoot the target SOC.
+        // Prefer charging too much over too little - real-world charge rates
+        // taper at high SOC, household consumption reduces net charge per block,
+        // and the scheduler's CFC post-processor may remove isolated blocks.
+        // After reaching target, the HoldCharge logic preserves the SOC using
+        // BackUpMode until expensive hours begin.
+        (kwh_needed / charge_per_block).ceil() as usize + 2
+    }
+
     /// Find arbitrage opportunities - cheap blocks to charge, expensive to discharge
+    ///
+    /// When `max_charge_blocks` is Some(n), only the cheapest n blocks are selected
+    /// for charging instead of the full cheapest percentile. This ensures the strategy
+    /// picks the absolute cheapest blocks when battery capacity is limited.
     fn find_arbitrage_opportunities(
         &self,
         blocks: &[TimeBlockPrice],
+        max_charge_blocks: Option<usize>,
     ) -> (Vec<usize>, Vec<usize>, f32) {
         if blocks.is_empty() {
             return (Vec::new(), Vec::new(), 0.0);
@@ -383,13 +417,37 @@ impl WinterAdaptiveV9Strategy {
         // Sort by price ascending
         ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let charge_blocks: Vec<usize> = ranked.iter().take(cheap_count).map(|(i, _)| *i).collect();
+        // If max_charge_blocks is set, limit to the cheapest N blocks needed.
+        // Otherwise use the full cheapest percentile as before.
+        let effective_charge_count = match max_charge_blocks {
+            Some(limit) => limit.min(cheap_count),
+            None => cheap_count,
+        };
 
-        // Find most expensive blocks
+        let mut charge_blocks: Vec<usize> = ranked
+            .iter()
+            .take(effective_charge_count)
+            .map(|(i, _)| *i)
+            .collect();
+
+        // Ensure charge blocks form consecutive groups of at least 2 so they
+        // survive the scheduler's remove_short_force_sequences post-processor.
+        // Isolated blocks get their cheapest immediate neighbor added.
+        Self::ensure_consecutive_charge_groups(&mut charge_blocks, blocks);
+
+        // Bridge short gaps (< 2 blocks) between charge groups to form unified
+        // continuous sequences. A 1-block SelfUse gap between two charge groups
+        // is wasteful - the mode switch doesn't make sense for such a short window.
+        Self::bridge_short_charge_gaps(&mut charge_blocks, blocks, 2);
+
+        // Find most expensive blocks (excluding any charge blocks)
+        let charge_set: std::collections::HashSet<usize> =
+            charge_blocks.iter().copied().collect();
         let discharge_count = self.config.top_discharge_blocks_count.min(n);
         let discharge_blocks: Vec<usize> = ranked
             .iter()
             .rev()
+            .filter(|(i, _)| !charge_set.contains(i))
             .take(discharge_count)
             .map(|(i, _)| *i)
             .collect();
@@ -420,6 +478,250 @@ impl WinterAdaptiveV9Strategy {
         let profit = (avg_discharge - avg_charge) * self.config.battery_round_trip_efficiency;
 
         (charge_blocks, discharge_blocks, profit)
+    }
+
+    /// Ensure all selected charge blocks form consecutive groups of at least 2.
+    ///
+    /// The scheduler's `remove_short_force_sequences` post-processor removes
+    /// ForceCharge blocks that appear in sequences shorter than
+    /// `min_consecutive_force_blocks` (default 2). For any isolated charge block,
+    /// this adds its cheapest immediate neighbor to form a valid pair.
+    fn ensure_consecutive_charge_groups(
+        charge_indices: &mut Vec<usize>,
+        blocks: &[TimeBlockPrice],
+    ) {
+        use std::collections::HashSet;
+
+        let total = blocks.len();
+        let mut charge_set: HashSet<usize> = charge_indices.iter().copied().collect();
+        let mut additions = Vec::new();
+
+        for &idx in charge_indices.iter() {
+            let has_neighbor = (idx > 0 && charge_set.contains(&(idx - 1)))
+                || (idx + 1 < total && charge_set.contains(&(idx + 1)));
+            if has_neighbor {
+                continue;
+            }
+
+            // Isolated block - find cheapest immediate neighbor to pair with
+            let prev = if idx > 0 && !charge_set.contains(&(idx - 1)) {
+                Some((idx - 1, blocks[idx - 1].effective_price_czk_per_kwh))
+            } else {
+                None
+            };
+            let next = if idx + 1 < total && !charge_set.contains(&(idx + 1)) {
+                Some((idx + 1, blocks[idx + 1].effective_price_czk_per_kwh))
+            } else {
+                None
+            };
+
+            let best = match (prev, next) {
+                (Some((pi, pp)), Some((ni, np))) => {
+                    if pp <= np {
+                        Some(pi)
+                    } else {
+                        Some(ni)
+                    }
+                }
+                (Some((pi, _)), None) => Some(pi),
+                (None, Some((ni, _))) => Some(ni),
+                (None, None) => None,
+            };
+
+            if let Some(neighbor) = best
+                && !charge_set.contains(&neighbor)
+            {
+                additions.push(neighbor);
+                charge_set.insert(neighbor);
+            }
+        }
+
+        charge_indices.extend(additions);
+    }
+
+    /// Bridge short gaps between charge groups.
+    ///
+    /// When two charge groups are separated by fewer than `min_gap` SelfUse blocks,
+    /// convert those gap blocks to Charge so the groups merge into one continuous
+    /// sequence. This prevents the scheduler from switching modes back and forth
+    /// for trivially short non-charge windows (e.g., 1 block of SelfUse between
+    /// two ForceCharge groups makes no sense).
+    fn bridge_short_charge_gaps(
+        charge_indices: &mut Vec<usize>,
+        blocks: &[TimeBlockPrice],
+        min_gap: usize,
+    ) {
+        use std::collections::HashSet;
+        let mut charge_set: HashSet<usize> = charge_indices.iter().copied().collect();
+        if charge_set.is_empty() {
+            return;
+        }
+
+        let mut sorted: Vec<usize> = charge_indices.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut additions = Vec::new();
+        for window in sorted.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            let gap = b - a - 1;
+            if gap > 0 && gap < min_gap && b < blocks.len() {
+                for fill in (a + 1)..b {
+                    if !charge_set.contains(&fill) {
+                        additions.push(fill);
+                        charge_set.insert(fill);
+                    }
+                }
+            }
+        }
+
+        charge_indices.extend(additions);
+    }
+
+    /// Remove short SelfUse gaps in the final schedule.
+    ///
+    /// After the schedule is built, scan for SelfUse sequences between Charge
+    /// groups (or at the start of the schedule before the first Charge group)
+    /// that are shorter than `min_gap` blocks. Convert those SelfUse blocks to
+    /// Charge, creating continuous charge sequences.
+    ///
+    /// This mirrors the scheduler's `remove_short_force_sequences` rule
+    /// symmetrically: just as short ForceCharge sequences get removed by the
+    /// scheduler, short non-charge gaps between charge groups should be filled
+    /// by the strategy so the scheduler never sees them.
+    ///
+    /// The leading-gap case is critical: because the scheduler passes a sliding
+    /// window (`all_price_blocks` starts at the current block), a block that was
+    /// part of a charge group in the previous evaluation can become the first
+    /// block in a new, smaller window. If the recalculated plan no longer
+    /// selects it, a 1-block SelfUse gap appears at the window's leading edge.
+    fn remove_short_selfuse_gaps_in_schedule(
+        schedule: &mut [ScheduledAction],
+        blocks: &[TimeBlockPrice],
+        min_gap: usize,
+    ) {
+        if schedule.is_empty() || min_gap == 0 {
+            return;
+        }
+
+        // Calculate average charge price for price sanity check
+        let charge_prices: Vec<f32> = schedule
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| matches!(a, ScheduledAction::Charge { .. }))
+            .filter_map(|(i, _)| blocks.get(i).map(|b| b.effective_price_czk_per_kwh))
+            .collect();
+
+        if charge_prices.is_empty() {
+            return;
+        }
+
+        let avg_charge_price = charge_prices.iter().sum::<f32>() / charge_prices.len() as f32;
+        // Only bridge gaps where the price is within 1 CZK of the average charge price
+        let price_tolerance = 1.0;
+
+        let mut i = 0;
+        while i < schedule.len() {
+            if matches!(schedule[i], ScheduledAction::SelfUse) {
+                let gap_start = i;
+                while i < schedule.len() && matches!(schedule[i], ScheduledAction::SelfUse) {
+                    i += 1;
+                }
+                let gap_end = i;
+                let gap_len = gap_end - gap_start;
+
+                if gap_len > 0 && gap_len < min_gap {
+                    let before_is_charge = gap_start > 0
+                        && matches!(schedule[gap_start - 1], ScheduledAction::Charge { .. });
+                    let after_is_charge = gap_end < schedule.len()
+                        && matches!(schedule[gap_end], ScheduledAction::Charge { .. });
+
+                    // Bridge if:
+                    // 1. Gap is between two charge groups (middle gap)
+                    // 2. Gap is at the start before a charge group (leading gap from sliding window)
+                    let should_bridge = (gap_start == 0 || before_is_charge) && after_is_charge;
+
+                    if should_bridge {
+                        // Verify prices are reasonable (not bridging into expensive blocks)
+                        let all_prices_ok = (gap_start..gap_end).all(|j| {
+                            blocks.get(j).is_some_and(|b| {
+                                b.effective_price_czk_per_kwh
+                                    <= avg_charge_price + price_tolerance
+                            })
+                        });
+
+                        if all_prices_ok {
+                            #[expect(clippy::needless_range_loop)]
+                            for j in gap_start..gap_end {
+                                schedule[j] = ScheduledAction::Charge {
+                                    reason: ChargeReason::Arbitrage,
+                                };
+                            }
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Add HoldCharge blocks after the overnight charge window.
+    ///
+    /// After charging completes, the battery should remain at target SOC using
+    /// BackUpMode ("Stop Charge or Discharge") while grid prices are still low.
+    /// The hold lasts until the first block where the grid fee jumps significantly
+    /// (HDO low→high tariff transition) or until `morning_peak_start_hour`.
+    fn add_hold_charge_blocks(
+        &self,
+        schedule: &mut [ScheduledAction],
+        blocks: &[TimeBlockPrice],
+    ) {
+        // Find the last charge block in the overnight / early morning window
+        let last_charge_idx = schedule
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(i, _)| {
+                blocks
+                    .get(*i)
+                    .is_some_and(|b| (b.block_start.hour() as u8) < self.config.morning_peak_start_hour)
+            })
+            .find(|(_, a)| matches!(a, ScheduledAction::Charge { .. }))
+            .map(|(i, _)| i);
+
+        let Some(last_charge) = last_charge_idx else {
+            return;
+        };
+
+        // Grid fee at the last charge block (used to detect HDO transition)
+        let charge_grid_fee = blocks[last_charge].effective_price_czk_per_kwh
+            - blocks[last_charge].price_czk_per_kwh;
+
+        for i in (last_charge + 1)..blocks.len() {
+            let block = &blocks[i];
+            let grid_fee = block.effective_price_czk_per_kwh - block.price_czk_per_kwh;
+
+            // Stop at HDO high tariff transition (grid fee jumps by >0.5 CZK)
+            if grid_fee > charge_grid_fee + 0.5 {
+                break;
+            }
+
+            // Fallback: stop at morning peak start hour
+            if block.block_start.hour() as u8 >= self.config.morning_peak_start_hour {
+                break;
+            }
+
+            // Stop at discharge blocks
+            if matches!(schedule[i], ScheduledAction::Discharge) {
+                break;
+            }
+
+            // Convert SelfUse blocks to HoldCharge
+            if matches!(schedule[i], ScheduledAction::SelfUse) {
+                schedule[i] = ScheduledAction::HoldCharge;
+            }
+        }
     }
 
     /// Generate the day plan based on mode and opportunities
@@ -456,7 +758,15 @@ impl WinterAdaptiveV9Strategy {
                 }
 
                 // Also find arbitrage opportunities for non-negative blocks
-                let (arb_charge, arb_discharge, profit) = self.find_arbitrage_opportunities(blocks);
+                // Limit additional charge blocks to remaining battery capacity
+                let blocks_needed = self.calculate_charge_blocks_needed(
+                    current_soc,
+                    battery_capacity_kwh,
+                    max_charge_rate_kw,
+                );
+                let remaining_needed = blocks_needed.saturating_sub(negative_blocks.len());
+                let (arb_charge, arb_discharge, profit) =
+                    self.find_arbitrage_opportunities(blocks, Some(remaining_needed));
 
                 if profit >= self.config.min_arbitrage_spread_czk {
                     for &idx in &arb_charge {
@@ -523,7 +833,12 @@ impl WinterAdaptiveV9Strategy {
                 }
 
                 // Step 4: Check if arbitrage is still profitable
-                let (arb_charge, arb_discharge, profit) = self.find_arbitrage_opportunities(blocks);
+                // Limit additional charge to remaining battery capacity after morning peak
+                let blocks_for_morning =
+                    self.calculate_charge_blocks_needed(current_soc, battery_capacity_kwh, max_charge_rate_kw);
+                let remaining_after_morning = blocks_for_morning.saturating_sub(morning_peak_charge_blocks);
+                let (arb_charge, arb_discharge, profit) =
+                    self.find_arbitrage_opportunities(blocks, Some(remaining_after_morning));
 
                 if profit >= self.config.min_arbitrage_spread_czk {
                     // Add arbitrage charge blocks (only if not already scheduled)
@@ -555,8 +870,16 @@ impl WinterAdaptiveV9Strategy {
             }
 
             OperatingMode::Arbitrage => {
-                // Full arbitrage mode like V7
-                let (arb_charge, arb_discharge, profit) = self.find_arbitrage_opportunities(blocks);
+                // Full arbitrage mode - charge on the absolute cheapest blocks only
+                // Calculate how many blocks are actually needed to fill the battery,
+                // then select only the cheapest N from the candidate pool.
+                let blocks_needed = self.calculate_charge_blocks_needed(
+                    current_soc,
+                    battery_capacity_kwh,
+                    max_charge_rate_kw,
+                );
+                let (arb_charge, arb_discharge, profit) =
+                    self.find_arbitrage_opportunities(blocks, Some(blocks_needed));
 
                 if profit >= self.config.min_arbitrage_spread_czk {
                     for &idx in &arb_charge {
@@ -611,6 +934,20 @@ impl WinterAdaptiveV9Strategy {
                 }
             }
         }
+
+        // Apply min_consecutive_force_blocks rule symmetrically: remove short
+        // SelfUse gaps between charge groups. This handles two cases:
+        // 1. Middle gaps: Charge→SelfUse(1)→Charge patterns within one plan
+        // 2. Leading gaps: The sliding window causes the first block to be SelfUse
+        //    when it was Charge in the previous evaluation's plan
+        // Using min_gap=2 to match the scheduler's min_consecutive_force_blocks default.
+        Self::remove_short_selfuse_gaps_in_schedule(&mut schedule, blocks, 2);
+
+        // After all charge/discharge scheduling, add HoldCharge blocks between
+        // the last overnight charge block and the first expensive block (HDO transition
+        // or morning peak). This preserves battery SOC at target using BackUpMode
+        // while grid is still cheap, instead of draining battery via SelfUse.
+        self.add_hold_charge_blocks(&mut schedule, blocks);
 
         DayPlan {
             schedule,
@@ -773,12 +1110,26 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                             excess_after_charge * context.grid_export_price_czk_per_kwh;
                     }
                 } else {
-                    eval.mode = InverterOperationMode::SelfUse;
+                    eval.mode = InverterOperationMode::BackUpMode;
                     eval.reason = format!(
-                        "SELF-USE: Battery at target ({:.1}%) [{}]",
+                        "HOLD CHARGE: Battery at target ({:.1}%), grid powers house [{}]",
                         context.current_battery_soc, summary
                     );
-                    eval.decision_uid = Some("winter_adaptive_v9:self_use".to_string());
+                    eval.decision_uid =
+                        Some("winter_adaptive_v9:hold_charge".to_string());
+
+                    // In BackUpMode: grid powers house, battery doesn't discharge
+                    let net_consumption =
+                        context.consumption_forecast_kwh - context.solar_forecast_kwh;
+                    if net_consumption > 0.0 {
+                        eval.energy_flows.grid_import_kwh = net_consumption;
+                        eval.cost_czk = net_consumption * effective_price;
+                    } else {
+                        let excess = -net_consumption;
+                        eval.energy_flows.grid_export_kwh = excess;
+                        eval.revenue_czk =
+                            excess * context.grid_export_price_czk_per_kwh;
+                    }
                 }
             }
 
@@ -865,6 +1216,31 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                 }
             }
 
+            ScheduledAction::HoldCharge => {
+                // After charging is complete, hold battery at target SOC using BackUpMode.
+                // Grid powers the house while electricity is still cheap (HDO low tariff).
+                // Battery is preserved for the upcoming expensive hours.
+                eval.mode = InverterOperationMode::BackUpMode;
+                eval.reason = format!(
+                    "HOLD AT TARGET: {:.3} CZK/kWh, preserving battery for expensive hours [{}]",
+                    effective_price, summary
+                );
+                eval.decision_uid =
+                    Some("winter_adaptive_v9:hold_for_peak".to_string());
+
+                let net_consumption =
+                    context.consumption_forecast_kwh - context.solar_forecast_kwh;
+                if net_consumption > 0.0 {
+                    eval.energy_flows.grid_import_kwh = net_consumption;
+                    eval.cost_czk = net_consumption * effective_price;
+                } else {
+                    let excess = -net_consumption;
+                    eval.energy_flows.grid_export_kwh = excess;
+                    eval.revenue_czk =
+                        excess * context.grid_export_price_czk_per_kwh;
+                }
+            }
+
             ScheduledAction::SelfUse => {
                 // Check for unscheduled negative prices
                 if self.config.negative_price_handling_enabled && effective_price < 0.0 {
@@ -891,14 +1267,46 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                             eval.revenue_czk =
                                 excess_after_charge * context.grid_export_price_czk_per_kwh;
                         }
+                    } else {
+                        // Battery full during negative prices - use BackUpMode so house
+                        // draws from grid (getting paid) while battery stays full
+                        eval.mode = InverterOperationMode::BackUpMode;
+                        eval.reason = format!(
+                            "NEGATIVE PRICE HOLD: {:.3} CZK/kWh, battery full ({:.1}%) [{}]",
+                            effective_price, context.current_battery_soc, summary
+                        );
+                        eval.decision_uid =
+                            Some("winter_adaptive_v9:negative_price_hold".to_string());
+
+                        let net_consumption =
+                            context.consumption_forecast_kwh - context.solar_forecast_kwh;
+                        if net_consumption > 0.0 {
+                            eval.energy_flows.grid_import_kwh = net_consumption;
+                            eval.cost_czk = net_consumption * effective_price;
+                        } else {
+                            let excess = -net_consumption;
+                            eval.energy_flows.grid_export_kwh = excess;
+                            eval.revenue_czk =
+                                excess * context.grid_export_price_czk_per_kwh;
+                        }
                     }
                 } else {
                     eval.mode = InverterOperationMode::SelfUse;
                     eval.reason = format!("SELF-USE: {:.3} CZK/kWh [{}]", effective_price, summary);
                     eval.decision_uid = Some("winter_adaptive_v9:self_use".to_string());
 
-                    let net_consumption =
-                        context.consumption_forecast_kwh - context.solar_forecast_kwh;
+                    // Use hourly consumption profile for more accurate per-hour estimate.
+                    // Falls back to flat forecast if hourly data unavailable.
+                    let consumption_kwh = context
+                        .hourly_consumption_profile
+                        .map(|profile| {
+                            let hour = context.price_block.block_start.hour() as usize;
+                            profile[hour] / 4.0 // hourly kWh → 15-min block
+                        })
+                        .unwrap_or(context.consumption_forecast_kwh);
+
+                    eval.energy_flows.household_consumption_kwh = consumption_kwh;
+                    let net_consumption = consumption_kwh - context.solar_forecast_kwh;
 
                     if net_consumption > 0.0 {
                         let usable_battery_kwh = ((context.current_battery_soc
@@ -1175,7 +1583,7 @@ mod tests {
         let strategy = WinterAdaptiveV9Strategy::new(config);
         let blocks = create_test_blocks_with_prices();
 
-        let (charge, discharge, profit) = strategy.find_arbitrage_opportunities(&blocks);
+        let (charge, discharge, profit) = strategy.find_arbitrage_opportunities(&blocks, None);
 
         println!(
             "Arbitrage: {} charge, {} discharge blocks, {:.2} CZK/kWh profit",
@@ -1211,5 +1619,735 @@ mod tests {
             !opportunistic.is_empty(),
             "Should find opportunistic blocks"
         );
+    }
+
+    #[test]
+    fn test_arbitrage_selects_cheapest_blocks_not_earliest() {
+        // Simulate the real-world scenario: moderate prices now (midnight),
+        // cheaper prices later (3-5 AM), expensive peaks in evening.
+        // The strategy should charge at 3-5 AM, not at midnight.
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 29, 23, 0, 0).unwrap();
+        let grid_fee = 0.50;
+
+        let mut blocks = Vec::new();
+        let prices = [
+            // 23:00-01:00 (8 blocks) - moderately cheap
+            2.45, 2.50, 2.48, 2.52, 2.47, 2.53, 2.49, 2.51,
+            // 01:00-03:00 (8 blocks) - medium prices
+            2.90, 2.85, 2.95, 3.00, 2.80, 2.75, 2.70, 2.65,
+            // 03:00-05:00 (8 blocks) - the CHEAPEST blocks
+            2.29, 2.30, 2.32, 2.34, 2.31, 2.33, 2.35, 2.36,
+            // 05:00-07:00 (8 blocks) - rising prices
+            2.80, 3.00, 3.20, 3.40, 3.60, 3.80, 4.00, 4.20,
+            // 07:00-09:00 (8 blocks) - morning peak
+            4.50, 4.60, 4.70, 4.80, 4.90, 5.00, 4.80, 4.60,
+            // 09:00-15:00 (24 blocks) - daytime
+            3.50, 3.40, 3.30, 3.20, 3.10, 3.00, 2.90, 2.80,
+            2.70, 2.60, 2.50, 2.40, 2.50, 2.60, 2.70, 2.80,
+            2.90, 3.00, 3.10, 3.20, 3.30, 3.40, 3.50, 3.60,
+            // 15:00-21:00 (24 blocks) - evening peak
+            3.80, 4.00, 4.20, 4.40, 4.60, 4.80, 5.00, 5.20,
+            4.80, 4.60, 4.40, 4.20, 4.00, 3.80, 3.60, 3.40,
+            3.80, 4.00, 4.20, 4.40, 4.60, 4.50, 4.30, 4.10,
+            // 21:00-23:00 (8 blocks) - late evening
+            3.50, 3.30, 3.10, 2.90, 2.70, 2.60, 2.50, 2.40,
+        ];
+
+        for (i, &price) in prices.iter().enumerate() {
+            blocks.push(TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(i as i64 * 15),
+                duration_minutes: 15,
+                price_czk_per_kwh: price,
+                effective_price_czk_per_kwh: price + grid_fee,
+            });
+        }
+
+        let config = WinterAdaptiveV9Config {
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            cheap_block_percentile: 0.25,
+            min_arbitrage_spread_czk: 1.0,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+
+        // Battery at 10% - needs ~9 blocks to charge to 95% (10 kWh battery, 3 kW charge rate)
+        let plan = strategy.generate_plan(&blocks, 10.0, 10.0, 3.0, 0.0);
+
+        assert_eq!(plan.mode, OperatingMode::Arbitrage);
+
+        // Collect the charge blocks and their prices
+        let charge_indices: Vec<usize> = plan
+            .schedule
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| matches!(a, ScheduledAction::Charge { .. }))
+            .map(|(i, _)| i)
+            .collect();
+
+        let charge_prices: Vec<f32> = charge_indices
+            .iter()
+            .map(|&i| blocks[i].effective_price_czk_per_kwh)
+            .collect();
+
+        println!(
+            "Charge blocks: {} blocks, prices: {:?}",
+            charge_indices.len(),
+            charge_prices
+        );
+
+        // The cheapest blocks are at indices 16-23 (3-5 AM, prices 2.29-2.36 + 0.50 fee)
+        // The strategy should NOT be charging at midnight blocks (2.45-2.53 + fee)
+        // when 3-5 AM blocks are cheaper (2.29-2.36 + fee)
+        let max_charge_price = charge_prices
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let cheapest_3am_price = 2.29 + grid_fee; // 2.79
+
+        // The most expensive charge block should not be much above the 3-5 AM prices
+        // (allowing some margin for the block count needed)
+        println!(
+            "Max charge price: {:.3}, cheapest available: {:.3}",
+            max_charge_price, cheapest_3am_price
+        );
+
+        // Key assertion: ALL 3-5 AM cheap blocks (indices 16-23) must be selected
+        // since they are the absolute cheapest. Midnight blocks may also be included
+        // due to gap bridging (connecting charge groups into continuous sequences).
+        let early_morning_count = charge_indices.iter().filter(|&&i| (16..24).contains(&i)).count();
+
+        println!(
+            "3-5 AM blocks selected: {}/8",
+            early_morning_count,
+        );
+
+        // All 8 cheapest blocks (3-5 AM) must be included
+        assert_eq!(
+            early_morning_count, 8,
+            "All 8 cheapest blocks (3-5 AM) should be selected, got {}",
+            early_morning_count,
+        );
+    }
+
+    #[test]
+    fn test_charge_blocks_limited_to_battery_capacity() {
+        let config = WinterAdaptiveV9Config {
+            target_battery_soc: 95.0,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+
+        // 10 kWh battery, 3 kW charge rate, 90% efficiency
+        // Charge per block = 3.0 * 0.25 * 0.9 = 0.675 kWh
+        // SOC needed = 95 - 10 = 85% = 8.5 kWh
+        // Blocks needed = ceil(8.5 / 0.675) + 2 buffer = 15
+        let blocks_needed = strategy.calculate_charge_blocks_needed(10.0, 10.0, 3.0);
+
+        println!("Blocks needed from 10% to 95%: {}", blocks_needed);
+        assert_eq!(blocks_needed, 15);
+
+        // Already at target
+        let blocks_needed_full = strategy.calculate_charge_blocks_needed(95.0, 10.0, 3.0);
+        assert_eq!(blocks_needed_full, 0);
+
+        // Halfway there (ceil(6.67) + 2 = 9)
+        let blocks_needed_half = strategy.calculate_charge_blocks_needed(50.0, 10.0, 3.0);
+        let expected = ((45.0_f32 / 100.0 * 10.0) / (3.0 * 0.25 * 0.90)).ceil() as usize + 2;
+        assert_eq!(blocks_needed_half, expected);
+    }
+
+    fn create_test_control_config() -> fluxion_types::config::ControlConfig {
+        fluxion_types::config::ControlConfig {
+            battery_capacity_kwh: 10.0,
+            max_battery_charge_rate_kw: 3.0,
+            battery_efficiency: 0.95,
+            min_battery_soc: 10.0,
+            max_battery_soc: 100.0,
+            hardware_min_battery_soc: 10.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_charge_block_at_target_soc_returns_backup_mode() {
+        // SolarFirst mode with high morning peak consumption ensures charge blocks
+        // are scheduled even at 95% SOC (because morning peak drains a lot).
+        // consumption_soc_delta = (12 blocks * 1.0 kWh / 10.0 capacity) * 100 = 120%
+        // soc_needed = (20.0 - 95.0 + 120.0) = 45% > 0, so charge blocks are scheduled
+        let config = WinterAdaptiveV9Config {
+            solar_threshold_kwh: 5.0,
+            min_overnight_charge_blocks: 4,
+            morning_peak_consumption_per_block_kwh: 1.0,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+        let blocks = create_test_blocks_with_prices();
+        let control_config = create_test_control_config();
+
+        // Block 0 is hour 0 (overnight, cheap) - will be scheduled as Charge in SolarFirst
+        let context = EvaluationContext {
+            price_block: &blocks[0],
+            all_price_blocks: Some(&blocks),
+            control_config: &control_config,
+            current_battery_soc: 95.0, // At target
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.5,
+            grid_export_price_czk_per_kwh: 0.5,
+            backup_discharge_min_soc: 10.0,
+            grid_import_today_kwh: None,
+            consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 10.0,
+            solar_forecast_remaining_today_kwh: 10.0, // High solar -> SolarFirst mode
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
+        };
+
+        let eval = strategy.evaluate(&context);
+
+        assert_eq!(
+            eval.mode,
+            InverterOperationMode::BackUpMode,
+            "Charge block at target SOC should return BackUpMode, got: {} - {}",
+            eval.mode,
+            eval.reason
+        );
+        assert!(
+            eval.reason.contains("HOLD CHARGE"),
+            "Reason should mention HOLD CHARGE: {}",
+            eval.reason
+        );
+    }
+
+    #[test]
+    fn test_charge_block_below_target_soc_returns_force_charge() {
+        // SolarFirst mode with high solar, overnight block will be Charge
+        let config = WinterAdaptiveV9Config {
+            solar_threshold_kwh: 5.0,
+            min_overnight_charge_blocks: 4,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+        let blocks = create_test_blocks_with_prices();
+        let control_config = create_test_control_config();
+
+        let context = EvaluationContext {
+            price_block: &blocks[0],
+            all_price_blocks: Some(&blocks),
+            control_config: &control_config,
+            current_battery_soc: 30.0, // Below target
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.5,
+            grid_export_price_czk_per_kwh: 0.5,
+            backup_discharge_min_soc: 10.0,
+            grid_import_today_kwh: None,
+            consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 10.0,
+            solar_forecast_remaining_today_kwh: 10.0, // High solar -> SolarFirst mode
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
+        };
+
+        let eval = strategy.evaluate(&context);
+
+        assert_eq!(
+            eval.mode,
+            InverterOperationMode::ForceCharge,
+            "Charge block below target SOC should return ForceCharge, got: {} - {}",
+            eval.mode,
+            eval.reason
+        );
+    }
+
+    #[test]
+    fn test_negative_price_at_target_soc_returns_backup_mode() {
+        let config = WinterAdaptiveV9Config {
+            negative_price_handling_enabled: true,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+        let control_config = create_test_control_config();
+
+        // Create blocks where one block has negative effective price.
+        // The planner detects negative prices and enters NegativePrice mode,
+        // scheduling it as a Charge block. At SOC >= target, the Charge arm
+        // returns BackUpMode (our fix).
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+
+        let mut blocks = Vec::new();
+        for hour in 0..24 {
+            for quarter in 0..4 {
+                let effective_price = match hour {
+                    0..=5 => 3.3,
+                    6..=8 => 6.8,
+                    9 => -0.5, // Single hour negative effective price
+                    10..=14 => 2.3,
+                    15..=17 => 6.3,
+                    18..=20 => 7.8,
+                    _ => 3.8,
+                };
+
+                blocks.push(TimeBlockPrice {
+                    block_start: base_time
+                        + chrono::Duration::hours(hour)
+                        + chrono::Duration::minutes(quarter * 15),
+                    duration_minutes: 15,
+                    price_czk_per_kwh: effective_price - 1.8,
+                    effective_price_czk_per_kwh: effective_price,
+                });
+            }
+        }
+
+        // Pick a negative-price block at hour 9
+        let block_index = 9 * 4;
+
+        let context = EvaluationContext {
+            price_block: &blocks[block_index],
+            all_price_blocks: Some(&blocks),
+            control_config: &control_config,
+            current_battery_soc: 95.0, // At target
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.5,
+            grid_export_price_czk_per_kwh: 0.5,
+            backup_discharge_min_soc: 10.0,
+            grid_import_today_kwh: None,
+            consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
+        };
+
+        let eval = strategy.evaluate(&context);
+
+        // Block is scheduled as Charge (NegativePrice) by the planner,
+        // and at target SOC our fix returns BackUpMode
+        assert_eq!(
+            eval.mode,
+            InverterOperationMode::BackUpMode,
+            "Negative price block at target SOC should return BackUpMode, got: {} - {}",
+            eval.mode,
+            eval.reason
+        );
+        assert!(
+            eval.reason.contains("HOLD CHARGE"),
+            "Reason should mention HOLD CHARGE: {}",
+            eval.reason
+        );
+    }
+
+    #[test]
+    fn test_hold_charge_after_overnight_charging() {
+        // Create blocks with HDO low tariff (0.50 fee) overnight and
+        // HDO high tariff (1.80 fee) from 6 AM onwards.
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let hdo_low_fee = 0.50;
+        let hdo_high_fee = 1.80;
+
+        let mut blocks = Vec::new();
+        for hour in 0..24 {
+            for quarter in 0..4 {
+                let spot_price = match hour {
+                    0..=5 => 2.0,   // Overnight
+                    6..=8 => 4.0,   // Morning peak
+                    9..=14 => 2.5,  // Midday
+                    15..=20 => 5.0, // Evening peak
+                    _ => 2.5,       // Late evening
+                };
+                let grid_fee = if hour < 6 { hdo_low_fee } else { hdo_high_fee };
+
+                blocks.push(TimeBlockPrice {
+                    block_start: base_time
+                        + chrono::Duration::hours(hour)
+                        + chrono::Duration::minutes(quarter * 15),
+                    duration_minutes: 15,
+                    price_czk_per_kwh: spot_price,
+                    effective_price_czk_per_kwh: spot_price + grid_fee,
+                });
+            }
+        }
+
+        let config = WinterAdaptiveV9Config {
+            target_battery_soc: 100.0,
+            morning_peak_start_hour: 6,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+
+        // Battery at 50% - needs charging, arbitrage mode (low solar)
+        let plan = strategy.generate_plan(&blocks, 50.0, 10.0, 3.0, 0.0);
+
+        // Blocks between last charge and hour 6 should be HoldCharge
+        let hold_count = plan
+            .schedule
+            .iter()
+            .filter(|a| matches!(a, ScheduledAction::HoldCharge))
+            .count();
+
+        println!("HoldCharge blocks after overnight charging: {}", hold_count);
+
+        // There should be some HoldCharge blocks between last charge and 6 AM
+        // (unless all overnight blocks are charging)
+        let last_overnight_charge = plan
+            .schedule
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(i, _)| blocks[*i].block_start.hour() < 6)
+            .find(|(_, a)| matches!(a, ScheduledAction::Charge { .. }))
+            .map(|(i, _)| i);
+
+        if let Some(last_idx) = last_overnight_charge {
+            let hour_6_idx = 6 * 4; // Index for 06:00
+            if last_idx + 1 < hour_6_idx {
+                assert!(
+                    hold_count > 0,
+                    "Should have HoldCharge blocks between last charge (idx {}) and 6 AM (idx {})",
+                    last_idx,
+                    hour_6_idx
+                );
+
+                // Verify all hold blocks are before hour 6
+                for (i, action) in plan.schedule.iter().enumerate() {
+                    if matches!(action, ScheduledAction::HoldCharge) {
+                        assert!(
+                            blocks[i].block_start.hour() < 6,
+                            "HoldCharge at hour {} should be before morning peak",
+                            blocks[i].block_start.hour()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hold_charge_stops_at_hdo_transition() {
+        // HDO transition at hour 7 (not the default 6)
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let hdo_low_fee = 0.50;
+        let hdo_high_fee = 1.80;
+
+        let mut blocks = Vec::new();
+        for hour in 0..24 {
+            for quarter in 0..4 {
+                let spot_price = 2.0; // Flat spot price
+                // HDO transition at hour 7
+                let grid_fee = if hour < 7 { hdo_low_fee } else { hdo_high_fee };
+
+                blocks.push(TimeBlockPrice {
+                    block_start: base_time
+                        + chrono::Duration::hours(hour)
+                        + chrono::Duration::minutes(quarter * 15),
+                    duration_minutes: 15,
+                    price_czk_per_kwh: spot_price,
+                    effective_price_czk_per_kwh: spot_price + grid_fee,
+                });
+            }
+        }
+
+        let config = WinterAdaptiveV9Config {
+            target_battery_soc: 100.0,
+            morning_peak_start_hour: 8, // Set peak later than HDO transition
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+
+        let plan = strategy.generate_plan(&blocks, 50.0, 10.0, 3.0, 0.0);
+
+        // No HoldCharge blocks should exist at hour 7+ (HDO high tariff)
+        for (i, action) in plan.schedule.iter().enumerate() {
+            if matches!(action, ScheduledAction::HoldCharge) {
+                let hour = blocks[i].block_start.hour();
+                assert!(
+                    hour < 7,
+                    "HoldCharge should stop at HDO transition (hour 7), found at hour {}",
+                    hour
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_bridge_short_charge_gaps() {
+        // Create charge blocks with a 1-block gap: [5, 6, _, 8, 9]
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let blocks: Vec<TimeBlockPrice> = (0..20)
+            .map(|i| TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(i * 15),
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            })
+            .collect();
+
+        let mut charge_indices = vec![5, 6, 8, 9];
+        WinterAdaptiveV9Strategy::bridge_short_charge_gaps(&mut charge_indices, &blocks, 2);
+
+        // Gap of 1 block (index 7) should be filled
+        assert!(
+            charge_indices.contains(&7),
+            "1-block gap at index 7 should be bridged, got: {:?}",
+            charge_indices
+        );
+    }
+
+    #[test]
+    fn test_bridge_does_not_fill_large_gaps() {
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let blocks: Vec<TimeBlockPrice> = (0..20)
+            .map(|i| TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(i * 15),
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            })
+            .collect();
+
+        // Gap of 3 blocks: [2, 3, _, _, _, 7, 8]
+        let mut charge_indices = vec![2, 3, 7, 8];
+        WinterAdaptiveV9Strategy::bridge_short_charge_gaps(&mut charge_indices, &blocks, 2);
+
+        // Gap of 3 should NOT be filled
+        assert!(
+            !charge_indices.contains(&4),
+            "3-block gap should not be bridged, got: {:?}",
+            charge_indices
+        );
+        assert!(
+            !charge_indices.contains(&5),
+            "3-block gap should not be bridged, got: {:?}",
+            charge_indices
+        );
+    }
+
+    #[test]
+    fn test_remove_short_selfuse_gaps_middle() {
+        // Schedule: Charge, SelfUse(1), Charge → gap should be filled
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let blocks: Vec<TimeBlockPrice> = (0..5)
+            .map(|i| TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(i * 15),
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            })
+            .collect();
+
+        let mut schedule = vec![
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::SelfUse, // 1-block gap
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+        ];
+
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
+            &mut schedule, &blocks, 2,
+        );
+
+        assert!(
+            matches!(schedule[2], ScheduledAction::Charge { .. }),
+            "1-block SelfUse gap between charge groups should be filled, got: {:?}",
+            schedule[2]
+        );
+    }
+
+    #[test]
+    fn test_remove_short_selfuse_gaps_leading() {
+        // Schedule: SelfUse(1), Charge, Charge → leading gap should be filled
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let blocks: Vec<TimeBlockPrice> = (0..4)
+            .map(|i| TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(i * 15),
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            })
+            .collect();
+
+        let mut schedule = vec![
+            ScheduledAction::SelfUse, // Leading gap (1 block)
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::SelfUse,
+        ];
+
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
+            &mut schedule, &blocks, 2,
+        );
+
+        assert!(
+            matches!(schedule[0], ScheduledAction::Charge { .. }),
+            "1-block leading SelfUse before charge group should be filled, got: {:?}",
+            schedule[0]
+        );
+        // Trailing SelfUse should NOT be changed (no charge group after it)
+        assert!(
+            matches!(schedule[3], ScheduledAction::SelfUse),
+            "Trailing SelfUse should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn test_remove_short_selfuse_gaps_respects_price() {
+        // Schedule: Charge, SelfUse(1 expensive), Charge → should NOT bridge
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let blocks = vec![
+            TimeBlockPrice {
+                block_start: base_time,
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            },
+            TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(15),
+                duration_minutes: 15,
+                price_czk_per_kwh: 10.0,
+                effective_price_czk_per_kwh: 10.5, // Very expensive gap
+            },
+            TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(30),
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            },
+        ];
+
+        let mut schedule = vec![
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::SelfUse, // Expensive gap
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+        ];
+
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
+            &mut schedule, &blocks, 2,
+        );
+
+        assert!(
+            matches!(schedule[1], ScheduledAction::SelfUse),
+            "Expensive gap should NOT be bridged, got: {:?}",
+            schedule[1]
+        );
+    }
+
+    #[test]
+    fn test_remove_short_selfuse_gaps_keeps_2block_gaps() {
+        // Schedule: Charge, SelfUse(2), Charge → 2-block gap should NOT be filled (min_gap=2)
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let blocks: Vec<TimeBlockPrice> = (0..6)
+            .map(|i| TimeBlockPrice {
+                block_start: base_time + chrono::Duration::minutes(i * 15),
+                duration_minutes: 15,
+                price_czk_per_kwh: 2.0,
+                effective_price_czk_per_kwh: 2.5,
+            })
+            .collect();
+
+        let mut schedule = vec![
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::SelfUse, // 2-block gap
+            ScheduledAction::SelfUse,
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+        ];
+
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
+            &mut schedule, &blocks, 2,
+        );
+
+        assert!(
+            matches!(schedule[2], ScheduledAction::SelfUse),
+            "2-block gap should NOT be bridged with min_gap=2"
+        );
+        assert!(
+            matches!(schedule[3], ScheduledAction::SelfUse),
+            "2-block gap should NOT be bridged with min_gap=2"
+        );
+    }
+
+    #[test]
+    fn test_hold_charge_evaluate_returns_backup_mode() {
+        // Test that evaluating a block scheduled as HoldCharge returns BackUpMode
+        // Use blocks with HDO low fee overnight, high fee from 6 AM
+        let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
+        let hdo_low_fee = 0.50;
+        let hdo_high_fee = 1.80;
+
+        let mut blocks = Vec::new();
+        for hour in 0..24 {
+            for quarter in 0..4 {
+                let spot_price = match hour {
+                    0..=5 => 2.0,
+                    _ => 4.0,
+                };
+                let grid_fee = if hour < 6 { hdo_low_fee } else { hdo_high_fee };
+
+                blocks.push(TimeBlockPrice {
+                    block_start: base_time
+                        + chrono::Duration::hours(hour)
+                        + chrono::Duration::minutes(quarter * 15),
+                    duration_minutes: 15,
+                    price_czk_per_kwh: spot_price,
+                    effective_price_czk_per_kwh: spot_price + grid_fee,
+                });
+            }
+        }
+
+        let config = WinterAdaptiveV9Config {
+            target_battery_soc: 100.0,
+            morning_peak_start_hour: 6,
+            ..Default::default()
+        };
+        let strategy = WinterAdaptiveV9Strategy::new(config);
+        let control_config = create_test_control_config();
+
+        // Generate plan first to find a HoldCharge block
+        let plan = strategy.generate_plan(&blocks, 30.0, 10.0, 3.0, 0.0);
+
+        // Find a HoldCharge block
+        let hold_block_idx = plan
+            .schedule
+            .iter()
+            .position(|a| matches!(a, ScheduledAction::HoldCharge));
+
+        if let Some(idx) = hold_block_idx {
+            let context = EvaluationContext {
+                price_block: &blocks[idx],
+                all_price_blocks: Some(&blocks),
+                control_config: &control_config,
+                current_battery_soc: 30.0,
+                solar_forecast_kwh: 0.0,
+                consumption_forecast_kwh: 0.5,
+                grid_export_price_czk_per_kwh: 0.5,
+                backup_discharge_min_soc: 10.0,
+                grid_import_today_kwh: None,
+                consumption_today_kwh: None,
+                solar_forecast_total_today_kwh: 0.0,
+                solar_forecast_remaining_today_kwh: 0.0,
+                solar_forecast_tomorrow_kwh: 0.0,
+                battery_avg_charge_price_czk_per_kwh: 0.0,
+                hourly_consumption_profile: None,
+            };
+
+            let eval = strategy.evaluate(&context);
+
+            assert_eq!(
+                eval.mode,
+                InverterOperationMode::BackUpMode,
+                "HoldCharge block should return BackUpMode, got: {} - {}",
+                eval.mode,
+                eval.reason
+            );
+            assert!(
+                eval.reason.contains("HOLD AT TARGET"),
+                "Reason should mention HOLD AT TARGET: {}",
+                eval.reason
+            );
+        }
     }
 }

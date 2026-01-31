@@ -579,6 +579,10 @@ struct ChartDataJson {
     grid_fees: Vec<f32>,
     tariff_types: Vec<String>,
     is_historical: Vec<bool>,
+    reasons: Vec<Option<String>>,
+    decision_uids: Vec<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hourly_consumption_profile: Option<Vec<f32>>,
 }
 
 /// Chart data endpoint - returns JSON for chart updates (once per minute)
@@ -611,6 +615,9 @@ async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoRespo
                     grid_fees: prices.chart_data.grid_fees,
                     tariff_types: prices.chart_data.tariff_types,
                     is_historical: prices.chart_data.is_historical,
+                    reasons: prices.chart_data.reasons,
+                    decision_uids: prices.chart_data.decision_uids,
+                    hourly_consumption_profile: prices.chart_data.hourly_consumption_profile,
                 };
                 Json(chart_json).into_response()
             } else {

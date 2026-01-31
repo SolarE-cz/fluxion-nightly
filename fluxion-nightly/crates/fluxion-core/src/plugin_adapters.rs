@@ -25,6 +25,7 @@ use crate::strategy::{
 };
 use fluxion_plugins::{BlockDecision, EvaluationRequest, Plugin, PluginManager};
 use fluxion_types::config::ControlConfig;
+use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::TimeBlockPrice;
 use std::sync::Arc;
 
@@ -85,6 +86,8 @@ impl Plugin for WinterAdaptivePlugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -168,6 +171,8 @@ impl Plugin for WinterAdaptiveV2Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -253,6 +258,8 @@ impl Plugin for WinterAdaptiveV3Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -338,6 +345,8 @@ impl Plugin for WinterAdaptiveV4Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -427,6 +436,8 @@ impl Plugin for WinterAdaptiveV5Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -514,6 +525,8 @@ impl Plugin for WinterAdaptiveV7Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -601,6 +614,8 @@ impl Plugin for WinterAdaptiveV8Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -688,6 +703,8 @@ impl Plugin for WinterAdaptiveV9Plugin {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            hourly_consumption_profile: request.historical.hourly_consumption_profile.as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -743,15 +760,21 @@ fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBloc
 /// Only uses real measurable costs (grid import/export at spot/tariff prices).
 /// Does NOT include battery degradation or other estimated costs.
 ///
-/// Net profit = export revenue - import cost
+/// For **Self-Use mode**: includes battery discharge as savings (avoided grid purchase).
+/// This makes the dashboard show meaningful cost/savings for Self-Use blocks:
+/// - Positive profit = battery covers consumption (money saved)
+/// - Negative profit = grid import needed (money spent)
+/// - Net of both for partial coverage
+///
+/// For **other modes**: profit = export revenue - import cost
 ///
 /// # Arguments
-/// * `eval` - The block evaluation containing energy flows
+/// * `eval` - The block evaluation containing energy flows and mode
 /// * `import_price_czk_per_kwh` - Grid import price for this block
 /// * `export_price_czk_per_kwh` - Grid export price for this block
 ///
 /// # Returns
-/// Net profit in CZK (positive = profit, negative = cost)
+/// Net profit in CZK (positive = profit/savings, negative = cost)
 fn calculate_net_profit(
     eval: &crate::strategy::BlockEvaluation,
     import_price_czk_per_kwh: f32,
@@ -759,7 +782,16 @@ fn calculate_net_profit(
 ) -> f32 {
     let import_cost = eval.energy_flows.grid_import_kwh * import_price_czk_per_kwh;
     let export_revenue = eval.energy_flows.grid_export_kwh * export_price_czk_per_kwh;
-    export_revenue - import_cost
+
+    // For Self-Use: battery discharge represents money saved by not buying from grid.
+    // Without this, Self-Use blocks that use battery show 0 CZK profit on the dashboard.
+    let battery_savings = if matches!(eval.mode, InverterOperationMode::SelfUse) {
+        eval.energy_flows.battery_discharge_kwh * import_price_czk_per_kwh
+    } else {
+        0.0
+    };
+
+    battery_savings + export_revenue - import_cost
 }
 
 /// Initialize a PluginManager with the default built-in strategies.

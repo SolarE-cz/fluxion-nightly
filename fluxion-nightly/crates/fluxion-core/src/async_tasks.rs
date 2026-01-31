@@ -56,8 +56,14 @@ pub struct ConsumptionHistoryFetcher {
     pub fetch_interval_hours: u64,
 }
 
+/// Combined consumption history update containing daily summaries and hourly profile
+pub struct ConsumptionHistoryUpdate {
+    pub daily_summaries: Vec<crate::components::DailyEnergySummary>,
+    pub hourly_profile: Option<crate::components::HourlyConsumptionProfile>,
+}
+
 /// Component that holds a channel receiver for consumption history updates
 #[derive(Component)]
 pub struct ConsumptionHistoryChannel {
-    pub receiver: Receiver<Vec<crate::components::DailyEnergySummary>>,
+    pub receiver: Receiver<ConsumptionHistoryUpdate>,
 }

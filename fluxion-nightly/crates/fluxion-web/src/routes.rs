@@ -76,6 +76,8 @@ pub struct ChartData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub debug_info: Vec<Option<fluxion_core::strategy::BlockDebugInfo>>,
     pub is_historical: Vec<bool>, // True for past blocks (shows regenerated schedule, not actual history)
+    pub reasons: Vec<Option<String>>,
+    pub decision_uids: Vec<Option<String>>,
 
     // Price breakdown for stacked bar chart
     /// Base spot prices (same as prices, for clarity in stacked display)
@@ -88,6 +90,9 @@ pub struct ChartData {
     pub buy_fees: Vec<f32>,
     /// Total effective price: spot + grid_fee + buy_fees
     pub effective_prices: Vec<f32>,
+    /// Hourly consumption profile (24 values, kWh per hour, index = hour of day)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hourly_consumption_profile: Option<Vec<f32>>,
 }
 
 /// Live data template (for SSE updates only)
@@ -201,6 +206,12 @@ impl DashboardTemplate {
             None
         };
 
+        // Extract hourly consumption profile before response.prices moves it
+        let hourly_consumption_profile = response
+            .consumption_stats
+            .as_ref()
+            .and_then(|cs| cs.hourly_consumption_profile.clone());
+
         // Prepare chart data for Chart.js from price data if available
         let prices = response.prices.map(|price_data| {
             let mut labels = Vec::new();
@@ -211,6 +222,8 @@ impl DashboardTemplate {
             let mut profits = Vec::new();
             let mut debug_info_vec = Vec::new();
             let mut is_historical_vec = Vec::new();
+            let mut reasons = Vec::new();
+            let mut decision_uids = Vec::new();
 
             // Price breakdown for stacked bars
             let mut spot_prices = Vec::new();
@@ -276,6 +289,8 @@ impl DashboardTemplate {
                 profits.push(block.expected_profit);
                 debug_info_vec.push(block.debug_info.clone());
                 is_historical_vec.push(block.is_historical); // Track if block is past (regenerated schedule)
+                reasons.push(block.reason.clone());
+                decision_uids.push(block.decision_uid.clone());
 
                 // Map mode for display
                 let mode = match block.block_type.as_str() {
@@ -524,12 +539,15 @@ impl DashboardTemplate {
                     pv_generation_history,
                     debug_info: debug_info_vec,
                     is_historical: is_historical_vec,
+                    reasons,
+                    decision_uids,
                     // Price breakdown for stacked bars
                     spot_prices,
                     grid_fees,
                     tariff_types,
                     buy_fees,
                     effective_prices,
+                    hourly_consumption_profile: hourly_consumption_profile.clone(),
                 },
             }
         });

@@ -1,3 +1,5 @@
+<div class="ha-card-grid">
+
 <!-- System Health -->
 <div class="card {% if !health.inverter_source || !health.price_source %}error{% endif %}">
     <h2>🏥 {{ self.t("section-system") }}</h2>
@@ -26,9 +28,11 @@
 </div>
 
 <!-- Inverters Grid -->
+<div class="ha-card-grid-full">
 {% if !inverters.is_empty() %}
 <div class="grid">
     {% for inverter in inverters %}
+    <!-- Inverter Card -->
     <div class="card">
         <h2>🔌 {{ inverter.id }}</h2>
         <div class="stat">
@@ -36,14 +40,6 @@
             <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-") }}">
                 {{ inverter.mode }}
             </span>
-        </div>
-        <div class="stat">
-            <span class="stat-label"><i class="mdi mdi-battery-70"></i>{{ self.t("battery-soc") }}</span>
-            <span class="stat-value">{{ inverter.battery_soc }}{{ self.t("unit-percent") }}</span>
-        </div>
-        <div class="stat">
-            <span class="stat-label"><i class="mdi mdi-battery-charging"></i>{{ self.t("battery-power") }}</span>
-            <span class="stat-value">{{ inverter.battery_power_w }} {{ self.t("unit-watt") }}</span>
         </div>
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-transmission-tower"></i>{{ self.t("grid-power") }}</span>
@@ -57,16 +53,12 @@
             <span class="stat-label"><i class="mdi mdi-sitemap"></i>{{ self.t("inverter-topology") }}</span>
             <span class="stat-value">{{ inverter.topology }}</span>
         </div>
-        
-        <!-- Load -->
         {% if let Some(load) = inverter.house_load_w %}
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-home-lightning-bolt"></i>{{ self.t("load-house") }}</span>
             <span class="stat-value">{{ load }} {{ self.t("unit-watt") }}</span>
         </div>
         {% endif %}
-        
-        <!-- Grid Details -->
         {% if let Some(import) = inverter.grid_import_w %}
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-transmission-tower-import"></i>{{ self.t("grid-import-power") }}</span>
@@ -97,28 +89,6 @@
             <span class="stat-value">{{ export_today }} {{ self.t("unit-kilowatt-hour") }}</span>
         </div>
         {% endif %}
-        
-        <!-- Battery Extended -->
-        {% if let Some(capacity) = inverter.battery_capacity_kwh %}
-        <div class="stat">
-            <span class="stat-label"><i class="mdi mdi-battery-high"></i>{{ self.t("battery-capacity") }}</span>
-            <span class="stat-value">{{ capacity }} {{ self.t("unit-percent") }}</span>
-        </div>
-        {% endif %}
-        {% if let Some(input) = inverter.battery_input_energy_today_kwh %}
-        <div class="stat">
-            <span class="stat-label"><i class="mdi mdi-battery-arrow-up"></i>{{ self.t("battery-input-today") }}</span>
-            <span class="stat-value">{{ input }} {{ self.t("unit-kilowatt-hour") }}</span>
-        </div>
-        {% endif %}
-        {% if let Some(output) = inverter.battery_output_energy_today_kwh %}
-        <div class="stat">
-            <span class="stat-label"><i class="mdi mdi-battery-arrow-down"></i>{{ self.t("battery-output-today") }}</span>
-            <span class="stat-value">{{ output }} {{ self.t("unit-kilowatt-hour") }}</span>
-        </div>
-        {% endif %}
-        
-        <!-- Inverter Details -->
         {% if let Some(voltage) = inverter.inverter_voltage_v %}
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-lightning-bolt"></i>{{ self.t("inverter-voltage-total") }}</span>
@@ -143,8 +113,6 @@
             <span class="stat-value">{{ freq }} {{ self.t("unit-hertz") }}</span>
         </div>
         {% endif %}
-        
-        <!-- Solar Energy -->
         {% if let Some(today) = inverter.today_solar_energy_kwh %}
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-weather-sunny"></i>{{ self.t("solar-energy-today") }}</span>
@@ -158,6 +126,36 @@
         </div>
         {% endif %}
     </div>
+    <!-- Battery Card -->
+    <div class="card">
+        <h2>🔋 Battery</h2>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-70"></i>{{ self.t("battery-soc") }}</span>
+            <span class="stat-value">{{ inverter.battery_soc }}{{ self.t("unit-percent") }}</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-charging"></i>{{ self.t("battery-power") }}</span>
+            <span class="stat-value">{{ inverter.battery_power_w }} {{ self.t("unit-watt") }}</span>
+        </div>
+        {% if let Some(capacity) = inverter.battery_capacity_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-high"></i>{{ self.t("battery-capacity") }}</span>
+            <span class="stat-value">{{ capacity }} {{ self.t("unit-percent") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(input) = inverter.battery_input_energy_today_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-arrow-up"></i>{{ self.t("battery-input-today") }}</span>
+            <span class="stat-value">{{ input }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(output) = inverter.battery_output_energy_today_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-arrow-down"></i>{{ self.t("battery-output-today") }}</span>
+            <span class="stat-value">{{ output }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+    </div>
     {% endfor %}
 </div>
 {% else %}
@@ -167,6 +165,7 @@
     <div class="loading" style="margin-top: 10px;"></div>
 </div>
 {% endif %}
+</div><!-- End of ha-card-grid-full (inverters) -->
 
 <!-- Current Schedule -->
 {% if let Some(schedule) = schedule %}
@@ -315,10 +314,11 @@
 </div>
 {% endif %}
 
-<!-- Consumption History / EMA -->
-{% if let Some(stats) = consumption_stats %}
+<!-- Consumption & Solar Forecast -->
 <div class="card">
-    <h2>📊 Consumption</h2>
+    <h2>📊 Energy & Solar</h2>
+    {% if let Some(stats) = consumption_stats %}
+    <h3 style="margin-top: 10px; margin-bottom: 8px; font-size: 1.0em;">🏠 Consumption</h3>
     <div class="stat">
         <span class="stat-label">Historical EMA ({{ stats.ema_days }} days)</span>
         <span class="stat-value">
@@ -352,14 +352,10 @@
             {% endmatch %}
         </span>
     </div>
-</div>
-{% endif %}
-
-<!-- Solar Forecast -->
-{% if let Some(forecast) = solar_forecast %}
-{% if forecast.available %}
-<div class="card">
-    <h2>☀️ Solar Forecast</h2>
+    {% endif %}
+    {% if let Some(forecast) = solar_forecast %}
+    {% if forecast.available %}
+    <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
     <div class="stat">
         <span class="stat-label">Predicted Today</span>
         <span class="stat-value">{{ format!("{:.1}", forecast.total_today_kwh) }} kWh</span>
@@ -385,11 +381,11 @@
         <span class="stat-label">Tomorrow</span>
         <span class="stat-value">{{ format!("{:.1}", forecast.tomorrow_kwh) }} kWh</span>
     </div>
+    {% else %}
+    <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
+    <p style="color: var(--text-secondary); font-size: 0.9em;">No solar forecast data available.</p>
+    {% endif %}
+    {% endif %}
 </div>
-{% else %}
-<div class="card warning">
-    <h2>☀️ Solar Forecast</h2>
-    <p>No solar forecast data available. Check sensor configuration.</p>
-</div>
-{% endif %}
-{% endif %}
+
+</div><!-- End of ha-card-grid -->

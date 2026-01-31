@@ -151,6 +151,7 @@ fn test_v2_waits_for_cheapest_blocks() {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
         };
 
         let eval = v1_strategy.evaluate(&context);
@@ -186,6 +187,7 @@ fn test_v2_waits_for_cheapest_blocks() {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
         };
 
         let eval = v2_strategy.evaluate(&context);
