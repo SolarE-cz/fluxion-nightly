@@ -10,6 +10,7 @@ default = []
 [dependencies]
 # Local dependencies
 fluxion-i18n = { path = "../fluxion-i18n" }
+fluxion-plugins = { path = "../fluxion-plugins" }
 fluxion-types = { path = "../fluxion-types" }
 
 # Core dependencies only - no inverter-specific or runtime dependencies

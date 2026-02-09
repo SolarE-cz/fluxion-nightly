@@ -14,13 +14,14 @@ use bevy_ecs::prelude::*;
 use tracing::{error, info, trace};
 
 use crate::{
+    PluginManagerResource,
     components::*,
-    config_events::ConfigSection,
+    config_events::{ConfigSection, UserControlChangeType},
     debug::DebugModeConfig,
     pricing::analyze_prices,
-    resources::SystemConfig,
+    resources::{SystemConfig, UserControlResource},
     scheduling::{ScheduleConfig, generate_schedule_with_optimizer},
-    web_bridge::ConfigUpdateChannel,
+    web_bridge::{ConfigUpdateChannel, UserControlUpdateChannel},
 };
 
 use super::BackupDischargeMinSoc;
@@ -108,8 +109,11 @@ pub struct ConfigEventParams<'w, 's> {
     _battery_query: Query<'w, 's, &'static BatteryStatus>,
     commands: Commands<'w, 's>,
     backup_soc: Option<Res<'w, BackupDischargeMinSoc>>,
+    hdo_data: Option<Res<'w, super::HdoScheduleData>>,
     consumption_history: Res<'w, crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
+    plugin_manager_res: Res<'w, PluginManagerResource>,
+    user_control: Option<Res<'w, crate::resources::UserControlResource>>,
 }
 
 /// System that processes config update events from the web UI
@@ -274,7 +278,10 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                         .map(|s| s.grid_import_kwh)
                 });
 
-            // Generate new schedule with updated config
+            // Generate new schedule with updated config using shared plugin manager
+            let plugin_manager = params.plugin_manager_res.0.read();
+            let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
+            let user_control_state = params.user_control.as_ref().map(|uc| &uc.state);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
@@ -282,9 +289,15 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 current_soc,
                 None,                            // Future: Solar forecast
                 consumption_forecast.as_deref(), // Enhanced consumption forecast
-                Some(&params.system_config.strategies_config),
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
+                &plugin_manager,
+                hdo_raw_data,
+                0.0, // TODO: Wire up solar_forecast_total_today_kwh from SolarForecastData resource
+                0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
+                0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
+                user_control_state,
+                params.consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
             );
 
             // Update schedule
@@ -323,6 +336,136 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                     old_config.control_config.force_charge_hours,
                     old_config.control_config.force_discharge_hours
                 );
+            }
+        }
+    }
+}
+
+/// System parameters for user_control_event_handler
+#[derive(bevy_ecs::system::SystemParam)]
+pub struct UserControlEventParams<'w, 's> {
+    update_channel: ResMut<'w, UserControlUpdateChannel>,
+    user_control: ResMut<'w, UserControlResource>,
+    system_config: Res<'w, SystemConfig>,
+    schedule_query: Query<'w, 's, &'static mut OperationSchedule>,
+    price_data_query: Query<'w, 's, &'static SpotPriceData>,
+    commands: Commands<'w, 's>,
+    backup_soc: Option<Res<'w, BackupDischargeMinSoc>>,
+    hdo_data: Option<Res<'w, super::HdoScheduleData>>,
+    consumption_history: Res<'w, crate::components::ConsumptionHistory>,
+    inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
+    plugin_manager_res: Res<'w, PluginManagerResource>,
+}
+
+/// System that processes user control update events from the web UI
+/// Updates UserControlResource and triggers schedule recalculation when needed
+pub fn user_control_event_handler(mut params: UserControlEventParams) {
+    // Process all pending user control update events
+    while let Ok(event) = params.update_channel.receiver.try_recv() {
+        info!("🎛️ Processing user control update: {:?}", event.change_type);
+
+        // Update the resource with new state
+        params.user_control.state = event.new_state.clone();
+
+        info!(
+            "🎛️ User control updated: enabled={}, disallow_charge={}, disallow_discharge={}, {} fixed slots",
+            params.user_control.state.enabled,
+            params.user_control.state.disallow_charge,
+            params.user_control.state.disallow_discharge,
+            params.user_control.state.fixed_time_slots.len()
+        );
+
+        // Determine if schedule recalculation is needed
+        let needs_schedule_recalc = matches!(
+            event.change_type,
+            UserControlChangeType::SlotAdded
+                | UserControlChangeType::SlotModified
+                | UserControlChangeType::SlotRemoved
+                | UserControlChangeType::RestrictionsChanged
+        );
+
+        if needs_schedule_recalc {
+            info!("🔄 Triggering schedule recalculation due to user control changes");
+
+            // Get current price data
+            let Some(price_data) = params.price_data_query.single().ok() else {
+                info!("⚠️ No price data available, skipping schedule recalculation");
+                continue;
+            };
+
+            // Create schedule config
+            let schedule_config = ScheduleConfig {
+                min_battery_soc: params.system_config.control_config.min_battery_soc,
+                max_battery_soc: params.system_config.control_config.max_battery_soc,
+                target_inverters: params
+                    .system_config
+                    .inverters
+                    .iter()
+                    .map(|i| i.id.clone())
+                    .collect(),
+                display_currency: params.system_config.system_config.display_currency,
+                default_battery_mode: params.system_config.control_config.default_battery_mode,
+            };
+
+            // Get current battery SOC
+            let current_soc = params
+                .inverter_raw_state_query
+                .iter()
+                .map(|raw| raw.state.battery_soc)
+                .sum::<f32>()
+                / params.inverter_raw_state_query.iter().count().max(1) as f32;
+            let current_soc = if current_soc > 0.0 { current_soc } else { 50.0 };
+
+            // Get backup_discharge_min_soc
+            let backup_discharge_min_soc = params
+                .backup_soc
+                .as_ref()
+                .map(|s| s.value)
+                .unwrap_or(params.system_config.control_config.hardware_min_battery_soc);
+
+            // Generate consumption forecast
+            let consumption_forecast = generate_consumption_forecast(
+                &params.consumption_history,
+                params.inverter_raw_state_query.iter().next(),
+                &params.system_config.control_config,
+                price_data.time_block_prices.len(),
+            );
+
+            // Get today's grid import
+            let grid_import_today_kwh = params
+                .inverter_raw_state_query
+                .iter()
+                .next()
+                .and_then(|raw_state| raw_state.state.grid_import_today_kwh);
+
+            // Generate new schedule with updated user control
+            let plugin_manager = params.plugin_manager_res.0.read();
+            let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
+            let new_schedule = generate_schedule_with_optimizer(
+                &price_data.time_block_prices,
+                &params.system_config.control_config,
+                &schedule_config,
+                current_soc,
+                None,
+                consumption_forecast.as_deref(),
+                backup_discharge_min_soc,
+                grid_import_today_kwh,
+                &plugin_manager,
+                hdo_raw_data,
+                0.0,
+                0.0,
+                0.0,
+                Some(&params.user_control.state),
+                params.consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
+            );
+
+            // Update schedule
+            if let Ok(mut schedule) = params.schedule_query.single_mut() {
+                *schedule = new_schedule;
+                info!("✅ Schedule recalculated with user control changes");
+            } else {
+                params.commands.spawn(new_schedule);
+                info!("✅ Initial schedule created with user control changes");
             }
         }
     }

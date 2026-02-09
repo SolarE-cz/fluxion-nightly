@@ -21,12 +21,16 @@ use tracing_subscriber::FmtSubscriber;
 
 use fluxion_adapters::{
     CzSpotPriceAdapter, HaClientResource, HaPlugin, HomeAssistantClient,
-    HomeAssistantInverterAdapter,
+    HomeAssistantInverterAdapter, PriceAdapterTimezoneHandle,
 };
 use fluxion_core::{
-    ConfigUpdateSender, FluxionCorePlugin, SystemConfig, TimezoneConfig, WebQuerySender,
+    ConfigUpdateSender, FluxionCorePlugin, PluginManagerResource, SystemConfig, TimezoneConfig,
+    UserControlPersistence, UserControlResource, UserControlUpdateSender, WebQuerySender,
+    plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::I18n;
+use fluxion_web::{PluginApiState, UserControlApiState};
+use parking_lot::RwLock;
 
 fn main() -> Result<()> {
     // Handle command line arguments
@@ -159,22 +163,25 @@ fn initialize_and_run() -> Result<()> {
     // Create spot price adapter (always create, but may not be used)
     let spot_adapter = if let Some(tomorrow_entity) = &config.pricing.tomorrow_price_entity {
         info!("💰 Using separate tomorrow sensor: {}", tomorrow_entity);
-        Arc::new(CzSpotPriceAdapter::with_tomorrow_sensor(
+        CzSpotPriceAdapter::with_tomorrow_sensor(
             ha_client.clone(),
             config.pricing.spot_price_entity.clone(),
             tomorrow_entity.clone(),
-        ))
+        )
     } else {
-        Arc::new(CzSpotPriceAdapter::new(
-            ha_client.clone(),
-            config.pricing.spot_price_entity.clone(),
-        ))
+        CzSpotPriceAdapter::new(ha_client.clone(), config.pricing.spot_price_entity.clone())
     };
+
+    // Get the timezone handle from the spot adapter for later synchronization
+    // This allows the timezone_sync_system to update the adapter's timezone
+    // when the Home Assistant timezone changes
+    let price_adapter_tz_handle = PriceAdapterTimezoneHandle::new(spot_adapter.timezone_handle());
+    info!("🌍 Price adapter timezone handle created for HA timezone sync");
 
     // Wrap spot adapter in configurable source that respects use_spot_prices_to_buy/sell flags
     let price_source: Arc<dyn fluxion_core::PriceDataSource> =
         Arc::new(fluxion_adapters::ConfigurablePriceDataSource::new(
-            spot_adapter,
+            Arc::new(spot_adapter),
             config.pricing.use_spot_prices_to_buy,
             config.pricing.use_spot_prices_to_sell,
             config.pricing.fixed_buy_prices.clone(),
@@ -189,6 +196,14 @@ fn initialize_and_run() -> Result<()> {
 
     // Convert AppConfig to SystemConfig for ECS
     let system_config = SystemConfig::from(config.clone());
+
+    // Create shared plugin manager with built-in strategies
+    let plugin_manager = create_plugin_manager(
+        Some(&system_config.strategies_config),
+        &system_config.control_config,
+    );
+    let plugin_manager = Arc::new(RwLock::new(plugin_manager));
+    info!("🔌 Plugin manager initialized with built-in strategies");
 
     // Configure debug mode
     let debug_config = if config.system.debug_mode {
@@ -206,6 +221,41 @@ fn initialize_and_run() -> Result<()> {
 
     // Create message passing channel for config updates
     let (config_update_sender, config_update_channel) = ConfigUpdateSender::new();
+
+    // Load user control state from persistence
+    let user_control_persistence = UserControlPersistence::default_production();
+    let user_control_state = match user_control_persistence.load() {
+        Ok(state) => {
+            info!(
+                "🎛️ Loaded user control state: enabled={}, disallow_charge={}, disallow_discharge={}, {} fixed slots",
+                state.enabled,
+                state.disallow_charge,
+                state.disallow_discharge,
+                state.fixed_time_slots.len()
+            );
+            state
+        }
+        Err(e) => {
+            warn!(
+                "⚠️ Failed to load user control state, using defaults: {}",
+                e
+            );
+            Default::default()
+        }
+    };
+
+    // Create channel for user control updates from web to ECS
+    let (user_control_update_sender, user_control_update_channel) = UserControlUpdateSender::new();
+
+    // Create user control API state for web server
+    let user_control_api_state = UserControlApiState::new(
+        user_control_state.clone(),
+        user_control_persistence
+            .path()
+            .to_string_lossy()
+            .to_string(),
+        Some(user_control_update_sender),
+    );
 
     // Initialize i18n with configured language from config
     let language = config.system.language;
@@ -225,6 +275,7 @@ fn initialize_and_run() -> Result<()> {
         serde_json::json!({})
     });
     let config_sender_for_web = config_update_sender.clone();
+    let plugin_api_state = PluginApiState::new(plugin_manager.clone());
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -233,6 +284,9 @@ fn initialize_and_run() -> Result<()> {
             config_json,
             Some(config_sender_for_web),
             Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
+            Some(plugin_api_state), // Plugin API with shared PluginManager
+            Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
+            Some(user_control_api_state), // User control API state
         )
         .await
         {
@@ -258,12 +312,17 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(config_update_channel)
         .insert_resource(timezone_config)
         .insert_resource(HaClientResource(ha_client))
+        .insert_resource(price_adapter_tz_handle)
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
         .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
         .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
             history_source,
         ))
-        .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>();
+        .insert_resource(PluginManagerResource(plugin_manager))
+        .insert_resource(UserControlResource::new(user_control_state))
+        .insert_resource(user_control_update_channel)
+        .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>()
+        .init_resource::<fluxion_core::async_systems::HdoScheduleData>();
 
     info!("✅ Starting main loop...");
 

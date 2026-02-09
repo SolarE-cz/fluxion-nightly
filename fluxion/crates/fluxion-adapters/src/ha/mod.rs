@@ -14,6 +14,7 @@ pub mod adapters;
 pub mod client;
 pub mod errors;
 pub mod plugin;
+pub mod solar_forecast_fetcher;
 pub mod types;
 
 pub use adapters::{
@@ -22,5 +23,5 @@ pub use adapters::{
 };
 pub use client::HomeAssistantClient;
 pub use errors::{HaError, HaResult};
-pub use plugin::{HaClientResource, HaPlugin};
+pub use plugin::{HaClientResource, HaPlugin, PriceAdapterTimezoneHandle};
 pub use types::{HaEntityState, HaHistoryState, HistoryDataPoint};

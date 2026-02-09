@@ -20,7 +20,6 @@ use anyhow::{Context, Result};
 use bevy_ecs::prelude::*;
 use fluxion_i18n::Language;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tracing::{info, warn};
 
 /// Main application configuration - FluxION MVP
@@ -45,6 +44,10 @@ pub struct AppConfig {
     /// Consumption history configuration
     #[serde(default)]
     pub history: ConsumptionHistoryConfig,
+
+    /// Solar forecast configuration
+    #[serde(default, rename = "solar_forecast")]
+    pub solar_forecast: SolarForecastConfig,
 }
 
 /// Configuration for a single inverter
@@ -107,9 +110,17 @@ pub struct PricingConfig {
     #[serde(default = "default_spot_sell_fee")]
     pub spot_sell_fee: f32,
 
-    /// Grid distribution fee (CZK/kWh) - added to import price
-    #[serde(default = "default_grid_distribution_fee")]
-    pub spot_grid_fee: f32,
+    /// Home Assistant entity for HDO tariff schedule (e.g., "sensor.cez_hdo_raw_data")
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+
+    /// Grid fee during HDO low tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+
+    /// Grid fee during HDO high tariff periods (CZK/kWh)
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
 }
 
 /// Control configuration
@@ -234,8 +245,16 @@ fn default_spot_sell_fee() -> f32 {
     0.5
 }
 
-fn default_grid_distribution_fee() -> f32 {
-    1.2
+fn default_hdo_sensor_entity() -> String {
+    "sensor.cez_hdo_raw_data".to_string()
+}
+
+fn default_hdo_low_tariff_czk() -> f32 {
+    0.50
+}
+
+fn default_hdo_high_tariff_czk() -> f32 {
+    1.80
 }
 
 /// System configuration
@@ -276,6 +295,18 @@ pub struct StrategiesConfig {
     pub winter_adaptive: WinterAdaptiveConfig,
     #[serde(default)]
     pub winter_adaptive_v2: WinterAdaptiveV2Config,
+    #[serde(default)]
+    pub winter_adaptive_v3: WinterAdaptiveV3Config,
+    #[serde(default)]
+    pub winter_adaptive_v4: WinterAdaptiveV4Config,
+    #[serde(default)]
+    pub winter_adaptive_v5: WinterAdaptiveV5Config,
+    #[serde(default)]
+    pub winter_adaptive_v7: WinterAdaptiveV7Config,
+    #[serde(default)]
+    pub winter_adaptive_v8: WinterAdaptiveV8Config,
+    #[serde(default)]
+    pub winter_adaptive_v9: WinterAdaptiveV9Config,
     #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfig,
     #[serde(default)]
@@ -326,7 +357,7 @@ fn default_winter_adaptive_priority() -> u8 {
 impl Default for WinterAdaptiveConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false, // V3 is now the default
             priority: 100,
             ema_period_days: 7,
             min_solar_percentage: 0.10,
@@ -349,10 +380,16 @@ pub struct WinterAdaptiveV2Config {
     pub enabled: bool,
     #[serde(default = "default_winter_adaptive_v2_priority")]
     pub priority: u8,
+    #[serde(default = "default_daily_charging_target_soc")]
+    pub daily_charging_target_soc: f32,
 }
 
 fn default_winter_adaptive_v2_priority() -> u8 {
     100
+}
+
+fn default_daily_charging_target_soc() -> f32 {
+    90.0
 }
 
 impl Default for WinterAdaptiveV2Config {
@@ -360,6 +397,535 @@ impl Default for WinterAdaptiveV2Config {
         Self {
             enabled: false, // V1 is default
             priority: 100,
+            daily_charging_target_soc: 90.0,
+        }
+    }
+}
+
+/// Winter Adaptive V3 config with HDO tariff integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV3Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v3_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v3_daily_charging_target_soc")]
+    pub daily_charging_target_soc: f32,
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    #[serde(default = "default_winter_discharge_min_soc")]
+    pub winter_discharge_min_soc: f32,
+    #[serde(default = "default_top_discharge_blocks_per_day")]
+    pub top_discharge_blocks_per_day: usize,
+    #[serde(default = "default_discharge_arbitrage_buffer")]
+    pub discharge_arbitrage_buffer: f32,
+}
+
+fn default_winter_adaptive_v3_priority() -> u8 {
+    100
+}
+
+fn default_v3_daily_charging_target_soc() -> f32 {
+    90.0
+}
+
+fn default_winter_discharge_min_soc() -> f32 {
+    50.0
+}
+
+fn default_top_discharge_blocks_per_day() -> usize {
+    4
+}
+
+fn default_discharge_arbitrage_buffer() -> f32 {
+    1.0 // 1.0 CZK, use 0.05 for EUR
+}
+
+impl Default for WinterAdaptiveV3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V3 is deprecated, V4 is the default
+            priority: 100,
+            daily_charging_target_soc: 90.0,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            winter_discharge_min_soc: 50.0,
+            top_discharge_blocks_per_day: 4,
+            discharge_arbitrage_buffer: 1.0,
+        }
+    }
+}
+
+/// Winter Adaptive V4 - Global Price Optimization
+///
+/// V4 uses true global optimization: it ranks ALL blocks by price and selects
+/// the globally cheapest for charging and globally most expensive for discharge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterAdaptiveV4Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v4_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v4_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    #[serde(default = "default_v4_discharge_blocks_per_day")]
+    pub discharge_blocks_per_day: usize,
+    #[serde(default = "default_v4_min_discharge_spread")]
+    pub min_discharge_spread_czk: f32,
+}
+
+fn default_winter_adaptive_v4_priority() -> u8 {
+    100
+}
+
+fn default_v4_target_battery_soc() -> f32 {
+    100.0
+}
+
+fn default_v4_discharge_blocks_per_day() -> usize {
+    4
+}
+
+fn default_v4_min_discharge_spread() -> f32 {
+    0.50
+}
+
+impl Default for WinterAdaptiveV4Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V5 is now the default strategy
+            priority: 100,
+            target_battery_soc: 100.0,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            discharge_blocks_per_day: 4,
+            min_discharge_spread_czk: 0.50,
+        }
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V5 Strategy Configuration
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV5Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v5_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v5_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_v5_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    #[serde(default = "default_hdo_sensor_entity")]
+    pub hdo_sensor_entity: String,
+    #[serde(default = "default_hdo_low_tariff_czk")]
+    pub hdo_low_tariff_czk: f32,
+    #[serde(default = "default_hdo_high_tariff_czk")]
+    pub hdo_high_tariff_czk: f32,
+    #[serde(default = "default_v5_cheap_block_percentile")]
+    pub cheap_block_percentile: f32,
+    #[serde(default = "default_v5_expensive_block_percentile")]
+    pub expensive_block_percentile: f32,
+    #[serde(default = "default_v5_min_discharge_spread")]
+    pub min_discharge_spread_czk: f32,
+    #[serde(default = "default_v5_safety_margin")]
+    pub safety_margin_pct: f32,
+}
+
+fn default_winter_adaptive_v5_priority() -> u8 {
+    95
+}
+
+fn default_v5_target_battery_soc() -> f32 {
+    100.0
+}
+
+fn default_v5_min_discharge_soc() -> f32 {
+    40.0
+}
+
+fn default_v5_cheap_block_percentile() -> f32 {
+    30.0
+}
+
+fn default_v5_expensive_block_percentile() -> f32 {
+    70.0
+}
+
+fn default_v5_min_discharge_spread() -> f32 {
+    0.50
+}
+
+fn default_v5_safety_margin() -> f32 {
+    0.15
+}
+
+impl Default for WinterAdaptiveV5Config {
+    fn default() -> Self {
+        Self {
+            enabled: true, // V5 is the new default strategy
+            priority: 95,
+            target_battery_soc: 100.0,
+            min_discharge_soc: 40.0,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+            cheap_block_percentile: 30.0,
+            expensive_block_percentile: 70.0,
+            min_discharge_spread_czk: 0.50,
+            safety_margin_pct: 0.15,
+        }
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V7 Strategy Configuration
+// ============================================================================
+
+/// Winter Adaptive V7 - Unconstrained Multi-Cycle Arbitrage Optimizer
+/// V7 removes all artificial limitations and uses pure economic decision-making.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV7Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v7_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v7_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_v7_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    #[serde(default = "default_v7_min_cycle_profit_czk")]
+    pub min_cycle_profit_czk: f32,
+    #[serde(default = "default_v7_valley_threshold")]
+    pub valley_threshold_std_dev: f32,
+    #[serde(default = "default_v7_peak_threshold")]
+    pub peak_threshold_std_dev: f32,
+    #[serde(default = "default_v7_min_export_spread")]
+    pub min_export_spread_czk: f32,
+    #[serde(default = "default_v7_min_soc_after_export")]
+    pub min_soc_after_export: f32,
+    #[serde(default = "default_v7_avg_consumption")]
+    pub avg_consumption_per_block_kwh: f32,
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    #[serde(default = "default_v7_efficiency")]
+    pub battery_round_trip_efficiency: f32,
+    /// Enable solar-aware charge reduction
+    #[serde(default = "default_true")]
+    pub solar_aware_charging_enabled: bool,
+    /// Minimum grid charge blocks (safety margin)
+    #[serde(default = "default_v7_min_grid_charge_blocks")]
+    pub min_grid_charge_blocks: usize,
+    /// Price threshold (CZK/kWh) below which we always charge
+    #[serde(default = "default_v7_opportunistic_threshold")]
+    pub opportunistic_charge_threshold_czk: f32,
+}
+
+fn default_v7_min_grid_charge_blocks() -> usize {
+    2
+}
+fn default_v7_opportunistic_threshold() -> f32 {
+    1.5
+}
+
+fn default_winter_adaptive_v7_priority() -> u8 {
+    100
+}
+fn default_v7_target_battery_soc() -> f32 {
+    95.0
+}
+fn default_v7_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v7_min_cycle_profit_czk() -> f32 {
+    3.0
+}
+fn default_v7_valley_threshold() -> f32 {
+    0.5
+}
+fn default_v7_peak_threshold() -> f32 {
+    0.5
+}
+fn default_v7_min_export_spread() -> f32 {
+    5.0
+}
+fn default_v7_min_soc_after_export() -> f32 {
+    50.0
+}
+fn default_v7_avg_consumption() -> f32 {
+    0.25
+}
+fn default_true() -> bool {
+    true
+}
+fn default_v7_efficiency() -> f32 {
+    0.90
+}
+
+impl Default for WinterAdaptiveV7Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V5 is still the default
+            priority: 100,
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            min_cycle_profit_czk: 3.0,
+            valley_threshold_std_dev: 0.5,
+            peak_threshold_std_dev: 0.5,
+            min_export_spread_czk: 5.0,
+            min_soc_after_export: 50.0,
+            avg_consumption_per_block_kwh: 0.25,
+            negative_price_handling_enabled: true,
+            battery_round_trip_efficiency: 0.90,
+            solar_aware_charging_enabled: true,
+            min_grid_charge_blocks: 2,
+            opportunistic_charge_threshold_czk: 1.5,
+        }
+    }
+}
+
+// ============================================================================
+// Winter Adaptive V8 Strategy Configuration
+// ============================================================================
+
+/// Winter Adaptive V8 - Top-N Peak Discharge Optimizer
+/// V8 focuses on aggressive discharge during absolute highest price peaks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterAdaptiveV8Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v8_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v8_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_v8_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    #[serde(default = "default_v8_top_discharge_blocks_count")]
+    pub top_discharge_blocks_count: usize,
+    #[serde(default = "default_v8_min_discharge_spread_czk")]
+    pub min_discharge_spread_czk: f32,
+    #[serde(default = "default_v8_battery_round_trip_efficiency")]
+    pub battery_round_trip_efficiency: f32,
+    #[serde(default = "default_v8_cheap_block_percentile")]
+    pub cheap_block_percentile: f32,
+    #[serde(default = "default_v8_avg_consumption_per_block_kwh")]
+    pub avg_consumption_per_block_kwh: f32,
+    #[serde(default = "default_v8_min_export_spread_czk")]
+    pub min_export_spread_czk: f32,
+    #[serde(default = "default_v8_min_soc_after_export")]
+    pub min_soc_after_export: f32,
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    // === Solar-Aware Charging ===
+    #[serde(default = "default_true")]
+    pub solar_aware_charging_enabled: bool,
+    #[serde(default = "default_v8_min_grid_charge_blocks")]
+    pub min_grid_charge_blocks: usize,
+    #[serde(default = "default_v8_opportunistic_charge_threshold_czk")]
+    pub opportunistic_charge_threshold_czk: f32,
+    #[serde(default = "default_v8_solar_capacity_reservation_factor")]
+    pub solar_capacity_reservation_factor: f32,
+    #[serde(default = "default_v8_min_solar_for_reduction_kwh")]
+    pub min_solar_for_reduction_kwh: f32,
+}
+
+fn default_winter_adaptive_v8_priority() -> u8 {
+    100
+}
+fn default_v8_target_battery_soc() -> f32 {
+    95.0
+}
+fn default_v8_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v8_top_discharge_blocks_count() -> usize {
+    8
+}
+fn default_v8_min_discharge_spread_czk() -> f32 {
+    3.0
+}
+fn default_v8_battery_round_trip_efficiency() -> f32 {
+    0.90
+}
+fn default_v8_cheap_block_percentile() -> f32 {
+    0.25
+}
+fn default_v8_avg_consumption_per_block_kwh() -> f32 {
+    0.25
+}
+fn default_v8_min_export_spread_czk() -> f32 {
+    5.0
+}
+fn default_v8_min_soc_after_export() -> f32 {
+    50.0
+}
+fn default_v8_min_grid_charge_blocks() -> usize {
+    2
+}
+fn default_v8_opportunistic_charge_threshold_czk() -> f32 {
+    1.5
+}
+fn default_v8_solar_capacity_reservation_factor() -> f32 {
+    0.7
+}
+fn default_v8_min_solar_for_reduction_kwh() -> f32 {
+    2.0
+}
+
+impl Default for WinterAdaptiveV8Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V7 is the default
+            priority: 100,
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            top_discharge_blocks_count: 8,
+            min_discharge_spread_czk: 3.0,
+            battery_round_trip_efficiency: 0.90,
+            cheap_block_percentile: 0.25,
+            avg_consumption_per_block_kwh: 0.25,
+            min_export_spread_czk: 5.0,
+            min_soc_after_export: 50.0,
+            negative_price_handling_enabled: true,
+            // Solar-aware charging defaults
+            solar_aware_charging_enabled: true,
+            min_grid_charge_blocks: 2,
+            opportunistic_charge_threshold_czk: 1.5,
+            solar_capacity_reservation_factor: 0.7,
+            min_solar_for_reduction_kwh: 2.0,
+        }
+    }
+}
+
+/// Winter Adaptive V9 - Solar-Aware Morning Peak Optimizer
+/// V9 maximizes solar utilization while ensuring morning peak coverage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterAdaptiveV9Config {
+    pub enabled: bool,
+    #[serde(default = "default_winter_adaptive_v9_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v9_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_v9_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    #[serde(default = "default_v9_morning_peak_start_hour")]
+    pub morning_peak_start_hour: u8,
+    #[serde(default = "default_v9_morning_peak_end_hour")]
+    pub morning_peak_end_hour: u8,
+    #[serde(default = "default_v9_target_soc_after_morning_peak")]
+    pub target_soc_after_morning_peak: f32,
+    #[serde(default = "default_v9_morning_peak_consumption_per_block_kwh")]
+    pub morning_peak_consumption_per_block_kwh: f32,
+    #[serde(default = "default_v9_solar_threshold_kwh")]
+    pub solar_threshold_kwh: f32,
+    #[serde(default = "default_v9_solar_confidence_factor")]
+    pub solar_confidence_factor: f32,
+    #[serde(default = "default_v9_min_arbitrage_spread_czk")]
+    pub min_arbitrage_spread_czk: f32,
+    #[serde(default = "default_v9_cheap_block_percentile")]
+    pub cheap_block_percentile: f32,
+    #[serde(default = "default_v9_top_discharge_blocks_count")]
+    pub top_discharge_blocks_count: usize,
+    #[serde(default = "default_v9_min_export_spread_czk")]
+    pub min_export_spread_czk: f32,
+    #[serde(default = "default_v9_min_soc_after_export")]
+    pub min_soc_after_export: f32,
+    #[serde(default = "default_v9_battery_round_trip_efficiency")]
+    pub battery_round_trip_efficiency: f32,
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    #[serde(default = "default_v9_min_overnight_charge_blocks")]
+    pub min_overnight_charge_blocks: usize,
+    #[serde(default = "default_v9_opportunistic_charge_threshold_czk")]
+    pub opportunistic_charge_threshold_czk: f32,
+}
+
+fn default_winter_adaptive_v9_priority() -> u8 {
+    100
+}
+fn default_v9_target_battery_soc() -> f32 {
+    95.0
+}
+fn default_v9_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v9_morning_peak_start_hour() -> u8 {
+    6
+}
+fn default_v9_morning_peak_end_hour() -> u8 {
+    9
+}
+fn default_v9_target_soc_after_morning_peak() -> f32 {
+    20.0
+}
+fn default_v9_morning_peak_consumption_per_block_kwh() -> f32 {
+    0.5
+}
+fn default_v9_solar_threshold_kwh() -> f32 {
+    5.0
+}
+fn default_v9_solar_confidence_factor() -> f32 {
+    0.7
+}
+fn default_v9_min_arbitrage_spread_czk() -> f32 {
+    3.0
+}
+fn default_v9_cheap_block_percentile() -> f32 {
+    0.25
+}
+fn default_v9_top_discharge_blocks_count() -> usize {
+    8
+}
+fn default_v9_min_export_spread_czk() -> f32 {
+    5.0
+}
+fn default_v9_min_soc_after_export() -> f32 {
+    50.0
+}
+fn default_v9_battery_round_trip_efficiency() -> f32 {
+    0.90
+}
+fn default_v9_min_overnight_charge_blocks() -> usize {
+    4
+}
+fn default_v9_opportunistic_charge_threshold_czk() -> f32 {
+    1.5
+}
+
+impl Default for WinterAdaptiveV9Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V7 is the default
+            priority: 100,
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            morning_peak_start_hour: 6,
+            morning_peak_end_hour: 9,
+            target_soc_after_morning_peak: 20.0,
+            morning_peak_consumption_per_block_kwh: 0.5,
+            solar_threshold_kwh: 5.0,
+            solar_confidence_factor: 0.7,
+            min_arbitrage_spread_czk: 3.0,
+            cheap_block_percentile: 0.25,
+            top_discharge_blocks_count: 8,
+            min_export_spread_czk: 5.0,
+            min_soc_after_export: 50.0,
+            battery_round_trip_efficiency: 0.90,
+            negative_price_handling_enabled: true,
+            min_overnight_charge_blocks: 4,
+            opportunistic_charge_threshold_czk: 1.5,
         }
     }
 }
@@ -491,6 +1057,30 @@ pub struct SeasonalConfig {
     pub force_season: Option<String>,
 }
 
+/// Solar forecast configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SolarForecastConfig {
+    /// Enable solar forecast fetching
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Sensor pattern for total today forecast
+    #[serde(default)]
+    pub sensor_total_today_pattern: String,
+
+    /// Sensor pattern for remaining today forecast
+    #[serde(default)]
+    pub sensor_remaining_today_pattern: String,
+
+    /// Sensor pattern for tomorrow forecast
+    #[serde(default)]
+    pub sensor_tomorrow_pattern: String,
+
+    /// Fetch interval in seconds
+    #[serde(default)]
+    pub fetch_interval_seconds: u64,
+}
+
 impl Default for AppConfig {
     /// Default configuration for single Solax inverter
     fn default() -> Self {
@@ -512,7 +1102,9 @@ impl Default for AppConfig {
                 fixed_sell_prices: vec![0.08; 24],
                 spot_buy_fee: default_spot_buy_fee(),
                 spot_sell_fee: default_spot_sell_fee(),
-                spot_grid_fee: default_grid_distribution_fee(),
+                hdo_sensor_entity: default_hdo_sensor_entity(),
+                hdo_low_tariff_czk: default_hdo_low_tariff_czk(),
+                hdo_high_tariff_czk: default_hdo_high_tariff_czk(),
             },
             control: ControlConfig {
                 maximum_export_power_w: 5000,
@@ -542,6 +1134,7 @@ impl Default for AppConfig {
             },
             strategies: StrategiesConfig::default(),
             history: ConsumptionHistoryConfig::default(),
+            solar_forecast: SolarForecastConfig::default(),
         }
     }
 }
@@ -934,33 +1527,16 @@ impl AppConfig {
 
         Ok(())
     }
+}
 
-    /// Save current configuration to file
-    ///
-    /// Future use: Will enable runtime configuration changes via Web UI
-    /// Currently used in tests to verify serialization/deserialization
-    #[allow(dead_code)]
-    pub fn save(&self, path: &str) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self)?;
-        std::fs::write(path, toml_str)?;
-        info!("Configuration saved to {}", path);
-        Ok(())
+#[cfg(test)]
+impl AppConfig {
+    /// Get update interval as Duration (test helper)
+    pub fn update_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.system.update_interval_secs)
     }
 
-    /// Get update interval as Duration
-    ///
-    /// Helper method for converting update_interval_secs to Duration type
-    /// Currently used in tests; may be used by future runtime config updates
-    #[allow(dead_code)]
-    pub fn update_interval(&self) -> Duration {
-        Duration::from_secs(self.system.update_interval_secs)
-    }
-
-    /// Check if running in debug mode
-    ///
-    /// Helper method for debug mode status
-    /// Currently used in tests; may be used by future conditional features
-    #[allow(dead_code)]
+    /// Check if running in debug mode (test helper)
     pub fn is_debug_mode(&self) -> bool {
         self.system.debug_mode
     }
@@ -1053,7 +1629,9 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 },
                 spot_buy_fee_czk: app_config.pricing.spot_buy_fee,
                 spot_sell_fee_czk: app_config.pricing.spot_sell_fee,
-                grid_distribution_fee_czk: app_config.pricing.spot_grid_fee,
+                hdo_sensor_entity: app_config.pricing.hdo_sensor_entity,
+                hdo_low_tariff_czk: app_config.pricing.hdo_low_tariff_czk,
+                hdo_high_tariff_czk: app_config.pricing.hdo_high_tariff_czk,
             },
             control_config: fluxion_core::ControlConfig {
                 force_charge_hours: app_config.control.force_charge_hours,
@@ -1141,6 +1719,268 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 winter_adaptive_v2: fluxion_core::WinterAdaptiveV2ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v2.enabled,
                     priority: app_config.strategies.winter_adaptive_v2.priority,
+                    daily_charging_target_soc: app_config
+                        .strategies
+                        .winter_adaptive_v2
+                        .daily_charging_target_soc,
+                },
+                winter_adaptive_v3: fluxion_core::WinterAdaptiveV3ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v3.enabled,
+                    priority: app_config.strategies.winter_adaptive_v3.priority,
+                    daily_charging_target_soc: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .daily_charging_target_soc,
+                    hdo_sensor_entity: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .hdo_sensor_entity
+                        .clone(),
+                    hdo_low_tariff_czk: app_config.strategies.winter_adaptive_v3.hdo_low_tariff_czk,
+                    hdo_high_tariff_czk: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .hdo_high_tariff_czk,
+                    winter_discharge_min_soc: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .winter_discharge_min_soc,
+                    top_discharge_blocks_per_day: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .top_discharge_blocks_per_day,
+                    discharge_arbitrage_buffer: app_config
+                        .strategies
+                        .winter_adaptive_v3
+                        .discharge_arbitrage_buffer,
+                },
+                winter_adaptive_v4: fluxion_core::WinterAdaptiveV4ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v4.enabled,
+                    priority: app_config.strategies.winter_adaptive_v4.priority,
+                    target_battery_soc: app_config.strategies.winter_adaptive_v4.target_battery_soc,
+                    hdo_sensor_entity: app_config
+                        .strategies
+                        .winter_adaptive_v4
+                        .hdo_sensor_entity
+                        .clone(),
+                    hdo_low_tariff_czk: app_config.strategies.winter_adaptive_v4.hdo_low_tariff_czk,
+                    hdo_high_tariff_czk: app_config
+                        .strategies
+                        .winter_adaptive_v4
+                        .hdo_high_tariff_czk,
+                    discharge_blocks_per_day: app_config
+                        .strategies
+                        .winter_adaptive_v4
+                        .discharge_blocks_per_day,
+                    min_discharge_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v4
+                        .min_discharge_spread_czk,
+                },
+                winter_adaptive_v5: fluxion_core::WinterAdaptiveV5ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v5.enabled,
+                    priority: app_config.strategies.winter_adaptive_v5.priority,
+                    target_battery_soc: app_config.strategies.winter_adaptive_v5.target_battery_soc,
+                    min_discharge_soc: app_config.strategies.winter_adaptive_v5.min_discharge_soc,
+                    hdo_sensor_entity: app_config
+                        .strategies
+                        .winter_adaptive_v5
+                        .hdo_sensor_entity
+                        .clone(),
+                    hdo_low_tariff_czk: app_config.strategies.winter_adaptive_v5.hdo_low_tariff_czk,
+                    hdo_high_tariff_czk: app_config
+                        .strategies
+                        .winter_adaptive_v5
+                        .hdo_high_tariff_czk,
+                    cheap_block_percentile: app_config
+                        .strategies
+                        .winter_adaptive_v5
+                        .cheap_block_percentile,
+                    expensive_block_percentile: app_config
+                        .strategies
+                        .winter_adaptive_v5
+                        .expensive_block_percentile,
+                    min_discharge_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v5
+                        .min_discharge_spread_czk,
+                    safety_margin_pct: app_config.strategies.winter_adaptive_v5.safety_margin_pct,
+                },
+                winter_adaptive_v6: fluxion_core::WinterAdaptiveV6ConfigCore::default(),
+                winter_adaptive_v7: fluxion_core::WinterAdaptiveV7ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v7.enabled,
+                    priority: app_config.strategies.winter_adaptive_v7.priority,
+                    target_battery_soc: app_config.strategies.winter_adaptive_v7.target_battery_soc,
+                    min_discharge_soc: app_config.strategies.winter_adaptive_v7.min_discharge_soc,
+                    min_cycle_profit_czk: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .min_cycle_profit_czk,
+                    valley_threshold_std_dev: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .valley_threshold_std_dev,
+                    peak_threshold_std_dev: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .peak_threshold_std_dev,
+                    min_export_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .min_export_spread_czk,
+                    min_soc_after_export: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .min_soc_after_export,
+                    avg_consumption_per_block_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .avg_consumption_per_block_kwh,
+                    negative_price_handling_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .negative_price_handling_enabled,
+                    battery_round_trip_efficiency: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .battery_round_trip_efficiency,
+                    solar_aware_charging_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .solar_aware_charging_enabled,
+                    min_grid_charge_blocks: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .min_grid_charge_blocks,
+                    opportunistic_charge_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v7
+                        .opportunistic_charge_threshold_czk,
+                },
+                winter_adaptive_v8: fluxion_core::WinterAdaptiveV8ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v8.enabled,
+                    priority: app_config.strategies.winter_adaptive_v8.priority,
+                    target_battery_soc: app_config.strategies.winter_adaptive_v8.target_battery_soc,
+                    min_discharge_soc: app_config.strategies.winter_adaptive_v8.min_discharge_soc,
+                    top_discharge_blocks_count: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .top_discharge_blocks_count,
+                    min_discharge_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .min_discharge_spread_czk,
+                    battery_round_trip_efficiency: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .battery_round_trip_efficiency,
+                    cheap_block_percentile: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .cheap_block_percentile,
+                    avg_consumption_per_block_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .avg_consumption_per_block_kwh,
+                    min_export_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .min_export_spread_czk,
+                    min_soc_after_export: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .min_soc_after_export,
+                    negative_price_handling_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .negative_price_handling_enabled,
+                    // Solar-aware charging config
+                    solar_aware_charging_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .solar_aware_charging_enabled,
+                    min_grid_charge_blocks: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .min_grid_charge_blocks,
+                    opportunistic_charge_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .opportunistic_charge_threshold_czk,
+                    solar_capacity_reservation_factor: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .solar_capacity_reservation_factor,
+                    min_solar_for_reduction_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v8
+                        .min_solar_for_reduction_kwh,
+                },
+                winter_adaptive_v9: fluxion_core::WinterAdaptiveV9ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v9.enabled,
+                    priority: app_config.strategies.winter_adaptive_v9.priority,
+                    target_battery_soc: app_config.strategies.winter_adaptive_v9.target_battery_soc,
+                    min_discharge_soc: app_config.strategies.winter_adaptive_v9.min_discharge_soc,
+                    morning_peak_start_hour: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .morning_peak_start_hour,
+                    morning_peak_end_hour: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .morning_peak_end_hour,
+                    target_soc_after_morning_peak: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .target_soc_after_morning_peak,
+                    morning_peak_consumption_per_block_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .morning_peak_consumption_per_block_kwh,
+                    solar_threshold_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .solar_threshold_kwh,
+                    solar_confidence_factor: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .solar_confidence_factor,
+                    min_arbitrage_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .min_arbitrage_spread_czk,
+                    cheap_block_percentile: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .cheap_block_percentile,
+                    top_discharge_blocks_count: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .top_discharge_blocks_count,
+                    min_export_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .min_export_spread_czk,
+                    min_soc_after_export: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .min_soc_after_export,
+                    battery_round_trip_efficiency: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .battery_round_trip_efficiency,
+                    negative_price_handling_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .negative_price_handling_enabled,
+                    min_overnight_charge_blocks: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .min_overnight_charge_blocks,
+                    opportunistic_charge_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v9
+                        .opportunistic_charge_threshold_czk,
                 },
                 winter_peak_discharge: fluxion_core::WinterPeakDischargeConfigCore {
                     enabled: app_config.strategies.winter_peak_discharge.enabled,
@@ -1208,6 +2048,41 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 solar_production_entity: app_config.history.solar_production_entity,
                 ema_days: app_config.history.ema_days,
                 seasonal_detection_days: app_config.history.seasonal_detection_days,
+            },
+            solar_forecast: fluxion_core::SolarForecastConfigCore {
+                enabled: true, // Solar forecast is always enabled (default from SolarForecastConfigCore)
+                sensor_total_today_pattern: if app_config
+                    .solar_forecast
+                    .sensor_total_today_pattern
+                    .is_empty()
+                {
+                    "sensor.energy_production_today".to_string()
+                } else {
+                    app_config.solar_forecast.sensor_total_today_pattern
+                },
+                sensor_remaining_today_pattern: if app_config
+                    .solar_forecast
+                    .sensor_remaining_today_pattern
+                    .is_empty()
+                {
+                    "sensor.energy_production_today_remaining".to_string()
+                } else {
+                    app_config.solar_forecast.sensor_remaining_today_pattern
+                },
+                sensor_tomorrow_pattern: if app_config
+                    .solar_forecast
+                    .sensor_tomorrow_pattern
+                    .is_empty()
+                {
+                    "sensor.energy_production_tomorrow".to_string()
+                } else {
+                    app_config.solar_forecast.sensor_tomorrow_pattern
+                },
+                fetch_interval_seconds: if app_config.solar_forecast.fetch_interval_seconds == 0 {
+                    60
+                } else {
+                    app_config.solar_forecast.fetch_interval_seconds
+                },
             },
         }
     }
@@ -1363,7 +2238,7 @@ mod tests {
         let config = AppConfig::default();
         let duration = config.update_interval();
 
-        assert_eq!(duration, Duration::from_secs(60));
+        assert_eq!(duration, std::time::Duration::from_secs(60));
     }
 
     #[test]

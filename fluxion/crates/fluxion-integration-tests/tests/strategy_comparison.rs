@@ -24,10 +24,6 @@ struct HistoricalData {
     timestamp: DateTime<Utc>,
     battery_soc: f32,
     pv_power_w: f32,
-    #[allow(dead_code)]
-    battery_power_w: f32,
-    #[allow(dead_code)]
-    grid_power_w: f32,
     house_load_w: f32,
 }
 
@@ -50,6 +46,7 @@ fn load_data() -> TestData {
             Ok(TimeBlockPrice {
                 block_start: Utc.timestamp_opt(ts, 0).unwrap(),
                 price_czk_per_kwh: price as f32,
+                effective_price_czk_per_kwh: price as f32,
                 duration_minutes: 15, // Default assumption
             })
         })
@@ -57,7 +54,7 @@ fn load_data() -> TestData {
 
     let prices: Vec<TimeBlockPrice> = price_iter.map(|r| r.unwrap()).collect();
 
-    let mut stmt = conn.prepare("SELECT timestamp, battery_soc, pv_power_w, battery_power_w, grid_power_w, house_load_w FROM historical_plant_data ORDER BY timestamp ASC").unwrap();
+    let mut stmt = conn.prepare("SELECT timestamp, battery_soc, pv_power_w, house_load_w FROM historical_plant_data ORDER BY timestamp ASC").unwrap();
     let hist_iter = stmt
         .query_map([], |row| {
             let ts: i64 = row.get(0)?;
@@ -65,9 +62,7 @@ fn load_data() -> TestData {
                 timestamp: Utc.timestamp_opt(ts, 0).unwrap(),
                 battery_soc: row.get::<_, f64>(1)? as f32,
                 pv_power_w: row.get::<_, f64>(2)? as f32,
-                battery_power_w: row.get::<_, f64>(3)? as f32,
-                grid_power_w: row.get::<_, f64>(4)? as f32,
-                house_load_w: row.get::<_, f64>(5)? as f32,
+                house_load_w: row.get::<_, f64>(3)? as f32,
             })
         })
         .unwrap();
@@ -251,6 +246,11 @@ fn compare_strategies() {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: Some(cumulative_consumption_kwh),
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
         };
 
         let evaluation = winter_strategy.evaluate(&context);

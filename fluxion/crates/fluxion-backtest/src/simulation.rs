@@ -198,6 +198,7 @@ fn simulate_winter_adaptive(
         .map(|p| TimeBlockPrice {
             block_start: p.timestamp,
             price_czk_per_kwh: p.price_czk_per_kwh,
+            effective_price_czk_per_kwh: p.price_czk_per_kwh,
             duration_minutes: 15,
         })
         .collect();
@@ -234,6 +235,7 @@ fn simulate_winter_adaptive(
         let fallback_price_block = TimeBlockPrice {
             block_start: record.timestamp,
             price_czk_per_kwh: price,
+            effective_price_czk_per_kwh: price,
             duration_minutes: 15,
         };
         let price_block = time_block_prices
@@ -252,6 +254,11 @@ fn simulate_winter_adaptive(
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: Some(cumulative_consumption_kwh),
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
         };
 
         let evaluation = strategy.evaluate(&context);

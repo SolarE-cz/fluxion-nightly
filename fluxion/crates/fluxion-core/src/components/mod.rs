@@ -20,7 +20,8 @@ pub use battery_predictor::{
     BatteryPrediction, BatteryPredictionPoint, calculate_soc_change, predict_battery_soc,
 };
 pub use consumption_history::{
-    ConsumptionHistory, ConsumptionHistoryConfig, DailyEnergySummary, aggregate_daily_consumption,
+    ConsumptionHistory, ConsumptionHistoryConfig, DailyEnergySummary, HourlyConsumptionProfile,
+    aggregate_daily_consumption, aggregate_hourly_consumption,
 };
 pub use pv_history::{PvHistory, PvHistoryPoint};
 

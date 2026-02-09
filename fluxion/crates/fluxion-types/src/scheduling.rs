@@ -38,6 +38,12 @@ pub struct ScheduledMode {
     /// Human-readable reason for this mode
     pub reason: String,
 
+    /// Unique identifier for the decision logic that chose this mode
+    /// Format: "strategy_name:decision_point" (e.g., "winter_adaptive_v2:negative_price")
+    /// Only available via /export endpoint for debugging
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_uid: Option<String>,
+
     /// Debug info captured during scheduling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<BlockDebugInfo>,

@@ -176,6 +176,7 @@ mod tests {
                     target_inverters: None,
                     mode: InverterOperationMode::ForceCharge,
                     reason: "Test charge".to_string(),
+                    decision_uid: None,
                     debug_info: None,
                 },
                 ScheduledMode {
@@ -184,6 +185,7 @@ mod tests {
                     target_inverters: None,
                     mode: InverterOperationMode::ForceDischarge,
                     reason: "Test discharge".to_string(),
+                    decision_uid: None,
                     debug_info: None,
                 },
             ],
@@ -325,6 +327,7 @@ mod tests {
             target_inverters: None,
             mode: InverterOperationMode::ForceCharge,
             reason: "Test".to_string(),
+            decision_uid: None,
             debug_info: None,
         };
 
@@ -340,6 +343,7 @@ mod tests {
             target_inverters: Some(vec!["inv1".to_string(), "inv2".to_string()]),
             mode: InverterOperationMode::ForceCharge,
             reason: "Test".to_string(),
+            decision_uid: None,
             debug_info: None,
         };
 

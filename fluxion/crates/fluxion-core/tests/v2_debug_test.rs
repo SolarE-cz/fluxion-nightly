@@ -30,6 +30,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
+            effective_price_czk_per_kwh: 1.5,
         });
     }
 
@@ -39,6 +40,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
+            effective_price_czk_per_kwh: 3.0,
         });
     }
 
@@ -48,6 +50,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 4.5,
+            effective_price_czk_per_kwh: 4.5,
         });
     }
 
@@ -57,6 +60,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
+            effective_price_czk_per_kwh: 2.0,
         });
     }
 
@@ -66,6 +70,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.5,
+            effective_price_czk_per_kwh: 3.5,
         });
     }
 
@@ -75,6 +80,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
+            effective_price_czk_per_kwh: 5.0,
         });
     }
 
@@ -84,6 +90,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
+            effective_price_czk_per_kwh: 2.5,
         });
     }
 
@@ -144,6 +151,11 @@ fn debug_v2_charge_scheduling() {
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(5.0),
             consumption_today_kwh: Some(8.0),
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            hourly_consumption_profile: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

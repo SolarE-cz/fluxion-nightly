@@ -16,6 +16,7 @@ pub mod history;
 pub mod inverter;
 pub mod pricing;
 pub mod scheduling;
+pub mod user_control;
 pub mod web;
 
 // Re-export common types for convenience
@@ -25,3 +26,4 @@ pub use history::{ConsumptionHistory, ConsumptionHistoryConfig};
 pub use inverter::{Inverter, InverterOperationMode, InverterType};
 pub use pricing::{PriceAnalysis, SpotPriceData};
 pub use scheduling::{BlockDebugInfo, OperationSchedule, ScheduledMode, StrategyEvaluation};
+pub use user_control::{FixedTimeSlot, UserControlState};

@@ -18,10 +18,13 @@ use bevy_app::App;
 use bevy_ecs::system::RunSystemOnce;
 use fluxion_core::{
     ConfigSection, ConfigUpdateEvent, ConfigUpdateSender, DebugModeConfig, OperationSchedule,
-    SpotPriceData, SystemConfig, TimeBlockPrice, components::ConsumptionHistory,
+    PluginManagerResource, SpotPriceData, SystemConfig, TimeBlockPrice,
+    components::ConsumptionHistory, plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::Language;
+use parking_lot::RwLock;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 #[test]
 fn test_config_update_flow() {
@@ -40,7 +43,9 @@ fn test_config_update_flow() {
             fixed_sell_price_czk: fluxion_core::PriceSchedule::Flat(2.0),
             spot_buy_fee_czk: 0.5,
             spot_sell_fee_czk: 0.5,
-            grid_distribution_fee_czk: 1.2,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
         },
         control_config: fluxion_core::ControlConfig {
             force_charge_hours: 2,
@@ -58,16 +63,25 @@ fn test_config_update_flow() {
         },
         strategies_config: Default::default(),
         history: Default::default(),
+        solar_forecast: Default::default(),
     };
 
     // Create config update channel
     let (config_sender, config_channel) = ConfigUpdateSender::new();
+
+    // Create plugin manager for scheduling
+    let plugin_manager = create_plugin_manager(
+        Some(&initial_config.strategies_config),
+        &initial_config.control_config,
+    );
+    let plugin_manager_res = PluginManagerResource(Arc::new(RwLock::new(plugin_manager)));
 
     // Insert resources
     app.insert_resource(initial_config.clone());
     app.insert_resource(config_channel);
     app.insert_resource(DebugModeConfig::default());
     app.insert_resource(ConsumptionHistory::default());
+    app.insert_resource(plugin_manager_res);
 
     // Create some dummy price data
     let price_data = SpotPriceData {
@@ -76,11 +90,13 @@ fn test_config_update_flow() {
                 block_start: chrono::Utc::now(),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.0,
             },
             TimeBlockPrice {
                 block_start: chrono::Utc::now() + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.0,
+                effective_price_czk_per_kwh: 5.0,
             },
         ],
         block_duration_minutes: 15,
@@ -146,7 +162,9 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
             fixed_sell_price_czk: fluxion_core::PriceSchedule::Flat(2.0),
             spot_buy_fee_czk: 0.5,
             spot_sell_fee_czk: 0.5,
-            grid_distribution_fee_czk: 1.2,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
         },
         control_config: Default::default(),
         system_config: fluxion_core::SystemSettingsConfig {
@@ -158,16 +176,25 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
         },
         strategies_config: Default::default(),
         history: Default::default(),
+        solar_forecast: Default::default(),
     };
 
     // Create config update channel
     let (config_sender, config_channel) = ConfigUpdateSender::new();
+
+    // Create plugin manager for scheduling
+    let plugin_manager = create_plugin_manager(
+        Some(&initial_config.strategies_config),
+        &initial_config.control_config,
+    );
+    let plugin_manager_res = PluginManagerResource(Arc::new(RwLock::new(plugin_manager)));
 
     // Insert resources
     app.insert_resource(initial_config.clone());
     app.insert_resource(config_channel);
     app.insert_resource(DebugModeConfig::default());
     app.insert_resource(ConsumptionHistory::default());
+    app.insert_resource(plugin_manager_res);
 
     // Modify only system settings (not Control/Pricing/Strategies)
     initial_config.system_config.debug_mode = false;

@@ -10,21 +10,129 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-use crate::strategy::{
-    AdaptiveSeasonalOptimizer, BlockEvaluation, EvaluationContext, SeasonalStrategiesConfig,
-};
+use crate::strategy::BlockEvaluation;
 use chrono::Utc;
 use fluent::fluent_args;
 use fluxion_i18n::I18n;
-use fluxion_types::config::{ControlConfig, Currency, StrategiesConfigCore};
+use fluxion_plugins::{
+    BatteryState, BlockDecision, EvaluationRequest, ForecastData, HistoricalData, OperationMode,
+    PluginManager, PriceBlock,
+};
+use fluxion_types::UserControlState;
+use fluxion_types::config::{ControlConfig, Currency, PricingConfig};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Check if debug logging is enabled based on log level
 fn is_debug_enabled() -> bool {
     tracing::enabled!(tracing::Level::DEBUG)
+}
+
+/// Calculate yesterday's average effective price for initial battery cost basis.
+///
+/// This provides a realistic starting cost for energy already in the battery at day start.
+/// Falls back to today's average if no yesterday data is available.
+///
+/// # Arguments
+/// * `time_block_prices` - All available price blocks (may include yesterday and today)
+///
+/// # Returns
+/// Average effective price (CZK/kWh) to use as initial battery cost basis
+fn calculate_initial_battery_price(time_block_prices: &[TimeBlockPrice]) -> f32 {
+    let today = Utc::now().date_naive();
+    let yesterday = today - chrono::Duration::days(1);
+
+    // Try to find yesterday's blocks
+    let yesterday_blocks: Vec<&TimeBlockPrice> = time_block_prices
+        .iter()
+        .filter(|b| b.block_start.date_naive() == yesterday)
+        .collect();
+
+    if !yesterday_blocks.is_empty() {
+        let avg: f32 = yesterday_blocks
+            .iter()
+            .map(|b| b.effective_price_czk_per_kwh)
+            .sum::<f32>()
+            / yesterday_blocks.len() as f32;
+        debug!(
+            "Using yesterday's average price for initial battery cost: {:.3} CZK/kWh ({} blocks)",
+            avg,
+            yesterday_blocks.len()
+        );
+        return avg;
+    }
+
+    // Fall back to today's average
+    if !time_block_prices.is_empty() {
+        let avg: f32 = time_block_prices
+            .iter()
+            .map(|b| b.effective_price_czk_per_kwh)
+            .sum::<f32>()
+            / time_block_prices.len() as f32;
+        debug!(
+            "No yesterday data available, using today's average for initial battery cost: {:.3} CZK/kWh",
+            avg
+        );
+        return avg;
+    }
+
+    // Ultimate fallback
+    3.0 // Reasonable default ~3 CZK/kWh
+}
+
+/// Calculate effective prices (spot price + grid fees) for all time blocks
+///
+/// Uses the GlobalHdoCache to determine whether each block is in low or high tariff period,
+/// then adds the appropriate grid fee from PricingConfig to the spot price.
+///
+/// # Arguments
+/// * `time_block_prices` - Mutable slice of price blocks to update
+/// * `hdo_cache` - Optional global HDO cache for tariff period lookup
+/// * `pricing_config` - Pricing configuration with grid fee amounts
+///
+/// # Note
+/// If HDO cache is not available or returns None, falls back to spot_buy_fee_czk
+pub fn calculate_effective_prices(
+    time_block_prices: &mut [TimeBlockPrice],
+    hdo_cache: Option<&crate::resources::GlobalHdoCache>,
+    pricing_config: &PricingConfig,
+) {
+    for block in time_block_prices.iter_mut() {
+        let grid_fee = if let Some(cache) = hdo_cache {
+            // Try to get HDO tariff period from cache
+            match cache.is_low_tariff(block.block_start) {
+                Some(true) => {
+                    // Low tariff period
+                    pricing_config.hdo_low_tariff_czk
+                }
+                Some(false) => {
+                    // High tariff period
+                    pricing_config.hdo_high_tariff_czk
+                }
+                None => {
+                    // HDO data not available for this time, use fallback
+                    warn!(
+                        "HDO tariff data not available for {}, using fallback spot_buy_fee",
+                        block.block_start
+                    );
+                    pricing_config.spot_buy_fee_czk
+                }
+            }
+        } else {
+            // No HDO cache available, use fallback
+            pricing_config.spot_buy_fee_czk
+        };
+
+        // Calculate effective price = spot price + grid fee
+        block.effective_price_czk_per_kwh = block.price_czk_per_kwh + grid_fee;
+    }
+
+    debug!(
+        "Calculated effective prices for {} blocks using HDO tariff data",
+        time_block_prices.len()
+    );
 }
 
 /// Configuration for schedule generation
@@ -71,9 +179,13 @@ impl Default for ScheduleConfig {
 /// * `solar_forecast` - Optional solar generation forecast per block (kWh)
 /// * `consumption_forecast` - Optional consumption forecast per block (kWh)
 /// * Export price is taken from control_config.grid_export_fee_czk_per_kwh (fixed fee)
-/// * `strategies_config` - Optional strategies configuration (uses defaults if None)
 /// * `backup_discharge_min_soc` - Minimum SOC from HA sensor (backup_discharge_min_soc)
 /// * `grid_import_today_kwh` - Optional grid import energy consumed today (kWh)
+/// * `plugin_manager` - The shared plugin manager with registered strategies
+/// * `solar_forecast_total_today_kwh` - Total solar forecast for today (kWh)
+/// * `solar_forecast_remaining_today_kwh` - Remaining solar forecast for today (kWh)
+/// * `solar_forecast_tomorrow_kwh` - Solar forecast for tomorrow (kWh)
+/// * `user_control` - Optional user control state for overrides and restrictions
 ///
 /// # Returns
 /// Complete `OperationSchedule` with economically optimized mode assignments
@@ -85,21 +197,20 @@ pub fn generate_schedule_with_optimizer(
     current_battery_soc: f32,
     solar_forecast: Option<&[f32]>,
     consumption_forecast: Option<&[f32]>,
-    strategies_config: Option<&StrategiesConfigCore>,
     backup_discharge_min_soc: f32,
     grid_import_today_kwh: Option<f32>,
+    plugin_manager: &PluginManager,
+    hdo_raw_data: Option<String>,
+    solar_forecast_total_today_kwh: f32,
+    solar_forecast_remaining_today_kwh: f32,
+    solar_forecast_tomorrow_kwh: f32,
+    user_control: Option<&UserControlState>,
+    hourly_consumption_profile: Option<&[f32; 24]>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
         return OperationSchedule::default();
     }
-
-    let optimizer = if let Some(config) = strategies_config {
-        let seasonal_config = SeasonalStrategiesConfig::from(config);
-        AdaptiveSeasonalOptimizer::with_config(&seasonal_config)
-    } else {
-        AdaptiveSeasonalOptimizer::with_defaults()
-    };
     let mut scheduled_blocks = Vec::new();
     let mut total_profit = 0.0;
 
@@ -125,11 +236,23 @@ pub fn generate_schedule_with_optimizer(
         return OperationSchedule::default();
     }
 
-    info!(
+    // Initialize battery cost tracking for arbitrage profit calculation
+    // battery_energy_kwh: Current energy stored in battery
+    // battery_total_cost_czk: Total cost of energy currently in battery
+    let initial_battery_price = calculate_initial_battery_price(time_block_prices);
+    let battery_capacity = control_config.battery_capacity_kwh;
+    let mut battery_energy_kwh = (current_battery_soc / 100.0) * battery_capacity;
+    let mut battery_total_cost_czk = battery_energy_kwh * initial_battery_price;
+
+    debug!(
         "Scheduling for {} blocks (filtered {} past blocks, current SOC: {:.1}%)",
         relevant_blocks.len(),
         time_block_prices.len() - relevant_blocks.len(),
         current_battery_soc
+    );
+    debug!(
+        "Initial battery state: {:.2} kWh @ {:.3} CZK/kWh avg (total cost: {:.2} CZK)",
+        battery_energy_kwh, initial_battery_price, battery_total_cost_czk
     );
 
     // The TimeAwareChargeStrategy now handles all charging decisions dynamically
@@ -157,20 +280,33 @@ pub fn generate_schedule_with_optimizer(
             .map(|(_, block)| (*block).clone())
             .collect();
 
-        let context = EvaluationContext {
-            price_block,
-            control_config,
-            current_battery_soc: temp_predicted_soc,
-            solar_forecast_kwh: solar_kwh,
-            consumption_forecast_kwh: consumption_kwh,
-            grid_export_price_czk_per_kwh: export_price,
-            all_price_blocks: Some(&remaining_blocks),
-            backup_discharge_min_soc,
-            grid_import_today_kwh,
-            consumption_today_kwh: None,
+        // Calculate current average charge price for arbitrage tracking
+        let avg_charge_price = if battery_energy_kwh > 0.0 {
+            battery_total_cost_czk / battery_energy_kwh
+        } else {
+            initial_battery_price
         };
 
-        let evaluation = optimizer.evaluate(&context);
+        let request = create_evaluation_request(
+            price_block,
+            &remaining_blocks,
+            control_config,
+            temp_predicted_soc,
+            solar_kwh,
+            consumption_kwh,
+            export_price,
+            backup_discharge_min_soc,
+            grid_import_today_kwh,
+            hdo_raw_data.clone(),
+            solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh,
+            avg_charge_price,
+            hourly_consumption_profile,
+        );
+
+        let decision = plugin_manager.evaluate(&request);
+        let evaluation = convert_decision_to_evaluation(&decision, &request);
         temp_predicted_soc = update_soc_prediction(
             temp_predicted_soc,
             &evaluation,
@@ -229,27 +365,150 @@ pub fn generate_schedule_with_optimizer(
             .map(|(_, block)| (*block).clone())
             .collect();
 
-        // Create evaluation context with appropriate SOC
-        let context = EvaluationContext {
-            price_block,
-            control_config,
-            current_battery_soc: soc_for_evaluation,
-            solar_forecast_kwh: solar_kwh,
-            consumption_forecast_kwh: consumption_kwh,
-            grid_export_price_czk_per_kwh: export_price,
-            all_price_blocks: Some(&remaining_blocks),
-            backup_discharge_min_soc,
-            grid_import_today_kwh,
-            consumption_today_kwh: None,
+        // Calculate current average charge price for arbitrage tracking
+        let avg_charge_price = if battery_energy_kwh > 0.0 {
+            battery_total_cost_czk / battery_energy_kwh
+        } else {
+            initial_battery_price
         };
 
-        // Optimize and get best strategy evaluation
-        // Capture debug info if debug logging is enabled
-        let capture_debug = is_debug_enabled();
-        let evaluation = optimizer.evaluate_with_debug(&context, capture_debug);
+        // Check for user-defined fixed time slot FIRST
+        // If a fixed slot covers this block, use it instead of strategy evaluation
+        if let Some(uc) = user_control
+            && let Some(fixed_slot) = uc.get_fixed_slot_at(price_block.block_start)
+        {
+            // User override takes precedence - skip normal evaluation
+            debug!(
+                "Block {}: Using user override slot {} ({:?})",
+                local_idx, fixed_slot.id, fixed_slot.mode
+            );
+
+            // Still update predicted SOC based on the fixed mode
+            let mut fixed_evaluation = BlockEvaluation::new(
+                price_block.block_start,
+                price_block.duration_minutes,
+                fixed_slot.mode,
+                "User Override".to_string(),
+            );
+            fixed_evaluation.reason = fixed_slot
+                .note
+                .clone()
+                .unwrap_or_else(|| "User-locked time slot".to_string());
+            fixed_evaluation.decision_uid = Some(format!("user_override:{}", fixed_slot.id));
+
+            predicted_soc = update_soc_prediction(
+                predicted_soc,
+                &fixed_evaluation,
+                control_config,
+                solar_kwh,
+                consumption_kwh,
+            );
+
+            scheduled_blocks.push(ScheduledMode {
+                block_start: fixed_evaluation.block_start,
+                duration_minutes: fixed_evaluation.duration_minutes,
+                target_inverters: if schedule_config.target_inverters.is_empty() {
+                    None
+                } else {
+                    Some(schedule_config.target_inverters.clone())
+                },
+                mode: fixed_evaluation.mode,
+                reason: format!("User Override - {}", fixed_evaluation.reason),
+                decision_uid: fixed_evaluation.decision_uid.clone(),
+                debug_info: None,
+            });
+
+            continue; // Skip normal evaluation for this block
+        }
+
+        // Create evaluation request for plugin manager
+        let request = create_evaluation_request(
+            price_block,
+            &remaining_blocks,
+            control_config,
+            soc_for_evaluation,
+            solar_kwh,
+            consumption_kwh,
+            export_price,
+            backup_discharge_min_soc,
+            grid_import_today_kwh,
+            hdo_raw_data.clone(),
+            solar_forecast_total_today_kwh,
+            solar_forecast_remaining_today_kwh,
+            solar_forecast_tomorrow_kwh,
+            avg_charge_price,
+            hourly_consumption_profile,
+        );
+
+        // Get decision from plugin manager
+        let decision = plugin_manager.evaluate(&request);
+        let mut evaluation = convert_decision_to_evaluation(&decision, &request);
+
+        // Apply user control restrictions (disallow charge/discharge)
+        if let Some(uc) = user_control
+            && !uc.is_mode_allowed(evaluation.mode)
+        {
+            let original_mode = evaluation.mode;
+            let original_reason = evaluation.reason.clone();
+
+            // Convert disallowed mode to SelfUse (default safe mode)
+            evaluation.mode = schedule_config.default_battery_mode;
+            evaluation.reason = format!(
+                "{} (converted from {:?} - user restriction: {})",
+                original_reason,
+                original_mode,
+                if uc.disallow_charge && original_mode == InverterOperationMode::ForceCharge {
+                    "charge disallowed"
+                } else {
+                    "discharge disallowed"
+                }
+            );
+
+            debug!(
+                "Block {}: Mode {:?} restricted by user, using {:?} instead",
+                local_idx, original_mode, evaluation.mode
+            );
+        }
+
+        // Update battery cost tracking based on the decision
+        let current_price = price_block.effective_price_czk_per_kwh;
+        match evaluation.mode {
+            InverterOperationMode::ForceCharge => {
+                // Energy charged = max charge rate * 0.25 hours (15 min block)
+                let charge_kwh = control_config.max_battery_charge_rate_kw * 0.25;
+                let charge_cost = charge_kwh * current_price;
+                battery_energy_kwh += charge_kwh * control_config.battery_efficiency;
+                battery_total_cost_czk += charge_cost;
+            }
+            InverterOperationMode::ForceDischarge | InverterOperationMode::SelfUse => {
+                // Estimate discharge based on mode
+                let discharge_kwh = if evaluation.mode == InverterOperationMode::ForceDischarge {
+                    // Force discharge at export rate
+                    (control_config.maximum_export_power_w as f32 / 1000.0) * 0.25
+                } else {
+                    // Self-use: discharge equals net consumption (consumption - solar)
+                    (consumption_kwh - solar_kwh).max(0.0)
+                };
+
+                if discharge_kwh > 0.0 && battery_energy_kwh > 0.0 {
+                    // Remove proportional cost when discharging
+                    let discharge_ratio = (discharge_kwh / battery_energy_kwh).min(1.0);
+                    battery_total_cost_czk *= 1.0 - discharge_ratio;
+                    battery_energy_kwh = (battery_energy_kwh - discharge_kwh).max(0.0);
+                }
+            }
+            InverterOperationMode::BackUpMode => {
+                // Similar to SelfUse but more conservative
+                let discharge_kwh = (consumption_kwh - solar_kwh).max(0.0);
+                if discharge_kwh > 0.0 && battery_energy_kwh > 0.0 {
+                    let discharge_ratio = (discharge_kwh / battery_energy_kwh).min(1.0);
+                    battery_total_cost_czk *= 1.0 - discharge_ratio;
+                    battery_energy_kwh = (battery_energy_kwh - discharge_kwh).max(0.0);
+                }
+            }
+        }
 
         // Update predicted SOC for next block
-        // Since all blocks in relevant_blocks are current/future, always update prediction
         predicted_soc = update_soc_prediction(
             predicted_soc,
             &evaluation,
@@ -283,6 +542,7 @@ pub fn generate_schedule_with_optimizer(
                 "{} - {} (expected profit: {:.2} CZK)",
                 evaluation.strategy_name, evaluation.reason, evaluation.net_profit_czk
             ),
+            decision_uid: evaluation.decision_uid.clone(),
             debug_info: evaluation.debug_info,
         });
     }
@@ -310,7 +570,7 @@ pub fn generate_schedule_with_optimizer(
         .filter(|b| b.mode == InverterOperationMode::SelfUse)
         .count();
 
-    info!(
+    debug!(
         "Generated economic schedule: {} blocks, {} charge, {} discharge, {} self-use, total expected profit: {:.2} CZK",
         schedule.scheduled_blocks.len(),
         charge_count,
@@ -438,7 +698,8 @@ pub fn generate_schedule(
             },
             mode,
             reason,
-            debug_info: None, // Legacy scheduler doesn't generate debug info
+            decision_uid: None, // Legacy scheduler doesn't generate decision UIDs
+            debug_info: None,   // Legacy scheduler doesn't generate debug info
         });
     }
 
@@ -558,7 +819,7 @@ fn remove_short_force_sequences(schedule: &mut OperationSchedule, config: &Contr
     }
 
     if changes > 0 {
-        info!(
+        debug!(
             "Removed {} short force operation blocks (< {} consecutive blocks required)",
             changes, min_consecutive
         );
@@ -632,4 +893,131 @@ fn update_soc_prediction(
 
     // Clamp SOC to hardware limits
     new_soc.clamp(config.hardware_min_battery_soc, 100.0)
+}
+
+/// Create an evaluation request for the plugin manager
+#[expect(clippy::too_many_arguments)]
+fn create_evaluation_request(
+    price_block: &TimeBlockPrice,
+    remaining_blocks: &[TimeBlockPrice],
+    control_config: &ControlConfig,
+    current_soc: f32,
+    solar_kwh: f32,
+    consumption_kwh: f32,
+    export_price: f32,
+    backup_discharge_min_soc: f32,
+    grid_import_today_kwh: Option<f32>,
+    hdo_raw_data: Option<String>,
+    solar_forecast_total_today_kwh: f32,
+    solar_forecast_remaining_today_kwh: f32,
+    solar_forecast_tomorrow_kwh: f32,
+    battery_avg_charge_price_czk_per_kwh: f32,
+    hourly_consumption_profile: Option<&[f32; 24]>,
+) -> EvaluationRequest {
+    EvaluationRequest {
+        block: PriceBlock {
+            block_start: price_block.block_start,
+            duration_minutes: price_block.duration_minutes,
+            price_czk_per_kwh: price_block.price_czk_per_kwh,
+            effective_price_czk_per_kwh: price_block.effective_price_czk_per_kwh,
+        },
+        battery: BatteryState {
+            current_soc_percent: current_soc,
+            capacity_kwh: control_config.battery_capacity_kwh,
+            max_charge_rate_kw: control_config.max_battery_charge_rate_kw,
+            min_soc_percent: control_config.hardware_min_battery_soc,
+            max_soc_percent: 100.0,
+            efficiency: control_config.battery_efficiency,
+            wear_cost_czk_per_kwh: control_config.battery_wear_cost_czk_per_kwh,
+        },
+        forecast: ForecastData {
+            solar_kwh,
+            consumption_kwh,
+            grid_export_price_czk_per_kwh: export_price,
+        },
+        all_blocks: remaining_blocks
+            .iter()
+            .map(|b| PriceBlock {
+                block_start: b.block_start,
+                duration_minutes: b.duration_minutes,
+                price_czk_per_kwh: b.price_czk_per_kwh,
+                effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
+            })
+            .collect(),
+        historical: HistoricalData {
+            grid_import_today_kwh,
+            consumption_today_kwh: None, // TODO: Track actual consumption
+            hourly_consumption_profile: hourly_consumption_profile.map(|p| p.to_vec()),
+        },
+        backup_discharge_min_soc,
+        hdo_raw_data,
+        solar_forecast_total_today_kwh,
+        solar_forecast_remaining_today_kwh,
+        solar_forecast_tomorrow_kwh,
+        battery_avg_charge_price_czk_per_kwh,
+    }
+}
+
+/// Convert a plugin decision back to a BlockEvaluation for compatibility
+fn convert_decision_to_evaluation(
+    decision: &BlockDecision,
+    request: &EvaluationRequest,
+) -> BlockEvaluation {
+    use crate::strategy::{Assumptions, EnergyFlows};
+    use fluxion_types::scheduling::{BlockDebugInfo, StrategyEvaluation};
+
+    let mode = match decision.mode {
+        OperationMode::SelfUse => InverterOperationMode::SelfUse,
+        OperationMode::ForceCharge => InverterOperationMode::ForceCharge,
+        OperationMode::ForceDischarge => InverterOperationMode::ForceDischarge,
+        OperationMode::BackUpMode => InverterOperationMode::BackUpMode,
+    };
+
+    let net_profit = decision.expected_profit_czk.unwrap_or(0.0);
+
+    // Use actual strategy name from decision, falling back to priority-based name
+    let strategy_name = decision
+        .strategy_name
+        .clone()
+        .unwrap_or_else(|| format!("Plugin (priority {})", decision.priority));
+
+    BlockEvaluation {
+        block_start: decision.block_start,
+        duration_minutes: decision.duration_minutes,
+        mode,
+        revenue_czk: if net_profit > 0.0 { net_profit } else { 0.0 },
+        cost_czk: if net_profit < 0.0 { -net_profit } else { 0.0 },
+        net_profit_czk: net_profit,
+        energy_flows: EnergyFlows::default(),
+        assumptions: Assumptions {
+            solar_forecast_kwh: request.forecast.solar_kwh,
+            consumption_forecast_kwh: request.forecast.consumption_kwh,
+            current_battery_soc: request.battery.current_soc_percent,
+            battery_efficiency: request.battery.efficiency,
+            battery_wear_cost_czk_per_kwh: request.battery.wear_cost_czk_per_kwh,
+            grid_import_price_czk_per_kwh: request.block.price_czk_per_kwh,
+            grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
+        },
+        reason: decision.reason.clone(),
+        strategy_name: strategy_name.clone(),
+        decision_uid: decision.decision_uid.clone(),
+        debug_info: if is_debug_enabled() {
+            Some(BlockDebugInfo {
+                evaluated_strategies: vec![StrategyEvaluation {
+                    strategy_name,
+                    mode,
+                    net_profit_czk: net_profit,
+                    reason: decision.reason.clone(),
+                }],
+                winning_reason: decision.reason.clone(),
+                conditions: vec![
+                    format!("SOC: {:.1}%", request.battery.current_soc_percent),
+                    format!("Price: {:.3} CZK/kWh", request.block.price_czk_per_kwh),
+                ],
+            })
+        } else {
+            None
+        },
+        arbitrage_profit_czk: 0.0, // Calculated by strategy if discharge occurs
+    }
 }

@@ -16,7 +16,7 @@ use bevy_ecs::prelude::*;
 use tracing::{debug, error, info, trace};
 
 use crate::{
-    PriceDataSourceResource,
+    PluginManagerResource, PriceDataSourceResource,
     components::*,
     pricing::analyze_prices,
     resources::SystemConfig,
@@ -122,8 +122,12 @@ pub fn update_prices_system(
     _battery_query: Query<&BatteryStatus>,
     config: Res<SystemConfig>,
     backup_soc: Option<Res<BackupDischargeMinSoc>>,
+    hdo_data: Option<Res<super::HdoScheduleData>>,
+    hdo_cache: Option<Res<crate::resources::GlobalHdoCache>>,
     consumption_history: Res<crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<&RawInverterState>,
+    plugin_manager_res: Res<PluginManagerResource>,
+    user_control: Option<Res<crate::resources::UserControlResource>>,
 ) {
     // Only fetch if cache is stale (non-blocking check)
     if !price_cache.is_stale() {
@@ -133,13 +137,20 @@ pub fn update_prices_system(
     debug!("💰 Checking for updated price data...");
 
     // Fetch prices using the cache (will return cached data if fresh)
-    let new_prices = match price_cache.get_or_fetch() {
+    let mut new_prices = match price_cache.get_or_fetch() {
         Ok(prices) => prices,
         Err(e) => {
             error!("❌ Failed to fetch prices: {}", e);
             return;
         }
     };
+
+    // Calculate effective prices (spot + grid fees) using HDO tariff data
+    crate::scheduling::calculate_effective_prices(
+        &mut new_prices.time_block_prices,
+        hdo_cache.as_deref(),
+        &config.pricing_config,
+    );
 
     let new_block_count = new_prices.time_block_prices.len();
     let new_hours = new_block_count as f32 / 4.0;
@@ -175,7 +186,7 @@ pub fn update_prices_system(
         commands.spawn(new_prices.clone());
     }
 
-    info!(
+    debug!(
         "🔄 Regenerating schedule due to: {}",
         if is_day_ahead_arrival {
             "day-ahead prices arrival"
@@ -248,7 +259,10 @@ pub fn update_prices_system(
                 .map(|s| s.grid_import_kwh)
         });
 
-    // Use economic optimizer for schedule generation
+    // Use economic optimizer for schedule generation with shared plugin manager
+    let plugin_manager = plugin_manager_res.0.read();
+    let hdo_raw_data = hdo_data.as_ref().and_then(|h| h.raw_data.clone());
+    let user_control_state = user_control.as_ref().map(|uc| &uc.state);
     let new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
@@ -256,9 +270,15 @@ pub fn update_prices_system(
         current_soc,
         None, // Future: Add solar forecast integration (Solcast/Forecast.Solar API)
         consumption_forecast.as_deref(), // Enhanced consumption forecast
-        Some(&config.strategies_config),
         backup_discharge_min_soc,
         grid_import_today_kwh,
+        &plugin_manager,
+        hdo_raw_data,
+        0.0, // TODO: Wire up solar_forecast_total_today_kwh from SolarForecastData resource
+        0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
+        0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
+        user_control_state,
+        consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
     );
 
     // Update or create PriceAnalysis entity
@@ -271,7 +291,7 @@ pub fn update_prices_system(
     // Update schedule or create if doesn't exist
     if let Ok(mut schedule) = schedule_query.single_mut() {
         *schedule = new_schedule;
-        info!("✅ Schedule regenerated based on new price data");
+        debug!("✅ Schedule regenerated based on new price data");
     } else {
         commands.spawn(new_schedule);
         info!("✅ Initial schedule created");

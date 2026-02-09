@@ -32,7 +32,7 @@ mod price_fetcher;
 mod state_reader;
 
 // Re-export public functions and types
-pub use config_handler::{ConfigEventParams, config_event_handler};
+pub use config_handler::{ConfigEventParams, config_event_handler, user_control_event_handler};
 pub use health_checker::{check_health_system, setup_health_checker};
 pub use history_fetcher::{poll_consumption_history_channel, spawn_history_fetcher_worker};
 pub use inverter_writer::setup_async_inverter_writer;
@@ -71,6 +71,50 @@ pub struct BackupSocSender {
 
 /// Channel capacity for backup discharge min SOC updates
 const BACKUP_SOC_CHANNEL_CAPACITY: usize = 10;
+
+// ============================================================================
+// HDO (High/Low Tariff) Schedule Resources
+// ============================================================================
+
+/// Cached HDO schedule data from Home Assistant sensor
+/// Contains raw JSON data for V3 strategy and parsed periods for chart display
+#[derive(Resource, Clone, Default)]
+pub struct HdoScheduleData {
+    /// Raw JSON/attributes data from HA sensor (for V3 strategy parsing)
+    pub raw_data: Option<String>,
+    /// Low tariff periods for today: (start_time, end_time) in local time format "HH:MM"
+    pub low_tariff_periods: Vec<(String, String)>,
+    /// High tariff fee in CZK/kWh (from config)
+    pub high_tariff_czk: f32,
+    /// Low tariff fee in CZK/kWh (from config)
+    pub low_tariff_czk: f32,
+    /// Last successful update timestamp
+    pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Channel for receiving HDO schedule updates from async fetcher
+#[derive(Component)]
+pub struct HdoChannel {
+    pub receiver: crossbeam_channel::Receiver<HdoUpdateMessage>,
+}
+
+/// Message sent through HDO channel containing sensor data
+#[derive(Debug, Clone)]
+pub struct HdoUpdateMessage {
+    /// Raw sensor data (JSON attributes)
+    pub raw_data: String,
+    /// Parsed low tariff periods: (start "HH:MM", end "HH:MM")
+    pub low_tariff_periods: Vec<(String, String)>,
+}
+
+/// Resource to send HDO schedule values from the async worker
+#[derive(Resource)]
+pub struct HdoSender {
+    pub sender: crossbeam_channel::Sender<HdoUpdateMessage>,
+}
+
+/// Channel capacity for HDO schedule updates
+const HDO_CHANNEL_CAPACITY: usize = 5;
 
 /// Startup system that spawns all long-running async worker tasks
 /// These tasks run in the background and communicate via channels
@@ -124,5 +168,77 @@ pub fn setup_async_workers(
         sender: backup_soc_tx,
     });
 
+    // ============= HDO Schedule Fetcher Worker =============
+    // Note: This fetcher requires HaClientResource and V3 config which are inserted by main.rs
+    // The actual worker will be spawned in a separate startup system
+    info!("⚡ HDO schedule fetcher will be initialized after HaClientResource is available");
+
+    let (hdo_tx, hdo_rx) = crossbeam_channel::bounded(HDO_CHANNEL_CAPACITY);
+    commands.spawn(HdoChannel { receiver: hdo_rx });
+    commands.insert_resource(HdoSender { sender: hdo_tx });
+
+    // ============= Solar Forecast Fetcher Worker =============
+    // Note: This fetcher requires HaClientResource which is inserted by main.rs
+    // The actual worker will be spawned in a separate startup system
+    info!("☀️ Solar forecast fetcher will be initialized after HaClientResource is available");
+
+    let (solar_forecast_tx, solar_forecast_rx) = crossbeam_channel::bounded(10);
+    commands.spawn(SolarForecastChannel {
+        receiver: solar_forecast_rx,
+    });
+    commands.insert_resource(SolarForecastSender {
+        sender: solar_forecast_tx,
+    });
+    commands.init_resource::<SolarForecastData>();
+
     info!("🎉 All async workers initialized successfully");
+}
+
+// ============================================================================
+// Solar Forecast Resources
+// ============================================================================
+
+use std::time::Instant;
+
+#[derive(Resource)]
+pub struct SolarForecastData {
+    /// Total solar production forecast for today (kWh)
+    pub total_today_kwh: f32,
+
+    /// Remaining solar production forecast for today (kWh)
+    pub remaining_today_kwh: f32,
+
+    /// Solar production forecast for tomorrow (kWh)
+    pub tomorrow_kwh: f32,
+
+    /// Last successful update timestamp
+    pub last_updated: Instant,
+}
+
+impl Default for SolarForecastData {
+    fn default() -> Self {
+        Self {
+            total_today_kwh: 0.0,
+            remaining_today_kwh: 0.0,
+            tomorrow_kwh: 0.0,
+            last_updated: Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SolarForecastUpdate {
+    pub total_today_kwh: f32,
+    pub remaining_today_kwh: f32,
+    pub tomorrow_kwh: f32,
+}
+
+#[derive(Resource)]
+pub struct SolarForecastSender {
+    pub sender: crossbeam_channel::Sender<SolarForecastUpdate>,
+}
+
+#[derive(Component)]
+pub struct SolarForecastChannel {
+    pub receiver: crossbeam_channel::Receiver<SolarForecastUpdate>,
 }

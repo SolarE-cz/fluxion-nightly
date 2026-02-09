@@ -17,19 +17,34 @@ pub mod config_events;
 pub mod continuous_systems;
 pub mod debug;
 pub mod execution;
+pub mod plugin_adapters;
 pub mod pricing;
 pub mod resources;
 pub mod scheduling;
 pub mod strategy;
 pub mod traits;
+pub mod user_control_persistence;
 pub mod utils;
 pub mod web_bridge;
 
 pub use async_tasks::*;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use fluxion_plugins::PluginManager;
+use parking_lot::RwLock;
+use std::sync::Arc;
+
+/// Shared plugin manager resource for ECS systems.
+///
+/// This resource holds the plugin manager that coordinates all strategy plugins
+/// (both built-in Rust strategies and external HTTP plugins). It's shared between
+/// the web API (for plugin registration) and the scheduling system (for evaluations).
+#[derive(Resource, Clone)]
+pub struct PluginManagerResource(pub Arc<RwLock<PluginManager>>);
 pub use components::*;
-pub use config_events::{ConfigSection, ConfigUpdateEvent};
+pub use config_events::{
+    ConfigSection, ConfigUpdateEvent, UserControlChangeType, UserControlUpdateEvent,
+};
 pub use continuous_systems::{
     ContinuousSystemsPlugin, InverterDataSourceResource, PriceDataSourceResource,
     schedule_execution_system,
@@ -44,11 +59,12 @@ pub use traits::{
     EntityChange, GenericInverterState, InverterDataSource, ModeChangeRequest, PriceDataSource,
     VendorEntityMapper,
 };
+pub use user_control_persistence::{DEFAULT_USER_CONTROL_PATH, UserControlPersistence};
 pub use utils::*;
 pub use web_bridge::{
     ConfigUpdateChannel, ConfigUpdateSender, InverterData, PriceBlockData, PriceData,
-    PvGenerationHistoryPoint, ScheduleData, SystemHealthData, WebQueryChannel, WebQueryResponse,
-    WebQuerySender, web_query_system,
+    PvGenerationHistoryPoint, ScheduleData, SystemHealthData, UserControlUpdateChannel,
+    UserControlUpdateSender, WebQueryChannel, WebQueryResponse, WebQuerySender, web_query_system,
 };
 
 /// Core plugin that registers fundamental ECS resources and systems
