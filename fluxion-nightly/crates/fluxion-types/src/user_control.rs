@@ -189,6 +189,7 @@ mod tests {
         assert!(state.is_mode_allowed(InverterOperationMode::ForceCharge));
         assert!(state.is_mode_allowed(InverterOperationMode::ForceDischarge));
         assert!(state.is_mode_allowed(InverterOperationMode::BackUpMode));
+        assert!(state.is_mode_allowed(InverterOperationMode::NoChargeNoDischarge));
 
         // Disallow charge
         state.disallow_charge = true;

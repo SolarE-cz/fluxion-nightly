@@ -62,7 +62,6 @@ ehthumbs.db
 /.nix-bin/gemini
 /fluxion/.nix-bin/claude
 /fluxion/.nix-bin/gemini
-/.claude/
 __pycache__/
 /dev/.~lock.H34A10I5503271-2025-11-01-2025-12-03.csv#
 /dev/fluxion_export_20251129_213025.json

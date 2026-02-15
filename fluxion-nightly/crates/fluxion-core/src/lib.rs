@@ -15,6 +15,7 @@ pub mod async_tasks;
 pub mod components;
 pub mod config_events;
 pub mod continuous_systems;
+pub mod day_profiling;
 pub mod debug;
 pub mod execution;
 pub mod plugin_adapters;

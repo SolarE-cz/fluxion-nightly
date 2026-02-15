@@ -11,6 +11,7 @@
 // For commercial licensing, please contact: info@solare.cz
 
 mod config;
+mod heartbeat_client;
 mod version;
 
 use anyhow::Result;
@@ -186,6 +187,7 @@ fn initialize_and_run() -> Result<()> {
             config.pricing.use_spot_prices_to_sell,
             config.pricing.fixed_buy_prices.clone(),
             config.pricing.fixed_sell_prices.clone(),
+            config.pricing.spot_sell_fee,
         ));
     info!("💰 Price data source: {}", price_source.name());
 
@@ -265,6 +267,14 @@ fn initialize_and_run() -> Result<()> {
         language.display_name()
     );
 
+    // Spawn heartbeat client if enabled
+    if config.server_heartbeat.enabled {
+        heartbeat_client::spawn_heartbeat_task(
+            config.server_heartbeat.clone(),
+            query_sender.clone(),
+        );
+    }
+
     // Spawn web server on tokio runtime
     info!("🌐 Starting web server on port 8099...");
     let i18n_for_server = i18n.clone();
@@ -287,6 +297,7 @@ fn initialize_and_run() -> Result<()> {
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
             Some(user_control_api_state), // User control API state
+            None, // Remote access
         )
         .await
         {

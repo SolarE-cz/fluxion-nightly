@@ -388,6 +388,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 duration_minutes: 15,
                 price_czk_per_kwh: spot_price + buy_fee_czk, // Import price = Spot + Buy Fee
                 effective_price_czk_per_kwh: spot_price + buy_fee_czk,
+                spot_sell_price_czk_per_kwh: None,
             }
         })
         .collect();

@@ -5,18 +5,26 @@
 //! Strategy registry and baseline implementations for simulation.
 //!
 //! This module provides:
-//! - Strategy registry for managing V1-V5 and baseline strategies
+//! - Strategy registry for managing V1-V10 and baseline strategies
+//! - C-series configurable strategies (simulator-only)
 //! - No-battery baseline (all consumption from grid)
 //! - Naive self-use baseline (simple self-consumption)
 
+mod winter_adaptive_c10;
+mod winter_adaptive_c20;
+
+pub use winter_adaptive_c10::{WinterAdaptiveC10Config, WinterAdaptiveC10Strategy};
+pub use winter_adaptive_c20::{WinterAdaptiveC20Config, WinterAdaptiveC20Strategy};
+
 use fluxion_core::strategy::{
-    BlockEvaluation, EconomicStrategy, EnergyFlows, EvaluationContext, WinterAdaptiveConfig,
-    WinterAdaptiveStrategy, WinterAdaptiveV2Config, WinterAdaptiveV2Strategy,
-    WinterAdaptiveV3Config, WinterAdaptiveV3Strategy, WinterAdaptiveV4Config,
-    WinterAdaptiveV4Strategy, WinterAdaptiveV5Config, WinterAdaptiveV5Strategy,
-    WinterAdaptiveV6Config, WinterAdaptiveV6Strategy, WinterAdaptiveV7Config,
+    BlockEvaluation, EconomicStrategy, EnergyFlows, EvaluationContext, FixedPriceArbitrageConfig,
+    FixedPriceArbitrageStrategy, WinterAdaptiveConfig, WinterAdaptiveStrategy,
+    WinterAdaptiveV2Config, WinterAdaptiveV2Strategy, WinterAdaptiveV3Config,
+    WinterAdaptiveV3Strategy, WinterAdaptiveV4Config, WinterAdaptiveV4Strategy,
+    WinterAdaptiveV5Config, WinterAdaptiveV5Strategy, WinterAdaptiveV7Config,
     WinterAdaptiveV7Strategy, WinterAdaptiveV8Config, WinterAdaptiveV8Strategy,
-    WinterAdaptiveV9Config, WinterAdaptiveV9Strategy,
+    WinterAdaptiveV9Config, WinterAdaptiveV9Strategy, WinterAdaptiveV10Config,
+    WinterAdaptiveV10Strategy, WinterAdaptiveV20Config, WinterAdaptiveV20Strategy,
 };
 use fluxion_types::inverter::InverterOperationMode;
 use serde::{Deserialize, Serialize};
@@ -104,14 +112,6 @@ impl StrategyRegistry {
             )),
         );
 
-        // V6 - Winter Adaptive V6 (Adaptive Hybrid Optimizer)
-        strategies.insert(
-            "winter_adaptive_v6".to_string(),
-            Arc::new(WinterAdaptiveV6Strategy::new(
-                WinterAdaptiveV6Config::default(),
-            )),
-        );
-
         // V7 - Winter Adaptive V7 (Unconstrained Multi-Cycle Arbitrage Optimizer)
         strategies.insert(
             "winter_adaptive_v7".to_string(),
@@ -133,6 +133,46 @@ impl StrategyRegistry {
             "winter_adaptive_v9".to_string(),
             Arc::new(WinterAdaptiveV9Strategy::new(
                 WinterAdaptiveV9Config::default(),
+            )),
+        );
+
+        // V10 - Winter Adaptive V10 (Dynamic Battery Budget Allocation)
+        strategies.insert(
+            "winter_adaptive_v10".to_string(),
+            Arc::new(WinterAdaptiveV10Strategy::new(
+                WinterAdaptiveV10Config::default(),
+            )),
+        );
+
+        // V20 - Winter Adaptive V20 (Adaptive Budget Allocation with DayMetrics)
+        strategies.insert(
+            "winter_adaptive_v20".to_string(),
+            Arc::new(WinterAdaptiveV20Strategy::new(
+                WinterAdaptiveV20Config::default(),
+            )),
+        );
+
+        // C10 - Winter Adaptive C10 (Maximally Configurable Budget Allocation, simulator-only)
+        strategies.insert(
+            "winter_adaptive_c10".to_string(),
+            Arc::new(WinterAdaptiveC10Strategy::new(
+                WinterAdaptiveC10Config::default(),
+            )),
+        );
+
+        // C20 - Winter Adaptive C20 (Maximally Configurable Adaptive Budget Allocation, simulator-only)
+        strategies.insert(
+            "winter_adaptive_c20".to_string(),
+            Arc::new(WinterAdaptiveC20Strategy::new(
+                WinterAdaptiveC20Config::default(),
+            )),
+        );
+
+        // Fixed Price Arbitrage
+        strategies.insert(
+            "fixed_price_arbitrage".to_string(),
+            Arc::new(FixedPriceArbitrageStrategy::new(
+                FixedPriceArbitrageConfig::default(),
             )),
         );
 
@@ -178,13 +218,6 @@ impl StrategyRegistry {
                 is_baseline: false,
             },
             StrategyInfo {
-                id: "winter_adaptive_v6".to_string(),
-                name: "Winter Adaptive V6".to_string(),
-                description: "Adaptive Hybrid Optimizer - combines V3/V4/V5 with pattern detection".to_string(),
-                version: "V6".to_string(),
-                is_baseline: false,
-            },
-            StrategyInfo {
                 id: "winter_adaptive_v7".to_string(),
                 name: "Winter Adaptive V7".to_string(),
                 description: "Unconstrained Multi-Cycle Arbitrage Optimizer - maximum cost savings with no artificial limits".to_string(),
@@ -206,6 +239,41 @@ impl StrategyRegistry {
                 is_baseline: false,
             },
             StrategyInfo {
+                id: "winter_adaptive_v10".to_string(),
+                name: "Winter Adaptive V10".to_string(),
+                description: "Dynamic Battery Budget Allocation - unified economic optimization, allocates finite battery budget to most expensive blocks".to_string(),
+                version: "V10".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
+                id: "winter_adaptive_v20".to_string(),
+                name: "Winter Adaptive V20".to_string(),
+                description: "Adaptive Budget Allocation - V10 algorithm with DayMetrics-driven parameter resolution for market-aware behavior".to_string(),
+                version: "V20".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
+                id: "winter_adaptive_c10".to_string(),
+                name: "Winter Adaptive C10".to_string(),
+                description: "Maximally Configurable Budget Allocation - all V10 constants exposed as config parameters (simulator-only)".to_string(),
+                version: "C10".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
+                id: "winter_adaptive_c20".to_string(),
+                name: "Winter Adaptive C20".to_string(),
+                description: "Maximally Configurable Adaptive Budget Allocation - all V20 constants + resolve_params adjustment values exposed (simulator-only)".to_string(),
+                version: "C20".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
+                id: "fixed_price_arbitrage".to_string(),
+                name: "Fixed Price Arbitrage".to_string(),
+                description: "Charges at fixed price, sells at high spot price for arbitrage profit".to_string(),
+                version: "FPA".to_string(),
+                is_baseline: false,
+            },
+            StrategyInfo {
                 id: "no_battery".to_string(),
                 name: "No Battery".to_string(),
                 description: "Baseline without battery storage - all consumption from grid".to_string(),
@@ -222,6 +290,42 @@ impl StrategyRegistry {
         ];
 
         Self { strategies, info }
+    }
+
+    /// Create registry with config overrides for C-strategies.
+    ///
+    /// Overrides map strategy IDs to their config as serde_json::Value.
+    /// Only C-strategies support overrides; all others use defaults.
+    pub fn new_with_overrides(
+        overrides: HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<Self> {
+        let mut registry = Self::new_with_defaults();
+
+        // Apply C10 overrides if present
+        if let Some(c10_value) = overrides.get("winter_adaptive_c10") {
+            let config: WinterAdaptiveC10Config = serde_json::from_value(c10_value.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to parse winter_adaptive_c10 config: {}", e)
+                })?;
+            registry.strategies.insert(
+                "winter_adaptive_c10".to_string(),
+                Arc::new(WinterAdaptiveC10Strategy::new(config)),
+            );
+        }
+
+        // Apply C20 overrides if present
+        if let Some(c20_value) = overrides.get("winter_adaptive_c20") {
+            let config: WinterAdaptiveC20Config = serde_json::from_value(c20_value.clone())
+                .map_err(|e| {
+                    anyhow::anyhow!("Failed to parse winter_adaptive_c20 config: {}", e)
+                })?;
+            registry.strategies.insert(
+                "winter_adaptive_c20".to_string(),
+                Arc::new(WinterAdaptiveC20Strategy::new(config)),
+            );
+        }
+
+        Ok(registry)
     }
 
     /// Get a strategy by ID
@@ -448,6 +552,7 @@ mod tests {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
+            spot_sell_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig::default();
 
@@ -467,6 +572,7 @@ mod tests {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
+            spot_sell_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig::default();
 
@@ -485,6 +591,7 @@ mod tests {
             duration_minutes: 15,
             price_czk_per_kwh: 4.0,
             effective_price_czk_per_kwh: 4.0,
+            spot_sell_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig {
             battery_capacity_kwh: 10.0,
@@ -513,6 +620,7 @@ mod tests {
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
+            spot_sell_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig {
             battery_capacity_kwh: 10.0,

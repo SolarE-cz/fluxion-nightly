@@ -1,0 +1,40 @@
+# FluxION Server Configuration
+# Copy this file to config.toml and adjust the values.
+
+[server]
+# Address to bind the HTTP server to
+bind_address = "0.0.0.0"
+# Port to listen on
+port = 8100
+
+[auth]
+# Shared secret that all FluxION instances must provide in heartbeat requests.
+# Generate a strong random string, e.g.: openssl rand -hex 32
+shared_secret = "change-me-to-a-strong-random-secret"
+
+[heartbeat]
+# Expected interval (seconds) between heartbeats from each instance.
+# Default: 300 (5 minutes)
+expected_interval_secs = 300
+# Number of missed intervals before an instance is considered offline.
+# Default: 3 (i.e. offline after 15 minutes with default interval)
+miss_threshold = 3
+
+[email]
+# SMTP server settings for sending alert emails
+smtp_host = "smtp.example.com"
+smtp_port = 587
+smtp_username = "fluxion-server@example.com"
+smtp_password = "your-smtp-password"
+from_address = "fluxion-server@example.com"
+# Use STARTTLS (true) or plain connection (false)
+use_tls = true
+# List of administrator email addresses to receive alerts
+admin_recipients = ["admin@example.com"]
+
+[database]
+# Path to the SQLite database file (created automatically)
+path = "./data/fluxion-server.db"
+# Number of days to retain telemetry snapshots before automatic cleanup.
+# Default: 30
+telemetry_retention_days = 30

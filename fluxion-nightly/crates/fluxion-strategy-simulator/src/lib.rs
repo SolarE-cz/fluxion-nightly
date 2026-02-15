@@ -57,7 +57,10 @@ pub use simulation_engine::SimulationEngine;
 pub use state::{
     SimulationConfig, SimulationOverrides, SimulationState, SocOverride, StrategySimulationResult,
 };
-pub use strategies::{NaiveSelfUseStrategy, NoBatteryBaseline, StrategyInfo, StrategyRegistry};
+pub use strategies::{
+    NaiveSelfUseStrategy, NoBatteryBaseline, StrategyInfo, StrategyRegistry,
+    WinterAdaptiveC10Config, WinterAdaptiveC10Strategy,
+};
 pub use synthetic_data::{
     ConsumptionProfile, SolarProfile, SyntheticBlock, SyntheticDay, SyntheticDayConfig,
     SyntheticDayGenerator,

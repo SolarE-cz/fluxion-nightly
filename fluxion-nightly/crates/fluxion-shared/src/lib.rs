@@ -10,18 +10,5 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
-use crate::config::AppConfig;
-use bevy_ecs::prelude::*;
-use std::time::Instant;
-
-/* Old Modbus-specific implementation - will be replaced in later phases
-
-#[derive(Resource)]
-pub struct LogTicker {
-    last: Option<Instant>,
-    interval: Duration,
-}
-
-... (commented out for Phase 1)
-
-*/
+pub mod heartbeat;
+pub mod telemetry;

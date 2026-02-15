@@ -1,0 +1,419 @@
+{% extends "base.html" %}
+
+{% block title %}FluxION Server Dashboard{% endblock %}
+
+{% block head %}
+<meta http-equiv="refresh" content="30">
+<style>
+    .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 24px;
+        flex-wrap: wrap;
+        gap: 16px;
+    }
+
+    .header h1 {
+        font-size: 1.5rem;
+        font-weight: 600;
+    }
+
+    .header .server-time {
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+    }
+
+    .stats {
+        display: flex;
+        gap: 16px;
+        margin-bottom: 32px;
+        flex-wrap: wrap;
+    }
+
+    .stat-card {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--card-radius);
+        padding: 16px 24px;
+        flex: 1;
+        min-width: 120px;
+        text-align: center;
+    }
+
+    .stat-card .value {
+        font-size: 2rem;
+        font-weight: 700;
+    }
+
+    .stat-card .label {
+        color: var(--text-secondary);
+        font-size: 0.85rem;
+        margin-top: 4px;
+    }
+
+    .stat-card.online .value { color: var(--success); }
+    .stat-card.warning .value { color: var(--warning); }
+    .stat-card.offline .value { color: var(--error); }
+    .stat-card.total .value { color: var(--info); }
+
+    .client-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+        gap: 16px;
+    }
+
+    .client-card {
+        background: var(--bg-secondary);
+        border: 1px solid var(--border-color);
+        border-radius: var(--card-radius);
+        padding: 20px;
+        transition: border-color 0.2s;
+    }
+
+    .client-card:hover {
+        border-color: #555;
+    }
+
+    .client-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+    }
+
+    .status-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+
+    .status-dot.online { background: var(--success); box-shadow: 0 0 6px var(--success); }
+    .status-dot.warning { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+    .status-dot.offline { background: var(--error); box-shadow: 0 0 6px var(--error); }
+
+    .client-name {
+        font-weight: 600;
+        font-size: 1.1rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .client-details {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 0.9rem;
+    }
+
+    .detail-row {
+        display: flex;
+        justify-content: space-between;
+    }
+
+    .detail-label {
+        color: var(--text-secondary);
+    }
+
+    .detail-value {
+        text-align: right;
+    }
+
+    .status-text {
+        text-transform: capitalize;
+        font-weight: 500;
+    }
+
+    .status-text.online { color: var(--success); }
+    .status-text.warning { color: var(--warning); }
+    .status-text.offline { color: var(--error); }
+
+    .section-divider {
+        border: none;
+        border-top: 1px solid var(--border-color);
+        margin: 10px 0;
+    }
+
+    .section-title {
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-bottom: 4px;
+    }
+
+    .no-telemetry {
+        color: var(--text-secondary);
+        font-style: italic;
+        font-size: 0.85rem;
+        margin-top: 8px;
+    }
+
+    .synced-ok { color: var(--success); }
+    .synced-mismatch { color: var(--warning); }
+
+    .error-list {
+        color: var(--error);
+        font-size: 0.8rem;
+        margin-top: 2px;
+    }
+
+    .empty-state {
+        text-align: center;
+        padding: 64px 24px;
+        color: var(--text-secondary);
+    }
+
+    .empty-state h2 {
+        margin-bottom: 8px;
+        font-weight: 500;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container">
+    <div class="header">
+        <h1>FluxION Server</h1>
+        <span class="server-time">{{ server_time }}</span>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card total">
+            <div class="value">{{ total }}</div>
+            <div class="label">Total</div>
+        </div>
+        <div class="stat-card online">
+            <div class="value">{{ online }}</div>
+            <div class="label">Online</div>
+        </div>
+        <div class="stat-card warning">
+            <div class="value">{{ warning }}</div>
+            <div class="label">Warning</div>
+        </div>
+        <div class="stat-card offline">
+            <div class="value">{{ offline }}</div>
+            <div class="label">Offline</div>
+        </div>
+    </div>
+
+    {% if clients.is_empty() %}
+    <div class="empty-state">
+        <h2>No instances registered</h2>
+        <p>Waiting for FluxION instances to send their first heartbeat...</p>
+    </div>
+    {% else %}
+    <div class="client-grid">
+        {% for client in clients %}
+        <div class="client-card">
+            <div class="client-header">
+                <div class="status-dot {{ client.status }}"></div>
+                <div class="client-name" title="{{ client.instance_id }}">{{ client.friendly_name }}</div>
+            </div>
+            <div class="client-details">
+                <div class="detail-row">
+                    <span class="detail-label">Status</span>
+                    <span class="detail-value status-text {{ client.status }}">{{ client.status }}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Version</span>
+                    <span class="detail-value">{{ client.fluxion_version }}</span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Strategy</span>
+                    <span class="detail-value">{{ client.strategy_name }}</span>
+                </div>
+                {% match client.battery_soc %}
+                    {% when Some with (soc) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Battery SOC</span>
+                        <span class="detail-value">{{ "{:.0}"|format(soc) }}%</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                <div class="detail-row">
+                    <span class="detail-label">Last seen</span>
+                    <span class="detail-value" title="{{ client.last_seen }}">{{ client.last_seen_relative }}</span>
+                </div>
+
+                {% match client.telemetry %}
+                {% when Some with (t) %}
+                {# --- Today's Energy --- #}
+                <hr class="section-divider">
+                <div class="section-title">Today's Energy</div>
+                {% match t.grid_import_today_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Grid Import</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.grid_export_today_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Grid Export</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.solar_today_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Solar</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.battery_charge_today_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Battery Charge</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.battery_discharge_today_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Battery Discharge</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+
+                {# --- System Info --- #}
+                <hr class="section-divider">
+                <div class="section-title">System</div>
+                {% match t.inverter_online %}
+                    {% when Some with (is_online) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Inverter</span>
+                        {% if is_online %}
+                        <span class="detail-value synced-ok">Connected</span>
+                        {% else %}
+                        <span class="detail-value synced-mismatch">Disconnected</span>
+                        {% endif %}
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match client.battery_capacity_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Battery Capacity</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match client.target_soc_max %}
+                    {% when Some with (max_soc) %}
+                    {% match client.target_soc_min %}
+                        {% when Some with (min_soc) %}
+                        <div class="detail-row">
+                            <span class="detail-label">SOC Limits</span>
+                            <span class="detail-value">{{ "{:.0}"|format(min_soc) }}% - {{ "{:.0}"|format(max_soc) }}%</span>
+                        </div>
+                        {% when None %}
+                    {% endmatch %}
+                    {% when None %}
+                {% endmatch %}
+                {% match t.battery_temperature_c %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Battery Temp</span>
+                        <span class="detail-value">{{ "{:.0}"|format(v) }} &deg;C</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.inverter_temperature_c %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Inverter Temp</span>
+                        <span class="detail-value">{{ "{:.0}"|format(v) }} &deg;C</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+
+                {# --- Mode --- #}
+                <hr class="section-divider">
+                <div class="section-title">Mode</div>
+                {% match t.current_mode %}
+                    {% when Some with (mode) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Current Mode</span>
+                        <span class="detail-value">{{ mode }}</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.current_strategy %}
+                    {% when Some with (strat) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Strategy</span>
+                        <span class="detail-value">{{ strat }}</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.mode_synced %}
+                    {% when Some with (synced) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Mode Synced</span>
+                        {% if synced %}
+                        <span class="detail-value synced-ok">Yes</span>
+                        {% else %}
+                        <span class="detail-value synced-mismatch">No</span>
+                        {% endif %}
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+
+                {# --- Solar Forecast --- #}
+                <hr class="section-divider">
+                <div class="section-title">Solar Forecast</div>
+                {% match t.solar_forecast_today_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Today Forecast</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.solar_forecast_remaining_kwh %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Remaining</span>
+                        <span class="detail-value">{{ "{:.1}"|format(v) }} kWh</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+                {% match t.solar_forecast_accuracy %}
+                    {% when Some with (v) %}
+                    <div class="detail-row">
+                        <span class="detail-label">Accuracy</span>
+                        <span class="detail-value">{{ "{:.0}"|format(v) }}%</span>
+                    </div>
+                    {% when None %}
+                {% endmatch %}
+
+                {# --- Errors --- #}
+                {% if !t.errors.is_empty() %}
+                <hr class="section-divider">
+                <div class="section-title">Errors</div>
+                <div class="error-list">
+                    {% for err in t.errors %}
+                    <div>{{ err }}</div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% when None %}
+                <div class="no-telemetry">No telemetry data</div>
+                {% endmatch %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

@@ -599,11 +599,11 @@ impl CzSpotPriceAdapter {
 pub struct ConfigurablePriceDataSource {
     spot_adapter: Arc<CzSpotPriceAdapter>,
     use_spot_for_buy: bool,
-    #[expect(dead_code, reason = "Reserved for future sell-back functionality")]
     use_spot_for_sell: bool,
     fixed_buy_prices: Vec<f32>,
-    #[expect(dead_code, reason = "Reserved for future sell-back functionality")]
+    #[expect(dead_code, reason = "Reserved for fixed sell price schedule support")]
     fixed_sell_prices: Vec<f32>,
+    spot_sell_fee_czk: f32,
 }
 
 impl ConfigurablePriceDataSource {
@@ -613,6 +613,7 @@ impl ConfigurablePriceDataSource {
         use_spot_for_sell: bool,
         fixed_buy_prices: Vec<f32>,
         fixed_sell_prices: Vec<f32>,
+        spot_sell_fee_czk: f32,
     ) -> Self {
         Self {
             spot_adapter,
@@ -620,6 +621,7 @@ impl ConfigurablePriceDataSource {
             use_spot_for_sell,
             fixed_buy_prices,
             fixed_sell_prices,
+            spot_sell_fee_czk,
         }
     }
 
@@ -664,6 +666,7 @@ impl ConfigurablePriceDataSource {
                     price_czk_per_kwh: hour_price,
                     // Effective price will be calculated by scheduler with HDO fees
                     effective_price_czk_per_kwh: hour_price,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -691,13 +694,60 @@ impl PriceDataSource for ConfigurablePriceDataSource {
         // If using spot prices for buying, fetch from spot adapter
         if self.use_spot_for_buy {
             debug!("💰 [ConfigurablePrice] Using spot prices for buy decisions");
-            self.spot_adapter.read_prices().await
+            let mut data = self.spot_adapter.read_prices().await?;
+
+            // When using spot for both buy and sell, compute spot sell price from raw spot price
+            if self.use_spot_for_sell {
+                for block in &mut data.time_block_prices {
+                    // Raw spot price minus sell fee = net sell price
+                    let sell_price = block.price_czk_per_kwh - self.spot_sell_fee_czk;
+                    block.spot_sell_price_czk_per_kwh = Some(sell_price);
+                }
+                debug!(
+                    "💰 [ConfigurablePrice] Populated spot sell prices (fee: {:.2} CZK/kWh)",
+                    self.spot_sell_fee_czk
+                );
+            }
+
+            Ok(data)
         } else {
-            // Use fixed prices
+            // Use fixed prices for buying
             debug!(
                 "💰 [ConfigurablePrice] Using fixed prices for buy decisions (use_spot_prices_to_buy=false)"
             );
-            self.generate_fixed_price_data()
+            let mut data = self.generate_fixed_price_data()?;
+
+            // When selling at spot but buying at fixed price, fetch spot prices separately
+            // to populate spot_sell_price_czk_per_kwh for arbitrage strategies
+            if self.use_spot_for_sell {
+                match self.spot_adapter.read_prices().await {
+                    Ok(spot_data) => {
+                        // Match spot prices to fixed price blocks by timestamp
+                        for block in &mut data.time_block_prices {
+                            if let Some(spot_block) = spot_data
+                                .time_block_prices
+                                .iter()
+                                .find(|sb| sb.block_start == block.block_start)
+                            {
+                                let sell_price =
+                                    spot_block.price_czk_per_kwh - self.spot_sell_fee_czk;
+                                block.spot_sell_price_czk_per_kwh = Some(sell_price);
+                            }
+                        }
+                        debug!(
+                            "💰 [ConfigurablePrice] Populated spot sell prices on fixed-buy blocks (fee: {:.2} CZK/kWh)",
+                            self.spot_sell_fee_czk
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "⚠️ [ConfigurablePrice] Failed to fetch spot prices for sell: {e}. Spot sell prices will be unavailable."
+                        );
+                    }
+                }
+            }
+
+            Ok(data)
         }
     }
 
@@ -785,6 +835,7 @@ mod tests {
                 InverterOperationMode::BackUpMode => 1,
                 InverterOperationMode::ForceCharge => 2,
                 InverterOperationMode::ForceDischarge => 3,
+                InverterOperationMode::NoChargeNoDischarge => 5,
             }
         }
 
@@ -793,6 +844,7 @@ mod tests {
                 0 => Some(InverterOperationMode::SelfUse),
                 1 => Some(InverterOperationMode::BackUpMode),
                 2 => Some(InverterOperationMode::ForceCharge),
+                5 => Some(InverterOperationMode::NoChargeNoDischarge),
                 3 => Some(InverterOperationMode::ForceDischarge),
                 _ => None,
             }

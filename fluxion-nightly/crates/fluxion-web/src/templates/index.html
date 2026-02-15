@@ -778,6 +778,7 @@
                 <span><div class="legend-box charge"></div> Force Charge</span>
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
                 <span><div class="legend-box backup"></div> Back Up Mode</span>
+                <span><div class="legend-box no-charge-discharge"></div> No Charge/Discharge</span>
                 <span><div class="legend-box self-use"></div> Self-Use</span>
                 <span><div class="legend-box hdo-low"></div> HDO Low Tariff</span>
                 <span><div class="legend-box hdo-high"></div> HDO High Tariff</span>
@@ -815,6 +816,7 @@
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                     if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
 
@@ -824,6 +826,7 @@
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                     if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
 
@@ -1339,6 +1342,7 @@
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                                     if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                             }
@@ -1455,6 +1459,31 @@
         // Update every 15 minutes
         setInterval(fetchAndUpdateSchedule, FETCH_INTERVAL_MS);
     })();
+
+    // Approximate sunrise/sunset hours for ~50°N latitude (Central Europe)
+    function getSunHours(month, day) {
+        const daysInMonth = [0,31,28,31,30,31,30,31,31,30,31,30];
+        let doy = day;
+        for (let m = 1; m < month; m++) doy += daysInMonth[m];
+        const decl = 23.45 * Math.sin(2 * Math.PI * (284 + doy) / 365);
+        const lat = 50.0;
+        const latRad = lat * Math.PI / 180;
+        const declRad = decl * Math.PI / 180;
+        const cosHA = -Math.tan(latRad) * Math.tan(declRad);
+        const ha = Math.acos(Math.max(-1, Math.min(1, cosHA)));
+        const sunriseHour = 12 - (ha * 180 / Math.PI) / 15;
+        const sunsetHour = 12 + (ha * 180 / Math.PI) / 15;
+        return { sunrise: sunriseHour, sunset: sunsetHour };
+    }
+
+    // Sine-weighted solar production for a 15-min block
+    function getSolarWeight(blockMinuteOfDay, sunriseMinute, sunsetMinute) {
+        const blockCenter = blockMinuteOfDay + 7.5;
+        if (blockCenter <= sunriseMinute || blockCenter >= sunsetMinute) return 0;
+        const dayLength = sunsetMinute - sunriseMinute;
+        const progress = (blockCenter - sunriseMinute) / dayLength;
+        return Math.sin(progress * Math.PI);
+    }
 
     function populateUpcomingBlocks(tbody, chartData) {
         if (!tbody || !chartData) return;
@@ -1694,6 +1723,145 @@
             }
 
             tbody.appendChild(summaryRow);
+
+            // Baseline cost calculation: what grid-only consumption would cost minus solar self-consumption
+            if (chartData.hourly_consumption_profile && chartData.effective_prices) {
+                const utcOffset = chartData.utc_offset_minutes || 0;
+                const solarToday = chartData.solar_forecast_remaining_today_kwh || 0;
+                const solarTomorrow = chartData.solar_forecast_tomorrow_kwh || 0;
+
+                // Determine which date label counts as "today" vs "tomorrow"
+                // Use the first upcoming block's date as "today"
+                const firstLabel = chartData.labels[startIndex];
+                const todayDateStr = firstLabel ? firstLabel.split(' ')[0] : null;
+
+                // Collect solar weights and consumption per block, grouped by date
+                let baselineCost = 0;
+                const todayWeights = [];
+                const tomorrowWeights = [];
+
+                for (let bi = startIndex; bi < maxBlocks; bi++) {
+                    const label = chartData.labels[bi];
+                    if (!label) continue;
+
+                    // Parse local hour and minute from label "MM-DD HH:MM"
+                    const match = label.match(/(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/);
+                    if (!match) continue;
+
+                    const blockMonth = parseInt(match[1], 10);
+                    const blockDay = parseInt(match[2], 10);
+                    const localHour = parseInt(match[3], 10);
+                    const localMinute = parseInt(match[4], 10);
+
+                    // Convert local hour to UTC hour for consumption profile lookup
+                    let utcHour = localHour - Math.round(utcOffset / 60);
+                    if (utcHour < 0) utcHour += 24;
+                    if (utcHour >= 24) utcHour -= 24;
+
+                    // Block consumption from hourly profile (15 min = 1/4 hour)
+                    const consumptionKwh = chartData.hourly_consumption_profile[utcHour] / 4;
+
+                    // Determine if this block is today or tomorrow
+                    const blockDateStr = label.split(' ')[0];
+                    const isToday = (blockDateStr === todayDateStr);
+
+                    // Compute solar weight for this block
+                    const sun = getSunHours(blockMonth, blockDay);
+                    const sunriseMin = sun.sunrise * 60;
+                    const sunsetMin = sun.sunset * 60;
+                    const blockMinOfDay = localHour * 60 + localMinute;
+                    const weight = getSolarWeight(blockMinOfDay, sunriseMin, sunsetMin);
+
+                    if (isToday) {
+                        todayWeights.push({ idx: bi, weight, consumptionKwh });
+                    } else {
+                        tomorrowWeights.push({ idx: bi, weight, consumptionKwh });
+                    }
+                }
+
+                // Distribute solar production across blocks proportionally to their weights
+                function computeBaselineCost(blocks, totalSolarKwh) {
+                    const totalWeight = blocks.reduce((s, b) => s + b.weight, 0);
+                    let cost = 0;
+                    for (const b of blocks) {
+                        const solarKwh = (totalWeight > 0) ? totalSolarKwh * (b.weight / totalWeight) : 0;
+                        const netConsumption = Math.max(0, b.consumptionKwh - solarKwh);
+                        cost += netConsumption * chartData.effective_prices[b.idx];
+                    }
+                    return cost;
+                }
+
+                baselineCost = computeBaselineCost(todayWeights, solarToday)
+                             + computeBaselineCost(tomorrowWeights, solarTomorrow);
+
+                // Baseline row
+                const baselineRow = document.createElement('tr');
+                baselineRow.style.background = 'rgba(255,255,255,0.03)';
+                for (let c = 0; c < 4; c++) {
+                    const td = document.createElement('td');
+                    td.style.padding = '8px';
+                    if (c === 0) {
+                        td.style.fontWeight = '600';
+                        td.style.color = 'var(--text-secondary)';
+                        td.textContent = 'Baseline';
+                        td.title = 'Cost if all consumption bought from grid (minus solar self-consumption)';
+                    }
+                    baselineRow.appendChild(td);
+                }
+                const tdBaseline = document.createElement('td');
+                tdBaseline.style.padding = '8px';
+                tdBaseline.style.textAlign = 'right';
+                tdBaseline.style.fontWeight = 'bold';
+                tdBaseline.style.fontSize = '1.05em';
+                tdBaseline.style.color = '#f44336';
+                tdBaseline.textContent = (-baselineCost).toFixed(2) + ' CZK';
+                baselineRow.appendChild(tdBaseline);
+                // Verbose cells
+                for (let c = 0; c < 2; c++) {
+                    const td = document.createElement('td');
+                    td.className = 'verbose-col';
+                    td.style.display = verboseDisplay;
+                    td.style.padding = '8px';
+                    baselineRow.appendChild(td);
+                }
+                tbody.appendChild(baselineRow);
+
+                // Savings row
+                const savings = Math.abs(baselineCost) - Math.abs(grandTotal);
+                const savingsPercent = baselineCost !== 0 ? (savings / Math.abs(baselineCost) * 100) : 0;
+                const savingsRow = document.createElement('tr');
+                savingsRow.style.background = 'rgba(255,255,255,0.03)';
+                for (let c = 0; c < 4; c++) {
+                    const td = document.createElement('td');
+                    td.style.padding = '8px';
+                    if (c === 0) {
+                        td.style.fontWeight = '600';
+                        td.style.color = 'var(--text-secondary)';
+                        td.textContent = 'Savings';
+                        td.title = 'Difference between baseline grid cost and battery strategy cost';
+                    }
+                    savingsRow.appendChild(td);
+                }
+                const tdSavings = document.createElement('td');
+                tdSavings.style.padding = '8px';
+                tdSavings.style.textAlign = 'right';
+                tdSavings.style.fontWeight = 'bold';
+                tdSavings.style.fontSize = '1.05em';
+                const savingsSpan = document.createElement('span');
+                savingsSpan.style.color = savings >= 0 ? '#4caf50' : '#f44336';
+                savingsSpan.textContent = savings.toFixed(2) + ' CZK (' + savingsPercent.toFixed(0) + '%)';
+                tdSavings.appendChild(savingsSpan);
+                savingsRow.appendChild(tdSavings);
+                // Verbose cells
+                for (let c = 0; c < 2; c++) {
+                    const td = document.createElement('td');
+                    td.className = 'verbose-col';
+                    td.style.display = verboseDisplay;
+                    td.style.padding = '8px';
+                    savingsRow.appendChild(td);
+                }
+                tbody.appendChild(savingsRow);
+            }
         }
     }
 
@@ -2417,6 +2585,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                                     if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                                 spotDataset.borderColor = chartData.modes.map((mode, idx) => {
@@ -2425,6 +2594,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                                     if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                             }
@@ -2810,6 +2980,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         <option value="ForceCharge">Force Charge</option>
                         <option value="ForceDischarge">Force Discharge</option>
                         <option value="BackUpMode">Back Up Mode</option>
+                        <option value="NoChargeNoDischarge">No Charge/Discharge</option>
                     </select>
                 </div>
 

@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="ui-version" content="{{ ui_version }}">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111111">
+<title>FluxION</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#111;--bg2:#1c1c1c;--bg3:#2a2a2a;
+  --text:#e1e1e1;--text2:#9b9b9b;
+  --border:#333;--radius:12px;
+  --green:#4caf50;--orange:#ff9800;--red:#f44336;--blue:#2196f3;
+}
+body{font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--text);
+  padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);line-height:1.4;
+  -webkit-user-select:none;user-select:none}
+.card{background:var(--bg2);border-radius:var(--radius);padding:16px;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;align-items:center}
+.label{color:var(--text2);font-size:.8em}
+.value{font-size:1.4em;font-weight:600}
+.unit{font-size:.7em;color:var(--text2);margin-left:2px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.75em;font-weight:600}
+.badge-green{background:var(--green);color:#000}
+.badge-orange{background:var(--orange);color:#000}
+.badge-red{background:var(--red);color:#000}
+.badge-blue{background:var(--blue);color:#fff}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;text-align:center}
+.energy-flow{display:flex;justify-content:space-around;align-items:center;padding:12px 0}
+.energy-item{text-align:center;flex:1}
+.energy-icon{font-size:1.5em;margin-bottom:4px}
+.energy-value{font-size:1.1em;font-weight:600}
+.energy-label{font-size:.7em;color:var(--text2)}
+.positive{color:var(--green)}
+.negative{color:var(--red)}
+canvas{width:100%!important;height:200px!important}
+.banner{padding:10px 16px;border-radius:8px;text-align:center;margin-bottom:12px;cursor:pointer;font-size:.9em}
+.banner-refresh{background:var(--blue);color:#fff;display:none}
+.banner-offline{background:var(--bg3);color:var(--orange);display:none}
+.banner-save{background:var(--green);color:#000;display:none}
+.save-btn{width:100%;padding:12px;border:none;border-radius:8px;background:var(--blue);color:#fff;
+  font-size:1em;font-weight:600;cursor:pointer;display:none}
+.save-btn:disabled{opacity:.5}
+.status-bar{display:flex;justify-content:space-between;align-items:center;padding:8px 0;font-size:.75em;color:var(--text2)}
+.toggle{position:relative;width:48px;height:26px;display:inline-block}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;cursor:pointer;inset:0;background:var(--bg3);border-radius:13px;transition:.2s}
+.toggle input:checked+.toggle-slider{background:var(--green)}
+.toggle-slider:before{content:"";position:absolute;height:20px;width:20px;left:3px;bottom:3px;
+  background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked+.toggle-slider:before{transform:translateX(22px)}
+select{background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:8px;border-radius:6px;width:100%}
+.readonly-notice{background:var(--bg3);color:var(--orange);padding:8px 12px;border-radius:8px;
+  font-size:.85em;text-align:center;margin-bottom:12px;display:none}
+.slot-row{display:flex;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)}
+.slot-row:last-child{border-bottom:none}
+.slot-input{background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:6px;border-radius:4px;flex:1}
+.btn-sm{padding:4px 10px;border:none;border-radius:4px;cursor:pointer;font-size:.8em}
+.btn-add{background:var(--blue);color:#fff}
+.btn-remove{background:var(--red);color:#fff}
+</style>
+</head>
+<body>
+
+<!-- Status Bar -->
+<div class="status-bar">
+  <span id="instance-name">FluxION</span>
+  <span id="last-updated"></span>
+</div>
+
+<!-- Banners -->
+<div id="banner-offline" class="banner banner-offline">Offline</div>
+<div id="banner-refresh" class="banner banner-refresh" onclick="window.fluxion && window.fluxion.applyPendingData()">New data available — tap to refresh</div>
+<div id="banner-save-ok" class="banner banner-save">Changes saved</div>
+
+<!-- Read Only Notice -->
+<div id="readonly-notice" class="readonly-notice">Read Only — controls are not available</div>
+
+<!-- Mode Card -->
+<div class="card">
+  <div class="row">
+    <div>
+      <div class="label">Current Mode</div>
+      <div class="value" id="mode">—</div>
+    </div>
+    <div style="text-align:right">
+      <div class="label">Price</div>
+      <div class="value"><span id="price">—</span><span class="unit" id="currency">CZK/kWh</span></div>
+    </div>
+  </div>
+  <div class="label" style="margin-top:4px" id="mode-reason"></div>
+</div>
+
+<!-- Energy Flow -->
+<div class="card">
+  <div class="energy-flow">
+    <div class="energy-item">
+      <div class="energy-icon">&#9728;</div>
+      <div class="energy-value" id="solar-w">—</div>
+      <div class="energy-label">Solar</div>
+    </div>
+    <div class="energy-item">
+      <div class="energy-icon">&#9107;</div>
+      <div class="energy-value" id="battery-w">—</div>
+      <div class="energy-label">Battery</div>
+    </div>
+    <div class="energy-item">
+      <div class="energy-icon">&#9881;</div>
+      <div class="energy-value" id="grid-w">—</div>
+      <div class="energy-label">Grid</div>
+    </div>
+    <div class="energy-item">
+      <div class="energy-icon">&#9751;</div>
+      <div class="energy-value" id="load-w">—</div>
+      <div class="energy-label">Load</div>
+    </div>
+  </div>
+</div>
+
+<!-- Battery SOC -->
+<div class="card">
+  <div class="row">
+    <div class="label">Battery</div>
+    <div><span id="battery-soc" class="value">—</span><span class="unit">%</span></div>
+  </div>
+  <div style="margin-top:8px;background:var(--bg3);border-radius:4px;height:8px;overflow:hidden">
+    <div id="soc-bar" style="height:100%;background:var(--green);width:0%;transition:width .5s"></div>
+  </div>
+</div>
+
+<!-- Price Chart -->
+<div class="card">
+  <div class="label" style="margin-bottom:8px">Today's Prices</div>
+  <canvas id="price-chart"></canvas>
+</div>
+
+<!-- Controls Section (hidden in readonly) -->
+<div id="controls-section">
+  <div class="card">
+    <div class="row" style="margin-bottom:12px">
+      <div class="label" style="font-size:.9em;font-weight:600">Charge from Grid</div>
+      <label class="toggle">
+        <input type="checkbox" id="ctrl-charge-grid" onchange="markPendingEdit()">
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+    <div style="margin-bottom:12px">
+      <div class="label" style="margin-bottom:4px">Forced Mode</div>
+      <select id="ctrl-forced-mode" onchange="markPendingEdit()">
+        <option value="">None (automatic)</option>
+        <option value="ForceCharge">Force Charge</option>
+        <option value="ForceDischarge">Force Discharge</option>
+        <option value="SelfUse">Self Use</option>
+      </select>
+    </div>
+    <div>
+      <div class="row" style="margin-bottom:8px">
+        <div class="label" style="font-size:.9em;font-weight:600">Fixed Time Slots</div>
+        <button class="btn-sm btn-add" onclick="addSlot()">+ Add</button>
+      </div>
+      <div id="slots-container"></div>
+    </div>
+  </div>
+
+  <!-- Save Button -->
+  <button id="save-btn" class="save-btn" onclick="saveChanges()">Save Changes</button>
+</div>
+
+<script>
+// State management
+let currentState = null;
+let pendingData = null;
+let hasPendingEdits = false;
+let accessMode = 'full';
+let priceChart = null;
+
+// Initialize with embedded state (first launch optimization)
+{% if let Some(state) = initial_state %}
+window.__initialState = {{ state }};
+{% endif %}
+
+function updateState(data) {
+  currentState = data;
+  accessMode = data.access_mode || 'full';
+
+  // Mode
+  document.getElementById('mode').textContent = data.mode || '—';
+  document.getElementById('mode-reason').textContent = data.mode_reason || '';
+
+  // Price
+  const price = data.current_price;
+  document.getElementById('price').textContent = price != null ? price.toFixed(2) : '—';
+  document.getElementById('currency').textContent = (data.currency || 'CZK') + '/kWh';
+
+  // Energy flow
+  formatPower('solar-w', data.solar_w);
+  formatPower('battery-w', data.battery_w);
+  formatPower('grid-w', data.grid_w);
+  formatPower('load-w', data.load_w);
+
+  // Battery SOC
+  const soc = data.battery_soc;
+  document.getElementById('battery-soc').textContent = soc != null ? soc.toFixed(0) : '—';
+  document.getElementById('soc-bar').style.width = (soc || 0) + '%';
+  const socBar = document.getElementById('soc-bar');
+  if (soc < 20) socBar.style.background = 'var(--red)';
+  else if (soc < 50) socBar.style.background = 'var(--orange)';
+  else socBar.style.background = 'var(--green)';
+
+  // Controls (only apply if no pending edits)
+  if (!hasPendingEdits && data.user_control) {
+    document.getElementById('ctrl-charge-grid').checked = !!data.user_control.charge_from_grid_enabled;
+    document.getElementById('ctrl-forced-mode').value = data.user_control.forced_mode || '';
+    renderSlots(data.user_control.fixed_time_slots || []);
+  }
+
+  // Access mode
+  if (accessMode === 'readonly') {
+    document.getElementById('controls-section').style.display = 'none';
+    document.getElementById('readonly-notice').style.display = 'block';
+  } else {
+    document.getElementById('controls-section').style.display = 'block';
+    document.getElementById('readonly-notice').style.display = 'none';
+  }
+
+  // Chart
+  if (data.chart_data) renderChart(data.chart_data);
+
+  // Timestamp
+  if (data.timestamp) {
+    const ago = Math.floor((Date.now() - new Date(data.timestamp).getTime()) / 60000);
+    document.getElementById('last-updated').textContent = ago < 1 ? 'just now' : ago + ' min ago';
+  }
+}
+
+function formatPower(id, watts) {
+  const el = document.getElementById(id);
+  if (watts == null) { el.textContent = '—'; return; }
+  const abs = Math.abs(watts);
+  el.textContent = abs >= 1000 ? (abs / 1000).toFixed(1) + ' kW' : Math.round(abs) + ' W';
+  el.className = 'energy-value' + (watts > 50 ? ' positive' : watts < -50 ? ' negative' : '');
+}
+
+function renderChart(chartData) {
+  const canvas = document.getElementById('price-chart');
+  const ctx = canvas.getContext('2d');
+  if (!chartData.length) return;
+
+  // Simple bar chart using Canvas API (no Chart.js dependency)
+  const W = canvas.width = canvas.offsetWidth * 2;
+  const H = canvas.height = 400;
+  ctx.clearRect(0, 0, W, H);
+
+  const prices = chartData.map(d => d.price);
+  const maxP = Math.max(...prices, 0.01);
+  const minP = Math.min(...prices, 0);
+  const range = maxP - minP || 1;
+  const barW = W / prices.length;
+  const pad = 40;
+
+  for (let i = 0; i < prices.length; i++) {
+    const p = prices[i];
+    const h = ((p - minP) / range) * (H - pad * 2);
+    const x = i * barW;
+    const y = H - pad - h;
+
+    // Color by mode
+    const mode = chartData[i].mode;
+    if (mode === 'ForceCharge') ctx.fillStyle = '#2196f3';
+    else if (mode === 'ForceDischarge') ctx.fillStyle = '#f44336';
+    else if (mode === 'SelfUse') ctx.fillStyle = '#4caf50';
+    else ctx.fillStyle = '#666';
+
+    ctx.fillRect(x + 1, y, barW - 2, h);
+  }
+
+  // Price labels
+  ctx.fillStyle = '#9b9b9b';
+  ctx.font = '20px -apple-system, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(maxP.toFixed(1), 4, pad);
+  ctx.fillText(minP.toFixed(1), 4, H - pad + 16);
+}
+
+// Edit tracking
+function markPendingEdit() {
+  hasPendingEdits = true;
+  document.getElementById('save-btn').style.display = 'block';
+}
+
+// Slot management
+let slots = [];
+function renderSlots(slotData) {
+  slots = slotData || [];
+  const container = document.getElementById('slots-container');
+  if (!slots.length) {
+    container.innerHTML = '<div class="label">No fixed time slots</div>';
+    return;
+  }
+  container.innerHTML = slots.map((s, i) => `
+    <div class="slot-row">
+      <input type="time" class="slot-input" value="${s.start}" onchange="updateSlot(${i},'start',this.value)">
+      <input type="time" class="slot-input" value="${s.end}" onchange="updateSlot(${i},'end',this.value)">
+      <select class="slot-input" onchange="updateSlot(${i},'mode',this.value)">
+        <option value="ForceCharge" ${s.mode==='ForceCharge'?'selected':''}>Charge</option>
+        <option value="ForceDischarge" ${s.mode==='ForceDischarge'?'selected':''}>Discharge</option>
+        <option value="SelfUse" ${s.mode==='SelfUse'?'selected':''}>Self Use</option>
+      </select>
+      <button class="btn-sm btn-remove" onclick="removeSlot(${i})">X</button>
+    </div>
+  `).join('');
+}
+
+function addSlot() {
+  slots.push({ start: '22:00', end: '06:00', mode: 'ForceCharge' });
+  renderSlots(slots);
+  markPendingEdit();
+}
+
+function removeSlot(i) {
+  slots.splice(i, 1);
+  renderSlots(slots);
+  markPendingEdit();
+}
+
+function updateSlot(i, field, value) {
+  slots[i][field] = value;
+  markPendingEdit();
+}
+
+// Save
+async function saveChanges() {
+  const btn = document.getElementById('save-btn');
+  btn.textContent = 'Saving...';
+  btn.disabled = true;
+
+  const changes = {
+    charge_from_grid_enabled: document.getElementById('ctrl-charge-grid').checked,
+    forced_mode: document.getElementById('ctrl-forced-mode').value || null,
+    fixed_time_slots: slots
+  };
+
+  try {
+    if (window.fluxion && window.fluxion.save) {
+      const result = await window.fluxion.save(JSON.stringify(changes));
+      if (result && result.ok) {
+        hasPendingEdits = false;
+        btn.style.display = 'none';
+        const banner = document.getElementById('banner-save-ok');
+        banner.style.display = 'block';
+        setTimeout(() => banner.style.display = 'none', 3000);
+        if (result.state) updateState(result.state);
+      } else {
+        btn.textContent = 'Save failed — try again';
+        setTimeout(() => { btn.textContent = 'Save Changes'; btn.disabled = false; }, 3000);
+      }
+    }
+  } catch (e) {
+    btn.textContent = 'Save failed — try again';
+    setTimeout(() => { btn.textContent = 'Save Changes'; btn.disabled = false; }, 3000);
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Save Changes';
+}
+
+// Auto-apply data from background fetch
+window.updateState = function(data) {
+  if (hasPendingEdits) {
+    pendingData = data;
+    document.getElementById('banner-refresh').style.display = 'block';
+  } else {
+    updateState(data);
+  }
+};
+
+// Apply pending data on banner tap
+window.applyPendingData = function() {
+  if (pendingData) {
+    hasPendingEdits = false;
+    document.getElementById('save-btn').style.display = 'none';
+    updateState(pendingData);
+    pendingData = null;
+  }
+  document.getElementById('banner-refresh').style.display = 'none';
+};
+
+// Initialize with embedded state
+if (window.__initialState) {
+  updateState(window.__initialState);
+}
+</script>
+</body>
+</html>

@@ -93,7 +93,8 @@ fn calculate_initial_battery_price(time_block_prices: &[TimeBlockPrice]) -> f32 
 /// * `pricing_config` - Pricing configuration with grid fee amounts
 ///
 /// # Note
-/// If HDO cache is not available or returns None, falls back to spot_buy_fee_czk
+/// If HDO cache is not available or returns None for a given block, defaults to
+/// hdo_high_tariff_czk (conservative: avoids underpricing unknown periods)
 pub fn calculate_effective_prices(
     time_block_prices: &mut [TimeBlockPrice],
     hdo_cache: Option<&crate::resources::GlobalHdoCache>,
@@ -112,17 +113,18 @@ pub fn calculate_effective_prices(
                     pricing_config.hdo_high_tariff_czk
                 }
                 None => {
-                    // HDO data not available for this time, use fallback
+                    // HDO data not available for this time — default to high tariff
+                    // (conservative: avoids charging during unknown periods that may be expensive)
                     warn!(
-                        "HDO tariff data not available for {}, using fallback spot_buy_fee",
+                        "HDO tariff data not available for {}, defaulting to high tariff",
                         block.block_start
                     );
-                    pricing_config.spot_buy_fee_czk
+                    pricing_config.hdo_high_tariff_czk
                 }
             }
         } else {
-            // No HDO cache available, use fallback
-            pricing_config.spot_buy_fee_czk
+            // No HDO cache available, default to high tariff (conservative)
+            pricing_config.hdo_high_tariff_czk
         };
 
         // Calculate effective price = spot price + grid fee
@@ -272,7 +274,10 @@ pub fn generate_schedule_with_optimizer(
         let consumption_kwh = consumption_forecast
             .and_then(|f| f.get(*original_idx).copied())
             .unwrap_or(0.25);
-        let export_price = control_config.grid_export_fee_czk_per_kwh;
+        // Use per-block spot sell price when available, otherwise fall back to fixed export fee
+        let export_price = price_block
+            .spot_sell_price_czk_per_kwh
+            .unwrap_or(control_config.grid_export_fee_czk_per_kwh);
 
         let remaining_blocks: Vec<TimeBlockPrice> = relevant_blocks
             .iter()
@@ -351,7 +356,10 @@ pub fn generate_schedule_with_optimizer(
             .and_then(|f| f.get(*original_idx).copied())
             .unwrap_or(0.25); // Default: ~1 kWh/hour
 
-        let export_price = control_config.grid_export_fee_czk_per_kwh;
+        // Use per-block spot sell price when available, otherwise fall back to fixed export fee
+        let export_price = price_block
+            .spot_sell_price_czk_per_kwh
+            .unwrap_or(control_config.grid_export_fee_czk_per_kwh);
 
         // For filtered blocks, all are current or future, so we use predicted SOC
         // (starting with current SOC for the first block)
@@ -505,6 +513,9 @@ pub fn generate_schedule_with_optimizer(
                     battery_total_cost_czk *= 1.0 - discharge_ratio;
                     battery_energy_kwh = (battery_energy_kwh - discharge_kwh).max(0.0);
                 }
+            }
+            InverterOperationMode::NoChargeNoDischarge => {
+                // Battery idle - no charge or discharge, no cost change
             }
         }
 
@@ -754,8 +765,10 @@ pub fn check_soc_constraints(
                 return false;
             }
         }
-        InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
-            // Self-use and Backup Mode are always allowed
+        InverterOperationMode::SelfUse
+        | InverterOperationMode::BackUpMode
+        | InverterOperationMode::NoChargeNoDischarge => {
+            // Self-use, Backup Mode, and NoChargeNoDischarge are always allowed
         }
     }
 
@@ -889,6 +902,9 @@ fn update_soc_prediction(
                 new_soc += soc_increase;
             }
         }
+        InverterOperationMode::NoChargeNoDischarge => {
+            // Battery idle - SOC stays constant
+        }
     }
 
     // Clamp SOC to hardware limits
@@ -920,6 +936,7 @@ fn create_evaluation_request(
             duration_minutes: price_block.duration_minutes,
             price_czk_per_kwh: price_block.price_czk_per_kwh,
             effective_price_czk_per_kwh: price_block.effective_price_czk_per_kwh,
+            spot_sell_price_czk_per_kwh: price_block.spot_sell_price_czk_per_kwh,
         },
         battery: BatteryState {
             current_soc_percent: current_soc,
@@ -942,6 +959,7 @@ fn create_evaluation_request(
                 duration_minutes: b.duration_minutes,
                 price_czk_per_kwh: b.price_czk_per_kwh,
                 effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
+                spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
             })
             .collect(),
         historical: HistoricalData {
@@ -971,6 +989,7 @@ fn convert_decision_to_evaluation(
         OperationMode::ForceCharge => InverterOperationMode::ForceCharge,
         OperationMode::ForceDischarge => InverterOperationMode::ForceDischarge,
         OperationMode::BackUpMode => InverterOperationMode::BackUpMode,
+        OperationMode::NoChargeNoDischarge => InverterOperationMode::NoChargeNoDischarge,
     };
 
     let net_profit = decision.expected_profit_czk.unwrap_or(0.0);
@@ -1018,6 +1037,5 @@ fn convert_decision_to_evaluation(
         } else {
             None
         },
-        arbitrage_profit_czk: 0.0, // Calculated by strategy if discharge occurs
     }
 }

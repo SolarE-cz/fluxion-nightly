@@ -48,6 +48,7 @@ fn load_data() -> TestData {
                 price_czk_per_kwh: price as f32,
                 effective_price_czk_per_kwh: price as f32,
                 duration_minutes: 15, // Default assumption
+                spot_sell_price_czk_per_kwh: None,
             })
         })
         .unwrap();

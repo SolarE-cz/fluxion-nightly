@@ -18,6 +18,11 @@
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ (import rust-overlay) ];
+          config = {
+            android_sdk.accept_license = true;
+            # Allow unfree packages (required for Android SDK)
+            allowUnfree = true;
+          };
         };
 
         # Create crane library instance
@@ -28,6 +33,35 @@
 
         # Override crane library with our toolchain
         craneLibToolchain = craneLib.overrideToolchain rustToolchain;
+
+        # Android SDK for mobile development
+        androidComposition = pkgs.androidenv.composeAndroidPackages {
+          platformVersions = [ "36" ];
+          buildToolsVersions = [ "35.0.0" ];
+          includeNDK = true;
+          ndkVersions = [ "26.3.11579264" ];
+          abiVersions = [ "armeabi-v7a" "arm64-v8a" "x86" "x86_64" ];
+          extraLicenses = [
+            "android-sdk-preview-license"
+            "android-googletv-license"
+            "android-sdk-arm-dbt-license"
+            "google-gdk-license"
+            "intel-android-extra-license"
+            "intel-android-sysimage-license"
+            "mips-android-sysimage-license"
+          ];
+        };
+        androidSdk = androidComposition.androidsdk;
+
+        # Rust toolchain with Android cross-compilation targets for mobile builds
+        rustToolchainMobile = (pkgs.rust-bin.fromRustupToolchainFile ./fluxion/rust-toolchain.toml).override {
+          targets = [
+            "aarch64-linux-android"
+            "armv7-linux-androideabi"
+            "i686-linux-android"
+            "x86_64-linux-android"
+          ];
+        };
 
         # Custom source filter to include .ftl locale files, .html templates, and .py scripts
         sourceFilter = path: type:
@@ -80,6 +114,13 @@
           inherit cargoArtifacts;
           pname = "fluxion-version";
           cargoBuildFlags = [ "--bin" "fluxion-version" ];
+        });
+
+        # Build the fluxion-server binary
+        fluxion-server-bin = craneLibToolchain.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "fluxion-server";
+          cargoBuildFlags = [ "--bin" "fluxion-server" ];
         });
 
         # Clippy package using crane
@@ -196,6 +237,12 @@
             cargo-edit
             pkg-config
             openssl
+            # Tauri 2.0 dependencies (for fluxion-mobile development)
+            gtk3
+            webkitgtk_4_1
+            libsoup_3
+            # Arti Tor client dependency (rusqlite needs sqlite3 at link time)
+            sqlite
           ];
 
           # Environment variables for development
@@ -239,6 +286,71 @@
           '';
         };
 
+        # Data analysis shell (Python + matplotlib/pandas/seaborn)
+        devShells.analysis = pkgs.mkShell {
+          packages = with pkgs; [
+            (python3.withPackages (ps: with ps; [
+              matplotlib
+              numpy
+              pandas
+              seaborn
+              scipy
+            ]))
+          ];
+
+          shellHook = ''
+            echo "FluxION Analysis Environment"
+            echo "  Python: $(python3 --version)"
+            echo ""
+            echo "Available packages: matplotlib, numpy, pandas, seaborn, scipy"
+            echo ""
+            echo "Usage:"
+            echo "  python3 ralph/scripts/c10_analysis.py    - Run C10 sweep analysis"
+          '';
+        };
+
+        # Mobile (Android) development shell
+        devShells.mobile = pkgs.mkShell {
+          packages = with pkgs; [
+            rustToolchainMobile
+            cargo-watch
+            cargo-edit
+            pkg-config
+            openssl
+            sqlite
+            # Tauri 2.0 desktop dependencies (needed for cargo check on host)
+            gtk3
+            webkitgtk_4_1
+            libsoup_3
+            # Tauri CLI (provides `cargo tauri` subcommand)
+            cargo-tauri
+            # Android development
+            androidSdk
+            jdk17
+            gradle
+          ];
+
+          ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
+          ANDROID_SDK_ROOT = "${androidSdk}/libexec/android-sdk";
+          ANDROID_NDK_HOME = "${androidSdk}/libexec/android-sdk/ndk-bundle";
+          NDK_HOME = "${androidSdk}/libexec/android-sdk/ndk-bundle";
+          JAVA_HOME = "${pkgs.jdk17}/lib/openjdk";
+          GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdk}/libexec/android-sdk/build-tools/35.0.0/aapt2";
+
+          shellHook = ''
+            echo "FluxION Mobile Android Development Environment"
+            echo "  Rust: $(rustc --version)"
+            echo "  Android SDK: $ANDROID_HOME"
+            echo "  NDK: $ANDROID_NDK_HOME"
+            echo "  JDK: $(java -version 2>&1 | head -1)"
+            echo ""
+            echo "Commands:"
+            echo "  cd fluxion-mobile && cargo tauri android init    - Initialize Android project"
+            echo "  cd fluxion-mobile && cargo tauri android build --debug  - Build debug APK"
+            echo "  cd fluxion-mobile && cargo tauri android build   - Build release APK"
+          '';
+        };
+
         # Packages
         packages = {
           default = fluxion-main;
@@ -247,6 +359,7 @@
           fluxion-clippy = fluxion-clippy;
           fluxion-audit = fluxion-audit;
           fluxion-tests = fluxion-tests;
+          fluxion-server = fluxion-server-bin;
 
           # CI/CD tools
           github-publish-script = github-publish-script;
@@ -437,6 +550,45 @@
             '');
           };
 
+          # ============= Deployment Apps =============
+
+          # Deploy fluxion-server to remote NixOS host
+          deploy-server = {
+            type = "app";
+            program = toString (pkgs.writeShellScript "deploy-server" ''
+              set -euo pipefail
+
+              export PATH="${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.nix}/bin:$PATH"
+
+              SERVER="tever@reborn"
+              REMOTE_DIR="/home/tever/fluxion"
+              CONFIG_SRC="fluxion/crates/fluxion-server/config.example.toml"
+
+              echo "Building fluxion-server..."
+              RESULT=$(nix build --no-link --print-out-paths .#fluxion-server)
+              echo "Built: $RESULT"
+
+              echo ""
+              echo "Copying closure to remote Nix store..."
+              nix copy --to "ssh://$SERVER" "$RESULT"
+
+              echo ""
+              echo "Updating symlink and restarting service..."
+              ssh "$SERVER" "\
+                sudo mkdir -p $REMOTE_DIR/data && \
+                sudo ln -sfn $RESULT/bin/fluxion-server $REMOTE_DIR/fluxion-server && \
+                if [ ! -f $REMOTE_DIR/config.toml ]; then \
+                  echo 'No config.toml found — copying example config (edit before starting!)'; \
+                  sudo cp $REMOTE_DIR/config.example.toml $REMOTE_DIR/config.toml 2>/dev/null || true; \
+                fi && \
+                sudo systemctl restart fluxion-server"
+
+              echo ""
+              echo "Deployed! Current status:"
+              ssh "$SERVER" "sudo systemctl status fluxion-server --no-pager" || true
+            '');
+          };
+
           # ============= CI/CD Pipeline Apps =============
 
           # Check code formatting and license headers
@@ -492,7 +644,7 @@
               set -euo pipefail
 
               # Add required tools to PATH
-              export PATH="${pkgs.python3.withPackages (ps: with ps; [ pyyaml tomli tomli-w ])}/bin:${pkgs.tree}/bin:${pkgs.coreutils}/bin:${pkgs.findutils}/bin:${pkgs.bash}/bin:$PATH"
+              export PATH="${pkgs.python3.withPackages (ps: with ps; [ pyyaml tomli tomli-w ])}/bin:${pkgs.tree}/bin:${pkgs.coreutils}/bin:${pkgs.findutils}/bin:${pkgs.gnugrep}/bin:${pkgs.bash}/bin:$PATH"
 
               # Create temporary work directory
               WORK_DIR=$(mktemp -d)
@@ -547,8 +699,8 @@
             program = toString (pkgs.writeShellScript "ci-publish-github" ''
               set -euo pipefail
 
-              # Add git and SSH to PATH
-              export PATH="${pkgs.git}/bin:${pkgs.openssh}/bin:$PATH"
+              # Add git, SSH and core utilities to PATH
+              export PATH="${pkgs.git}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.findutils}/bin:${pkgs.gnugrep}/bin:${pkgs.bash}/bin:$PATH"
 
               # Run the GitHub publish script
               ${github-publish-script}/bin/publish-github
@@ -562,7 +714,7 @@
               set -euo pipefail
 
               # Add Python packages, Rust toolchain and tools to PATH
-              export PATH="${pkgs.python3.withPackages (ps: with ps; [ tomli tomli-w ])}/bin:${rustToolchain}/bin:${pkgs.git}/bin:${pkgs.bash}/bin:${pkgs.gnused}/bin:${pkgs.gawk}/bin:${pkgs.coreutils}/bin:$PATH"
+              export PATH="${pkgs.python3.withPackages (ps: with ps; [ tomli tomli-w ])}/bin:${rustToolchain}/bin:${pkgs.git}/bin:${pkgs.bash}/bin:${pkgs.gnused}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:$PATH"
 
               # Colors for output
               RED='\033[0;31m'

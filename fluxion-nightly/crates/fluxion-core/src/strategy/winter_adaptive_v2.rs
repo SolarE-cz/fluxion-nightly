@@ -1555,7 +1555,9 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+            InverterOperationMode::SelfUse
+            | InverterOperationMode::BackUpMode
+            | InverterOperationMode::NoChargeNoDischarge => {
                 // Calculate net consumption accounting for solar
                 // Negative consumption means excess power (solar > load)
                 let net_consumption = context.consumption_forecast_kwh - context.solar_forecast_kwh;
@@ -1634,6 +1636,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.5,
                 effective_price_czk_per_kwh: 1.5,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 
@@ -1644,6 +1647,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 4.5,
                 effective_price_czk_per_kwh: 4.5,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 
@@ -1654,6 +1658,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.0,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 
@@ -1664,6 +1669,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.0,
                 effective_price_czk_per_kwh: 5.0,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 
@@ -1700,6 +1706,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
                 effective_price_czk_per_kwh: 3.0,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 
@@ -1709,6 +1716,7 @@ mod tests {
             duration_minutes: 15,
             price_czk_per_kwh: 10.0,
             effective_price_czk_per_kwh: 10.0,
+            spot_sell_price_czk_per_kwh: None,
         });
 
         // More normal prices
@@ -1718,6 +1726,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
                 effective_price_czk_per_kwh: 3.0,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 

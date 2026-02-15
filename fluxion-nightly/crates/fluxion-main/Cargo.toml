@@ -7,6 +7,10 @@ edition = "2024"
 name = "fluxion"
 path = "src/main.rs"
 
+[[bin]]
+name = "fluxion-version"
+path = "src/bin/version.rs"
+
 [features]
 # Forward the modbus feature to fluxion-core when enabled
 default = []
@@ -14,6 +18,7 @@ default = []
 [dependencies]
 # Local dependencies
 fluxion-core = { path = "../fluxion-core" }
+fluxion-shared = { path = "../fluxion-shared" }
 fluxion-i18n = { path = "../fluxion-i18n" }
 fluxion-adapters = { path = "../fluxion-adapters" }
 fluxion-web = { path = "../fluxion-web" }
@@ -35,6 +40,7 @@ chrono.workspace = true
 prometheus.workspace = true
 warp.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

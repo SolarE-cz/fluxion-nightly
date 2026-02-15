@@ -179,13 +179,16 @@ async fn fetch_consumption_history(
         crate::components::aggregate_daily_consumption(&consumption_history, &solar_history);
 
     // Compute hourly consumption profile
-    let hourly_profile =
-        crate::components::aggregate_hourly_consumption(&consumption_history);
+    let hourly_profile = crate::components::aggregate_hourly_consumption(&consumption_history);
 
     info!(
         "✅ Aggregated {} daily summaries, hourly profile: {}",
         summaries.len(),
-        if hourly_profile.is_some() { "computed" } else { "none" }
+        if hourly_profile.is_some() {
+            "computed"
+        } else {
+            "none"
+        }
     );
 
     // Send to channel

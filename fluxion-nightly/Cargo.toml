@@ -10,6 +10,8 @@ members = [
     "crates/fluxion-strategy-simulator",
     "crates/fluxion-types",
     "crates/fluxion-web",
+    "crates/fluxion-shared",
+    "crates/fluxion-server",
     "crates/solax-csv-importer",
 ]
 resolver = "2"
@@ -151,4 +153,13 @@ version = "0.33.0"
 features = [
     "bundled",
     "chrono",
+]
+
+[workspace.dependencies.lettre]
+version = "0.11"
+default-features = false
+features = [
+    "builder",
+    "smtp-transport",
+    "tokio1-rustls-tls",
 ]
