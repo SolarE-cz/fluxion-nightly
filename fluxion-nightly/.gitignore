@@ -76,3 +76,23 @@ __pycache__/
 /dev/Plant Reports 2025-12-03.xlsx
 /dev/.fluxion_export_20260129_221900.json.kate-swp
 /dev/fluxion_export_20260129_222406.json
+/fluxion/.fluxion-data/tor/data/cached-certs
+/fluxion/.fluxion-data/tor/data/cached-microdesc-consensus
+/fluxion/.fluxion-data/tor/data/cached-microdescs
+/fluxion/.fluxion-data/tor/data/cached-microdescs.new
+/fluxion/.fluxion-data/tor/data/lock
+/fluxion/.fluxion-data/tor/data/state
+/fluxion/.fluxion-data/tor/hidden_service/authorized_clients/5ead845e-4bd4-4e36-b69e-0dbc06848563.auth
+/fluxion/.fluxion-data/tor/hidden_service/authorized_clients/dfd42cca-1741-4757-b65b-a5a8e519c8a9.auth
+/fluxion/.fluxion-data/tor/hidden_service/hostname
+/fluxion/.fluxion-data/tor/hidden_service/hs_ed25519_public_key
+/fluxion/.fluxion-data/tor/hidden_service/hs_ed25519_secret_key
+/fluxion/.fluxion-data/tor/devices.json
+/fluxion/.fluxion-data/tor/torrc
+/fluxion/sweep_results/charts/cost_distribution.png
+/fluxion/sweep_results/charts/executive_summary.png
+/fluxion/sweep_results/charts/parameter_heatmaps.png
+/fluxion/sweep_results/charts/parameter_ranking.png
+/fluxion/sweep_results/charts/parameter_sensitivity.png
+/fluxion/sweep_results/charts/period_breakdown.png
+/fluxion-mobile/src-tauri/target
