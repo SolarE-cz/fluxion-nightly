@@ -4,6 +4,7 @@ members = [
     "crates/fluxion-backtest",
     "crates/fluxion-core",
     "crates/fluxion-i18n",
+    "crates/fluxion-mobile-types",
     "crates/fluxion-integration-tests",
     "crates/fluxion-main",
     "crates/fluxion-plugins",

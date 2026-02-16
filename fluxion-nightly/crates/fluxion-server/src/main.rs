@@ -63,6 +63,24 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ => {}
                 }
+                match db.cleanup_old_schedule_blocks(retention_days) {
+                    Ok(deleted) if deleted > 0 => {
+                        info!(deleted, "Cleaned up old schedule blocks");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to clean up old schedule blocks");
+                    }
+                    _ => {}
+                }
+                match db.cleanup_old_soc_predictions(retention_days) {
+                    Ok(deleted) if deleted > 0 => {
+                        info!(deleted, "Cleaned up old SOC predictions");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to clean up old SOC predictions");
+                    }
+                    _ => {}
+                }
             }
         });
     }

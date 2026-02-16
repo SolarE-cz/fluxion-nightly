@@ -1653,6 +1653,7 @@ version = "0.1.0"
 dependencies = [
  "arti-client",
  "chrono",
+ "fluxion-mobile-types",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1667,6 +1668,14 @@ dependencies = [
  "tokio",
  "tor-rtcompat",
  "tracing",
+]
+
+[[package]]
+name = "fluxion-mobile-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
 ]
 
 [[package]]

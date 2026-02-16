@@ -680,6 +680,655 @@
         background: #6c757d;
         cursor: not-allowed;
     }
+
+    /* ============== Phone Pairing Modal Styles ============== */
+
+    /* Phone Connect Button */
+    .phone-connect-button {
+        background: linear-gradient(135deg, #9c27b0 0%, #7b1fa2 100%);
+        color: #fff;
+        padding: 10px 20px;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 0.9em;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        transition: all 0.2s ease;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+
+    .phone-connect-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+
+    .phone-connect-button:active {
+        transform: translateY(0);
+    }
+
+    /* Modal Overlay */
+    .pairing-modal-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.75);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 2000;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s ease;
+    }
+
+    .pairing-modal-overlay.show {
+        opacity: 1;
+        pointer-events: all;
+    }
+
+    /* Modal Dialog */
+    .pairing-modal {
+        background: var(--bg-secondary);
+        border-radius: 16px;
+        max-width: 480px;
+        width: 90%;
+        max-height: 90vh;
+        overflow-y: auto;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        transform: scale(0.9);
+        transition: transform 0.3s ease;
+    }
+
+    .pairing-modal-overlay.show .pairing-modal {
+        transform: scale(1);
+    }
+
+    .pairing-modal-header {
+        padding: 24px 24px 16px;
+        border-bottom: 1px solid var(--border-color);
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+    }
+
+    .pairing-modal-header h2 {
+        font-size: 1.4em;
+        font-weight: 600;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .pairing-modal-subtitle {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+        margin-top: 8px;
+        line-height: 1.5;
+    }
+
+    .pairing-modal-close {
+        background: none;
+        border: none;
+        color: var(--text-secondary);
+        font-size: 1.5em;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+        transition: background 0.2s, color 0.2s;
+    }
+
+    .pairing-modal-close:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+
+    .pairing-modal-body {
+        padding: 24px;
+    }
+
+    .pairing-modal-footer {
+        padding: 16px 24px 24px;
+        border-top: 1px solid var(--border-color);
+        text-align: center;
+    }
+
+    /* Step Indicator */
+    .step-indicator {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0;
+        margin-bottom: 24px;
+        padding: 0 24px;
+    }
+
+    .step-dot {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 600;
+        font-size: 0.9em;
+        background: var(--bg-tertiary);
+        color: var(--text-secondary);
+        transition: all 0.3s ease;
+    }
+
+    .step-dot.active {
+        background: var(--info);
+        color: #fff;
+    }
+
+    .step-dot.completed {
+        background: var(--success);
+        color: #fff;
+    }
+
+    .step-line {
+        width: 40px;
+        height: 2px;
+        background: var(--border-color);
+        transition: background 0.3s ease;
+    }
+
+    .step-line.completed {
+        background: var(--success);
+    }
+
+    /* Step Content */
+    .step-content {
+        animation: fade-slide-in 0.3s ease-out;
+    }
+
+    .step-content.reverse {
+        animation: fade-slide-in-reverse 0.3s ease-out;
+    }
+
+    /* Form Styles */
+    .pairing-form-group {
+        margin-bottom: 20px;
+    }
+
+    .pairing-form-label {
+        display: block;
+        font-size: 0.9em;
+        font-weight: 500;
+        color: var(--text-primary);
+        margin-bottom: 8px;
+    }
+
+    .pairing-form-input {
+        width: 100%;
+        padding: 12px 14px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        color: var(--text-primary);
+        font-size: 1em;
+        transition: border-color 0.2s, box-shadow 0.2s;
+        box-sizing: border-box;
+    }
+
+    .pairing-form-input:focus {
+        outline: none;
+        border-color: var(--info);
+        box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.2);
+    }
+
+    .pairing-form-input::placeholder {
+        color: var(--text-secondary);
+    }
+
+    /* Access Mode Selector */
+    .access-mode-selector {
+        display: flex;
+        gap: 12px;
+        margin-top: 8px;
+    }
+
+    .access-mode-option {
+        flex: 1;
+        position: relative;
+    }
+
+    .access-mode-option input[type="radio"] {
+        position: absolute;
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+
+    .access-mode-card {
+        display: block;
+        padding: 16px;
+        background: var(--bg-tertiary);
+        border: 2px solid var(--border-color);
+        border-radius: 10px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .access-mode-option input:checked + .access-mode-card {
+        border-color: var(--info);
+        background: rgba(33, 150, 243, 0.1);
+    }
+
+    .access-mode-option input:focus + .access-mode-card {
+        box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.2);
+    }
+
+    .access-mode-card:hover {
+        border-color: var(--text-secondary);
+    }
+
+    .access-mode-title {
+        font-weight: 600;
+        font-size: 0.95em;
+        margin-bottom: 4px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .access-mode-description {
+        font-size: 0.8em;
+        color: var(--text-secondary);
+        line-height: 1.4;
+    }
+
+    .access-mode-icon {
+        font-size: 1.3em;
+    }
+
+    .access-mode-icon.full { color: var(--success); }
+    .access-mode-icon.readonly { color: var(--warning); }
+
+    /* QR Code Display */
+    .qr-code-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 20px;
+    }
+
+    .qr-code-wrapper {
+        background: #ffffff;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+        animation: qr-appear 0.4s ease-out;
+    }
+
+    .qr-code-wrapper svg {
+        display: block;
+        width: 240px;
+        height: 240px;
+    }
+
+    .qr-instruction-title {
+        font-size: 1.1em;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin-bottom: 8px;
+        text-align: center;
+    }
+
+    .qr-instructions {
+        color: var(--text-secondary);
+        font-size: 0.85em;
+        line-height: 1.6;
+        text-align: left;
+        max-width: 280px;
+    }
+
+    .qr-instructions ol {
+        margin: 0;
+        padding-left: 20px;
+    }
+
+    .qr-instructions li {
+        margin: 6px 0;
+    }
+
+    .qr-security-note {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 16px;
+        padding: 12px;
+        background: rgba(76, 175, 80, 0.1);
+        border-radius: 8px;
+        font-size: 0.8em;
+        color: var(--success);
+    }
+
+    .qr-security-note .mdi {
+        font-size: 1.2em;
+    }
+
+    /* Success State */
+    .success-icon-container {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        background: rgba(76, 175, 80, 0.15);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 20px;
+    }
+
+    .success-checkmark {
+        font-size: 48px;
+        color: var(--success);
+        animation: pop-in 0.4s ease-out;
+    }
+
+    .success-title {
+        font-size: 1.3em;
+        font-weight: 600;
+        margin-bottom: 8px;
+        color: var(--text-primary);
+        text-align: center;
+    }
+
+    .success-subtitle {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+        text-align: center;
+    }
+
+    .success-device-summary {
+        margin-top: 20px;
+        padding: 16px;
+        background: var(--bg-tertiary);
+        border-radius: 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .success-device-name {
+        font-weight: 600;
+    }
+
+    .success-device-badge {
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 0.8em;
+        font-weight: 600;
+    }
+
+    .success-device-badge.full {
+        background: var(--success);
+        color: #000;
+    }
+
+    .success-device-badge.readonly {
+        background: var(--warning);
+        color: #000;
+    }
+
+    /* Loading State */
+    .pairing-loading {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        padding: 40px;
+    }
+
+    .pairing-spinner {
+        width: 48px;
+        height: 48px;
+        border: 3px solid var(--border-color);
+        border-top-color: var(--info);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+
+    .pairing-loading-text {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+    }
+
+    /* Error State */
+    .pairing-error {
+        padding: 16px;
+        background: rgba(244, 67, 54, 0.1);
+        border: 1px solid rgba(244, 67, 54, 0.3);
+        border-radius: 8px;
+        margin-bottom: 16px;
+    }
+
+    .pairing-error-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+        color: var(--error);
+        margin-bottom: 4px;
+    }
+
+    .pairing-error-message {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+    }
+
+    /* Manage Devices Link */
+    .manage-devices-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--text-secondary);
+        text-decoration: none;
+        font-size: 0.9em;
+        transition: color 0.2s;
+    }
+
+    .manage-devices-link:hover {
+        color: var(--text-primary);
+        text-decoration: underline;
+    }
+
+    .manage-devices-link .mdi {
+        font-size: 1.1em;
+    }
+
+    /* Pairing Buttons */
+    .pairing-btn {
+        padding: 12px 24px;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 0.95em;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        border: none;
+    }
+
+    .pairing-btn-primary {
+        background: var(--info);
+        color: #fff;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+
+    .pairing-btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+
+    .pairing-btn-primary:active {
+        transform: translateY(0);
+    }
+
+    .pairing-btn-primary:disabled {
+        background: #555;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+    }
+
+    .pairing-btn-secondary {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+    }
+
+    .pairing-btn-secondary:hover {
+        background: #3a3a3a;
+    }
+
+    .pairing-btn-success {
+        background: var(--success);
+        color: #fff;
+    }
+
+    .pairing-btn-success:hover {
+        background: #45a049;
+    }
+
+    .pairing-button-group {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        margin-top: 24px;
+    }
+
+    /* Screen Reader Only */
+    .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    /* Animations */
+    @keyframes fade-slide-in {
+        from {
+            opacity: 0;
+            transform: translateX(20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+
+    @keyframes fade-slide-in-reverse {
+        from {
+            opacity: 0;
+            transform: translateX(-20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+
+    @keyframes pop-in {
+        0% {
+            transform: scale(0);
+            opacity: 0;
+        }
+        50% {
+            transform: scale(1.2);
+        }
+        100% {
+            transform: scale(1);
+            opacity: 1;
+        }
+    }
+
+    @keyframes qr-appear {
+        from {
+            opacity: 0;
+            transform: scale(0.8);
+        }
+        to {
+            opacity: 1;
+            transform: scale(1);
+        }
+    }
+
+    /* Responsive for Pairing Modal */
+    @media (max-width: 768px) {
+        .phone-connect-button span.btn-text {
+            display: none;
+        }
+        .phone-connect-button {
+            padding: 10px 14px;
+        }
+
+        .pairing-modal {
+            width: 95%;
+            max-width: none;
+            max-height: 85vh;
+            margin: auto 2.5%;
+        }
+
+        .pairing-modal-header {
+            padding: 20px 16px 14px;
+        }
+
+        .pairing-modal-body {
+            padding: 16px;
+        }
+
+        .pairing-modal-footer {
+            padding: 14px 16px 20px;
+        }
+
+        .access-mode-selector {
+            flex-direction: column;
+        }
+
+        .qr-code-wrapper svg {
+            width: 200px;
+            height: 200px;
+        }
+
+        .step-dot {
+            width: 28px;
+            height: 28px;
+            font-size: 0.8em;
+        }
+
+        .step-line {
+            width: 30px;
+        }
+
+        .step-indicator {
+            padding: 0 16px;
+        }
+    }
+
+    @media (max-width: 360px) {
+        .qr-code-wrapper {
+            padding: 16px;
+        }
+
+        .qr-code-wrapper svg {
+            width: 180px;
+            height: 180px;
+        }
+
+        .pairing-form-input {
+            padding: 10px 12px;
+        }
+    }
 </style>
 
 <div class="dashboard-wrapper" id="dashboard-wrapper">
@@ -697,6 +1346,10 @@
                         <span>✓</span>
                         <span>Normal Mode</span>
                         {% endif %}
+                    </button>
+                    <button id="phone-connect-btn" class="phone-connect-button" onclick="openPairingModal()">
+                        <span class="mdi mdi-cellphone-link"></span>
+                        <span class="btn-text">Connect Phone</span>
                     </button>
                     <button id="config-toggle" class="config-button" onclick="toggleConfigSidebar()">
                         <span>⚙️</span>
@@ -2997,5 +3650,513 @@ document.addEventListener('DOMContentLoaded', function() {
         </div>
     </div>
 </div>
+
+<!-- Phone Pairing Modal -->
+<div id="pairing-modal-overlay" class="pairing-modal-overlay" onclick="if(event.target === this) closePairingModal()">
+    <div class="pairing-modal" role="dialog" aria-modal="true" aria-labelledby="pairing-modal-title">
+
+        <!-- Header -->
+        <div class="pairing-modal-header">
+            <div>
+                <h2 id="pairing-modal-title">
+                    <span class="mdi mdi-cellphone-link"></span> Connect via Phone
+                </h2>
+                <p class="pairing-modal-subtitle">
+                    Pair your mobile device to monitor and control your solar plant from anywhere.
+                </p>
+            </div>
+            <button class="pairing-modal-close" onclick="closePairingModal()" aria-label="Close">&times;</button>
+        </div>
+
+        <!-- Step Indicator -->
+        <div class="step-indicator" role="navigation" aria-label="Pairing steps">
+            <span class="step-dot active" id="step-dot-1" aria-current="step">1</span>
+            <span class="step-line" id="step-line-1"></span>
+            <span class="step-dot" id="step-dot-2">2</span>
+            <span class="step-line" id="step-line-2"></span>
+            <span class="step-dot" id="step-dot-3">3</span>
+        </div>
+
+        <!-- Body -->
+        <div class="pairing-modal-body">
+            <!-- Step 1: Configure Device -->
+            <div id="pairing-step-1" class="step-content">
+                <div class="pairing-form-group">
+                    <label class="pairing-form-label" for="pairing-device-name">Device Name</label>
+                    <input type="text" id="pairing-device-name" class="pairing-form-input"
+                           placeholder="My Phone" maxlength="50" autocomplete="off">
+                </div>
+
+                <div class="pairing-form-group">
+                    <label class="pairing-form-label">Access Mode</label>
+                    <div class="access-mode-selector">
+                        <label class="access-mode-option">
+                            <input type="radio" name="access-mode" value="full" checked>
+                            <div class="access-mode-card">
+                                <div class="access-mode-title">
+                                    <span class="mdi mdi-shield-check access-mode-icon full"></span>
+                                    Full Access
+                                </div>
+                                <div class="access-mode-description">Monitor and control your solar plant</div>
+                            </div>
+                        </label>
+                        <label class="access-mode-option">
+                            <input type="radio" name="access-mode" value="read_only">
+                            <div class="access-mode-card">
+                                <div class="access-mode-title">
+                                    <span class="mdi mdi-eye access-mode-icon readonly"></span>
+                                    Read Only
+                                </div>
+                                <div class="access-mode-description">View status without control</div>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="pairing-step1-error" class="pairing-error" style="display: none;">
+                    <div class="pairing-error-title">
+                        <span class="mdi mdi-alert-circle"></span>
+                        <span id="pairing-step1-error-title">Error</span>
+                    </div>
+                    <div class="pairing-error-message" id="pairing-step1-error-message"></div>
+                </div>
+
+                <div class="pairing-button-group">
+                    <button class="pairing-btn pairing-btn-primary" onclick="handleStep1Submit()" id="pairing-continue-btn">
+                        Continue
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 2: Display QR Code -->
+            <div id="pairing-step-2" class="step-content" style="display:none">
+                <!-- Loading State -->
+                <div id="pairing-step2-loading" class="pairing-loading">
+                    <div class="pairing-spinner"></div>
+                    <div class="pairing-loading-text">Generating secure connection...</div>
+                </div>
+
+                <!-- QR Code Container (hidden while loading) -->
+                <div id="pairing-step2-content" style="display: none;">
+                    <div class="qr-code-container">
+                        <div class="qr-instruction-title">Scan with FluxION Mobile App</div>
+                        <div class="qr-code-wrapper" id="pairing-qr-wrapper" role="img" aria-label="QR code for pairing device">
+                            <!-- QR SVG inserted here by JavaScript -->
+                        </div>
+                        <div class="qr-instructions">
+                            <ol>
+                                <li>Open FluxION app on your phone</li>
+                                <li>Tap "Add Connection" or scan icon</li>
+                                <li>Point camera at QR code</li>
+                            </ol>
+                        </div>
+                        <div class="qr-security-note">
+                            <span class="mdi mdi-shield-lock"></span>
+                            The connection is secured with end-to-end encryption via Tor.
+                        </div>
+                    </div>
+
+                    <div class="pairing-button-group">
+                        <button class="pairing-btn pairing-btn-secondary" onclick="goToStep(1, true)">
+                            Back
+                        </button>
+                        <button class="pairing-btn pairing-btn-primary" onclick="handleStep2Confirm()">
+                            I've Scanned It
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 3: Success -->
+            <div id="pairing-step-3" class="step-content" style="display:none">
+                <div class="success-icon-container">
+                    <span class="mdi mdi-check success-checkmark"></span>
+                </div>
+                <div class="success-title">Device Paired Successfully!</div>
+                <div class="success-subtitle">Your phone is now connected to FluxION.</div>
+
+                <div class="success-device-summary">
+                    <span class="success-device-name" id="pairing-success-device-name"></span>
+                    <span class="success-device-badge" id="pairing-success-device-badge"></span>
+                </div>
+
+                <div class="pairing-button-group">
+                    <button class="pairing-btn pairing-btn-secondary" onclick="handlePairAnother()">
+                        Pair Another
+                    </button>
+                    <button class="pairing-btn pairing-btn-success" onclick="closePairingModal()">
+                        Done
+                    </button>
+                </div>
+            </div>
+
+            <!-- Error State -->
+            <div id="pairing-error-state" class="step-content" style="display:none">
+                <div class="pairing-error">
+                    <div class="pairing-error-title">
+                        <span class="mdi mdi-alert-circle"></span>
+                        <span id="pairing-error-state-title">Connection Error</span>
+                    </div>
+                    <div class="pairing-error-message" id="pairing-error-state-message">
+                        Something went wrong. Please try again.
+                    </div>
+                </div>
+
+                <div class="pairing-button-group">
+                    <button class="pairing-btn pairing-btn-secondary" onclick="closePairingModal()">
+                        Cancel
+                    </button>
+                    <button class="pairing-btn pairing-btn-primary" onclick="handleRetry()">
+                        Try Again
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="pairing-modal-footer">
+            <a href="{{ ingress_path }}/remote-access" class="manage-devices-link">
+                <span class="mdi mdi-cog"></span> Manage All Devices
+            </a>
+        </div>
+
+    </div>
+</div>
+
+<!-- Screen reader live region for pairing -->
+<div class="sr-only" aria-live="polite" id="pairing-status"></div>
+
+<script>
+// ============== Phone Pairing Modal Functions ==============
+
+const PAIRING_API = '{{ ingress_path }}/api/remote/pair';
+
+// State management for pairing modal
+const pairingState = {
+    currentStep: 1,
+    deviceName: '',
+    accessMode: 'full',
+    qrSvg: '',
+    deviceId: '',
+    error: null
+};
+
+// Reference to previously focused element (for focus restoration)
+let pairingPreviousFocus = null;
+
+// Open the pairing modal
+function openPairingModal() {
+    // Store current focus for restoration
+    pairingPreviousFocus = document.activeElement;
+
+    // Reset state
+    pairingState.currentStep = 1;
+    pairingState.deviceName = '';
+    pairingState.accessMode = 'full';
+    pairingState.qrSvg = '';
+    pairingState.deviceId = '';
+    pairingState.error = null;
+
+    // Reset form
+    document.getElementById('pairing-device-name').value = '';
+    document.querySelector('input[name="access-mode"][value="full"]').checked = true;
+
+    // Hide error
+    document.getElementById('pairing-step1-error').style.display = 'none';
+
+    // Reset to step 1
+    showStep(1);
+
+    // Show modal
+    const overlay = document.getElementById('pairing-modal-overlay');
+    overlay.classList.add('show');
+
+    // Prevent body scroll
+    document.body.style.overflow = 'hidden';
+
+    // Focus the device name input
+    setTimeout(() => {
+        document.getElementById('pairing-device-name').focus();
+    }, 100);
+
+    // Announce to screen readers
+    announceToScreenReader('Pairing dialog opened. Step 1 of 3: Configure device.');
+}
+
+// Close the pairing modal
+function closePairingModal() {
+    const overlay = document.getElementById('pairing-modal-overlay');
+    overlay.classList.remove('show');
+
+    // Restore body scroll
+    document.body.style.overflow = '';
+
+    // Return focus to trigger button
+    if (pairingPreviousFocus) {
+        pairingPreviousFocus.focus();
+        pairingPreviousFocus = null;
+    }
+
+    // Announce to screen readers
+    announceToScreenReader('Pairing dialog closed.');
+}
+
+// Show a specific step
+function showStep(stepNumber) {
+    // Hide all steps
+    document.getElementById('pairing-step-1').style.display = 'none';
+    document.getElementById('pairing-step-2').style.display = 'none';
+    document.getElementById('pairing-step-3').style.display = 'none';
+    document.getElementById('pairing-error-state').style.display = 'none';
+
+    // Show the target step
+    document.getElementById(`pairing-step-${stepNumber}`).style.display = 'block';
+
+    // Update step indicators
+    for (let i = 1; i <= 3; i++) {
+        const dot = document.getElementById(`step-dot-${i}`);
+        const line = i < 3 ? document.getElementById(`step-line-${i}`) : null;
+
+        dot.classList.remove('active', 'completed');
+        dot.removeAttribute('aria-current');
+
+        if (i < stepNumber) {
+            dot.classList.add('completed');
+            if (line) line.classList.add('completed');
+        } else if (i === stepNumber) {
+            dot.classList.add('active');
+            dot.setAttribute('aria-current', 'step');
+        }
+
+        if (line && i >= stepNumber) {
+            line.classList.remove('completed');
+        }
+    }
+
+    pairingState.currentStep = stepNumber;
+}
+
+// Navigate to a step with animation direction
+function goToStep(stepNumber, isBack = false) {
+    const targetStep = document.getElementById(`pairing-step-${stepNumber}`);
+    if (targetStep) {
+        targetStep.classList.remove('reverse');
+        if (isBack) {
+            targetStep.classList.add('reverse');
+        }
+    }
+
+    showStep(stepNumber);
+
+    // Announce to screen readers
+    const stepNames = ['', 'Configure device', 'Scan QR code', 'Complete'];
+    announceToScreenReader(`Step ${stepNumber} of 3: ${stepNames[stepNumber]}`);
+
+    // Focus management
+    if (stepNumber === 1) {
+        document.getElementById('pairing-device-name').focus();
+    }
+}
+
+// Handle Step 1 form submission
+async function handleStep1Submit() {
+    const nameInput = document.getElementById('pairing-device-name');
+    const name = nameInput.value.trim();
+
+    // Validate name
+    if (!name) {
+        showStep1Error('Please enter a device name');
+        nameInput.focus();
+        return;
+    }
+
+    // Get access mode
+    const modeInput = document.querySelector('input[name="access-mode"]:checked');
+    const mode = modeInput ? modeInput.value : 'full';
+
+    // Store in state
+    pairingState.deviceName = name;
+    pairingState.accessMode = mode;
+
+    // Hide any previous error
+    document.getElementById('pairing-step1-error').style.display = 'none';
+
+    // Move to step 2 and call API
+    goToStep(2);
+
+    // Show loading state
+    document.getElementById('pairing-step2-loading').style.display = 'flex';
+    document.getElementById('pairing-step2-content').style.display = 'none';
+
+    // Call the pairing API
+    try {
+        const result = await callPairApi(name, mode);
+
+        if (result.error) {
+            // Show error in step 1
+            goToStep(1, true);
+            showStep1Error(result.error);
+            return;
+        }
+
+        // Store result
+        pairingState.qrSvg = result.qr_svg;
+        pairingState.deviceId = result.device_id;
+
+        // Display QR code
+        document.getElementById('pairing-qr-wrapper').innerHTML = result.qr_svg;
+
+        // Update aria-label with device name
+        document.getElementById('pairing-qr-wrapper').setAttribute(
+            'aria-label',
+            `QR code for pairing device: ${name}`
+        );
+
+        // Hide loading, show content
+        document.getElementById('pairing-step2-loading').style.display = 'none';
+        document.getElementById('pairing-step2-content').style.display = 'block';
+
+    } catch (error) {
+        console.error('Pairing API error:', error);
+        goToStep(1, true);
+        showStep1Error('Failed to connect. Please try again.');
+    }
+}
+
+// Show error in step 1
+function showStep1Error(message) {
+    const errorEl = document.getElementById('pairing-step1-error');
+    document.getElementById('pairing-step1-error-message').textContent = message;
+    errorEl.style.display = 'block';
+    announceToScreenReader('Error: ' + message);
+}
+
+// Call the pairing API
+async function callPairApi(name, mode) {
+    const response = await fetch(PAIRING_API, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            name: name,
+            mode: mode
+        })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        return { error: data.error || 'Failed to create pairing' };
+    }
+
+    return data;
+}
+
+// Handle Step 2 confirmation (user scanned the QR code)
+function handleStep2Confirm() {
+    // Move to success step
+    goToStep(3);
+
+    // Populate success summary
+    document.getElementById('pairing-success-device-name').textContent = pairingState.deviceName;
+
+    const badge = document.getElementById('pairing-success-device-badge');
+    if (pairingState.accessMode === 'full') {
+        badge.textContent = 'Full Access';
+        badge.className = 'success-device-badge full';
+    } else {
+        badge.textContent = 'Read Only';
+        badge.className = 'success-device-badge readonly';
+    }
+
+    announceToScreenReader(`Device ${pairingState.deviceName} paired successfully with ${pairingState.accessMode === 'full' ? 'full access' : 'read only'} mode.`);
+}
+
+// Handle "Pair Another" button
+function handlePairAnother() {
+    pairingState.deviceName = '';
+    pairingState.accessMode = 'full';
+    pairingState.qrSvg = '';
+    pairingState.deviceId = '';
+    pairingState.error = null;
+
+    document.getElementById('pairing-device-name').value = '';
+    document.querySelector('input[name="access-mode"][value="full"]').checked = true;
+    document.getElementById('pairing-step1-error').style.display = 'none';
+
+    goToStep(1, true);
+}
+
+// Handle retry from error state
+function handleRetry() {
+    goToStep(1, true);
+}
+
+// Announce to screen readers
+function announceToScreenReader(message) {
+    const statusEl = document.getElementById('pairing-status');
+    if (statusEl) {
+        statusEl.textContent = message;
+    }
+}
+
+// Keyboard event handler for pairing modal
+document.addEventListener('keydown', function(e) {
+    const overlay = document.getElementById('pairing-modal-overlay');
+    if (!overlay.classList.contains('show')) return;
+
+    // Escape closes modal
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        closePairingModal();
+        return;
+    }
+
+    // Tab focus trap
+    if (e.key === 'Tab') {
+        const modal = overlay.querySelector('.pairing-modal');
+        const focusableElements = modal.querySelectorAll(
+            'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"]), a[href]'
+        );
+
+        if (focusableElements.length === 0) return;
+
+        const firstFocusable = focusableElements[0];
+        const lastFocusable = focusableElements[focusableElements.length - 1];
+
+        if (e.shiftKey) {
+            if (document.activeElement === firstFocusable) {
+                e.preventDefault();
+                lastFocusable.focus();
+            }
+        } else {
+            if (document.activeElement === lastFocusable) {
+                e.preventDefault();
+                firstFocusable.focus();
+            }
+        }
+    }
+
+    // Enter submits form in step 1
+    if (e.key === 'Enter' && pairingState.currentStep === 1) {
+        const activeElement = document.activeElement;
+        if (activeElement && activeElement.id === 'pairing-device-name') {
+            e.preventDefault();
+            handleStep1Submit();
+        }
+    }
+});
+
+// Clear step 1 error when user starts typing
+document.addEventListener('DOMContentLoaded', function() {
+    const nameInput = document.getElementById('pairing-device-name');
+    if (nameInput) {
+        nameInput.addEventListener('input', function() {
+            document.getElementById('pairing-step1-error').style.display = 'none';
+        });
+    }
+});
+</script>
 
 {% endblock %}

@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-adapters"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-backtest"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-core"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-i18n"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "fluent",
  "fluent-bundle",
@@ -1290,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-integration-tests"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1307,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-main"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "bevy_app",
@@ -1335,8 +1335,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxion-mobile-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fluxion-plugins"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1352,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-server"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "askama",
@@ -1373,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-shared"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "chrono",
  "serde",
@@ -1381,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-strategy-simulator"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1401,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-types"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "bevy_ecs",
@@ -1412,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "fluxion-web"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "askama",
  "axum",
@@ -1423,6 +1432,7 @@ dependencies = [
  "fluxion-backtest",
  "fluxion-core",
  "fluxion-i18n",
+ "fluxion-mobile-types",
  "fluxion-plugins",
  "fluxion-strategy-simulator",
  "fluxion-types",
@@ -3085,7 +3095,7 @@ dependencies = [
 
 [[package]]
 name = "solax-csv-importer"
-version = "0.2.36"
+version = "0.2.37"
 dependencies = [
  "anyhow",
  "chrono",

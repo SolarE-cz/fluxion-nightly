@@ -16,7 +16,7 @@ use rusqlite::params;
 use std::path::Path;
 use std::sync::Mutex;
 
-use fluxion_shared::telemetry::TelemetrySnapshot;
+use fluxion_shared::telemetry::{ScheduleTelemetry, SocPredictionPoint, TelemetrySnapshot};
 
 #[derive(Debug)]
 pub struct Database {
@@ -40,6 +40,7 @@ pub struct ClientRecord {
 }
 
 impl Database {
+    #[expect(clippy::too_many_lines, reason = "schema initialization with migrations")]
     pub fn open(path: &str) -> Result<Self> {
         if let Some(parent) = Path::new(path).parent()
             && !parent.as_os_str().is_empty()
@@ -96,7 +97,43 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_telemetry_instance_time
-                ON telemetry_snapshots(instance_id, timestamp DESC);",
+                ON telemetry_snapshots(instance_id, timestamp DESC);
+
+            CREATE TABLE IF NOT EXISTS schedule_blocks (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id       TEXT NOT NULL,
+                snapshot_id       INTEGER NOT NULL,
+                block_ts          TEXT NOT NULL,
+                price_czk         REAL,
+                operation         TEXT,
+                target_soc        REAL,
+                strategy          TEXT,
+                expected_profit   REAL,
+                reason            TEXT,
+                is_historical     BOOLEAN,
+                FOREIGN KEY (instance_id) REFERENCES clients(instance_id),
+                FOREIGN KEY (snapshot_id) REFERENCES telemetry_snapshots(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schedule_blocks_instance_ts
+                ON schedule_blocks(instance_id, block_ts);
+            CREATE INDEX IF NOT EXISTS idx_schedule_blocks_strategy
+                ON schedule_blocks(strategy);
+            CREATE INDEX IF NOT EXISTS idx_schedule_blocks_snapshot
+                ON schedule_blocks(snapshot_id);
+
+            CREATE TABLE IF NOT EXISTS soc_predictions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id       TEXT NOT NULL,
+                snapshot_id       INTEGER NOT NULL,
+                prediction_ts     TEXT NOT NULL,
+                predicted_soc     REAL NOT NULL,
+                FOREIGN KEY (instance_id) REFERENCES clients(instance_id),
+                FOREIGN KEY (snapshot_id) REFERENCES telemetry_snapshots(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_soc_predictions_instance_ts
+                ON soc_predictions(instance_id, prediction_ts);",
         )
         .context("Failed to initialize database schema")?;
 
@@ -111,6 +148,22 @@ impl Database {
         for col_def in &migration_columns {
             let sql = format!("ALTER TABLE clients ADD COLUMN {col_def}");
             // Ignore "duplicate column" errors — column already exists
+            let _ = conn.execute_batch(&sql);
+        }
+
+        // Migrate telemetry_snapshots: add schedule/price/consumption columns
+        let telemetry_columns = [
+            "total_expected_profit REAL",
+            "schedule_blocks_count INTEGER",
+            "price_min REAL",
+            "price_max REAL",
+            "price_avg REAL",
+            "consumption_ema_kwh REAL",
+            "solar_forecast_today_kwh REAL",
+            "solar_actual_today_kwh REAL",
+        ];
+        for col_def in &telemetry_columns {
+            let sql = format!("ALTER TABLE telemetry_snapshots ADD COLUMN {col_def}");
             let _ = conn.execute_batch(&sql);
         }
 
@@ -231,7 +284,7 @@ impl Database {
         &self,
         instance_id: &str,
         snapshot: &TelemetrySnapshot,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let timestamp = snapshot.collected_at.to_rfc3339();
         let snapshot_json = serde_json::to_string(snapshot)?;
@@ -245,13 +298,29 @@ impl Database {
         let current_mode = Some(&snapshot.instance.current_mode);
         let current_strategy = snapshot.instance.current_strategy.as_deref();
 
+        // Extract schedule/price/consumption columns
+        let total_expected_profit = snapshot
+            .schedule
+            .as_ref()
+            .and_then(|s| s.total_expected_profit);
+        let schedule_blocks_count = snapshot
+            .schedule
+            .as_ref()
+            .map(|s| i64::try_from(s.total_blocks).unwrap_or(i64::MAX));
+        let price_min = snapshot.schedule.as_ref().map(|s| s.price_min);
+        let price_max = snapshot.schedule.as_ref().map(|s| s.price_max);
+        let price_avg = snapshot.schedule.as_ref().map(|s| s.price_avg);
+        let consumption_ema_kwh = snapshot.instance.consumption_ema_kwh;
+        let solar_forecast_today_kwh = Some(snapshot.instance.solar_forecast_total_today_kwh);
+        let solar_actual_today_kwh = snapshot.instance.solar_forecast_actual_today_kwh;
+
         conn.execute(
-            "INSERT INTO telemetry_snapshots (instance_id, timestamp, battery_soc, grid_import_today_kwh, grid_export_today_kwh, today_solar_energy_kwh, current_mode, current_strategy, snapshot_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![instance_id, timestamp, battery_soc, grid_import, grid_export, solar, current_mode, current_strategy, snapshot_json],
+            "INSERT INTO telemetry_snapshots (instance_id, timestamp, battery_soc, grid_import_today_kwh, grid_export_today_kwh, today_solar_energy_kwh, current_mode, current_strategy, snapshot_json, total_expected_profit, schedule_blocks_count, price_min, price_max, price_avg, consumption_ema_kwh, solar_forecast_today_kwh, solar_actual_today_kwh)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![instance_id, timestamp, battery_soc, grid_import, grid_export, solar, current_mode, current_strategy, snapshot_json, total_expected_profit, schedule_blocks_count, price_min, price_max, price_avg, consumption_ema_kwh, solar_forecast_today_kwh, solar_actual_today_kwh],
         )?;
 
-        Ok(())
+        Ok(conn.last_insert_rowid())
     }
 
     pub fn update_latest_telemetry(&self, instance_id: &str, json: &str) -> Result<()> {
@@ -308,5 +377,81 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    pub fn insert_schedule_blocks(
+        &self,
+        instance_id: &str,
+        snapshot_id: i64,
+        schedule: &ScheduleTelemetry,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn.prepare(
+            "INSERT INTO schedule_blocks (instance_id, snapshot_id, block_ts, price_czk, operation, target_soc, strategy, expected_profit, reason, is_historical)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+
+        for block in &schedule.blocks {
+            stmt.execute(params![
+                instance_id,
+                snapshot_id,
+                block.timestamp.to_rfc3339(),
+                block.price_czk,
+                block.operation,
+                block.target_soc,
+                block.strategy,
+                block.expected_profit,
+                block.reason,
+                block.is_historical,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn insert_soc_predictions(
+        &self,
+        instance_id: &str,
+        snapshot_id: i64,
+        predictions: &[SocPredictionPoint],
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn.prepare(
+            "INSERT INTO soc_predictions (instance_id, snapshot_id, prediction_ts, predicted_soc)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+
+        for pred in predictions {
+            stmt.execute(params![
+                instance_id,
+                snapshot_id,
+                pred.timestamp.to_rfc3339(),
+                pred.predicted_soc,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn cleanup_old_schedule_blocks(&self, retention_days: u32) -> Result<u64> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let cutoff_str = cutoff.to_rfc3339();
+        let deleted = conn.execute(
+            "DELETE FROM schedule_blocks WHERE block_ts < ?1",
+            params![cutoff_str],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    pub fn cleanup_old_soc_predictions(&self, retention_days: u32) -> Result<u64> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
+        let cutoff_str = cutoff.to_rfc3339();
+        let deleted = conn.execute(
+            "DELETE FROM soc_predictions WHERE prediction_ts < ?1",
+            params![cutoff_str],
+        )?;
+        Ok(deleted as u64)
     }
 }

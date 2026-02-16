@@ -23,6 +23,8 @@ use chrono::Utc;
 use serde::Serialize;
 use tauri::State;
 
+use fluxion_mobile_types::{MobileControlResponse, VersionResponse};
+
 use crate::credentials::{parse_qr_payload, save_connection, save_settings};
 use crate::state::AppState;
 
@@ -188,11 +190,13 @@ pub async fn save_controls(
 
     match tor.post("/mobile/api/control", &controls_json).await {
         Ok(response_body) => {
+            // Typed validation — ensures server response matches shared contract
+            let parsed = serde_json::from_str::<MobileControlResponse>(&response_body).ok();
             let _ = state.cache.store_data(&response_body, Utc::now());
             Ok(SaveResponse {
-                ok: true,
+                ok: parsed.as_ref().map_or(true, |p| p.ok),
                 updated_state: Some(response_body),
-                error: None,
+                error: parsed.and_then(|p| p.error),
             })
         }
         Err(e) => Ok(SaveResponse {
@@ -227,13 +231,9 @@ pub async fn check_ui_update(state: State<'_, AppState>) -> Result<UiUpdateResul
 
     // Fetch server version
     let server_version = match tor.get("/mobile/api/version").await {
-        Ok(body) => {
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&body);
-            match parsed {
-                Ok(v) => v["version"].as_str().map(|s| s.to_owned()),
-                Err(_) => None,
-            }
-        }
+        Ok(body) => serde_json::from_str::<VersionResponse>(&body)
+            .ok()
+            .map(|v| v.version),
         Err(e) => {
             tracing::warn!("Failed to check UI version: {e}");
             return Ok(UiUpdateResult {

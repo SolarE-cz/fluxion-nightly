@@ -98,11 +98,33 @@ pub async fn heartbeat_handler(
 
     // Store telemetry snapshot if present
     if let Some(ref snapshot) = request.telemetry {
-        if let Err(e) = state
+        match state
             .db
             .insert_telemetry_snapshot(&request.instance_id, snapshot)
         {
-            warn!(error = %e, "Failed to insert telemetry snapshot");
+            Ok(snapshot_id) => {
+                if let Some(ref schedule) = snapshot.schedule
+                    && let Err(e) = state.db.insert_schedule_blocks(
+                        &request.instance_id,
+                        snapshot_id,
+                        schedule,
+                    )
+                {
+                    warn!(error = %e, "Failed to insert schedule blocks");
+                }
+                if let Some(ref predictions) = snapshot.soc_predictions
+                    && let Err(e) = state.db.insert_soc_predictions(
+                        &request.instance_id,
+                        snapshot_id,
+                        predictions,
+                    )
+                {
+                    warn!(error = %e, "Failed to insert SOC predictions");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to insert telemetry snapshot");
+            }
         }
         if let Ok(json) = serde_json::to_string(snapshot)
             && let Err(e) = state

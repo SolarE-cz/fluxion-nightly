@@ -19,6 +19,7 @@
 //! the credential store holds only connection secrets.
 
 use chrono::{DateTime, Utc};
+use fluxion_mobile_types::QrPayload;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -60,38 +61,18 @@ impl Default for AppSettings {
 
 /// Parse a QR code payload into a StoredConnection.
 pub fn parse_qr_payload(payload: &str) -> Result<StoredConnection, String> {
-    let json: serde_json::Value =
+    let qr: QrPayload =
         serde_json::from_str(payload).map_err(|e| format!("Invalid QR payload: {e}"))?;
 
-    let version = json["v"]
-        .as_i64()
-        .ok_or("Missing 'v' field in QR payload")?;
-    if version != 1 {
-        return Err(format!("Unsupported QR protocol version: {version}"));
+    if qr.v != fluxion_mobile_types::API_VERSION {
+        return Err(format!("Unsupported QR protocol version: {}", qr.v));
     }
 
-    let onion_address = json["onion"]
-        .as_str()
-        .ok_or("Missing 'onion' field")?
-        .to_owned();
-
-    let client_auth_key_b64 = json["key"]
-        .as_str()
-        .ok_or("Missing 'key' field")?
-        .to_owned();
-
-    let instance_name = json["name"]
-        .as_str()
-        .ok_or("Missing 'name' field")?
-        .to_owned();
-
-    let access_mode = json["mode"].as_str().unwrap_or("full").to_owned();
-
     Ok(StoredConnection {
-        onion_address,
-        client_auth_key_b64,
-        instance_name,
-        access_mode,
+        onion_address: qr.onion,
+        client_auth_key_b64: qr.key,
+        instance_name: qr.name,
+        access_mode: qr.mode,
         added_at: Utc::now(),
     })
 }

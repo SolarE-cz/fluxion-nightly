@@ -689,6 +689,19 @@
               fi
               echo ""
 
+              # Check that CHANGELOG.md contains the current version
+              echo "📓 Changelog check:"
+              cd - >/dev/null
+              CARGO_VERSION=$(grep -m1 '^version = ' fluxion/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+              if grep -q "\[$CARGO_VERSION\]" fluxion/CHANGELOG.md 2>/dev/null; then
+                echo "✅ CHANGELOG.md contains entry for v$CARGO_VERSION"
+              else
+                echo "❌ CHANGELOG.md is missing an entry for v$CARGO_VERSION!"
+                echo "   Add a ## [$CARGO_VERSION] section to fluxion/CHANGELOG.md before publishing."
+                exit 1
+              fi
+              echo ""
+
               echo "✅ Dry-run complete. Files listed above would be published."
             '');
           };

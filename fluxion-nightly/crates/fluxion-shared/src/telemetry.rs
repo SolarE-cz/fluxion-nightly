@@ -19,6 +19,10 @@ pub struct TelemetrySnapshot {
     pub collected_at: DateTime<Utc>,
     pub inverters: Vec<InverterTelemetry>,
     pub instance: InstanceTelemetry,
+    #[serde(default)]
+    pub schedule: Option<ScheduleTelemetry>,
+    #[serde(default)]
+    pub soc_predictions: Option<Vec<SocPredictionPoint>>,
 }
 
 /// Per-inverter cumulative/status data (no instantaneous power readings).
@@ -73,6 +77,47 @@ pub struct InstanceTelemetry {
     pub hdo_low_tariff_periods: Vec<(String, String)>,
     pub hdo_low_tariff_czk: f32,
     pub hdo_high_tariff_czk: f32,
+}
+
+/// Schedule block telemetry — captures every strategy decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleBlockTelemetry {
+    pub timestamp: DateTime<Utc>,
+    pub price_czk: f32,
+    pub operation: String,
+    pub target_soc: Option<f32>,
+    pub strategy: Option<String>,
+    pub expected_profit: Option<f32>,
+    pub reason: Option<String>,
+    pub is_historical: bool,
+}
+
+/// Full schedule snapshot included in telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleTelemetry {
+    pub generated_at: DateTime<Utc>,
+    pub total_blocks: usize,
+    pub total_expected_profit: Option<f32>,
+    pub blocks: Vec<ScheduleBlockTelemetry>,
+    // Price statistics
+    pub price_min: f32,
+    pub price_max: f32,
+    pub price_avg: f32,
+    pub today_price_min: f32,
+    pub today_price_max: f32,
+    pub today_price_avg: f32,
+    pub today_price_median: f32,
+    pub tomorrow_price_min: Option<f32>,
+    pub tomorrow_price_max: Option<f32>,
+    pub tomorrow_price_avg: Option<f32>,
+    pub tomorrow_price_median: Option<f32>,
+}
+
+/// SOC prediction point for tracking prediction accuracy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocPredictionPoint {
+    pub timestamp: DateTime<Utc>,
+    pub predicted_soc: f32,
 }
 
 /// One-time sync data (sent at client startup, stored on clients table).

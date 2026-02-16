@@ -11,6 +11,7 @@ fluxion-i18n = { path = "../fluxion-i18n" }
 fluxion-plugins = { path = "../fluxion-plugins" }
 fluxion-strategy-simulator = { path = "../fluxion-strategy-simulator" }
 fluxion-types = { path = "../fluxion-types" }
+fluxion-mobile-types = { path = "../fluxion-mobile-types" }
 uuid = { version = "1.0", features = ["v4", "serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base32 = "0.5"

@@ -17,6 +17,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{delete, get, post},
 };
+use fluxion_mobile_types::QrPayload;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -139,14 +140,14 @@ async fn pair_handler(
         .read_onion_address()
         .unwrap_or_default();
 
-    let qr_payload = serde_json::json!({
-        "v": 1,
-        "onion": onion_address,
-        "key": privkey_b64,
-        "name": state.instance_name,
-        "mode": entry.access_mode,
+    let qr_payload = serde_json::to_string(&QrPayload {
+        v: fluxion_mobile_types::API_VERSION,
+        onion: onion_address,
+        key: privkey_b64,
+        name: state.instance_name.clone(),
+        mode: entry.access_mode.clone(),
     })
-    .to_string();
+    .expect("QrPayload serialization cannot fail");
 
     // Generate QR code SVG
     let qr_svg = render_qr_svg(&qr_payload);
@@ -282,14 +283,14 @@ mod tests {
 
     #[test]
     fn test_qr_payload_format() {
-        let payload = serde_json::json!({
-            "v": 1,
-            "onion": "xyz.onion",
-            "key": "base64key==",
-            "name": "FluxION Home",
-            "mode": "full",
-        });
-        let s = payload.to_string();
+        let payload = QrPayload {
+            v: fluxion_mobile_types::API_VERSION,
+            onion: "xyz.onion".to_owned(),
+            key: "base64key==".to_owned(),
+            name: "FluxION Home".to_owned(),
+            mode: "full".to_owned(),
+        };
+        let s = serde_json::to_string(&payload).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["v"], 1);
         assert_eq!(parsed["mode"], "full");

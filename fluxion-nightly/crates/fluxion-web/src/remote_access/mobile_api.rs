@@ -22,7 +22,11 @@ use fluxion_core::{
     UserControlChangeType, UserControlPersistence, UserControlUpdateEvent, WebQuerySender,
 };
 use fluxion_i18n::I18n;
-use serde::{Deserialize, Serialize};
+use fluxion_mobile_types::{
+    MobileChartPoint, MobileControlRequest, MobileControlResponse, MobileStateResponse,
+    MobileTimeSlot, MobileUserControl, VersionResponse, API_VERSION,
+};
+use serde::Deserialize;
 use std::sync::Arc;
 use tracing::error;
 
@@ -44,76 +48,6 @@ pub struct MobileApiState {
 struct UiBundleQuery {
     #[serde(default)]
     initial: Option<u8>,
-}
-
-// ==================== State response ====================
-
-#[derive(Serialize)]
-struct MobileStateResponse {
-    ui_version: String,
-    api_version: u8,
-    battery_soc: f32,
-    mode: String,
-    mode_reason: String,
-    solar_w: f32,
-    grid_w: f32,
-    load_w: f32,
-    battery_w: f32,
-    current_price: Option<f32>,
-    currency: String,
-    user_control: MobileUserControl,
-    chart_data: Vec<MobileChartPoint>,
-    access_mode: String,
-    timestamp: String,
-}
-
-#[derive(Serialize)]
-struct MobileUserControl {
-    charge_from_grid_enabled: bool,
-    forced_mode: Option<String>,
-    fixed_time_slots: Vec<MobileTimeSlot>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct MobileTimeSlot {
-    id: String,
-    start: String,
-    end: String,
-    mode: String,
-}
-
-#[derive(Serialize)]
-struct MobileChartPoint {
-    time: String,
-    price: f32,
-    mode: String,
-}
-
-// ==================== Version response ====================
-
-#[derive(Serialize)]
-struct VersionResponse {
-    version: String,
-}
-
-// ==================== Control request/response ====================
-
-#[derive(Deserialize)]
-struct MobileControlRequest {
-    charge_from_grid_enabled: Option<bool>,
-    forced_mode: Option<String>,
-    #[serde(default)]
-    fixed_time_slots: Option<Vec<MobileTimeSlot>>,
-}
-
-#[derive(Serialize)]
-struct MobileControlResponse {
-    ok: bool,
-    applied_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<MobileStateResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
 }
 
 // ==================== Handlers ====================
@@ -385,7 +319,7 @@ async fn build_state_response(state: &MobileApiState) -> Result<MobileStateRespo
 
     Ok(MobileStateResponse {
         ui_version: state.ui_version.clone(),
-        api_version: 1,
+        api_version: API_VERSION,
         battery_soc,
         mode,
         mode_reason,
@@ -471,7 +405,7 @@ mod tests {
     fn test_state_response_serialization() {
         let response = MobileStateResponse {
             ui_version: "0.2.35".to_owned(),
-            api_version: 1,
+            api_version: API_VERSION,
             battery_soc: 72.5,
             mode: "SelfUse".to_owned(),
             mode_reason: "Solar covers load".to_owned(),

@@ -30,7 +30,7 @@ use fluxion_core::{
     plugin_adapters::create_plugin_manager,
 };
 use fluxion_i18n::I18n;
-use fluxion_web::{PluginApiState, UserControlApiState};
+use fluxion_web::{PluginApiState, RemoteAccessApiState, UserControlApiState};
 use parking_lot::RwLock;
 
 fn main() -> Result<()> {
@@ -286,6 +286,11 @@ fn initialize_and_run() -> Result<()> {
     });
     let config_sender_for_web = config_update_sender.clone();
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
+    let remote_access_state = RemoteAccessApiState::new(
+        std::path::Path::new("./data"),
+        8099,
+        "FluxION".to_string(),
+    );
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -297,7 +302,7 @@ fn initialize_and_run() -> Result<()> {
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
             Some(user_control_api_state), // User control API state
-            None, // Remote access
+            Some(remote_access_state), // Remote access pairing API
         )
         .await
         {
