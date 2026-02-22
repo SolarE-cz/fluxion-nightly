@@ -39,9 +39,12 @@ impl VendorEntityMapper for SolaxEntityMapper {
         // Map generic mode to Solax charger mode enum, then get discriminant
         let charger_mode = match mode {
             InverterOperationMode::SelfUse => SolaxChargerUseMode::SelfUseMode,
-            // BackUpMode uses Manual Mode + Stop Charge and Discharge
+            // BackUpMode maps to native Solax Back Up Mode (value 2)
+            // The inverter will charge the battery and hold it ready for blackouts
+            InverterOperationMode::BackUpMode => SolaxChargerUseMode::BackUpMode,
+            // NoChargeNoDischarge uses Manual Mode + Stop Charge and Discharge
             // This prevents battery discharge and allows PV surplus to charge battery
-            InverterOperationMode::BackUpMode => SolaxChargerUseMode::ManualMode,
+            InverterOperationMode::NoChargeNoDischarge => SolaxChargerUseMode::ManualMode,
             // Both ForceCharge and ForceDischarge use ManualMode
             // The manual_mode_select entity differentiates between them
             InverterOperationMode::ForceCharge => SolaxChargerUseMode::ManualMode,
@@ -56,11 +59,9 @@ impl VendorEntityMapper for SolaxEntityMapper {
 
         match charger_mode {
             SolaxChargerUseMode::SelfUseMode => Some(InverterOperationMode::SelfUse),
-            // When reading: Map Solax BackUpMode to generic BackUpMode for display
-            // Note: When writing, we use Manual Mode + Stop Charge and Discharge instead
-            // because Solax's BackUpMode charges from grid (which we don't want)
+            // Native Solax BackUpMode (value 2) maps directly to generic BackUpMode
             SolaxChargerUseMode::BackUpMode => Some(InverterOperationMode::BackUpMode),
-            // ManualMode can be either BackUpMode (stop charge/discharge), ForceCharge or ForceDischarge
+            // ManualMode can be NoChargeNoDischarge (stop charge/discharge), ForceCharge or ForceDischarge
             // Future: Read manual_mode_select entity to determine actual mode
             // Current behavior: Default to ForceCharge (safe assumption for most cases)
             // Improvement would require reading select.{inverter_id}_manual_mode_select
@@ -83,51 +84,57 @@ impl VendorEntityMapper for SolaxEntityMapper {
         inverter_id: &str,
         mode: InverterOperationMode,
     ) -> ModeChangeRequest {
-        // Solax requires changing TWO entities in sequence:
-        // 1. charger_use_mode (primary mode)
-        // 2. manual_mode_select (force charge/discharge control)
+        // Solax mode changes may require one or two entity changes:
+        // 1. charger_use_mode (primary mode) - always required
+        // 2. manual_mode_select (force charge/discharge control) - only for ManualMode
 
         // Step 1: Map to charger_use_mode
         let charger_mode = match mode {
             InverterOperationMode::SelfUse => SolaxChargerUseMode::SelfUseMode,
-            // BackUpMode uses Manual Mode to prevent battery discharge
-            // but allow PV surplus to charge battery
-            InverterOperationMode::BackUpMode => SolaxChargerUseMode::ManualMode,
+            // BackUpMode maps to native Solax Back Up Mode (value 2)
+            InverterOperationMode::BackUpMode => SolaxChargerUseMode::BackUpMode,
+            // NoChargeNoDischarge uses Manual Mode + Stop Charge and Discharge
+            InverterOperationMode::NoChargeNoDischarge => SolaxChargerUseMode::ManualMode,
             // Both ForceCharge and ForceDischarge use ManualMode
             InverterOperationMode::ForceCharge => SolaxChargerUseMode::ManualMode,
             InverterOperationMode::ForceDischarge => SolaxChargerUseMode::ManualMode,
         };
 
-        // Step 2: Map to manual_mode_select
+        // Step 2: Map to manual_mode_select (only needed for ManualMode-based modes)
         let manual_mode = match mode {
-            InverterOperationMode::SelfUse => SolaxManualMode::StopChargeAndDischarge,
-            // BackUpMode: Stop Charge and Discharge = don't discharge battery, use grid
+            // NoChargeNoDischarge: Stop Charge and Discharge = don't discharge battery, use grid
             // PV surplus will still charge battery for later use
-            InverterOperationMode::BackUpMode => SolaxManualMode::StopChargeAndDischarge,
-            InverterOperationMode::ForceCharge => SolaxManualMode::ForceCharge,
-            InverterOperationMode::ForceDischarge => SolaxManualMode::ForceDischarge,
+            InverterOperationMode::NoChargeNoDischarge => {
+                Some(SolaxManualMode::StopChargeAndDischarge)
+            }
+            InverterOperationMode::ForceCharge => Some(SolaxManualMode::ForceCharge),
+            InverterOperationMode::ForceDischarge => Some(SolaxManualMode::ForceDischarge),
+            // SelfUse and BackUpMode don't use ManualMode, no manual_mode_select needed
+            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => None,
         };
 
-        // Use serde to serialize enums to their string values
+        // Build entity changes
         let charger_option = serde_json::to_value(charger_mode)
             .and_then(serde_json::from_value)
             .expect("Failed to serialize charger mode");
-        let manual_option = serde_json::to_value(manual_mode)
-            .and_then(serde_json::from_value)
-            .expect("Failed to serialize manual mode");
 
-        ModeChangeRequest {
-            entity_changes: vec![
-                EntityChange {
-                    entity_id: format!("select.{inverter_id}_charger_use_mode"),
-                    option: charger_option,
-                },
-                EntityChange {
-                    entity_id: format!("select.{inverter_id}_manual_mode_select"),
-                    option: manual_option,
-                },
-            ],
+        let mut entity_changes = vec![EntityChange {
+            entity_id: format!("select.{inverter_id}_charger_use_mode"),
+            option: charger_option,
+        }];
+
+        // Only add manual_mode_select when the mode requires it
+        if let Some(manual) = manual_mode {
+            let manual_option = serde_json::to_value(manual)
+                .and_then(serde_json::from_value)
+                .expect("Failed to serialize manual mode");
+            entity_changes.push(EntityChange {
+                entity_id: format!("select.{inverter_id}_manual_mode_select"),
+                option: manual_option,
+            });
         }
+
+        ModeChangeRequest { entity_changes }
     }
 
     fn get_battery_soc_entity(&self, inverter_id: &str) -> String {
@@ -634,7 +641,16 @@ mod tests {
         let mapper = SolaxEntityMapper::new();
 
         assert_eq!(mapper.map_mode_to_vendor(InverterOperationMode::SelfUse), 0);
-        // Both ForceCharge and ForceDischarge map to ManualMode (3)
+        // BackUpMode maps to native Solax BackUpMode (2)
+        assert_eq!(
+            mapper.map_mode_to_vendor(InverterOperationMode::BackUpMode),
+            2
+        );
+        // NoChargeNoDischarge, ForceCharge, and ForceDischarge all map to ManualMode (3)
+        assert_eq!(
+            mapper.map_mode_to_vendor(InverterOperationMode::NoChargeNoDischarge),
+            3
+        );
         assert_eq!(
             mapper.map_mode_to_vendor(InverterOperationMode::ForceCharge),
             3
@@ -661,11 +677,11 @@ mod tests {
         );
         // Other modes not mapped
         assert_eq!(mapper.map_mode_from_vendor(1), None); // FeedinPriority
-        // BackUpMode (2) is not mapped because Solax BackUpMode charges from grid (not what we want)
+        // BackUpMode (2) maps directly to generic BackUpMode
         assert_eq!(
             mapper.map_mode_from_vendor(2),
             Some(InverterOperationMode::BackUpMode)
-        ); // BackUpMode
+        );
         assert_eq!(mapper.map_mode_from_vendor(99), None); // Invalid mode
     }
 
@@ -679,6 +695,14 @@ mod tests {
         assert_eq!(
             mapper.map_mode_from_vendor(vendor_mode),
             Some(InverterOperationMode::SelfUse)
+        );
+
+        // BackUpMode round-trips correctly via native BackUpMode (2)
+        let vendor_mode = mapper.map_mode_to_vendor(InverterOperationMode::BackUpMode);
+        assert_eq!(vendor_mode, 2);
+        assert_eq!(
+            mapper.map_mode_from_vendor(vendor_mode),
+            Some(InverterOperationMode::BackUpMode)
         );
 
         // ForceCharge maps to ManualMode (3) and back to ForceCharge
@@ -696,6 +720,15 @@ mod tests {
         assert_eq!(
             mapper.map_mode_from_vendor(vendor_mode),
             Some(InverterOperationMode::ForceCharge) // Not ForceDischarge!
+        );
+
+        // NoChargeNoDischarge maps to ManualMode (3) but maps back to ForceCharge
+        // (the manual_mode_select entity differentiates them)
+        let vendor_mode = mapper.map_mode_to_vendor(InverterOperationMode::NoChargeNoDischarge);
+        assert_eq!(vendor_mode, 3);
+        assert_eq!(
+            mapper.map_mode_from_vendor(vendor_mode),
+            Some(InverterOperationMode::ForceCharge) // Not NoChargeNoDischarge!
         );
     }
 
@@ -727,6 +760,57 @@ mod tests {
             mapper.get_export_limit_entity("my_solax"),
             "number.my_solax_export_control_user_limit"
         );
+    }
+
+    #[test]
+    fn test_solax_backup_mode_change_request() {
+        let mapper = SolaxEntityMapper::new();
+
+        // BackUpMode should only send charger_use_mode (native Back Up Mode, no manual_mode_select)
+        let request = mapper.get_mode_change_request("my_solax", InverterOperationMode::BackUpMode);
+        assert_eq!(request.entity_changes.len(), 1);
+        assert_eq!(
+            request.entity_changes[0].entity_id,
+            "select.my_solax_charger_use_mode"
+        );
+        assert_eq!(request.entity_changes[0].option, "Back Up Mode");
+    }
+
+    #[test]
+    fn test_solax_no_charge_no_discharge_mode_change_request() {
+        let mapper = SolaxEntityMapper::new();
+
+        // NoChargeNoDischarge sends both: ManualMode + StopChargeAndDischarge
+        let request =
+            mapper.get_mode_change_request("my_solax", InverterOperationMode::NoChargeNoDischarge);
+        assert_eq!(request.entity_changes.len(), 2);
+        assert_eq!(
+            request.entity_changes[0].entity_id,
+            "select.my_solax_charger_use_mode"
+        );
+        assert_eq!(request.entity_changes[0].option, "Manual Mode");
+        assert_eq!(
+            request.entity_changes[1].entity_id,
+            "select.my_solax_manual_mode_select"
+        );
+        assert_eq!(
+            request.entity_changes[1].option,
+            "Stop Charge and Discharge"
+        );
+    }
+
+    #[test]
+    fn test_solax_self_use_mode_change_request() {
+        let mapper = SolaxEntityMapper::new();
+
+        // SelfUse should only send charger_use_mode (no manual_mode_select needed)
+        let request = mapper.get_mode_change_request("my_solax", InverterOperationMode::SelfUse);
+        assert_eq!(request.entity_changes.len(), 1);
+        assert_eq!(
+            request.entity_changes[0].entity_id,
+            "select.my_solax_charger_use_mode"
+        );
+        assert_eq!(request.entity_changes[0].option, "Self Use Mode");
     }
 
     #[test]

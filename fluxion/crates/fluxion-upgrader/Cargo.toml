@@ -1,0 +1,35 @@
+[package]
+name = "fluxion-upgrader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fluxion-upgrader"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# SHA256 checksums
+sha2 = "0.10"
+
+# Signal handling
+nix = { version = "0.29", features = ["signal", "process"] }
+
+# Async streaming
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mockito = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

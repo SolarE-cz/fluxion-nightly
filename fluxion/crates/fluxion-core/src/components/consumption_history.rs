@@ -178,8 +178,12 @@ impl ConsumptionHistory {
 
         let num_days = self.daily_summaries.len();
         // With only daily totals, distribute consumption uniformly across hours
-        let total_daily_avg: f32 =
-            self.daily_summaries.iter().map(|s| s.consumption_kwh).sum::<f32>() / num_days as f32;
+        let total_daily_avg: f32 = self
+            .daily_summaries
+            .iter()
+            .map(|s| s.consumption_kwh)
+            .sum::<f32>()
+            / num_days as f32;
         let hourly_avg = total_daily_avg / 24.0;
 
         self.hourly_profile = Some(HourlyConsumptionProfile {

@@ -18,7 +18,6 @@
 //!
 //! - **PluginManager**: Coordinates strategy plugins and merges their decisions
 //! - **Protocol Types**: JSON-serializable types for plugin communication
-//! - **Built-in Adapters**: Wrappers for Rust-native strategies
 //!
 //! ## Plugin Interface
 //!
@@ -27,17 +26,9 @@
 //! - `priority()`: Decision priority (0-100)
 //! - `is_enabled()`: Whether the plugin is active
 //! - `evaluate()`: Returns a `BlockDecision` for a given context
-//!
-//! ## External Plugins
-//!
-//! External plugins (Python, Go, etc.) communicate via HTTP/REST:
-//! - POST to plugin's callback URL with `EvaluationRequest`
-//! - Receive `BlockDecision` response
 
-pub mod builtin;
 pub mod manager;
 pub mod protocol;
 
-pub use builtin::*;
 pub use manager::{Plugin, PluginManager};
 pub use protocol::*;

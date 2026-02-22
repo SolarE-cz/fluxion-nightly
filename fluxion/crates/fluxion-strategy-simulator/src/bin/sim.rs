@@ -15,10 +15,12 @@ use fluxion_strategy_simulator::{
     price_scenarios::PriceScenario,
     simulation_engine::SimulationEngine,
     state::SimulationConfig,
-    strategies::StrategySelection,
+    strategies::{StrategyRegistry, StrategySelection},
     synthetic_data::{ConsumptionProfile, SolarProfile, SyntheticDayConfig},
 };
+use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -51,10 +53,13 @@ fn run_command(args: RunArgs) -> Result<()> {
             .map(|s| {
                 let trimmed = s.trim().to_lowercase();
                 match trimmed.as_str() {
+                    "c10" => "winter_adaptive_c10".to_string(),
+                    "c20" => "winter_adaptive_c20".to_string(),
+                    "v20" => "winter_adaptive_v20".to_string(),
+                    "v10" => "winter_adaptive_v10".to_string(),
                     "v9" => "winter_adaptive_v9".to_string(),
                     "v8" => "winter_adaptive_v8".to_string(),
                     "v7" => "winter_adaptive_v7".to_string(),
-                    "v6" => "winter_adaptive_v6".to_string(),
                     "v5" => "winter_adaptive_v5".to_string(),
                     "v4" => "winter_adaptive_v4".to_string(),
                     "v3" => "winter_adaptive_v3".to_string(),
@@ -143,6 +148,14 @@ fn run_command(args: RunArgs) -> Result<()> {
         Box::new(SyntheticLoader { config: day_config })
     };
 
+    // Load strategy config overrides if provided
+    let registry = if let Some(config_path) = &args.strategy_config {
+        let overrides = load_strategy_config(config_path)?;
+        Arc::new(StrategyRegistry::new_with_overrides(overrides)?)
+    } else {
+        Arc::new(StrategyRegistry::new_with_defaults())
+    };
+
     // Load data
     let day = loader.load(date)?;
 
@@ -173,8 +186,8 @@ fn run_command(args: RunArgs) -> Result<()> {
         ..SimulationConfig::default()
     };
 
-    // Create engine and run simulation
-    let engine = SimulationEngine::new();
+    // Create engine and run simulation (with custom registry if overrides provided)
+    let engine = SimulationEngine::with_registry(registry);
     let mut state = engine.create_simulation_from_day(day, sim_config.clone())?;
 
     println!("Running simulation...");
@@ -228,6 +241,7 @@ fn compare_command(args: CompareArgs) -> Result<()> {
         output: args.output,
         csv_path: args.csv_path,
         solar: args.solar,
+        strategy_config: args.strategy_config,
     };
 
     // Run the simulation
@@ -342,6 +356,7 @@ fn build_run_args_from_scenario(
         output,
         csv_path,
         solar: "none".to_string(), // Batch mode uses scenario-defined solar (TODO: add to batch config)
+        strategy_config: None,     // Batch mode doesn't support strategy config overrides yet
     })
 }
 
@@ -394,7 +409,15 @@ fn validate_run_args(args: &RunArgs) -> Result<()> {
         );
     }
 
-    // Validate output format is handled by clap value_parser
+    // Validate strategy config file if provided
+    if let Some(config_path) = &args.strategy_config
+        && !std::path::Path::new(config_path).exists()
+    {
+        anyhow::bail!(
+            "Strategy config file not found: {}\n\nPlease check the path and try again.",
+            config_path
+        );
+    }
 
     Ok(())
 }
@@ -448,6 +471,16 @@ fn validate_compare_args(args: &CompareArgs) -> Result<()> {
         );
     }
 
+    // Validate strategy config file if provided
+    if let Some(config_path) = &args.strategy_config
+        && !std::path::Path::new(config_path).exists()
+    {
+        anyhow::bail!(
+            "Strategy config file not found: {}\n\nPlease check the path and try again.",
+            config_path
+        );
+    }
+
     Ok(())
 }
 
@@ -468,4 +501,60 @@ fn validate_batch_args(args: &BatchArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Load strategy config overrides from a TOML file.
+///
+/// The TOML file has sections keyed by strategy ID:
+/// ```toml
+/// [winter_adaptive_c10]
+/// daylight_start_hour = 9
+/// daylight_end_hour = 15
+/// ```
+///
+/// Returns a map of strategy_id -> config as serde_json::Value.
+fn load_strategy_config(path: &str) -> Result<HashMap<String, serde_json::Value>> {
+    if !std::path::Path::new(path).exists() {
+        anyhow::bail!(
+            "Strategy config file not found: {}\n\nPlease check the path and try again.",
+            path
+        );
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read strategy config from {}", path))?;
+
+    let table: toml::Table =
+        toml::from_str(&content).with_context(|| format!("Failed to parse TOML from {}", path))?;
+
+    let mut overrides = HashMap::new();
+
+    for (key, value) in table {
+        // Convert TOML value to JSON value for serde compatibility
+        let json_value = toml_to_json(value);
+        overrides.insert(key, json_value);
+    }
+
+    Ok(overrides)
+}
+
+/// Convert a TOML value to a serde_json::Value.
+fn toml_to_json(value: toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => serde_json::Value::String(s),
+        toml::Value::Integer(i) => serde_json::json!(i),
+        toml::Value::Float(f) => serde_json::json!(f),
+        toml::Value::Boolean(b) => serde_json::Value::Bool(b),
+        toml::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(toml_to_json).collect())
+        }
+        toml::Value::Table(table) => {
+            let map: serde_json::Map<String, serde_json::Value> = table
+                .into_iter()
+                .map(|(k, v)| (k, toml_to_json(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+    }
 }

@@ -732,6 +732,9 @@ fn build_dashboard_response(
                                     InverterOperationMode::ForceDischarge => "discharge",
                                     InverterOperationMode::SelfUse => "self-use",
                                     InverterOperationMode::BackUpMode => "backup",
+                                    InverterOperationMode::NoChargeNoDischarge => {
+                                        "no-charge-discharge"
+                                    }
                                 };
                                 let target_soc = match sb.mode {
                                     InverterOperationMode::ForceCharge => {
@@ -741,7 +744,8 @@ fn build_dashboard_response(
                                         Some(system_config.control_config.min_battery_soc)
                                     }
                                     InverterOperationMode::SelfUse
-                                    | InverterOperationMode::BackUpMode => None,
+                                    | InverterOperationMode::BackUpMode
+                                    | InverterOperationMode::NoChargeNoDischarge => None,
                                 };
                                 (
                                     block_type_str.to_string(),

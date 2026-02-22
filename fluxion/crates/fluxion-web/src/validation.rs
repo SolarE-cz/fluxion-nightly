@@ -211,6 +211,7 @@ mod tests {
         ConsumptionHistoryConfig, ControlConfig, PricingConfig, StrategiesConfigCore, SystemConfig,
         SystemSettingsConfig,
     };
+    use fluxion_types::config::RemoteAccessConfigCore;
 
     fn default_config() -> SystemConfig {
         SystemConfig {
@@ -239,6 +240,7 @@ mod tests {
             strategies_config: StrategiesConfigCore::default(),
             history: ConsumptionHistoryConfig::default(),
             solar_forecast: fluxion_core::resources::SolarForecastConfigCore::default(),
+            remote_access: RemoteAccessConfigCore::default(),
         }
     }
 

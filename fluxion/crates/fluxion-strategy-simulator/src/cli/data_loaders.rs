@@ -94,19 +94,54 @@ impl DataLoader for SqliteLoader {
             .filter_map(std::result::Result::ok)
             .collect();
 
-        // Load price data
-        let mut stmt = conn.prepare(
-            "SELECT ts, price FROM prices
-             WHERE ts >= ?1 AND ts <= ?2
-             ORDER BY ts ASC",
-        )?;
+        // Load price data - try prices table first, fall back to ote_prices
+        let price_records: Vec<(i64, f32)> = {
+            let mut stmt = conn.prepare(
+                "SELECT ts, price FROM prices
+                 WHERE ts >= ?1 AND ts <= ?2
+                 ORDER BY ts ASC",
+            )?;
 
-        let price_records: Vec<(i64, f32)> = stmt
-            .query_map([start_ts, end_ts], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
-            })?
-            .filter_map(std::result::Result::ok)
-            .collect();
+            let records: Vec<(i64, f32)> = stmt
+                .query_map([start_ts, end_ts], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)? as f32))
+                })?
+                .filter_map(std::result::Result::ok)
+                .collect();
+
+            // If prices table has no data, try ote_prices table
+            if records.is_empty() {
+                let mut ote_stmt = conn.prepare(
+                    "SELECT datetime, price_czk FROM ote_prices
+                     WHERE datetime >= ?1 AND datetime <= ?2
+                     ORDER BY datetime ASC",
+                )?;
+
+                // Convert date to ISO 8601 format for comparison
+                let start_str = format!("{}T00:00:00+00:00", date.format("%Y-%m-%d"));
+                let end_str = format!("{}T23:59:59+00:00", date.format("%Y-%m-%d"));
+
+                ote_stmt
+                    .query_map([start_str, end_str], |row| {
+                        let datetime_str: String = row.get(0)?;
+                        let price_czk_per_mwh: f64 = row.get(1)?;
+
+                        // Parse datetime string to Unix timestamp
+                        let dt = DateTime::parse_from_rfc3339(&datetime_str)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                        let timestamp = dt.timestamp();
+
+                        // Convert CZK/MWh to CZK/kWh
+                        let price_czk_per_kwh = (price_czk_per_mwh / 1000.0) as f32;
+
+                        Ok((timestamp, price_czk_per_kwh))
+                    })?
+                    .filter_map(std::result::Result::ok)
+                    .collect()
+            } else {
+                records
+            }
+        };
 
         // Aggregate into 96 15-minute blocks
         let mut blocks = Vec::with_capacity(96);
@@ -133,12 +168,33 @@ impl DataLoader for SqliteLoader {
                 })
                 .collect();
 
+            // Hourly consumption profile (kWh per hour, from typical residential pattern)
+            // Used as fallback when recorded consumption is anomalously low (sensor issues)
+            #[rustfmt::skip]
+            let hourly_consumption_profile: [f32; 24] = [
+                0.3, 0.3, 0.3, 0.3, 0.3, 0.4,  // 00-05: overnight baseline
+                0.5, 0.8, 1.0, 0.8, 0.6, 0.6,  // 06-11: morning peak
+                0.6, 0.6, 0.6, 0.8, 1.0, 1.2,  // 12-17: afternoon/evening ramp
+                1.4, 1.2, 1.0, 0.8, 0.5, 0.4,  // 18-23: evening peak
+            ];
+
             let (consumption_kwh, solar_kwh) = if samples_in_block.is_empty() {
-                (0.25, 0.0) // Default: 1kW base load, no solar
+                // No data: use profile-based consumption
+                let profile_kwh = hourly_consumption_profile[hour] / 4.0; // hourly -> 15-min
+                (profile_kwh, 0.0)
             } else {
                 let consumption: f32 = samples_in_block.iter().map(|(c, _)| c).sum();
                 let solar: f32 = samples_in_block.iter().map(|(_, s)| s).sum();
-                (consumption, solar)
+
+                // When consumption is anomalously low (< 0.01 kWh for 15-min block = < 40W avg),
+                // fall back to the hourly profile. This handles inverter sensor issues where
+                // realtime_power reads zero during bypass mode.
+                if consumption < 0.01 {
+                    let profile_kwh = hourly_consumption_profile[hour] / 4.0;
+                    (profile_kwh, solar)
+                } else {
+                    (consumption, solar)
+                }
             };
 
             total_consumption += consumption_kwh;

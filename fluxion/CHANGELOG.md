@@ -5,7 +5,264 @@ All notable changes to FluxION will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+**Note:** When editing this changelog, reference the commit hash at the time of the previous edit to
+track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22).
+
 ## [Unreleased]
+
+## [0.2.38] - 2026-02-22
+
+### Added
+
+- **`fluxion-upgrader` crate** — New OTA self-updating binary that runs as PID 1 in Docker
+  containers. Manages the FluxION binary lifecycle with automatic over-the-air updates via GitHub
+  Releases:
+  - Release detection via GitHub Releases API with configurable `release_branch` (nightly/stable)
+  - SHA-256 verification of downloaded binaries for security
+  - Atomic update operations with automatic rollback on failure
+  - Calm-period detection before upgrades (waits for low-activity window to minimise disruption)
+  - Backup/restore subsystem preserving the previous binary for rollback
+  - Process supervisor managing the child `fluxion` process, forwarding signals, restarting on
+    crash, and coordinating graceful shutdown during upgrades
+  - Persistent state across restarts (`/data/upgrader-state.json`)
+  - Upgrade event telemetry reporting
+  - CLI flags: `--verbose`, `--dry-run`, `--check-update`
+  - 30 unit tests covering core modules
+- **Binary release CI workflow** (`.github/workflows/build-release-binaries.yml`) — Builds and
+  publishes `fluxion` and `fluxion-upgrader` binaries for `x86_64` and `aarch64` on every GitHub
+  release tag, using a self-hosted runner for the ARM target.
+- **aarch64 cross-compilation support in Nix flake** — `flake.nix` updated to allow targeting
+  `aarch64-unknown-linux-musl` for statically-linked ARM releases.
+
+### Changed
+
+- **CI pipeline** (`.github/workflows/ci.yml`) updated to integrate the new binary release jobs and
+  self-hosted runner configuration.
+- **GitLab CI** (`.gitlab-ci.yml`) extended with additional stages aligned with the multi-repo
+  publish pipeline.
+- **Dockerfile** updated to accommodate the upgrader-as-PID-1 model.
+
+### Documentation
+
+- **Major docs restructure** — All developer and operational documentation reorganised under a clear
+  hierarchy:
+  - `docs/architecture/` — ARCHITECTURE, ECONOMIC_OPTIMIZATION, SCHEDULING, REMOTE_ACCESS,
+    BUILD_SYSTEM
+  - `docs/guides/` — CONFIGURATION, DEPLOYMENT, TESTING, I18N, NIX_DOCKER, WEB_UI, CUSTOM_STRATEGIES
+  - `docs/operations/` — CI_CD, DEPLOYMENT_FLOW, UPGRADER
+  - `docs/reference/` — STRATEGIES, SCHEDULING_CONSTRAINTS, SIMULATION, COST_CALCULATION, TELEMETRY,
+    SOLAX
+  - `docs/vision/` — Premium subscription, tablet dashboard, AI automations specs
+  - Stale root-level docs (DEPLOYMENT_FLOW.md, DEPLOYMENT_SETUP.md, README-Docker.md, etc.) removed
+- **`docs/operations/UPGRADER.md`** — Comprehensive guide covering upgrader architecture, config
+  options, deployment model, update flow, rollback behaviour, and troubleshooting.
+- **Monorepo `CLAUDE.md`** — Created root-level development guide covering repository layout, Nix
+  shells, common commands, CI/CD, and architecture overview.
+- **`fluxion-mobile/CLAUDE.md`** — Added mobile app development guide.
+
+## [0.2.37] - 2026-02-15
+
+### Added
+
+- **Telemetry pipeline** — Heartbeat client now collects full telemetry from `WebQueryResponse`
+  (inverter state, schedule, prices, SOC predictions, consumption, solar, HDO) and sends it to
+  `fluxion-server` every 5 minutes.
+- **Schedule telemetry types** — `ScheduleBlockTelemetry`, `ScheduleTelemetry`, and
+  `SocPredictionPoint` in `fluxion-shared` for tracking every strategy decision per block.
+- **Server DB expanded** — New `schedule_blocks` and `soc_predictions` tables with foreign keys to
+  `telemetry_snapshots`; 8 new columns on `telemetry_snapshots` for aggregated metrics.
+- **Python analysis CLI** (`analysis/analyze_telemetry.py`) — 5 subcommands (summary, decisions,
+  accuracy, prices, charts) for analyzing telemetry data from the server SQLite DB.
+- **`fluxion-mobile-types` shared crate** — Compile-time API contract validation between server
+  (`fluxion-web`) and mobile app (`fluxion-mobile`), replacing runtime JSON field parsing.
+- **Parameter sweep analysis** — Script and comprehensive results CSV for strategy optimization.
+
+### Changed
+
+- Mobile API endpoints and credentials module refactored to use shared types from
+  `fluxion-mobile-types`.
+- Heartbeat handler extracts and stores schedule blocks and SOC predictions from telemetry.
+- Telemetry cleanup tasks now include `schedule_blocks` and `soc_predictions` tables.
+
+### Documentation
+
+- **Mobile architecture documentation** — Comprehensive CLAUDE.md section covering:
+  - QR-code-based pairing flow with x25519 key generation and Tor v3 client auth
+  - Security model (Tor hidden service, device authentication, encrypted storage)
+  - Connection architecture diagram showing full data flow from QR scan to authenticated requests
+  - Mobile API endpoints (served over Tor) and server-side admin API
+  - Shared API types (`fluxion-mobile-types`) with modification guide
+  - Server-side file layout (`./data/tor/` structure, torrc generation, device registry)
+  - Offline-first caching strategy (UI bundle versioning, state snapshots)
+  - Build requirements and cross-compilation notes (Android SDK, NDK, bundled sqlite3)
+- **Documentation maintenance rules** — Added to CLAUDE.md: guidelines for updating docs after
+  implementing new features (Project Structure, data flows, types, usage instructions).
+- **Project memory** — Created MEMORY.md with crate dependency map, key patterns, mobile API
+  architecture notes, files modified per feature, and common pitfalls.
+
+## [0.2.36] - 2026-02-15
+
+### Added
+
+- **Mobile remote access via Tor** — Full implementation of zero-cloud-dependency mobile monitoring
+  and control over Tor hidden services:
+  - Server-side Tor hidden service infrastructure with x25519 client authorization.
+  - QR-code-based device pairing protocol.
+  - REST API for remote status, pairing, device management, and mobile control.
+  - Remote access management page in the HA dashboard.
+  - Tauri 2.0 mobile app (Android) with offline-first architecture, PIN lock screen, dark theme UI,
+    battery SOC gauge, energy flow display, and canvas price chart.
+  - Real Arti Tor client replacing stub, with persistent credential storage.
+  - Mobile UI bundle versioning and automatic update checks.
+  - Android build support via `nix develop .#mobile` devShell (Android SDK 36, NDK 26, JDK 17).
+  - English and Czech translations for mobile UI.
+- **Winter Adaptive V10 strategy** — Dynamic battery budget allocation strategy with configurable
+  overrides via TOML files in simulations.
+- **Winter Adaptive V20 strategy** — Enhanced adaptive budgeting with DayMetrics-driven parameter
+  resolution for market-aware behavior, configurable thresholds for solar availability, volatility,
+  price levels, and tomorrow's outlook.
+- **Fixed Price Arbitrage strategy** — New strategy for leveraging fixed-price energy contracts with
+  spot market selling, including dynamic spot sell price computation.
+- **Day profiling module** (`day_profiling.rs`) — Precise day metrics computation including price
+  statistics (coefficient of variation, spread ratio, negative fraction), solar and consumption
+  ratio estimations, and daily consumption forecasting.
+- **NoChargeNoDischarge battery mode** — New inverter operation mode to hold battery charge while
+  powering the house from grid, with full scheduling and simulation support.
+- **HoldCharge action** — Preserve battery SOC using BackUpMode for upcoming expensive hours, with
+  smart charge block calculation, consecutive charge grouping, gap bridging, and short self-use gap
+  removal.
+- **Solar forecasting enhancements** — New fields for remaining-today and tomorrow solar forecasts,
+  sunrise/sunset estimation, and solar-weighted block cost estimation.
+- **Heartbeat monitoring system** — `fluxion-shared` crate with centralized telemetry and heartbeat
+  types; heartbeat client sends periodic status updates to `fluxion-server`.
+- **`fluxion-server` binary** — Standalone monitoring server with dashboard, database, email alerts,
+  and NixOS module, deployed via automated scripts.
+- **`fluxion-version` binary** — Simple binary to print the package version.
+- **Ralph Loop optimization framework** — Iterative AI-driven strategy optimization with benchmark
+  tools, C10 parameter sweep analysis scripts and charts, and tracking prompts.
+- **Strategy configuration overrides** — Support for `--strategy-config <path.toml>` in simulations
+  for runtime parameter tuning.
+- **Strategy registry** — Centralized registry for all strategies (V1-V10, V20, C10, C20) with
+  listing, info, and dynamic configuration support.
+
+### Changed
+
+- **Profit calculation** improved to use effective price (spot + grid fee + buy fee) for import
+  costs and subtract battery average charge cost basis from savings.
+- **Default thresholds adjusted** — `min_export_spread_czk` lowered from 5.0 to 3.0 CZK,
+  `min_soc_after_export` reduced from 35% to 25%, `expensive_level_threshold` decreased from 0.5 to
+  0.3.
+- **HDO entity resolution** enhanced with fallback prefix search for robustness.
+- **CI pipeline** migrated to NixOS-based Docker runner image with simplified job configuration.
+- **Dashboard UI** updated with solar-weighted cost estimation and savings visualization.
+- **Simulation engine** updated with effective price calculation and improved block handling with
+  hourly consumption profiles.
+
+### Removed
+
+- **Winter Adaptive V6 strategy** — Removed along with all associated configuration, modules, and
+  references.
+- **Deprecated logic** — Removed obsolete battery arbitrage fields, evaluation timeout from plugin
+  manager, and deprecated economic calculation utilities.
+- **Rust plugin adapter** — Removed `builtin/rust_adapter.rs` and unused plugin manager APIs.
+
+### Fixed
+
+- Clippy warnings resolved across remote access and config modules (derive Default, must_use
+  annotations, idiomatic error handling, let-else patterns).
+
+## [0.2.35] - 2026-01-27
+
+### Fixed
+
+- Fixed Docker build failure caused by cross-device link error (OS error 18) when
+  `rust-toolchain.toml` triggered a rustup toolchain update inside Docker's overlay filesystem. The
+  file is no longer copied into the Docker build context, as the stable toolchain installed by
+  rustup is sufficient for release builds.
+
+### Changed
+
+- Reformatted documentation and scripts for consistency: `CLAUDE.md` table/paragraph line wrapping,
+  `config.example.toml` alignment, and `week_simulation.sh` indentation.
+
+## [0.2.34] - 2026-01-26
+
+### Added
+
+- **Winter Adaptive V8 strategy** — Top-N peak discharge optimizer targeting the absolute
+  highest-priced blocks. Features predictive battery SOC simulation, configurable discharge block
+  count (default 8 = 2 hours), 3 CZK minimum spread requirement, and smart export policy with SOC
+  threshold protection.
+- **Winter Adaptive V9 strategy** (now the default) — Solar-aware morning peak optimizer. On sunny
+  days (>5 kWh solar forecast), performs minimal grid charging to cover only the morning peak (6-9
+  AM) and lets solar charge the battery during the day. On low-solar days, falls back to full
+  arbitrage mode like V8. Achieves ~40% savings on winter days with optimal solar utilization on
+  sunny days.
+- **Solar forecast integration** — Fetches solar production forecasts from Home Assistant sensors.
+  Supports multiple PV arrays via sensor pattern matching. Passes today's total, remaining, and
+  tomorrow's forecast through `EvaluationContext` so strategies can make solar-aware decisions.
+- **User control persistence** — Manual override of battery charging/discharging with automatic
+  timeout and state restoration. Includes `UserControlState`/`UserControlMode` types, file-based
+  persistence, and REST API endpoints.
+- **Web UI solar forecast display** — Dashboard now shows today's total solar forecast, remaining
+  forecast, and tomorrow's forecast.
+- **Week simulation script** (`scripts/week_simulation.sh`) — Multi-day simulation tool with SOC
+  carry-over between days, cost aggregation, and savings comparison vs no-battery baseline.
+- **Simulator solar forecast support** — Added `--solar none|moderate|high` CLI flag, synthetic
+  solar profiles, and historical solar data loading from the database.
+
+### Changed
+
+- **V9 is now the default strategy** for new installations, replacing V7. Updated defaults in
+  `fluxion-types`, HA addon `config.yaml`, and `config.example.toml`.
+- **Existing strategies improved with solar awareness** — V7 now reduces grid charging when solar
+  production is expected; V8 improved discharge timing and spread calculations.
+- **EvaluationContext expanded** with `solar_forecast_total_today_kwh`,
+  `solar_forecast_remaining_today_kwh`, `solar_forecast_tomorrow_kwh`, and
+  `battery_avg_charge_price_czk_per_kwh` fields.
+
+### Fixed
+
+- **V8 config exposure** — `WinterAdaptiveV8Config` was missing from `StrategiesConfig`; V8 now
+  properly receives user configuration instead of falling back to defaults.
+- **Solar forecast enabled logic** — Was always evaluating to `true` regardless of config; now
+  properly respects the configured default.
+
+## [0.2.33] - 2026-01-19
+
+### Added
+
+- **Winter Adaptive V5, V6, and V7 strategies** — Three new arbitrage strategies with progressively
+  better optimization. V7 is the new default strategy, featuring unconstrained multi-cycle arbitrage
+  that achieves 22-87% cost reduction across all market scenarios (volatile, negative prices, usual
+  day, elevated, HDO).
+- **Winter Adaptive V4 strategy** — New strategy variant with full configuration pipeline and Home
+  Assistant addon support.
+- **Strategy Simulator web UI** — New "Simulation" tab in the web dashboard allowing interactive
+  strategy comparison against synthetic price scenarios.
+- **CLI strategy simulator (`fluxion-sim`)** — New command-line tool for running strategy
+  simulations against historical SQLite data or synthetic scenarios, with CSV output support.
+- **Synthetic price scenarios** — Five built-in market scenarios for strategy testing: `usual_day`,
+  `volatile`, `elevated_day`, `negative_prices`, `hdo_optimized`.
+- **Shared strategy modules** — Centralized pricing (`pricing.rs`), locking (`locking.rs`), and
+  seasonal detection (`seasonal.rs`) modules extracted from strategies.
+- **Strategy performance analysis documentation** — New docs covering strategy comparison results
+  and cost calculation refactoring.
+- **CLI simulator reference documentation** — Comprehensive guide for the `fluxion-sim` tool.
+
+### Changed
+
+- **Default strategy changed from V5 to V7** — V7 provides significantly better arbitrage
+  performance: 62% better on volatile days, 87% better with negative prices, 48% better on usual
+  days.
+- **V3 strategy optimized** — Refactored V3 implementation with improved scheduling logic and HA
+  plugin integration.
+- **Web dashboard enhanced** — Added interactive schedule chart and dynamic route support.
+
+### Fixed
+
+- Clippy warnings resolved including range contains patterns, nested if statements, string
+  conversion methods, missing `must_use` attributes, and Debug implementation improvements.
 
 ## [0.2.0] - 2025-11-30
 
@@ -198,6 +455,15 @@ ______________________________________________________________________
 
 ## Version History Summary
 
+- **v0.2.38** (2026-02-22) - Upgrader crate (OTA, PID 1, rollback), binary release CI, docs
+  restructure
+- **v0.2.37** (2026-02-15) - Telemetry pipeline, schedule telemetry types, fluxion-mobile-types
+- **v0.2.36** (2026-02-15) - Mobile remote access via Tor, V10/V20/FPA strategies, heartbeat
+  monitoring
+- **v0.2.35** (2026-01-27) - Docker build fix, formatting cleanup
+- **v0.2.34** (2026-01-26) - V8/V9 strategies, solar forecast, user control persistence
+- **v0.2.33** (2026-01-19) - V4-V7 strategies, strategy simulator (web + CLI)
+- **v0.2.0** (2025-11-30) - Code quality and architecture improvements
 - **v0.1.0** (2025-10-29) - MVP Release - Production ready
 - **v0.0.1** (2025-01-15) - Initial development
 

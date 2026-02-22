@@ -1,0 +1,80 @@
+name: Build Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }} Binary
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build fluxion binary
+        working-directory: fluxion
+        run: |
+          echo "Building ${{ matrix.arch }} binary (target: ${{ matrix.target }})..."
+          nix develop ..#musl --command cargo build --release --bin fluxion --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: |
+          cp fluxion/target/${{ matrix.target }}/release/fluxion fluxion-${{ matrix.arch }}
+          chmod +x fluxion-${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fluxion-${{ matrix.arch }}
+          path: fluxion-${{ matrix.arch }}
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Calculate SHA256 checksums
+        run: |
+          # Rename artifacts to standard names
+          mv fluxion-amd64/fluxion-amd64 fluxion-amd64 2>/dev/null || true
+          mv fluxion-aarch64/fluxion-aarch64 fluxion-aarch64 2>/dev/null || true
+
+          # Generate SHA256SUMS
+          sha256sum fluxion-amd64 fluxion-aarch64 > SHA256SUMS
+
+          # Display checksums
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fluxion-amd64
+            fluxion-aarch64
+            SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

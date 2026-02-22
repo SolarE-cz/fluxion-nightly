@@ -4,13 +4,17 @@ members = [
     "crates/fluxion-backtest",
     "crates/fluxion-core",
     "crates/fluxion-i18n",
+    "crates/fluxion-mobile-types",
     "crates/fluxion-integration-tests",
     "crates/fluxion-main",
     "crates/fluxion-plugins",
     "crates/fluxion-strategy-simulator",
     "crates/fluxion-types",
     "crates/fluxion-web",
+    "crates/fluxion-shared",
+    "crates/fluxion-server",
     "crates/solax-csv-importer",
+    "crates/fluxion-upgrader",
 ]
 resolver = "2"
 
@@ -151,4 +155,13 @@ version = "0.33.0"
 features = [
     "bundled",
     "chrono",
+]
+
+[workspace.dependencies.lettre]
+version = "0.11"
+default-features = false
+features = [
+    "builder",
+    "smtp-transport",
+    "tokio1-rustls-tls",
 ]

@@ -101,23 +101,28 @@ pub enum InverterOperationMode {
     /// Normal self-use mode: use solar, battery for self-consumption
     #[default]
     SelfUse,
-    /// Battery preservation mode: prevent battery discharge, use grid for house load
-    /// PV surplus still charges battery for later use
-    /// Implemented as Manual Mode + Stop Charge and Discharge on Solax
+    /// Native Back Up Mode: battery reserved for power outages.
+    /// On Solax, this maps to charger_use_mode=2 (BackUpMode).
+    /// The inverter will charge the battery and hold it ready for blackouts.
     BackUpMode,
     /// Force charge battery from grid (during cheap price blocks)
     ForceCharge,
     /// Force discharge battery to grid (during expensive price blocks)
     ForceDischarge,
+    /// Hold battery charge: no charging, no discharging from/to battery.
+    /// Grid powers the house directly. SOC stays constant.
+    /// On Solax, implemented as Manual Mode + Stop Charge and Discharge.
+    NoChargeNoDischarge,
 }
 
 impl std::fmt::Display for InverterOperationMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SelfUse => write!(f, "Self-Use"),
-            Self::BackUpMode => write!(f, "Battery Preservation"),
+            Self::BackUpMode => write!(f, "Back Up Mode"),
             Self::ForceCharge => write!(f, "Force-Charge"),
             Self::ForceDischarge => write!(f, "Force-Discharge"),
+            Self::NoChargeNoDischarge => write!(f, "No Charge/Discharge"),
         }
     }
 }

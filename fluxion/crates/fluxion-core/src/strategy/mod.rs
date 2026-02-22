@@ -10,16 +10,18 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+pub mod fixed_price_arbitrage;
 pub mod locking;
 pub mod pricing;
 pub mod seasonal;
 pub mod utils;
 pub mod winter_adaptive;
+pub mod winter_adaptive_v10;
 pub mod winter_adaptive_v2;
+pub mod winter_adaptive_v20;
 pub mod winter_adaptive_v3;
 pub mod winter_adaptive_v4;
 pub mod winter_adaptive_v5;
-pub mod winter_adaptive_v6;
 pub mod winter_adaptive_v7;
 pub mod winter_adaptive_v8;
 pub mod winter_adaptive_v9;
@@ -37,15 +39,17 @@ pub use seasonal::{DayEnergyBalance, SeasonalMode};
 
 // Re-export strategies
 // Note: DayEnergyBalance is re-exported from seasonal module above
+pub use fixed_price_arbitrage::{FixedPriceArbitrageConfig, FixedPriceArbitrageStrategy};
 pub use winter_adaptive::{PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy};
 pub use winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy};
 pub use winter_adaptive_v3::{WinterAdaptiveV3Config, WinterAdaptiveV3Strategy};
 pub use winter_adaptive_v4::{WinterAdaptiveV4Config, WinterAdaptiveV4Strategy};
 pub use winter_adaptive_v5::{WinterAdaptiveV5Config, WinterAdaptiveV5Strategy};
-pub use winter_adaptive_v6::{WinterAdaptiveV6Config, WinterAdaptiveV6Strategy};
 pub use winter_adaptive_v7::{WinterAdaptiveV7Config, WinterAdaptiveV7Strategy};
 pub use winter_adaptive_v8::{WinterAdaptiveV8Config, WinterAdaptiveV8Strategy};
 pub use winter_adaptive_v9::{WinterAdaptiveV9Config, WinterAdaptiveV9Strategy};
+pub use winter_adaptive_v10::{WinterAdaptiveV10Config, WinterAdaptiveV10Strategy};
+pub use winter_adaptive_v20::{WinterAdaptiveV20Config, WinterAdaptiveV20Strategy};
 
 use chrono::{DateTime, Utc};
 use fluxion_types::config::ControlConfig;
@@ -167,11 +171,6 @@ pub struct BlockEvaluation {
 
     /// Debug information (only populated when log_level = debug)
     pub debug_info: Option<BlockDebugInfo>,
-
-    /// Profit from battery arbitrage (CZK)
-    /// Calculated as (current_price - avg_charge_price) * discharge_kwh
-    /// Only populated when battery discharges and avg_charge_price is available
-    pub arbitrage_profit_czk: f32,
 }
 
 impl BlockEvaluation {
@@ -195,7 +194,6 @@ impl BlockEvaluation {
             strategy_name,
             decision_uid: None,
             debug_info: None,
-            arbitrage_profit_czk: 0.0,
         }
     }
 
@@ -298,30 +296,6 @@ pub trait EconomicStrategy: Send + Sync {
 
 /// Helper functions for economic calculations
 pub mod economics {
-    /// Calculate battery degradation cost for a given energy throughput
-    ///
-    /// # Arguments
-    /// * `energy_kwh` - Energy cycled through battery (kWh)
-    /// * `wear_cost_per_kwh` - Cost per kWh cycled (CZK/kWh)
-    ///
-    /// # Returns
-    /// Degradation cost in CZK
-    pub fn battery_degradation_cost(energy_kwh: f32, wear_cost_per_kwh: f32) -> f32 {
-        energy_kwh * wear_cost_per_kwh
-    }
-
-    /// Calculate efficiency loss for battery operation
-    ///
-    /// # Arguments
-    /// * `energy_kwh` - Energy input to battery (kWh)
-    /// * `efficiency` - Round-trip efficiency (0.0 to 1.0)
-    ///
-    /// # Returns
-    /// Energy lost due to inefficiency (kWh)
-    pub fn efficiency_loss(energy_kwh: f32, efficiency: f32) -> f32 {
-        energy_kwh * (1.0 - efficiency)
-    }
-
     /// Calculate cost of grid import
     pub fn grid_import_cost(energy_kwh: f32, price_per_kwh: f32) -> f32 {
         energy_kwh * price_per_kwh
@@ -330,26 +304,5 @@ pub mod economics {
     /// Calculate revenue from grid export
     pub fn grid_export_revenue(energy_kwh: f32, price_per_kwh: f32) -> f32 {
         energy_kwh * price_per_kwh
-    }
-
-    /// Calculate opportunity cost of not exporting solar energy
-    ///
-    /// When we store solar energy instead of exporting it immediately,
-    /// we forgo the immediate export revenue but can potentially earn
-    /// more by exporting later at a higher price (minus losses)
-    pub fn solar_opportunity_cost(
-        solar_kwh: f32,
-        current_export_price: f32,
-        efficiency: f32,
-    ) -> f32 {
-        // Immediate revenue we're giving up
-        let immediate_revenue = solar_kwh * current_export_price;
-
-        // After round-trip losses, we'd have this much to export later
-        let future_exportable = solar_kwh * efficiency;
-
-        // Opportunity cost is the guaranteed revenue minus what we might earn
-        // (This is a simplified model; full model would consider future price forecasts)
-        immediate_revenue - (future_exportable * current_export_price)
     }
 }

@@ -60,6 +60,12 @@ pub struct TimeBlockPrice {
     /// Effective import price (CZK/kWh) = spot price + grid fees (HDO tariff)
     /// This is the final price strategies should use for buy decisions
     pub effective_price_czk_per_kwh: f32,
+
+    /// Spot sell price (CZK/kWh) = spot_price - spot_sell_fee, when available.
+    /// Only populated when use_spot_prices_to_sell is enabled.
+    /// Strategies can use this for arbitrage: charge at fixed price, sell at spot price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_sell_price_czk_per_kwh: Option<f32>,
 }
 
 /// Fixed price data when spot prices are disabled

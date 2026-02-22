@@ -441,8 +441,7 @@ impl WinterAdaptiveV9Strategy {
         Self::bridge_short_charge_gaps(&mut charge_blocks, blocks, 2);
 
         // Find most expensive blocks (excluding any charge blocks)
-        let charge_set: std::collections::HashSet<usize> =
-            charge_blocks.iter().copied().collect();
+        let charge_set: std::collections::HashSet<usize> = charge_blocks.iter().copied().collect();
         let discharge_count = self.config.top_discharge_blocks_count.min(n);
         let discharge_blocks: Vec<usize> = ranked
             .iter()
@@ -645,8 +644,7 @@ impl WinterAdaptiveV9Strategy {
                         // Verify prices are reasonable (not bridging into expensive blocks)
                         let all_prices_ok = (gap_start..gap_end).all(|j| {
                             blocks.get(j).is_some_and(|b| {
-                                b.effective_price_czk_per_kwh
-                                    <= avg_charge_price + price_tolerance
+                                b.effective_price_czk_per_kwh <= avg_charge_price + price_tolerance
                             })
                         });
 
@@ -672,20 +670,16 @@ impl WinterAdaptiveV9Strategy {
     /// BackUpMode ("Stop Charge or Discharge") while grid prices are still low.
     /// The hold lasts until the first block where the grid fee jumps significantly
     /// (HDO low→high tariff transition) or until `morning_peak_start_hour`.
-    fn add_hold_charge_blocks(
-        &self,
-        schedule: &mut [ScheduledAction],
-        blocks: &[TimeBlockPrice],
-    ) {
+    fn add_hold_charge_blocks(&self, schedule: &mut [ScheduledAction], blocks: &[TimeBlockPrice]) {
         // Find the last charge block in the overnight / early morning window
         let last_charge_idx = schedule
             .iter()
             .enumerate()
             .rev()
             .filter(|(i, _)| {
-                blocks
-                    .get(*i)
-                    .is_some_and(|b| (b.block_start.hour() as u8) < self.config.morning_peak_start_hour)
+                blocks.get(*i).is_some_and(|b| {
+                    (b.block_start.hour() as u8) < self.config.morning_peak_start_hour
+                })
             })
             .find(|(_, a)| matches!(a, ScheduledAction::Charge { .. }))
             .map(|(i, _)| i);
@@ -695,8 +689,8 @@ impl WinterAdaptiveV9Strategy {
         };
 
         // Grid fee at the last charge block (used to detect HDO transition)
-        let charge_grid_fee = blocks[last_charge].effective_price_czk_per_kwh
-            - blocks[last_charge].price_czk_per_kwh;
+        let charge_grid_fee =
+            blocks[last_charge].effective_price_czk_per_kwh - blocks[last_charge].price_czk_per_kwh;
 
         for i in (last_charge + 1)..blocks.len() {
             let block = &blocks[i];
@@ -834,9 +828,13 @@ impl WinterAdaptiveV9Strategy {
 
                 // Step 4: Check if arbitrage is still profitable
                 // Limit additional charge to remaining battery capacity after morning peak
-                let blocks_for_morning =
-                    self.calculate_charge_blocks_needed(current_soc, battery_capacity_kwh, max_charge_rate_kw);
-                let remaining_after_morning = blocks_for_morning.saturating_sub(morning_peak_charge_blocks);
+                let blocks_for_morning = self.calculate_charge_blocks_needed(
+                    current_soc,
+                    battery_capacity_kwh,
+                    max_charge_rate_kw,
+                );
+                let remaining_after_morning =
+                    blocks_for_morning.saturating_sub(morning_peak_charge_blocks);
                 let (arb_charge, arb_discharge, profit) =
                     self.find_arbitrage_opportunities(blocks, Some(remaining_after_morning));
 
@@ -1110,15 +1108,14 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                             excess_after_charge * context.grid_export_price_czk_per_kwh;
                     }
                 } else {
-                    eval.mode = InverterOperationMode::BackUpMode;
+                    eval.mode = InverterOperationMode::NoChargeNoDischarge;
                     eval.reason = format!(
                         "HOLD CHARGE: Battery at target ({:.1}%), grid powers house [{}]",
                         context.current_battery_soc, summary
                     );
-                    eval.decision_uid =
-                        Some("winter_adaptive_v9:hold_charge".to_string());
+                    eval.decision_uid = Some("winter_adaptive_v9:hold_charge".to_string());
 
-                    // In BackUpMode: grid powers house, battery doesn't discharge
+                    // In NoChargeNoDischarge: grid powers house, battery doesn't discharge
                     let net_consumption =
                         context.consumption_forecast_kwh - context.solar_forecast_kwh;
                     if net_consumption > 0.0 {
@@ -1127,8 +1124,7 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                     } else {
                         let excess = -net_consumption;
                         eval.energy_flows.grid_export_kwh = excess;
-                        eval.revenue_czk =
-                            excess * context.grid_export_price_czk_per_kwh;
+                        eval.revenue_czk = excess * context.grid_export_price_czk_per_kwh;
                     }
                 }
             }
@@ -1217,27 +1213,24 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
             }
 
             ScheduledAction::HoldCharge => {
-                // After charging is complete, hold battery at target SOC using BackUpMode.
+                // After charging is complete, hold battery at target SOC using NoChargeNoDischarge.
                 // Grid powers the house while electricity is still cheap (HDO low tariff).
                 // Battery is preserved for the upcoming expensive hours.
-                eval.mode = InverterOperationMode::BackUpMode;
+                eval.mode = InverterOperationMode::NoChargeNoDischarge;
                 eval.reason = format!(
                     "HOLD AT TARGET: {:.3} CZK/kWh, preserving battery for expensive hours [{}]",
                     effective_price, summary
                 );
-                eval.decision_uid =
-                    Some("winter_adaptive_v9:hold_for_peak".to_string());
+                eval.decision_uid = Some("winter_adaptive_v9:hold_for_peak".to_string());
 
-                let net_consumption =
-                    context.consumption_forecast_kwh - context.solar_forecast_kwh;
+                let net_consumption = context.consumption_forecast_kwh - context.solar_forecast_kwh;
                 if net_consumption > 0.0 {
                     eval.energy_flows.grid_import_kwh = net_consumption;
                     eval.cost_czk = net_consumption * effective_price;
                 } else {
                     let excess = -net_consumption;
                     eval.energy_flows.grid_export_kwh = excess;
-                    eval.revenue_czk =
-                        excess * context.grid_export_price_czk_per_kwh;
+                    eval.revenue_czk = excess * context.grid_export_price_czk_per_kwh;
                 }
             }
 
@@ -1268,9 +1261,9 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                                 excess_after_charge * context.grid_export_price_czk_per_kwh;
                         }
                     } else {
-                        // Battery full during negative prices - use BackUpMode so house
+                        // Battery full during negative prices - use NoChargeNoDischarge so house
                         // draws from grid (getting paid) while battery stays full
-                        eval.mode = InverterOperationMode::BackUpMode;
+                        eval.mode = InverterOperationMode::NoChargeNoDischarge;
                         eval.reason = format!(
                             "NEGATIVE PRICE HOLD: {:.3} CZK/kWh, battery full ({:.1}%) [{}]",
                             effective_price, context.current_battery_soc, summary
@@ -1286,8 +1279,7 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
                         } else {
                             let excess = -net_consumption;
                             eval.energy_flows.grid_export_kwh = excess;
-                            eval.revenue_czk =
-                                excess * context.grid_export_price_czk_per_kwh;
+                            eval.revenue_czk = excess * context.grid_export_price_czk_per_kwh;
                         }
                     }
                 } else {
@@ -1387,6 +1379,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: price,
                     effective_price_czk_per_kwh: price + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -1642,13 +1635,11 @@ mod tests {
             // 07:00-09:00 (8 blocks) - morning peak
             4.50, 4.60, 4.70, 4.80, 4.90, 5.00, 4.80, 4.60,
             // 09:00-15:00 (24 blocks) - daytime
-            3.50, 3.40, 3.30, 3.20, 3.10, 3.00, 2.90, 2.80,
-            2.70, 2.60, 2.50, 2.40, 2.50, 2.60, 2.70, 2.80,
-            2.90, 3.00, 3.10, 3.20, 3.30, 3.40, 3.50, 3.60,
+            3.50, 3.40, 3.30, 3.20, 3.10, 3.00, 2.90, 2.80, 2.70, 2.60, 2.50, 2.40, 2.50, 2.60,
+            2.70, 2.80, 2.90, 3.00, 3.10, 3.20, 3.30, 3.40, 3.50, 3.60,
             // 15:00-21:00 (24 blocks) - evening peak
-            3.80, 4.00, 4.20, 4.40, 4.60, 4.80, 5.00, 5.20,
-            4.80, 4.60, 4.40, 4.20, 4.00, 3.80, 3.60, 3.40,
-            3.80, 4.00, 4.20, 4.40, 4.60, 4.50, 4.30, 4.10,
+            3.80, 4.00, 4.20, 4.40, 4.60, 4.80, 5.00, 5.20, 4.80, 4.60, 4.40, 4.20, 4.00, 3.80,
+            3.60, 3.40, 3.80, 4.00, 4.20, 4.40, 4.60, 4.50, 4.30, 4.10,
             // 21:00-23:00 (8 blocks) - late evening
             3.50, 3.30, 3.10, 2.90, 2.70, 2.60, 2.50, 2.40,
         ];
@@ -1659,6 +1650,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price + grid_fee,
+                spot_sell_price_czk_per_kwh: None,
             });
         }
 
@@ -1715,12 +1707,12 @@ mod tests {
         // Key assertion: ALL 3-5 AM cheap blocks (indices 16-23) must be selected
         // since they are the absolute cheapest. Midnight blocks may also be included
         // due to gap bridging (connecting charge groups into continuous sequences).
-        let early_morning_count = charge_indices.iter().filter(|&&i| (16..24).contains(&i)).count();
+        let early_morning_count = charge_indices
+            .iter()
+            .filter(|&&i| (16..24).contains(&i))
+            .count();
 
-        println!(
-            "3-5 AM blocks selected: {}/8",
-            early_morning_count,
-        );
+        println!("3-5 AM blocks selected: {}/8", early_morning_count,);
 
         // All 8 cheapest blocks (3-5 AM) must be included
         assert_eq!(
@@ -1770,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_charge_block_at_target_soc_returns_backup_mode() {
+    fn test_charge_block_at_target_soc_returns_no_charge_no_discharge() {
         // SolarFirst mode with high morning peak consumption ensures charge blocks
         // are scheduled even at 95% SOC (because morning peak drains a lot).
         // consumption_soc_delta = (12 blocks * 1.0 kWh / 10.0 capacity) * 100 = 120%
@@ -1808,8 +1800,8 @@ mod tests {
 
         assert_eq!(
             eval.mode,
-            InverterOperationMode::BackUpMode,
-            "Charge block at target SOC should return BackUpMode, got: {} - {}",
+            InverterOperationMode::NoChargeNoDischarge,
+            "Charge block at target SOC should return NoChargeNoDischarge, got: {} - {}",
             eval.mode,
             eval.reason
         );
@@ -1862,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_price_at_target_soc_returns_backup_mode() {
+    fn test_negative_price_at_target_soc_returns_no_charge_no_discharge() {
         let config = WinterAdaptiveV9Config {
             negative_price_handling_enabled: true,
             ..Default::default()
@@ -1873,7 +1865,7 @@ mod tests {
         // Create blocks where one block has negative effective price.
         // The planner detects negative prices and enters NegativePrice mode,
         // scheduling it as a Charge block. At SOC >= target, the Charge arm
-        // returns BackUpMode (our fix).
+        // returns NoChargeNoDischarge (our fix).
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
 
         let mut blocks = Vec::new();
@@ -1896,6 +1888,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: effective_price - 1.8,
                     effective_price_czk_per_kwh: effective_price,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -1924,11 +1917,11 @@ mod tests {
         let eval = strategy.evaluate(&context);
 
         // Block is scheduled as Charge (NegativePrice) by the planner,
-        // and at target SOC our fix returns BackUpMode
+        // and at target SOC our fix returns NoChargeNoDischarge
         assert_eq!(
             eval.mode,
-            InverterOperationMode::BackUpMode,
-            "Negative price block at target SOC should return BackUpMode, got: {} - {}",
+            InverterOperationMode::NoChargeNoDischarge,
+            "Negative price block at target SOC should return NoChargeNoDischarge, got: {} - {}",
             eval.mode,
             eval.reason
         );
@@ -1966,6 +1959,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: spot_price,
                     effective_price_czk_per_kwh: spot_price + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -2045,6 +2039,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: spot_price,
                     effective_price_czk_per_kwh: spot_price + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -2081,6 +2076,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2104,6 +2100,7 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2134,20 +2131,27 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             })
             .collect();
 
         let mut schedule = vec![
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
             ScheduledAction::SelfUse, // 1-block gap
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
         ];
 
-        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
-            &mut schedule, &blocks, 2,
-        );
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(&mut schedule, &blocks, 2);
 
         assert!(
             matches!(schedule[2], ScheduledAction::Charge { .. }),
@@ -2166,19 +2170,22 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             })
             .collect();
 
         let mut schedule = vec![
             ScheduledAction::SelfUse, // Leading gap (1 block)
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
             ScheduledAction::SelfUse,
         ];
 
-        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
-            &mut schedule, &blocks, 2,
-        );
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(&mut schedule, &blocks, 2);
 
         assert!(
             matches!(schedule[0], ScheduledAction::Charge { .. }),
@@ -2202,30 +2209,35 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 10.0,
                 effective_price_czk_per_kwh: 10.5, // Very expensive gap
+                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(30),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             },
         ];
 
         let mut schedule = vec![
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
             ScheduledAction::SelfUse, // Expensive gap
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
         ];
 
-        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
-            &mut schedule, &blocks, 2,
-        );
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(&mut schedule, &blocks, 2);
 
         assert!(
             matches!(schedule[1], ScheduledAction::SelfUse),
@@ -2244,21 +2256,28 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
+                spot_sell_price_czk_per_kwh: None,
             })
             .collect();
 
         let mut schedule = vec![
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
             ScheduledAction::SelfUse, // 2-block gap
             ScheduledAction::SelfUse,
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
-            ScheduledAction::Charge { reason: ChargeReason::Arbitrage },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
+            ScheduledAction::Charge {
+                reason: ChargeReason::Arbitrage,
+            },
         ];
 
-        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(
-            &mut schedule, &blocks, 2,
-        );
+        WinterAdaptiveV9Strategy::remove_short_selfuse_gaps_in_schedule(&mut schedule, &blocks, 2);
 
         assert!(
             matches!(schedule[2], ScheduledAction::SelfUse),
@@ -2271,8 +2290,8 @@ mod tests {
     }
 
     #[test]
-    fn test_hold_charge_evaluate_returns_backup_mode() {
-        // Test that evaluating a block scheduled as HoldCharge returns BackUpMode
+    fn test_hold_charge_evaluate_returns_no_charge_no_discharge() {
+        // Test that evaluating a block scheduled as HoldCharge returns NoChargeNoDischarge
         // Use blocks with HDO low fee overnight, high fee from 6 AM
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let hdo_low_fee = 0.50;
@@ -2294,6 +2313,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: spot_price,
                     effective_price_czk_per_kwh: spot_price + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -2338,8 +2358,8 @@ mod tests {
 
             assert_eq!(
                 eval.mode,
-                InverterOperationMode::BackUpMode,
-                "HoldCharge block should return BackUpMode, got: {} - {}",
+                InverterOperationMode::NoChargeNoDischarge,
+                "HoldCharge block should return NoChargeNoDischarge, got: {} - {}",
                 eval.mode,
                 eval.reason
             );

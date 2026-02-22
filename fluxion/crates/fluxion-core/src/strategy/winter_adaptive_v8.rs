@@ -930,6 +930,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: 1.0,
                     effective_price_czk_per_kwh: 1.0 + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -944,6 +945,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: 3.0,
                     effective_price_czk_per_kwh: 3.0 + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -958,6 +960,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: 6.0,
                     effective_price_czk_per_kwh: 6.0 + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
@@ -972,6 +975,7 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: 4.0,
                     effective_price_czk_per_kwh: 4.0 + grid_fee,
+                    spot_sell_price_czk_per_kwh: None,
                 });
             }
         }
