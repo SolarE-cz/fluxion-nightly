@@ -184,18 +184,6 @@ pub struct RunArgs {
           \nIgnored when using --from-db or --from-json"
     )]
     pub solar: String,
-
-    /// TOML file with strategy config overrides (for C-strategies)
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "TOML file with strategy config overrides",
-        long_help = "Path to a TOML file containing config overrides for configurable strategies.\n\
-          Each section key is a strategy ID (e.g., [winter_adaptive_c10]).\n\
-          Only parameters that differ from defaults need to be specified.\n\
-          \nExample: --strategy-config c10_experiment.toml"
-    )]
-    pub strategy_config: Option<String>,
 }
 
 #[derive(Parser)]
@@ -283,18 +271,6 @@ pub struct CompareArgs {
           \nIgnored when using --from-db or --from-json"
     )]
     pub solar: String,
-
-    /// TOML file with strategy config overrides (for C-strategies)
-    #[arg(
-        long,
-        value_name = "PATH",
-        help = "TOML file with strategy config overrides",
-        long_help = "Path to a TOML file containing config overrides for configurable strategies.\n\
-          Each section key is a strategy ID (e.g., [winter_adaptive_c10]).\n\
-          Only parameters that differ from defaults need to be specified.\n\
-          \nExample: --strategy-config c10_experiment.toml"
-    )]
-    pub strategy_config: Option<String>,
 }
 
 #[derive(Parser)]

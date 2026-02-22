@@ -461,7 +461,7 @@ impl WinterAdaptiveV5Strategy {
             && context.current_battery_soc <= self.config.min_discharge_soc
         {
             return (
-                InverterOperationMode::NoChargeNoDischarge,
+                InverterOperationMode::BackUpMode,
                 format!(
                     "Expensive block but SOC {:.1}% ≤ {:.1}% - freeze battery, use grid",
                     context.current_battery_soc, self.config.min_discharge_soc
@@ -474,7 +474,7 @@ impl WinterAdaptiveV5Strategy {
         if current_category == BlockCategory::MidRange {
             if context.current_battery_soc > self.config.min_discharge_soc {
                 return (
-                    InverterOperationMode::NoChargeNoDischarge,
+                    InverterOperationMode::BackUpMode,
                     format!(
                         "Mid-price freeze: {:.3} CZK/kWh - preserve battery (SOC {:.1}%)",
                         effective_price, context.current_battery_soc
@@ -568,9 +568,7 @@ impl EconomicStrategy for WinterAdaptiveV5Strategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            InverterOperationMode::SelfUse
-            | InverterOperationMode::BackUpMode
-            | InverterOperationMode::NoChargeNoDischarge => {
+            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
                 let usable_battery_kwh = ((context.current_battery_soc
                     - context.control_config.hardware_min_battery_soc)
                     .max(0.0)
@@ -634,7 +632,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             });
         }
 

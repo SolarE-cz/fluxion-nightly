@@ -161,52 +161,6 @@ negative_price_handling_enabled = true       # Charge during negative prices
 min_overnight_charge_blocks = 4              # Minimum overnight charge blocks (safety margin)
 opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
 
-# V10: Dynamic Battery Budget Allocation (EXPERIMENTAL)
-# - Unified economic optimization: allocates finite battery budget to most expensive blocks
-# - No hardcoded time windows - everything driven by price economics
-# - Cheap overnight blocks get GridPowered (preserves battery for expensive hours)
-# - Solar excess blocks stay SelfUse for natural battery charging
-# - Savings threshold: only uses battery when savings > charge cost basis
-# [strategies.winter_adaptive_v10]
-# enabled = false                              # V9 remains the default
-# priority = 100                               # Highest priority
-# target_battery_soc = 95.0                    # Max charge level (%)
-# min_discharge_soc = 10.0                     # Minimum SOC before discharge
-# battery_round_trip_efficiency = 0.90         # Round-trip efficiency (90%)
-# negative_price_handling_enabled = true       # Charge during negative prices
-# opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
-# min_export_spread_czk = 5.0                  # Min spread for grid export
-# min_soc_after_export = 35.0                  # Min SOC after export (%)
-# solar_threshold_kwh = 5.0                    # Minimum solar for solar-excess mode
-# solar_confidence_factor = 0.7                # Conservative factor for solar forecast (70%)
-# min_savings_threshold_czk = 0.5              # Min savings per kWh to justify battery use
-
-# V20: Adaptive Budget Allocation (EXPERIMENTAL)
-# - V10 algorithm + DayMetrics-driven parameter resolution
-# - Adjusts strategy based on price volatility, solar availability, price level, tomorrow outlook
-# - Composable adjustments: volatile + high solar + negative prices can all apply simultaneously
-# [strategies.winter_adaptive_v20]
-# enabled = false                              # Disabled by default
-# priority = 100                               # Highest priority
-# target_battery_soc = 95.0                    # Max charge level (%)
-# min_discharge_soc = 10.0                     # Minimum SOC before discharge
-# battery_round_trip_efficiency = 0.90         # Round-trip efficiency (90%)
-# negative_price_handling_enabled = true       # Charge during negative prices
-# opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
-# min_export_spread_czk = 3.0                  # Min spread for grid export
-# min_soc_after_export = 25.0                  # Min SOC after export (%)
-# solar_threshold_kwh = 5.0                    # Minimum solar for solar-excess mode
-# solar_confidence_factor = 0.7                # Conservative factor for solar forecast (70%)
-# min_savings_threshold_czk = 0.5              # Min savings per kWh to justify battery use
-# --- DayMetrics thresholds ---
-# volatile_cv_threshold = 0.35                 # CV above this = volatile day
-# expensive_level_threshold = 0.3              # Price level above this = expensive day
-# high_solar_ratio_threshold = 1.1             # Solar ratio above this = high solar
-# low_solar_ratio_threshold = 0.9              # Solar ratio below this = low solar
-# tomorrow_expensive_ratio = 1.3               # Tomorrow/today price ratio above this = expensive tomorrow
-# tomorrow_cheap_ratio = 0.7                   # Tomorrow/today price ratio below this = cheap tomorrow
-# negative_price_fraction_threshold = 0.0      # Fraction of negative blocks above this = significant
-
 # V7: Unconstrained Multi-Cycle Arbitrage Optimizer
 # - No artificial limitations (no "top N blocks" or "below median only")
 # - Multiple charge/discharge cycles per day when profitable
@@ -249,14 +203,6 @@ opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (C
 # min_soc_after_export = 50.0             # Min SOC after export (%)
 # negative_price_handling_enabled = true  # Charge during negative prices
 
-# Fixed Price Arbitrage (for fixed-price contracts with spot selling)
-# Charges at fixed price, discharges to grid when spot prices spike
-# Requires use_spot_prices_to_sell = true in [pricing]
-# [strategies.fixed_price_arbitrage]
-# enabled = false                              # Disabled by default
-# priority = 85                                # Lower than main strategy
-# min_profit_threshold_czk = 3.0               # Min spread (sell - buy) to trigger (CZK/kWh)
-
 # Legacy strategies (disabled by default - use V9 instead)
 # Uncomment and set enabled = true to use these instead
 
@@ -274,31 +220,6 @@ opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (C
 
 # [strategies.winter_adaptive]
 # enabled = false
-
-# ============================================================================
-# Remote Access (Tor Hidden Service)
-# ============================================================================
-# Enables remote access to FluxION via a Tor hidden service.
-# A dedicated Tauri mobile app connects over Tor using x25519 client auth.
-# Pairing is done by scanning a QR code from the HA dashboard.
-
-# [remote_access]
-# enabled = false
-
-# ============================================================================
-# FluxION Server Heartbeat
-# ============================================================================
-# Connects this FluxION instance to a centralized FluxION Server for monitoring.
-# The server tracks heartbeats and alerts administrators if an instance goes offline.
-# The shared_secret must match the [auth].shared_secret configured on the server.
-
-# [server_heartbeat]
-# enabled = false
-# server_url = "https://fluxion-server.example.com:8100"
-# instance_id = "my-fluxion-instance"
-# shared_secret = "change-me-to-match-server-auth-secret"
-# friendly_name = "Home FluxION"
-# interval_seconds = 300
 
 # ============================================================================
 # Solar Production Forecast

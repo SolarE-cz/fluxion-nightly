@@ -11,7 +11,6 @@
 // For commercial licensing, please contact: info@solare.cz
 
 pub mod config;
-pub mod day_profile;
 pub mod health;
 pub mod history;
 pub mod inverter;
@@ -22,7 +21,6 @@ pub mod web;
 
 // Re-export common types for convenience
 pub use config::{ControlConfig, SystemConfig};
-pub use day_profile::DayMetrics;
 pub use health::{HealthStatus, SystemHealthData};
 pub use history::{ConsumptionHistory, ConsumptionHistoryConfig};
 pub use inverter::{Inverter, InverterOperationMode, InverterType};

@@ -147,9 +147,6 @@ pub fn predict_battery_soc(
                 // Use hardware minimum SOC enforced by inverter firmware
                 soc = (soc - soc_decrease).max(hardware_min_soc);
             }
-            InverterOperationMode::NoChargeNoDischarge => {
-                // Battery idle - SOC stays constant, grid powers house
-            }
             InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
                 // In self-use or backup mode, SOC changes depend on solar generation vs household consumption
                 // Backup mode behaves the same as self-use for SOC prediction purposes

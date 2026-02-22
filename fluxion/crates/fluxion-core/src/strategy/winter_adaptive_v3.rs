@@ -548,9 +548,7 @@ impl EconomicStrategy for WinterAdaptiveV3Strategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            InverterOperationMode::SelfUse
-            | InverterOperationMode::BackUpMode
-            | InverterOperationMode::NoChargeNoDischarge => {
+            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
                 let usable_battery_kwh = ((context.current_battery_soc
                     - context.control_config.hardware_min_battery_soc)
                     .max(0.0)

@@ -34,7 +34,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -45,7 +44,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
             effective_price_czk_per_kwh: 1.5,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -56,7 +54,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 1.0,
             effective_price_czk_per_kwh: 1.0,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -67,7 +64,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -78,7 +74,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
             effective_price_czk_per_kwh: 5.0,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -89,7 +84,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -100,7 +94,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 6.0,
             effective_price_czk_per_kwh: 6.0,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 
@@ -111,7 +104,6 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
             effective_price_czk_per_kwh: 2.5,
-            spot_sell_price_czk_per_kwh: None,
         });
     }
 

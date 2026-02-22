@@ -37,8 +37,8 @@ WORKDIR /build
 COPY Cargo.toml ./
 COPY crates/ ./crates/
 
-# Build release binaries (fluxion and fluxion-upgrader)
-RUN cargo build --release --bin fluxion --bin fluxion-upgrader
+# Build release binary
+RUN cargo build --release --bin fluxion
 
 # Create final image stages
 FROM ghcr.io/home-assistant/amd64-base:3.18 AS final-amd64
@@ -52,9 +52,8 @@ RUN apk add --no-cache \
     libgcc \
     && rm -rf /var/cache/apk/*
 
-# Copy binaries from builder (Phase 5.1: ships both binaries)
+# Copy binary from builder
 COPY --from=builder /build/target/release/fluxion /usr/local/bin/fluxion-main
-COPY --from=builder /build/target/release/fluxion-upgrader /usr/local/bin/fluxion-upgrader
 
 # Copy run script (flat structure after publishing)
 COPY run.sh /
@@ -64,7 +63,7 @@ RUN chmod a+x /run.sh
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.38" \
+    io.hass.version="0.2.35" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 

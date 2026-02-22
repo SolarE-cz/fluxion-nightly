@@ -64,7 +64,6 @@ fn test_config_update_flow() {
         strategies_config: Default::default(),
         history: Default::default(),
         solar_forecast: Default::default(),
-        remote_access: Default::default(),
     };
 
     // Create config update channel
@@ -92,14 +91,12 @@ fn test_config_update_flow() {
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
                 effective_price_czk_per_kwh: 3.0,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: chrono::Utc::now() + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.0,
                 effective_price_czk_per_kwh: 5.0,
-                spot_sell_price_czk_per_kwh: None,
             },
         ],
         block_duration_minutes: 15,
@@ -180,7 +177,6 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
         strategies_config: Default::default(),
         history: Default::default(),
         solar_forecast: Default::default(),
-        remote_access: Default::default(),
     };
 
     // Create config update channel

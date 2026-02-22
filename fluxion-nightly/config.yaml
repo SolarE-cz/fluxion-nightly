@@ -1,0 +1,393 @@
+arch:
+- aarch64
+- amd64
+boot: auto
+description: Solar plant automation based on electricity spot prices
+hassio_api: true
+hassio_role: default
+homeassistant_api: true
+host_network: false
+image: ghcr.io/solare-cz/fluxion-nightly-{arch}
+ingress: true
+ingress_port: 8099
+init: false
+labels:
+  org.opencontainers.image.description: Solar plant automation based on electricity
+    spot prices
+  org.opencontainers.image.licenses: CC-BY-NC-ND-4.0
+  org.opencontainers.image.source: https://github.com/SolarE-cz/fluxion-nightly
+  org.opencontainers.image.title: FluxION ECS
+name: FluxION ECS (Nightly)
+options:
+  control:
+    average_household_load_kw: 0.5
+    battery_capacity_kwh: 23.0
+    force_charge_hours: 4
+    force_discharge_hours: 2
+    max_battery_charge_rate_kw: 5.0
+    max_battery_soc: 100
+    min_battery_soc: 10
+  inverters:
+  - entity_prefix: solax
+    id: solax
+    topology: independent
+    vendor: solax
+  pricing:
+    fixed_buy_prices: []
+    fixed_sell_prices: []
+    spot_buy_fee_czk: 0.5
+    spot_price_entity: sensor.current_spot_electricity_price_15min
+    spot_sell_fee_czk: 0.5
+    use_spot_prices_to_buy: true
+    use_spot_prices_to_sell: true
+  remote_access:
+    enabled: false
+  strategies:
+    day_ahead_planning:
+      enabled: false
+    morning_precharge:
+      enabled: false
+    price_arbitrage:
+      enabled: false
+    self_use:
+      enabled: true
+    solar_aware_charging:
+      enabled: false
+      midday_max_soc: 90.0
+      min_solar_forecast_kwh: 2.0
+      solar_window_end_hour: 14
+      solar_window_start_hour: 10
+    solar_first:
+      enabled: false
+    time_aware_charge:
+      enabled: false
+    winter_adaptive:
+      charge_on_negative_even_if_full: false
+      ema_period_days: 7
+      enabled: false
+      export_trigger_multiplier: 2.5
+      grid_export_price_threshold: 8.0
+      min_soc_for_export: 50.0
+      min_solar_percentage: 0.1
+      negative_price_handling_enabled: true
+      target_battery_soc: 90.0
+      tomorrow_preservation_threshold: 1.2
+      top_expensive_blocks: 12
+    winter_adaptive_v10:
+      battery_round_trip_efficiency: 0.9
+      enabled: false
+      min_discharge_soc: 10.0
+      min_export_spread_czk: 5.0
+      min_savings_threshold_czk: 0.5
+      min_soc_after_export: 35.0
+      negative_price_handling_enabled: true
+      opportunistic_charge_threshold_czk: 1.5
+      solar_confidence_factor: 0.7
+      solar_threshold_kwh: 5.0
+      target_battery_soc: 95.0
+    winter_adaptive_v2:
+      charge_on_negative_even_if_full: false
+      ema_period_days: 7
+      enabled: false
+      export_trigger_multiplier: 2.5
+      grid_export_price_threshold: 8.0
+      min_soc_for_export: 50.0
+      min_solar_percentage: 0.1
+      negative_price_handling_enabled: true
+      target_battery_soc: 90.0
+      tomorrow_preservation_threshold: 1.2
+      top_expensive_blocks: 12
+    winter_adaptive_v20:
+      battery_round_trip_efficiency: 0.9
+      enabled: false
+      expensive_level_threshold: 0.3
+      high_solar_ratio_threshold: 1.1
+      low_solar_ratio_threshold: 0.9
+      min_discharge_soc: 10.0
+      min_export_spread_czk: 3.0
+      min_savings_threshold_czk: 0.5
+      min_soc_after_export: 25.0
+      negative_price_fraction_threshold: 0.0
+      negative_price_handling_enabled: true
+      opportunistic_charge_threshold_czk: 1.5
+      solar_confidence_factor: 0.7
+      solar_threshold_kwh: 5.0
+      target_battery_soc: 95.0
+      tomorrow_cheap_ratio: 0.7
+      tomorrow_expensive_ratio: 1.3
+      volatile_cv_threshold: 0.35
+    winter_adaptive_v3:
+      daily_charging_target_soc: 90.0
+      discharge_arbitrage_buffer: 1.0
+      enabled: false
+      hdo_high_tariff_czk: 1.8
+      hdo_low_tariff_czk: 0.5
+      hdo_sensor_entity: sensor.cez_hdo_raw_data
+      top_discharge_blocks_per_day: 4
+      winter_discharge_min_soc: 50.0
+    winter_adaptive_v4:
+      discharge_blocks_per_day: 4
+      enabled: false
+      hdo_high_tariff_czk: 1.8
+      hdo_low_tariff_czk: 0.5
+      hdo_sensor_entity: sensor.cez_hdo_raw_data
+      min_discharge_spread_czk: 0.5
+      target_battery_soc: 100.0
+    winter_adaptive_v7:
+      avg_consumption_per_block_kwh: 0.25
+      battery_round_trip_efficiency: 0.9
+      enabled: false
+      min_cycle_profit_czk: 3.0
+      min_discharge_soc: 10.0
+      min_export_spread_czk: 5.0
+      min_soc_after_export: 50.0
+      negative_price_handling_enabled: true
+      peak_threshold_std_dev: 0.3
+      target_battery_soc: 95.0
+      valley_threshold_std_dev: 0.3
+    winter_adaptive_v9:
+      battery_round_trip_efficiency: 0.9
+      cheap_block_percentile: 0.25
+      enabled: true
+      min_arbitrage_spread_czk: 3.0
+      min_discharge_soc: 10.0
+      min_export_spread_czk: 5.0
+      min_overnight_charge_blocks: 4
+      min_soc_after_export: 50.0
+      morning_peak_consumption_per_block_kwh: 0.5
+      morning_peak_end_hour: 9
+      morning_peak_start_hour: 6
+      negative_price_handling_enabled: true
+      opportunistic_charge_threshold_czk: 1.5
+      solar_confidence_factor: 0.7
+      solar_threshold_kwh: 5.0
+      target_battery_soc: 95.0
+      target_soc_after_morning_peak: 20.0
+      top_discharge_blocks_count: 8
+    winter_peak_discharge:
+      enabled: false
+      min_hours_to_solar: 4
+      min_soc_target: 50.0
+      min_soc_to_start: 70.0
+      min_spread_czk: 3.0
+      solar_window_end_hour: 14
+      solar_window_start_hour: 10
+  system:
+    debug_mode: true
+    log_level: info
+    update_interval_secs: 60
+panel_icon: mdi:solar-power
+schema:
+  control:
+    average_household_load_kw: float(0,)?
+    battery_capacity_kwh: float(0,)?
+    force_charge_hours: int(0,24)?
+    force_discharge_hours: int(0,24)?
+    max_battery_charge_rate_kw: float(0,)?
+    max_battery_soc: float(0,100)?
+    maximum_export_power_w: int(0,)
+    min_battery_soc: float(0,100)?
+  inverters:
+  - entity_prefix: str
+    id: str
+    master_id: str?
+    slave_ids:
+    - str?
+    topology: list(independent|master|slave)?
+    vendor: list(solax|solax-ultra)?
+  pricing:
+    fixed_buy_prices:
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    fixed_sell_prices:
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    - float?
+    spot_buy_fee_czk: float(0,)?
+    spot_price_entity: str?
+    spot_sell_fee_czk: float(0,)?
+    use_spot_prices_to_buy: bool?
+    use_spot_prices_to_sell: bool?
+  remote_access:
+    enabled: bool?
+  strategies:
+    day_ahead_planning:
+      enabled: bool?
+    morning_precharge:
+      enabled: bool?
+    price_arbitrage:
+      enabled: bool?
+    self_use:
+      enabled: bool?
+    solar_aware_charging:
+      enabled: bool?
+      midday_max_soc: float(0,100)?
+      min_solar_forecast_kwh: float?
+      solar_window_end_hour: int(0,23)?
+      solar_window_start_hour: int(0,23)?
+    solar_first:
+      enabled: bool?
+    time_aware_charge:
+      enabled: bool?
+    winter_adaptive:
+      charge_on_negative_even_if_full: bool?
+      ema_period_days: int(1,30)?
+      enabled: bool?
+      export_trigger_multiplier: float?
+      grid_export_price_threshold: float?
+      min_soc_for_export: float(0,100)?
+      min_solar_percentage: float(0,1)?
+      negative_price_handling_enabled: bool?
+      target_battery_soc: float(0,100)?
+      tomorrow_preservation_threshold: float?
+      top_expensive_blocks: int(0,96)?
+    winter_adaptive_v10:
+      battery_round_trip_efficiency: float(0,1)?
+      enabled: bool?
+      min_discharge_soc: float(0,100)?
+      min_export_spread_czk: float?
+      min_savings_threshold_czk: float?
+      min_soc_after_export: float(0,100)?
+      negative_price_handling_enabled: bool?
+      opportunistic_charge_threshold_czk: float?
+      solar_confidence_factor: float(0,1)?
+      solar_threshold_kwh: float?
+      target_battery_soc: float(0,100)?
+    winter_adaptive_v2:
+      charge_on_negative_even_if_full: bool?
+      ema_period_days: int(1,30)?
+      enabled: bool?
+      export_trigger_multiplier: float?
+      grid_export_price_threshold: float?
+      min_soc_for_export: float(0,100)?
+      min_solar_percentage: float(0,1)?
+      negative_price_handling_enabled: bool?
+      target_battery_soc: float(0,100)?
+      tomorrow_preservation_threshold: float?
+      top_expensive_blocks: int(0,96)?
+    winter_adaptive_v20:
+      battery_round_trip_efficiency: float(0,1)?
+      enabled: bool?
+      expensive_level_threshold: float?
+      high_solar_ratio_threshold: float?
+      low_solar_ratio_threshold: float?
+      min_discharge_soc: float(0,100)?
+      min_export_spread_czk: float?
+      min_savings_threshold_czk: float?
+      min_soc_after_export: float(0,100)?
+      negative_price_fraction_threshold: float?
+      negative_price_handling_enabled: bool?
+      opportunistic_charge_threshold_czk: float?
+      solar_confidence_factor: float(0,1)?
+      solar_threshold_kwh: float?
+      target_battery_soc: float(0,100)?
+      tomorrow_cheap_ratio: float?
+      tomorrow_expensive_ratio: float?
+      volatile_cv_threshold: float?
+    winter_adaptive_v3:
+      daily_charging_target_soc: float(0,100)?
+      discharge_arbitrage_buffer: float?
+      enabled: bool?
+      hdo_high_tariff_czk: float?
+      hdo_low_tariff_czk: float?
+      hdo_sensor_entity: str?
+      top_discharge_blocks_per_day: int(1,96)?
+      winter_discharge_min_soc: float(0,100)?
+    winter_adaptive_v4:
+      discharge_blocks_per_day: int(1,96)?
+      enabled: bool?
+      hdo_high_tariff_czk: float?
+      hdo_low_tariff_czk: float?
+      hdo_sensor_entity: str?
+      min_discharge_spread_czk: float?
+      target_battery_soc: float(0,100)?
+    winter_adaptive_v7:
+      avg_consumption_per_block_kwh: float?
+      battery_round_trip_efficiency: float(0,1)?
+      enabled: bool?
+      min_cycle_profit_czk: float?
+      min_discharge_soc: float(0,100)?
+      min_export_spread_czk: float?
+      min_soc_after_export: float(0,100)?
+      negative_price_handling_enabled: bool?
+      peak_threshold_std_dev: float?
+      target_battery_soc: float(0,100)?
+      valley_threshold_std_dev: float?
+    winter_adaptive_v9:
+      battery_round_trip_efficiency: float(0,1)?
+      cheap_block_percentile: float(0,1)?
+      enabled: bool?
+      min_arbitrage_spread_czk: float?
+      min_discharge_soc: float(0,100)?
+      min_export_spread_czk: float?
+      min_overnight_charge_blocks: int(1,96)?
+      min_soc_after_export: float(0,100)?
+      morning_peak_consumption_per_block_kwh: float?
+      morning_peak_end_hour: int(0,23)?
+      morning_peak_start_hour: int(0,23)?
+      negative_price_handling_enabled: bool?
+      opportunistic_charge_threshold_czk: float?
+      solar_confidence_factor: float(0,1)?
+      solar_threshold_kwh: float?
+      target_battery_soc: float(0,100)?
+      target_soc_after_morning_peak: float(0,100)?
+      top_discharge_blocks_count: int(1,96)?
+    winter_peak_discharge:
+      enabled: bool?
+      min_hours_to_solar: int(0,24)?
+      min_soc_target: float(0,100)?
+      min_soc_to_start: float(0,100)?
+      min_spread_czk: float?
+      solar_window_end_hour: int(0,23)?
+      solar_window_start_hour: int(0,23)?
+  system:
+    debug_mode: bool?
+    log_level: list(trace|debug|info|warning|error)?
+    update_interval_secs: int(10,3600)?
+slug: fluxion-nightly
+startup: application
+url: https://github.com/SolarE-cz/fluxion-nightly
+version: 0.2.37

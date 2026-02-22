@@ -1,0 +1,331 @@
+# FluxION ECS Configuration Example
+# Energy Control System for PV plant automation
+#
+# Copy this file to config.toml and customize for your setup
+
+# Inverter Configuration
+# You can configure multiple inverters with master/slave topology
+[[inverters]]
+id = "main_inverter"
+inverter_type = "solax"  # Options: solax, solax-ultra
+entity_prefix = "solax"  # Prefix for Home Assistant entities
+topology = "independent" # Options: independent, master, slave
+
+# Example: Multi-inverter setup (commented out)
+# [[inverters]]
+# id = "master_inverter"
+# inverter_type = "solax"
+# entity_prefix = "solax_1"
+# topology = "master"
+# slaves = ["slave_1", "slave_2"]
+#
+# [[inverters]]
+# id = "slave_1"
+# inverter_type = "solax"
+# entity_prefix = "solax_2"
+# topology = "slave"
+# master = "master_inverter"
+
+# Pricing Configuration
+[pricing]
+spot_price_entity = "sensor.current_spot_electricity_price_15min" # Your HA spot price sensor
+# Optional: separate sensor for tomorrow's prices (if your integration splits today/tomorrow)
+tomorrow_price_entity = "sensor.tomorrow_spot_electricity_15min_order"
+use_spot_prices_to_buy = true
+use_spot_prices_to_sell = true
+
+# Fixed hourly prices (24 values) - fallback when spot prices disabled
+# These are in CZK/kWh (or your local currency)
+fixed_buy_prices = [
+  0.05,
+  0.05,
+  0.05,
+  0.05,
+  0.05,
+  0.05, # 00:00 - 05:59
+  0.06,
+  0.07,
+  0.08,
+  0.08,
+  0.07,
+  0.06, # 06:00 - 11:59
+  0.06,
+  0.07,
+  0.08,
+  0.08,
+  0.09,
+  0.10, # 12:00 - 17:59
+  0.09,
+  0.08,
+  0.07,
+  0.06,
+  0.05,
+  0.05, # 18:00 - 23:59
+]
+fixed_sell_prices = [
+  0.08,
+  0.08,
+  0.08,
+  0.08,
+  0.08,
+  0.08, # 00:00 - 05:59
+  0.09,
+  0.10,
+  0.11,
+  0.11,
+  0.10,
+  0.09, # 06:00 - 11:59
+  0.09,
+  0.10,
+  0.11,
+  0.11,
+  0.12,
+  0.13, # 12:00 - 17:59
+  0.12,
+  0.11,
+  0.10,
+  0.09,
+  0.08,
+  0.08, # 18:00 - 23:59
+]
+
+# Spot market fees (CZK/kWh)
+# These fees are added to spot prices when buying/selling
+spot_buy_fee_czk = 0.5  # Fee added when buying from grid
+spot_sell_fee_czk = 0.5 # Fee deducted when selling to grid
+
+# Control Configuration
+[control]
+maximum_export_power_w = 5000 # Maximum grid export power in watts
+force_charge_hours = 4        # Number of cheapest hours to force-charge battery
+force_discharge_hours = 2     # Number of most expensive hours to force-discharge
+min_battery_soc = 10.0        # Minimum battery state of charge (%)
+max_battery_soc = 100.0       # Maximum battery state of charge (%)
+
+# Mode change debounce interval to prevent rapid switching
+# Default: 300 seconds (5 minutes), Minimum: 60 seconds (1 minute)
+min_mode_change_interval_secs = 300
+
+# Average household power consumption in kW (used for battery SOC predictions)
+# This is used as a fallback when actual load sensor data is not available
+# Typical values: 0.3-1.0 kW depending on household size and time of day
+# Default: 0.5 kW (500W)
+average_household_load_kw = 0.5
+
+# Minimum number of consecutive 15-minute blocks for force-charge/discharge operations
+# This protects inverter EEPROM from excessive writes due to frequent mode switching
+# Default: 2 blocks (30 minutes), Set to 1 to allow single blocks (not recommended)
+min_consecutive_force_blocks = 2
+
+# System Configuration
+[system]
+debug_mode = true         # Safe default - logs actions without making actual hardware changes
+update_interval_secs = 60 # How often to update (minimum 10 seconds)
+log_level = "info"        # Options: error, warn, info, debug, trace
+display_currency = "CZK"  # Display currency for web UI: EUR, USD, or CZK
+
+# Optional: Home Assistant connection
+# If not set, will use SUPERVISOR_TOKEN for HA addon, or fail for standalone
+# For development/testing outside HA addon, uncomment and set these:
+# ha_base_url = "http://homeassistant.local:8123"
+# ha_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."  # Your long-lived access token
+
+# Strategy Configuration
+# FluxION uses strategies to determine when to charge/discharge the battery
+# V9 is the recommended default - solar-aware morning peak optimizer
+
+# V9: Solar-Aware Morning Peak Optimizer (RECOMMENDED - DEFAULT)
+# - On sunny days: minimal grid charging, only covers morning peak (6-9 AM)
+# - Target ~20% SOC by end of morning peak, let solar charge battery during day
+# - On low-solar days: falls back to full arbitrage mode
+# - 3 CZK minimum arbitrage spread
+# - 40% savings on winter days, optimal solar utilization on sunny days
+[strategies.winter_adaptive_v9]
+enabled = true                               # V9 is enabled by default
+priority = 100                               # Highest priority
+target_battery_soc = 95.0                    # Max charge level (%)
+min_discharge_soc = 10.0                     # Minimum SOC before discharge
+morning_peak_start_hour = 6                  # Morning peak start (6 AM)
+morning_peak_end_hour = 9                    # Morning peak end (9 AM)
+target_soc_after_morning_peak = 20.0         # Target SOC after morning peak (%)
+morning_peak_consumption_per_block_kwh = 0.5 # Expected consumption per 15min block in morning
+solar_threshold_kwh = 5.0                    # Minimum solar forecast to trigger solar-first mode
+solar_confidence_factor = 0.7                # Conservative factor for solar forecast (70%)
+min_arbitrage_spread_czk = 3.0               # Minimum spread for arbitrage (CZK)
+cheap_block_percentile = 0.25                # Bottom 25% of prices are "cheap"
+top_discharge_blocks_count = 8               # Top expensive blocks for discharge (8 = 2 hours)
+min_export_spread_czk = 5.0                  # Min spread for grid export
+min_soc_after_export = 50.0                  # Min SOC after export (%)
+battery_round_trip_efficiency = 0.90         # Round-trip efficiency (90%)
+negative_price_handling_enabled = true       # Charge during negative prices
+min_overnight_charge_blocks = 4              # Minimum overnight charge blocks (safety margin)
+opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
+
+# V10: Dynamic Battery Budget Allocation (EXPERIMENTAL)
+# - Unified economic optimization: allocates finite battery budget to most expensive blocks
+# - No hardcoded time windows - everything driven by price economics
+# - Cheap overnight blocks get GridPowered (preserves battery for expensive hours)
+# - Solar excess blocks stay SelfUse for natural battery charging
+# - Savings threshold: only uses battery when savings > charge cost basis
+# [strategies.winter_adaptive_v10]
+# enabled = false                              # V9 remains the default
+# priority = 100                               # Highest priority
+# target_battery_soc = 95.0                    # Max charge level (%)
+# min_discharge_soc = 10.0                     # Minimum SOC before discharge
+# battery_round_trip_efficiency = 0.90         # Round-trip efficiency (90%)
+# negative_price_handling_enabled = true       # Charge during negative prices
+# opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
+# min_export_spread_czk = 5.0                  # Min spread for grid export
+# min_soc_after_export = 35.0                  # Min SOC after export (%)
+# solar_threshold_kwh = 5.0                    # Minimum solar for solar-excess mode
+# solar_confidence_factor = 0.7                # Conservative factor for solar forecast (70%)
+# min_savings_threshold_czk = 0.5              # Min savings per kWh to justify battery use
+
+# V20: Adaptive Budget Allocation (EXPERIMENTAL)
+# - V10 algorithm + DayMetrics-driven parameter resolution
+# - Adjusts strategy based on price volatility, solar availability, price level, tomorrow outlook
+# - Composable adjustments: volatile + high solar + negative prices can all apply simultaneously
+# [strategies.winter_adaptive_v20]
+# enabled = false                              # Disabled by default
+# priority = 100                               # Highest priority
+# target_battery_soc = 95.0                    # Max charge level (%)
+# min_discharge_soc = 10.0                     # Minimum SOC before discharge
+# battery_round_trip_efficiency = 0.90         # Round-trip efficiency (90%)
+# negative_price_handling_enabled = true       # Charge during negative prices
+# opportunistic_charge_threshold_czk = 1.5     # Always charge below this price (CZK/kWh)
+# min_export_spread_czk = 3.0                  # Min spread for grid export
+# min_soc_after_export = 25.0                  # Min SOC after export (%)
+# solar_threshold_kwh = 5.0                    # Minimum solar for solar-excess mode
+# solar_confidence_factor = 0.7                # Conservative factor for solar forecast (70%)
+# min_savings_threshold_czk = 0.5              # Min savings per kWh to justify battery use
+# --- DayMetrics thresholds ---
+# volatile_cv_threshold = 0.35                 # CV above this = volatile day
+# expensive_level_threshold = 0.3              # Price level above this = expensive day
+# high_solar_ratio_threshold = 1.1             # Solar ratio above this = high solar
+# low_solar_ratio_threshold = 0.9              # Solar ratio below this = low solar
+# tomorrow_expensive_ratio = 1.3               # Tomorrow/today price ratio above this = expensive tomorrow
+# tomorrow_cheap_ratio = 0.7                   # Tomorrow/today price ratio below this = cheap tomorrow
+# negative_price_fraction_threshold = 0.0      # Fraction of negative blocks above this = significant
+
+# V7: Unconstrained Multi-Cycle Arbitrage Optimizer
+# - No artificial limitations (no "top N blocks" or "below median only")
+# - Multiple charge/discharge cycles per day when profitable
+# - Valley-peak detection for volatile days, percentile-based for stable days
+# - Minimum 3 CZK profit threshold for discharge cycles
+# - Home-first export policy (keeps power for home use unless big spread)
+# - Solar-aware charging: reduces grid charging when solar is expected
+# [strategies.winter_adaptive_v7]
+# enabled = false                        # Disabled by default (V9 is recommended)
+# priority = 100                         # Highest priority
+# target_battery_soc = 95.0              # Charge to 95% during cheap periods
+# min_discharge_soc = 10.0               # Minimum SOC before discharge
+# min_cycle_profit_czk = 3.0             # Min profit per cycle (CZK)
+# valley_threshold_std_dev = 0.3         # Valley detection threshold
+# peak_threshold_std_dev = 0.3           # Peak detection threshold
+# min_export_spread_czk = 5.0            # Min spread for grid export
+# min_soc_after_export = 50.0            # Min SOC after export (%)
+# avg_consumption_per_block_kwh = 0.25   # Avg consumption per 15min block
+# negative_price_handling_enabled = true # Charge during negative prices
+# battery_round_trip_efficiency = 0.90   # Round-trip efficiency (90%)
+# solar_aware_charging_enabled = true    # Enable solar-aware charge reduction
+# min_grid_charge_blocks = 2             # Minimum grid charge blocks (safety margin)
+# opportunistic_charge_threshold_czk = 1.5 # Always charge below this price (CZK/kWh)
+
+# V8: Simplified Arbitrage Strategy
+# - Straightforward charging/discharging with configurable parameters
+# - Uses percentile-based cheap block detection
+# - Configurable discharge block count
+# [strategies.winter_adaptive_v8]
+# enabled = false                         # Disabled by default (V9 is recommended)
+# priority = 100                          # Highest priority
+# target_battery_soc = 95.0               # Charge to 95% during cheap periods
+# min_discharge_soc = 10.0                # Minimum SOC before discharge
+# top_discharge_blocks_count = 8          # Number of expensive blocks to discharge (8 = 2 hours)
+# min_discharge_spread_czk = 3.0          # Min spread for discharge (CZK)
+# battery_round_trip_efficiency = 0.90    # Round-trip efficiency (90%)
+# cheap_block_percentile = 0.25           # Bottom 25% of prices are "cheap"
+# avg_consumption_per_block_kwh = 0.25    # Avg consumption per 15min block
+# min_export_spread_czk = 5.0             # Min spread for grid export
+# min_soc_after_export = 50.0             # Min SOC after export (%)
+# negative_price_handling_enabled = true  # Charge during negative prices
+
+# Fixed Price Arbitrage (for fixed-price contracts with spot selling)
+# Charges at fixed price, discharges to grid when spot prices spike
+# Requires use_spot_prices_to_sell = true in [pricing]
+# [strategies.fixed_price_arbitrage]
+# enabled = false                              # Disabled by default
+# priority = 85                                # Lower than main strategy
+# min_profit_threshold_czk = 3.0               # Min spread (sell - buy) to trigger (CZK/kWh)
+
+# Legacy strategies (disabled by default - use V9 instead)
+# Uncomment and set enabled = true to use these instead
+
+# [strategies.winter_adaptive_v4]
+# enabled = false
+# target_battery_soc = 100.0
+
+# [strategies.winter_adaptive_v3]
+# enabled = false
+# target_battery_soc = 100.0
+
+# [strategies.winter_adaptive_v2]
+# enabled = false
+# daily_charging_target_soc = 100.0
+
+# [strategies.winter_adaptive]
+# enabled = false
+
+# ============================================================================
+# Remote Access (Tor Hidden Service)
+# ============================================================================
+# Enables remote access to FluxION via a Tor hidden service.
+# A dedicated Tauri mobile app connects over Tor using x25519 client auth.
+# Pairing is done by scanning a QR code from the HA dashboard.
+
+# [remote_access]
+# enabled = false
+
+# ============================================================================
+# FluxION Server Heartbeat
+# ============================================================================
+# Connects this FluxION instance to a centralized FluxION Server for monitoring.
+# The server tracks heartbeats and alerts administrators if an instance goes offline.
+# The shared_secret must match the [auth].shared_secret configured on the server.
+
+# [server_heartbeat]
+# enabled = false
+# server_url = "https://fluxion-server.example.com:8100"
+# instance_id = "my-fluxion-instance"
+# shared_secret = "change-me-to-match-server-auth-secret"
+# friendly_name = "Home FluxION"
+# interval_seconds = 300
+
+# ============================================================================
+# Solar Production Forecast
+# ============================================================================
+# Fetches solar production forecasts from Home Assistant sensors (e.g., Open-Meteo integration)
+# and makes them available to strategies for better planning decisions.
+
+[solar_forecast]
+# Enable solar forecast fetching
+enabled = true
+
+# Sensor name patterns for solar forecast data
+# Supports multiple PV arrays - will sum all sensors matching the pattern with optional suffixes
+# e.g., "sensor.energy_production_today" matches:
+#   - sensor.energy_production_today (exact match)
+#   - sensor.energy_production_today_1 (first PV array)
+#   - sensor.energy_production_today_2 (second PV array)
+
+# Total solar production forecast for today (kWh)
+sensor_total_today_pattern = "sensor.energy_production_today"
+
+# Remaining solar production forecast for today (kWh)
+sensor_remaining_today_pattern = "sensor.energy_production_today_remaining"
+
+# Solar production forecast for tomorrow (kWh)
+sensor_tomorrow_pattern = "sensor.energy_production_tomorrow"
+
+# How often to fetch solar forecast data (seconds)
+# Default: 60 (1 minute)
+fetch_interval_seconds = 60

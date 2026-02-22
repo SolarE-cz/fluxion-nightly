@@ -62,6 +62,8 @@ pub struct PluginManager {
     plugins: HashMap<String, PluginEntry>,
     /// Fallback mode when no plugins are available or all fail
     fallback_mode: OperationMode,
+    /// Timeout for plugin evaluation in milliseconds
+    evaluation_timeout_ms: u64,
 }
 
 impl Default for PluginManager {
@@ -77,7 +79,18 @@ impl PluginManager {
         Self {
             plugins: HashMap::new(),
             fallback_mode: OperationMode::SelfUse,
+            evaluation_timeout_ms: 5000,
         }
+    }
+
+    /// Set the fallback mode when no plugins produce a result
+    pub fn set_fallback_mode(&mut self, mode: OperationMode) {
+        self.fallback_mode = mode;
+    }
+
+    /// Set the evaluation timeout in milliseconds
+    pub fn set_evaluation_timeout(&mut self, timeout_ms: u64) {
+        self.evaluation_timeout_ms = timeout_ms;
     }
 
     /// Register a plugin

@@ -1138,28 +1138,24 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.00,
                 effective_price_czk_per_kwh: 1.00 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.10,
                 effective_price_czk_per_kwh: 1.10 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(30),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.05,
                 effective_price_czk_per_kwh: 1.05 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(45),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.15,
                 effective_price_czk_per_kwh: 1.15 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             // Peak 1: 07:00-08:00 (morning peak)
             TimeBlockPrice {
@@ -1167,21 +1163,18 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.50,
                 effective_price_czk_per_kwh: 5.50 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::hours(7) + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.80,
                 effective_price_czk_per_kwh: 5.80 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::hours(7) + chrono::Duration::minutes(30),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.60,
                 effective_price_czk_per_kwh: 5.60 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             // Valley 2: 12:00-13:00 (midday solar dip)
             TimeBlockPrice {
@@ -1189,7 +1182,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 0.80,
                 effective_price_czk_per_kwh: 0.80 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time
@@ -1198,7 +1190,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 0.50,
                 effective_price_czk_per_kwh: 0.50 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time
@@ -1207,7 +1198,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 0.60,
                 effective_price_czk_per_kwh: 0.60 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             // Peak 2: 18:00-19:00 (evening peak)
             TimeBlockPrice {
@@ -1215,7 +1205,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 6.50,
                 effective_price_czk_per_kwh: 6.50 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time
@@ -1224,7 +1213,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 7.00,
                 effective_price_czk_per_kwh: 7.00 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time
@@ -1233,7 +1221,6 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 6.80,
                 effective_price_czk_per_kwh: 6.80 + grid_fee,
-                spot_sell_price_czk_per_kwh: None,
             },
         ]
     }
@@ -1251,7 +1238,6 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: price,
                     effective_price_czk_per_kwh: price + grid_fee,
-                    spot_sell_price_czk_per_kwh: None,
                 }
             })
             .collect()
@@ -1352,28 +1338,24 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: -1.00,
                 effective_price_czk_per_kwh: -1.00 + 1.80,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: -2.00,
                 effective_price_czk_per_kwh: -2.00 + 1.80,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::hours(6),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.00,
                 effective_price_czk_per_kwh: 5.00 + 1.80,
-                spot_sell_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::hours(6) + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.50,
                 effective_price_czk_per_kwh: 5.50 + 1.80,
-                spot_sell_price_czk_per_kwh: None,
             },
         ];
 
@@ -1585,7 +1567,6 @@ mod tests {
                     duration_minutes: 15,
                     price_czk_per_kwh: price,
                     effective_price_czk_per_kwh: price + 1.0, // Add grid fee
-                    spot_sell_price_czk_per_kwh: None,
                 }
             })
             .collect();

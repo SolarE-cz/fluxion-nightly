@@ -35,8 +35,6 @@ pub struct SystemConfig {
     pub history: ConsumptionHistoryConfig,
     #[serde(default, rename = "solar_forecast")]
     pub solar_forecast: SolarForecastConfigCore,
-    #[serde(default, rename = "remote_access")]
-    pub remote_access: RemoteAccessConfigCore,
 }
 
 /// Configuration for a single inverter
@@ -273,15 +271,13 @@ pub struct StrategiesConfigCore {
     #[serde(default)]
     pub winter_adaptive_v5: WinterAdaptiveV5ConfigCore,
     #[serde(default)]
+    pub winter_adaptive_v6: WinterAdaptiveV6ConfigCore,
+    #[serde(default)]
     pub winter_adaptive_v7: WinterAdaptiveV7ConfigCore,
     #[serde(default)]
     pub winter_adaptive_v8: WinterAdaptiveV8ConfigCore,
     #[serde(default)]
     pub winter_adaptive_v9: WinterAdaptiveV9ConfigCore,
-    #[serde(default)]
-    pub winter_adaptive_v10: WinterAdaptiveV10ConfigCore,
-    #[serde(default)]
-    pub winter_adaptive_v20: WinterAdaptiveV20ConfigCore,
     #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfigCore,
     #[serde(default)]
@@ -298,8 +294,6 @@ pub struct StrategiesConfigCore {
     pub solar_first: StrategyEnabledConfigCore,
     #[serde(default)]
     pub self_use: StrategyEnabledConfigCore,
-    #[serde(default)]
-    pub fixed_price_arbitrage: FixedPriceArbitrageConfigCore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -694,8 +688,111 @@ impl Default for WinterAdaptiveV5ConfigCore {
     }
 }
 
+/// Winter Adaptive V6 configuration - Adaptive Hybrid Optimizer
+/// Combines best aspects of V3, V4, V5 with adaptive pattern detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterAdaptiveV6ConfigCore {
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_adaptive_v6_priority")]
+    pub priority: u8,
+    /// Target battery SOC for charging (default: 90%)
+    #[serde(default = "default_v6_target_battery_soc")]
+    pub target_battery_soc: f32,
+    /// Minimum SOC before allowing discharge (default: 10%)
+    #[serde(default = "default_v6_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    /// Volatility threshold (CV) for volatile mode (default: 0.4)
+    #[serde(default = "default_v6_volatility_cv_threshold")]
+    pub volatility_cv_threshold: f32,
+    /// Day/night spread ratio for simple arbitrage (default: 2.5)
+    #[serde(default = "default_v6_simple_arbitrage_spread_ratio")]
+    pub simple_arbitrage_spread_ratio: f32,
+    /// Percentile for cheap blocks (default: 25%)
+    #[serde(default = "default_v6_cheap_block_percentile")]
+    pub cheap_block_percentile: f32,
+    /// Percentile for expensive blocks (default: 75%)
+    #[serde(default = "default_v6_expensive_block_percentile")]
+    pub expensive_block_percentile: f32,
+    /// Minimum price spread for discharge (CZK/kWh)
+    #[serde(default = "default_v6_min_discharge_spread_czk")]
+    pub min_discharge_spread_czk: f32,
+    /// Number of most expensive blocks to discharge (default: 12)
+    #[serde(default = "default_v6_discharge_blocks_per_day")]
+    pub discharge_blocks_per_day: usize,
+    /// Safety margin for SOC targets (%)
+    #[serde(default = "default_v6_safety_margin_pct")]
+    pub safety_margin_pct: f32,
+    /// Enable negative price handling
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    /// Planning horizon in hours (default: 24)
+    #[serde(default = "default_v6_planning_horizon_hours")]
+    pub planning_horizon_hours: usize,
+    /// Minimum savings per cycle to justify wear (CZK)
+    #[serde(default = "default_zero_f32")]
+    pub min_savings_per_cycle_czk: f32,
+}
+
+fn default_winter_adaptive_v6_priority() -> u8 {
+    100 // Highest priority - experimental
+}
+fn default_v6_target_battery_soc() -> f32 {
+    90.0
+}
+fn default_v6_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v6_volatility_cv_threshold() -> f32 {
+    0.4
+}
+fn default_v6_simple_arbitrage_spread_ratio() -> f32 {
+    2.5
+}
+fn default_v6_cheap_block_percentile() -> f32 {
+    0.25
+}
+fn default_v6_expensive_block_percentile() -> f32 {
+    0.75
+}
+fn default_v6_min_discharge_spread_czk() -> f32 {
+    0.50
+}
+fn default_v6_discharge_blocks_per_day() -> usize {
+    12
+}
+fn default_v6_safety_margin_pct() -> f32 {
+    5.0
+}
+fn default_v6_planning_horizon_hours() -> usize {
+    24
+}
+fn default_zero_f32() -> f32 {
+    0.0
+}
 fn default_true() -> bool {
     true
+}
+
+impl Default for WinterAdaptiveV6ConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V5 is still default
+            priority: 100,
+            target_battery_soc: 90.0,
+            min_discharge_soc: 10.0,
+            volatility_cv_threshold: 0.4,
+            simple_arbitrage_spread_ratio: 2.5,
+            cheap_block_percentile: 0.25,
+            expensive_block_percentile: 0.75,
+            min_discharge_spread_czk: 0.50,
+            discharge_blocks_per_day: 12,
+            safety_margin_pct: 5.0,
+            negative_price_handling_enabled: true,
+            planning_horizon_hours: 24,
+            min_savings_per_cycle_czk: 0.0,
+        }
+    }
 }
 
 /// Winter Adaptive V7 configuration - Unconstrained Multi-Cycle Arbitrage Optimizer
@@ -1083,257 +1180,6 @@ impl Default for WinterAdaptiveV9ConfigCore {
     }
 }
 
-/// Winter Adaptive V10 configuration - Dynamic Battery Budget Allocation
-/// V10 uses unified budget allocation instead of mode-based planning:
-/// - Ranks all blocks by effective price
-/// - Allocates finite battery budget to most expensive blocks first
-/// - Cheap blocks get GridPowered (NoChargeNoDischarge) to preserve battery
-/// - Solar excess blocks stay SelfUse for natural charging
-/// - No hardcoded time windows - everything driven by economics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WinterAdaptiveV10ConfigCore {
-    pub enabled: bool,
-    /// Priority for conflict resolution (0-100, higher wins)
-    #[serde(default = "default_winter_adaptive_v10_priority")]
-    pub priority: u8,
-    /// Target battery SOC for charging (default: 95%)
-    #[serde(default = "default_v10_target_battery_soc")]
-    pub target_battery_soc: f32,
-    /// Minimum SOC before allowing discharge (default: 10%)
-    #[serde(default = "default_v10_min_discharge_soc")]
-    pub min_discharge_soc: f32,
-    /// Round-trip battery efficiency (default: 0.90)
-    #[serde(default = "default_v10_efficiency")]
-    pub battery_round_trip_efficiency: f32,
-    /// Enable negative price handling (default: true)
-    #[serde(default = "default_true")]
-    pub negative_price_handling_enabled: bool,
-    /// Price threshold (CZK/kWh) below which we always charge (default: 1.5)
-    #[serde(default = "default_v10_opportunistic_threshold")]
-    pub opportunistic_charge_threshold_czk: f32,
-    /// Minimum spread for grid export (CZK) (default: 5.0)
-    #[serde(default = "default_v10_min_export_spread")]
-    pub min_export_spread_czk: f32,
-    /// Minimum SOC after export (%) (default: 50%)
-    #[serde(default = "default_v10_min_soc_after_export")]
-    pub min_soc_after_export: f32,
-    /// Minimum solar forecast (kWh) to consider solar excess (default: 5.0)
-    #[serde(default = "default_v10_solar_threshold")]
-    pub solar_threshold_kwh: f32,
-    /// Factor to apply to solar forecast for conservative planning (default: 0.7)
-    #[serde(default = "default_v10_solar_confidence")]
-    pub solar_confidence_factor: f32,
-    /// Minimum savings per kWh (block_price - avg_charge_price) to justify battery use (default: 0.5)
-    #[serde(default = "default_v10_min_savings_threshold")]
-    pub min_savings_threshold_czk: f32,
-}
-
-fn default_winter_adaptive_v10_priority() -> u8 {
-    100
-}
-fn default_v10_target_battery_soc() -> f32 {
-    95.0
-}
-fn default_v10_min_discharge_soc() -> f32 {
-    10.0
-}
-fn default_v10_efficiency() -> f32 {
-    0.90
-}
-fn default_v10_opportunistic_threshold() -> f32 {
-    1.5
-}
-fn default_v10_min_export_spread() -> f32 {
-    5.0
-}
-fn default_v10_min_soc_after_export() -> f32 {
-    35.0
-}
-fn default_v10_solar_threshold() -> f32 {
-    5.0
-}
-fn default_v10_solar_confidence() -> f32 {
-    0.7
-}
-fn default_v10_min_savings_threshold() -> f32 {
-    0.5
-}
-
-impl Default for WinterAdaptiveV10ConfigCore {
-    fn default() -> Self {
-        Self {
-            enabled: false, // V9 remains the default strategy
-            priority: 100,
-            target_battery_soc: 95.0,
-            min_discharge_soc: 10.0,
-            battery_round_trip_efficiency: 0.90,
-            negative_price_handling_enabled: true,
-            opportunistic_charge_threshold_czk: 1.5,
-            min_export_spread_czk: 5.0,
-            min_soc_after_export: 35.0,
-            solar_threshold_kwh: 5.0,
-            solar_confidence_factor: 0.7,
-            min_savings_threshold_czk: 0.5,
-        }
-    }
-}
-
-/// Winter Adaptive V20 configuration - Adaptive Budget Allocation
-/// V20 = V10 algorithm + DayMetrics-driven parameter resolution:
-/// - Volatile days: lower savings threshold, more bootstrap blocks, lower export spread
-/// - Expensive days: higher savings threshold
-/// - High solar: wider daylight window, higher solar confidence
-/// - Low solar: tighter daylight window, lower solar confidence
-/// - Tomorrow expensive: limit discharge blocks (save battery)
-/// - Tomorrow cheap: reduce charge blocks (charge cheaper tomorrow)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WinterAdaptiveV20ConfigCore {
-    pub enabled: bool,
-    /// Priority for conflict resolution (0-100, higher wins)
-    #[serde(default = "default_winter_adaptive_v20_priority")]
-    pub priority: u8,
-    /// Target battery SOC for charging (default: 95%)
-    #[serde(default = "default_v20_target_battery_soc")]
-    pub target_battery_soc: f32,
-    /// Minimum SOC before allowing discharge (default: 10%)
-    #[serde(default = "default_v20_min_discharge_soc")]
-    pub min_discharge_soc: f32,
-    /// Round-trip battery efficiency (default: 0.90)
-    #[serde(default = "default_v20_efficiency")]
-    pub battery_round_trip_efficiency: f32,
-    /// Enable negative price handling (default: true)
-    #[serde(default = "default_true")]
-    pub negative_price_handling_enabled: bool,
-    /// Price threshold (CZK/kWh) below which we always charge (default: 1.5)
-    #[serde(default = "default_v20_opportunistic_threshold")]
-    pub opportunistic_charge_threshold_czk: f32,
-    /// Minimum spread for grid export (CZK) (default: 3.0)
-    #[serde(default = "default_v20_min_export_spread")]
-    pub min_export_spread_czk: f32,
-    /// Minimum SOC after export (%) (default: 25%)
-    #[serde(default = "default_v20_min_soc_after_export")]
-    pub min_soc_after_export: f32,
-    /// Minimum solar forecast (kWh) to consider solar excess (default: 5.0)
-    #[serde(default = "default_v20_solar_threshold")]
-    pub solar_threshold_kwh: f32,
-    /// Factor to apply to solar forecast for conservative planning (default: 0.7)
-    #[serde(default = "default_v20_solar_confidence")]
-    pub solar_confidence_factor: f32,
-    /// Minimum savings per kWh to justify battery use (default: 0.5)
-    #[serde(default = "default_v20_min_savings_threshold")]
-    pub min_savings_threshold_czk: f32,
-    // === DayMetrics thresholds ===
-    /// CV threshold above which day is considered volatile (default: 0.35)
-    #[serde(default = "default_v20_volatile_cv_threshold")]
-    pub volatile_cv_threshold: f32,
-    /// Price level threshold above which day is considered expensive (default: 0.5)
-    #[serde(default = "default_v20_expensive_level_threshold")]
-    pub expensive_level_threshold: f32,
-    /// Solar ratio above which solar is considered high (default: 1.1)
-    #[serde(default = "default_v20_high_solar_ratio_threshold")]
-    pub high_solar_ratio_threshold: f32,
-    /// Solar ratio below which solar is considered low (default: 0.9)
-    #[serde(default = "default_v20_low_solar_ratio_threshold")]
-    pub low_solar_ratio_threshold: f32,
-    /// Tomorrow price ratio above which tomorrow is expensive (default: 1.3)
-    #[serde(default = "default_v20_tomorrow_expensive_ratio")]
-    pub tomorrow_expensive_ratio: f32,
-    /// Tomorrow price ratio below which tomorrow is cheap (default: 0.7)
-    #[serde(default = "default_v20_tomorrow_cheap_ratio")]
-    pub tomorrow_cheap_ratio: f32,
-    /// Negative price fraction threshold for significant negative pricing (default: 0.0)
-    #[serde(default = "default_v20_negative_price_fraction_threshold")]
-    pub negative_price_fraction_threshold: f32,
-}
-
-fn default_winter_adaptive_v20_priority() -> u8 {
-    100
-}
-fn default_v20_target_battery_soc() -> f32 {
-    95.0
-}
-fn default_v20_min_discharge_soc() -> f32 {
-    10.0
-}
-fn default_v20_efficiency() -> f32 {
-    0.90
-}
-fn default_v20_opportunistic_threshold() -> f32 {
-    1.5
-}
-fn default_v20_min_export_spread() -> f32 {
-    3.0
-}
-fn default_v20_min_soc_after_export() -> f32 {
-    25.0
-}
-fn default_v20_solar_threshold() -> f32 {
-    5.0
-}
-fn default_v20_solar_confidence() -> f32 {
-    0.7
-}
-fn default_v20_min_savings_threshold() -> f32 {
-    0.5
-}
-fn default_v20_volatile_cv_threshold() -> f32 {
-    0.35
-}
-fn default_v20_expensive_level_threshold() -> f32 {
-    0.3
-}
-fn default_v20_high_solar_ratio_threshold() -> f32 {
-    1.1
-}
-fn default_v20_low_solar_ratio_threshold() -> f32 {
-    0.9
-}
-fn default_v20_tomorrow_expensive_ratio() -> f32 {
-    1.3
-}
-fn default_v20_tomorrow_cheap_ratio() -> f32 {
-    0.7
-}
-fn default_v20_negative_price_fraction_threshold() -> f32 {
-    0.0
-}
-
-impl Default for WinterAdaptiveV20ConfigCore {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            priority: 100,
-            target_battery_soc: 95.0,
-            min_discharge_soc: 10.0,
-            battery_round_trip_efficiency: 0.90,
-            negative_price_handling_enabled: true,
-            opportunistic_charge_threshold_czk: 1.5,
-            min_export_spread_czk: 3.0,
-            min_soc_after_export: 25.0,
-            solar_threshold_kwh: 5.0,
-            solar_confidence_factor: 0.7,
-            min_savings_threshold_czk: 0.5,
-            volatile_cv_threshold: 0.35,
-            expensive_level_threshold: 0.3,
-            high_solar_ratio_threshold: 1.1,
-            low_solar_ratio_threshold: 0.9,
-            tomorrow_expensive_ratio: 1.3,
-            tomorrow_cheap_ratio: 0.7,
-            negative_price_fraction_threshold: 0.0,
-        }
-    }
-}
-
-// ============================================================================
-// Remote Access Configuration
-// ============================================================================
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RemoteAccessConfigCore {
-    pub enabled: bool,
-}
-
 // ============================================================================
 // Solar Forecast Configuration
 // ============================================================================
@@ -1390,38 +1236,6 @@ impl Default for SolarForecastConfigCore {
     }
 }
 
-/// Fixed Price Arbitrage strategy configuration
-/// For users with fixed-price energy contracts who can sell at spot prices.
-/// Charges at fixed price, discharges to grid when spot sell price spikes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FixedPriceArbitrageConfigCore {
-    pub enabled: bool,
-    /// Priority for conflict resolution (0-100, higher wins)
-    #[serde(default = "default_fixed_price_arbitrage_priority")]
-    pub priority: u8,
-    /// Minimum spread (sell - buy) in CZK/kWh to trigger arbitrage
-    #[serde(default = "default_fpa_min_profit_threshold")]
-    pub min_profit_threshold_czk: f32,
-}
-
-fn default_fixed_price_arbitrage_priority() -> u8 {
-    85
-}
-
-fn default_fpa_min_profit_threshold() -> f32 {
-    3.0
-}
-
-impl Default for FixedPriceArbitrageConfigCore {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            priority: 85,
-            min_profit_threshold_czk: 3.0,
-        }
-    }
-}
-
 /// All available strategy types - add new strategies here to ensure they're tracked
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1431,11 +1245,10 @@ pub enum StrategyType {
     WinterAdaptiveV3,
     WinterAdaptiveV4,
     WinterAdaptiveV5,
+    WinterAdaptiveV6,
     WinterAdaptiveV7,
     WinterAdaptiveV8,
     WinterAdaptiveV9,
-    WinterAdaptiveV10,
-    WinterAdaptiveV20,
     WinterPeakDischarge,
     SolarAwareCharging,
     MorningPrecharge,
@@ -1444,7 +1257,6 @@ pub enum StrategyType {
     PriceArbitrage,
     SolarFirst,
     SelfUse,
-    FixedPriceArbitrage,
 }
 
 impl StrategyType {
@@ -1456,11 +1268,10 @@ impl StrategyType {
             StrategyType::WinterAdaptiveV3,
             StrategyType::WinterAdaptiveV4,
             StrategyType::WinterAdaptiveV5,
+            StrategyType::WinterAdaptiveV6,
             StrategyType::WinterAdaptiveV7,
             StrategyType::WinterAdaptiveV8,
             StrategyType::WinterAdaptiveV9,
-            StrategyType::WinterAdaptiveV10,
-            StrategyType::WinterAdaptiveV20,
             StrategyType::WinterPeakDischarge,
             StrategyType::SolarAwareCharging,
             StrategyType::MorningPrecharge,
@@ -1469,7 +1280,6 @@ impl StrategyType {
             StrategyType::PriceArbitrage,
             StrategyType::SolarFirst,
             StrategyType::SelfUse,
-            StrategyType::FixedPriceArbitrage,
         ]
     }
 
@@ -1481,11 +1291,10 @@ impl StrategyType {
             StrategyType::WinterAdaptiveV3 => "Winter Adaptive V3",
             StrategyType::WinterAdaptiveV4 => "Winter Adaptive V4",
             StrategyType::WinterAdaptiveV5 => "Winter Adaptive V5",
+            StrategyType::WinterAdaptiveV6 => "Winter Adaptive V6",
             StrategyType::WinterAdaptiveV7 => "Winter Adaptive V7",
             StrategyType::WinterAdaptiveV8 => "Winter Adaptive V8",
             StrategyType::WinterAdaptiveV9 => "Winter Adaptive V9",
-            StrategyType::WinterAdaptiveV10 => "Winter Adaptive V10",
-            StrategyType::WinterAdaptiveV20 => "Winter Adaptive V20",
             StrategyType::WinterPeakDischarge => "Winter Peak Discharge",
             StrategyType::SolarAwareCharging => "Solar Aware Charging",
             StrategyType::MorningPrecharge => "Morning Precharge",
@@ -1494,7 +1303,6 @@ impl StrategyType {
             StrategyType::PriceArbitrage => "Price Arbitrage",
             StrategyType::SolarFirst => "Solar First",
             StrategyType::SelfUse => "Self Use",
-            StrategyType::FixedPriceArbitrage => "Fixed Price Arbitrage",
         }
     }
 }

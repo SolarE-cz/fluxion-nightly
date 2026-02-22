@@ -18,11 +18,6 @@
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ (import rust-overlay) ];
-          config = {
-            android_sdk.accept_license = true;
-            # Allow unfree packages (required for Android SDK)
-            allowUnfree = true;
-          };
         };
 
         # Create crane library instance
@@ -33,43 +28,6 @@
 
         # Override crane library with our toolchain
         craneLibToolchain = craneLib.overrideToolchain rustToolchain;
-
-        # Android SDK for mobile development
-        androidComposition = pkgs.androidenv.composeAndroidPackages {
-          platformVersions = [ "36" ];
-          buildToolsVersions = [ "35.0.0" ];
-          includeNDK = true;
-          ndkVersions = [ "26.3.11579264" ];
-          abiVersions = [ "armeabi-v7a" "arm64-v8a" "x86" "x86_64" ];
-          extraLicenses = [
-            "android-sdk-preview-license"
-            "android-googletv-license"
-            "android-sdk-arm-dbt-license"
-            "google-gdk-license"
-            "intel-android-extra-license"
-            "intel-android-sysimage-license"
-            "mips-android-sysimage-license"
-          ];
-        };
-        androidSdk = androidComposition.androidsdk;
-
-        # Rust toolchain with Android cross-compilation targets for mobile builds
-        rustToolchainMobile = (pkgs.rust-bin.fromRustupToolchainFile ./fluxion/rust-toolchain.toml).override {
-          targets = [
-            "aarch64-linux-android"
-            "armv7-linux-androideabi"
-            "i686-linux-android"
-            "x86_64-linux-android"
-          ];
-        };
-
-        # Rust toolchain with musl targets for static binary releases
-        rustToolchainMusl = (pkgs.rust-bin.fromRustupToolchainFile ./fluxion/rust-toolchain.toml).override {
-          targets = [
-            "x86_64-unknown-linux-musl"
-            "aarch64-unknown-linux-musl"
-          ];
-        };
 
         # Custom source filter to include .ftl locale files, .html templates, and .py scripts
         sourceFilter = path: type:
@@ -124,13 +82,6 @@
           cargoBuildFlags = [ "--bin" "fluxion-version" ];
         });
 
-        # Build the fluxion-server binary
-        fluxion-server-bin = craneLibToolchain.buildPackage (commonArgs // {
-          inherit cargoArtifacts;
-          pname = "fluxion-server";
-          cargoBuildFlags = [ "--bin" "fluxion-server" ];
-        });
-
         # Clippy package using crane
         fluxion-clippy = craneLibToolchain.cargoClippy (commonArgs // {
           inherit cargoArtifacts;
@@ -176,33 +127,21 @@
         # Build Docker image for a specific architecture
         buildDockerImageFor = targetSystem:
           let
-            isNative = system == targetSystem;
-
-            # pkgsCross is the idiomatic nixpkgs way to get a cross-compilation
-            # package set. It reuses the already-fetched nixpkgs and correctly
-            # wires up the cross-compiler (aarch64-linux-gcc, binutils, etc.).
-            crossPkgs =
-              if isNative then pkgs
-              else if targetSystem == "aarch64-linux" then pkgs.pkgsCross.aarch64-multiplatform
-              else throw "Unsupported cross target: ${targetSystem}";
-
-            # The Rust stdlib for the target triple must be present in the toolchain.
-            # Without this override, rustc has no `core`/`std` for the target and
-            # fails with E0463 "can't find crate for `core`".
-            crossRustToolchain =
-              if isNative then rustToolchain
-              else
-                rustToolchain.override {
-                  targets = [ "aarch64-unknown-linux-gnu" ];
-                };
-
-            crossCraneLib = (crane.mkLib crossPkgs).overrideToolchain crossRustToolchain;
-
             fluxionBinary =
-              if isNative then
+              if system == targetSystem then
                 fluxion-main
               else
-                crossCraneLib.buildPackage (commonArgs // {
+              # Cross-compilation case
+                let
+                  crossPkgs = import nixpkgs {
+                    inherit system;
+                    overlays = [ (import rust-overlay) ];
+                    crossSystem = nixpkgs.lib.systems.examples.${targetSystem} or { config = targetSystem; };
+                  };
+                  crossCraneLib = crane.mkLib crossPkgs;
+                  crossCraneLibToolchain = crossCraneLib.overrideToolchain rustToolchain;
+                in
+                crossCraneLibToolchain.buildPackage (commonArgs // {
                   pname = "fluxion-main";
                   cargoBuildFlags = [ "--bin" "fluxion" ];
                   doCheck = false;
@@ -217,14 +156,15 @@
             name = "fluxion-ha";
             tag = arch;
 
+            # Use scratch as base - we'll reference HA base in documentation
             fromImage = null;
 
             copyToRoot = pkgs.buildEnv {
               name = "fluxion-root";
               paths = [
                 fluxionBinary
-                crossPkgs.bash # arch-correct: aarch64 bash when cross-compiling
-                crossPkgs.coreutils # arch-correct: aarch64 coreutils when cross-compiling
+                pkgs.bash
+                pkgs.coreutils
               ];
               pathsToLink = [ "/bin" ];
             };
@@ -256,12 +196,6 @@
             cargo-edit
             pkg-config
             openssl
-            # Tauri 2.0 dependencies (for fluxion-mobile development)
-            gtk3
-            webkitgtk_4_1
-            libsoup_3
-            # Arti Tor client dependency (rusqlite needs sqlite3 at link time)
-            sqlite
           ];
 
           # Environment variables for development
@@ -297,104 +231,10 @@
             echo "   nix run .#ci-format-check        - Check code formatting"
             echo "   nix build .#fluxion-audit        - Run security audit"
             echo "   nix run .#ci-docker-build-amd64  - Build Docker AMD64 image"
-            echo "   nix run .#ci-publish-dry-run     - Preview files for publish (dry-run)"
             echo "   nix run .#ci-publish-github      - Publish to GitHub"
             echo "   nix run .#ci-bump-version        - Bump version (set BUMP_TYPE=major|minor|patch)"
             echo ""
             echo "📜 License: CC-BY-NC-ND-4.0 (SOLARE S.R.O.)"
-          '';
-        };
-
-        # Data analysis shell (Python + matplotlib/pandas/seaborn)
-        devShells.analysis = pkgs.mkShell {
-          packages = with pkgs; [
-            (python3.withPackages (ps: with ps; [
-              matplotlib
-              numpy
-              pandas
-              seaborn
-              scipy
-            ]))
-          ];
-
-          shellHook = ''
-            echo "FluxION Analysis Environment"
-            echo "  Python: $(python3 --version)"
-            echo ""
-            echo "Available packages: matplotlib, numpy, pandas, seaborn, scipy"
-            echo ""
-            echo "Usage:"
-            echo "  python3 ralph/scripts/c10_analysis.py    - Run C10 sweep analysis"
-          '';
-        };
-
-        # Musl static binary build shell (for release binary CI)
-        devShells.musl = pkgs.mkShell {
-          packages = [
-            rustToolchainMusl
-            # Native musl toolchain (for x86_64-unknown-linux-musl)
-            pkgs.musl
-            # aarch64 musl cross-compiler (for aarch64-unknown-linux-musl)
-            pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
-          ];
-
-          # Tell cargo which linker to use for aarch64 musl cross-compilation
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER =
-            "${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-cc";
-
-          shellHook = ''
-            echo "FluxION Musl Static Binary Build Environment"
-            echo "  Rust: $(rustc --version)"
-            echo ""
-            echo "Targets available:"
-            echo "  x86_64-unknown-linux-musl  (native)"
-            echo "  aarch64-unknown-linux-musl (cross)"
-            echo ""
-            echo "Build commands:"
-            echo "  cargo build --release --bin fluxion --target x86_64-unknown-linux-musl"
-            echo "  cargo build --release --bin fluxion --target aarch64-unknown-linux-musl"
-          '';
-        };
-
-        # Mobile (Android) development shell
-        devShells.mobile = pkgs.mkShell {
-          packages = with pkgs; [
-            rustToolchainMobile
-            cargo-watch
-            cargo-edit
-            pkg-config
-            openssl
-            sqlite
-            # Tauri 2.0 desktop dependencies (needed for cargo check on host)
-            gtk3
-            webkitgtk_4_1
-            libsoup_3
-            # Tauri CLI (provides `cargo tauri` subcommand)
-            cargo-tauri
-            # Android development
-            androidSdk
-            jdk17
-            gradle
-          ];
-
-          ANDROID_HOME = "${androidSdk}/libexec/android-sdk";
-          ANDROID_SDK_ROOT = "${androidSdk}/libexec/android-sdk";
-          ANDROID_NDK_HOME = "${androidSdk}/libexec/android-sdk/ndk-bundle";
-          NDK_HOME = "${androidSdk}/libexec/android-sdk/ndk-bundle";
-          JAVA_HOME = "${pkgs.jdk17}/lib/openjdk";
-          GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdk}/libexec/android-sdk/build-tools/35.0.0/aapt2";
-
-          shellHook = ''
-            echo "FluxION Mobile Android Development Environment"
-            echo "  Rust: $(rustc --version)"
-            echo "  Android SDK: $ANDROID_HOME"
-            echo "  NDK: $ANDROID_NDK_HOME"
-            echo "  JDK: $(java -version 2>&1 | head -1)"
-            echo ""
-            echo "Commands:"
-            echo "  cd fluxion-mobile && cargo tauri android init    - Initialize Android project"
-            echo "  cd fluxion-mobile && cargo tauri android build --debug  - Build debug APK"
-            echo "  cd fluxion-mobile && cargo tauri android build   - Build release APK"
           '';
         };
 
@@ -406,7 +246,6 @@
           fluxion-clippy = fluxion-clippy;
           fluxion-audit = fluxion-audit;
           fluxion-tests = fluxion-tests;
-          fluxion-server = fluxion-server-bin;
 
           # CI/CD tools
           github-publish-script = github-publish-script;
@@ -592,47 +431,8 @@
                 alias run-fluxion="run_fluxion"
                 alias fluxion-bin="echo $FLUXION_BIN"
                 PS1="\[\033[1;32m\][fluxion-test]\[\033[0m\] \w $ "
-                echo "Type 'run-fluxion' to start, or '"'"'exit'"'"' to quit"
+                echo "Type 'run-fluxion' to start, or 'exit' to quit"
               ')
-            '');
-          };
-
-          # ============= Deployment Apps =============
-
-          # Deploy fluxion-server to remote NixOS host
-          deploy-server = {
-            type = "app";
-            program = toString (pkgs.writeShellScript "deploy-server" ''
-              set -euo pipefail
-
-              export PATH="${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.nix}/bin:$PATH"
-
-              SERVER="tever@reborn"
-              REMOTE_DIR="/home/tever/fluxion"
-              CONFIG_SRC="fluxion/crates/fluxion-server/config.example.toml"
-
-              echo "Building fluxion-server..."
-              RESULT=$(nix build --no-link --print-out-paths .#fluxion-server)
-              echo "Built: $RESULT"
-
-              echo ""
-              echo "Copying closure to remote Nix store..."
-              nix copy --to "ssh://$SERVER" "$RESULT"
-
-              echo ""
-              echo "Updating symlink and restarting service..."
-              ssh "$SERVER" "\
-                sudo mkdir -p $REMOTE_DIR/data && \
-                sudo ln -sfn $RESULT/bin/fluxion-server $REMOTE_DIR/fluxion-server && \
-                if [ ! -f $REMOTE_DIR/config.toml ]; then \
-                  echo 'No config.toml found — copying example config (edit before starting!)'; \
-                  sudo cp $REMOTE_DIR/config.example.toml $REMOTE_DIR/config.toml 2>/dev/null || true; \
-                fi && \
-                sudo systemctl restart fluxion-server"
-
-              echo ""
-              echo "Deployed! Current status:"
-              ssh "$SERVER" "sudo systemctl status fluxion-server --no-pager" || true
             '');
           };
 
@@ -684,83 +484,14 @@
             '');
           };
 
-          # Dry-run publish to preview files without actually publishing
-          ci-publish-dry-run = {
-            type = "app";
-            program = toString (pkgs.writeShellScript "ci-publish-dry-run" ''
-              set -euo pipefail
-
-              # Add required tools to PATH
-              export PATH="${pkgs.python3.withPackages (ps: with ps; [ pyyaml tomli tomli-w ])}/bin:${pkgs.tree}/bin:${pkgs.coreutils}/bin:${pkgs.findutils}/bin:${pkgs.gnugrep}/bin:${pkgs.bash}/bin:$PATH"
-
-              # Create temporary work directory
-              WORK_DIR=$(mktemp -d)
-              trap "rm -rf $WORK_DIR" EXIT
-
-              echo "🔍 FluxION Publish Dry-Run"
-              echo "=========================="
-              echo "Work directory: $WORK_DIR"
-              echo ""
-
-              # Run the GitHub publish script in dry-run mode
-              echo "📋 Building snapshot from manifest..."
-              ${github-publish-script}/bin/publish-github --dry-run --output "$WORK_DIR/snapshot"
-
-              cd "$WORK_DIR/snapshot"
-
-              # Count total files and directories
-              TOTAL_FILES=$(find . -type f | wc -l)
-              TOTAL_DIRS=$(find . -type d | wc -l)
-
-              echo ""
-              echo "📊 Summary:"
-              echo "- Total files: $TOTAL_FILES"
-              echo "- Total directories: $TOTAL_DIRS"
-              echo ""
-
-              echo "🗂️ Directory tree:"
-              tree . 2>/dev/null || find . -type d | sort
-              echo ""
-
-              echo "📝 All files with sizes:"
-              find . -type f -exec ls -lah {} + | sort -k9
-              echo ""
-
-              # Check for locale files specifically
-              echo "🌍 Locale files check:"
-              if find . -name "*.ftl" -type f | head -1 >/dev/null; then
-                echo "✅ Found locale files:"
-                find . -name "*.ftl" -type f | sort
-              else
-                echo "❌ No .ftl locale files found!"
-              fi
-              echo ""
-
-              # Check that CHANGELOG.md contains the current version
-              echo "📓 Changelog check:"
-              cd - >/dev/null
-              CARGO_VERSION=$(grep -m1 '^version = ' fluxion/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-              if grep -q "\[$CARGO_VERSION\]" fluxion/CHANGELOG.md 2>/dev/null; then
-                echo "✅ CHANGELOG.md contains entry for v$CARGO_VERSION"
-              else
-                echo "❌ CHANGELOG.md is missing an entry for v$CARGO_VERSION!"
-                echo "   Add a ## [$CARGO_VERSION] section to fluxion/CHANGELOG.md before publishing."
-                exit 1
-              fi
-              echo ""
-
-              echo "✅ Dry-run complete. Files listed above would be published."
-            '');
-          };
-
           # Publish to GitHub (manual job)
           ci-publish-github = {
             type = "app";
             program = toString (pkgs.writeShellScript "ci-publish-github" ''
               set -euo pipefail
 
-              # Add git, SSH and core utilities to PATH
-              export PATH="${pkgs.git}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin:${pkgs.findutils}/bin:${pkgs.gnugrep}/bin:${pkgs.bash}/bin:$PATH"
+              # Add git and SSH to PATH
+              export PATH="${pkgs.git}/bin:${pkgs.openssh}/bin:$PATH"
 
               # Run the GitHub publish script
               ${github-publish-script}/bin/publish-github
@@ -774,7 +505,7 @@
               set -euo pipefail
 
               # Add Python packages, Rust toolchain and tools to PATH
-              export PATH="${pkgs.python3.withPackages (ps: with ps; [ tomli tomli-w ])}/bin:${rustToolchain}/bin:${pkgs.git}/bin:${pkgs.bash}/bin:${pkgs.gnused}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:$PATH"
+              export PATH="${pkgs.python3.withPackages (ps: with ps; [ tomli tomli-w ])}/bin:${rustToolchain}/bin:${pkgs.git}/bin:${pkgs.bash}/bin:${pkgs.gnused}/bin:${pkgs.gawk}/bin:${pkgs.coreutils}/bin:$PATH"
 
               # Colors for output
               RED='\033[0;31m'
@@ -955,4 +686,3 @@
       }
     );
 }
-

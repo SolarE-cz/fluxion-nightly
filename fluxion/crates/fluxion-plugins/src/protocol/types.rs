@@ -28,10 +28,6 @@ pub struct PriceBlock {
     /// Effective import price per kWh in CZK (spot price + grid fees from HDO tariff)
     /// This is the final price strategies should use for buy decisions
     pub effective_price_czk_per_kwh: f32,
-    /// Spot sell price (CZK/kWh) = spot_price - spot_sell_fee, when available.
-    /// Only populated when use_spot_prices_to_sell is enabled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spot_sell_price_czk_per_kwh: Option<f32>,
 }
 
 /// Battery state information
@@ -127,8 +123,6 @@ pub enum OperationMode {
     ForceDischarge,
     /// Backup mode - battery ready for backup
     BackUpMode,
-    /// No charge/no discharge - battery idle, grid powers house
-    NoChargeNoDischarge,
 }
 
 impl From<fluxion_types::inverter::InverterOperationMode> for OperationMode {
@@ -138,9 +132,6 @@ impl From<fluxion_types::inverter::InverterOperationMode> for OperationMode {
             fluxion_types::inverter::InverterOperationMode::ForceCharge => Self::ForceCharge,
             fluxion_types::inverter::InverterOperationMode::ForceDischarge => Self::ForceDischarge,
             fluxion_types::inverter::InverterOperationMode::BackUpMode => Self::BackUpMode,
-            fluxion_types::inverter::InverterOperationMode::NoChargeNoDischarge => {
-                Self::NoChargeNoDischarge
-            }
         }
     }
 }
@@ -152,7 +143,6 @@ impl From<OperationMode> for fluxion_types::inverter::InverterOperationMode {
             OperationMode::ForceCharge => Self::ForceCharge,
             OperationMode::ForceDischarge => Self::ForceDischarge,
             OperationMode::BackUpMode => Self::BackUpMode,
-            OperationMode::NoChargeNoDischarge => Self::NoChargeNoDischarge,
         }
     }
 }

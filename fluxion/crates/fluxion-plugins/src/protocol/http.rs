@@ -228,6 +228,19 @@ pub struct PluginRegistrationResponse {
     pub plugin_id: Option<String>,
 }
 
+/// Health check request for external plugins
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HealthCheckResponse {
+    /// Plugin name
+    pub name: String,
+    /// Plugin version
+    pub version: String,
+    /// Whether the plugin is healthy
+    pub healthy: bool,
+    /// Optional status message
+    pub message: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

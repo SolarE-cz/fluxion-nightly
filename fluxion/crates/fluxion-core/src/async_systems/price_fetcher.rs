@@ -278,9 +278,7 @@ pub fn update_prices_system(
         0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
         0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
         user_control_state,
-        consumption_history
-            .hourly_profile()
-            .map(|p| &p.hourly_avg_kwh),
+        consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
     );
 
     // Update or create PriceAnalysis entity

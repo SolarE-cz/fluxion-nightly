@@ -1,0 +1,308 @@
+// Copyright (c) 2025 SOLARE S.R.O.
+//
+// This file is part of FluxION.
+//
+// Licensed under the Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+// (CC BY-NC-ND 4.0). You may use and share this file for non-commercial purposes only and you may not
+// create derivatives. See <https://creativecommons.org/licenses/by-nc-nd/4.0/>.
+//
+// This software is provided "AS IS", without warranty of any kind.
+//
+// For commercial licensing, please contact: info@solare.cz
+
+pub mod fixed_price_arbitrage;
+pub mod locking;
+pub mod pricing;
+pub mod seasonal;
+pub mod utils;
+pub mod winter_adaptive;
+pub mod winter_adaptive_v10;
+pub mod winter_adaptive_v2;
+pub mod winter_adaptive_v20;
+pub mod winter_adaptive_v3;
+pub mod winter_adaptive_v4;
+pub mod winter_adaptive_v5;
+pub mod winter_adaptive_v7;
+pub mod winter_adaptive_v8;
+pub mod winter_adaptive_v9;
+
+// Re-export shared locking utilities
+pub use locking::{LockedBlock, ScheduleLockState};
+
+// Re-export shared pricing utilities
+pub use pricing::{
+    HdoCache, HdoDaySchedule, HdoTimeRange, calculate_effective_price, parse_hdo_sensor_data,
+};
+
+// Re-export shared seasonal utilities
+pub use seasonal::{DayEnergyBalance, SeasonalMode};
+
+// Re-export strategies
+// Note: DayEnergyBalance is re-exported from seasonal module above
+pub use fixed_price_arbitrage::{FixedPriceArbitrageConfig, FixedPriceArbitrageStrategy};
+pub use winter_adaptive::{PriceHorizonAnalysis, WinterAdaptiveConfig, WinterAdaptiveStrategy};
+pub use winter_adaptive_v2::{WinterAdaptiveV2Config, WinterAdaptiveV2Strategy};
+pub use winter_adaptive_v3::{WinterAdaptiveV3Config, WinterAdaptiveV3Strategy};
+pub use winter_adaptive_v4::{WinterAdaptiveV4Config, WinterAdaptiveV4Strategy};
+pub use winter_adaptive_v5::{WinterAdaptiveV5Config, WinterAdaptiveV5Strategy};
+pub use winter_adaptive_v7::{WinterAdaptiveV7Config, WinterAdaptiveV7Strategy};
+pub use winter_adaptive_v8::{WinterAdaptiveV8Config, WinterAdaptiveV8Strategy};
+pub use winter_adaptive_v9::{WinterAdaptiveV9Config, WinterAdaptiveV9Strategy};
+pub use winter_adaptive_v10::{WinterAdaptiveV10Config, WinterAdaptiveV10Strategy};
+pub use winter_adaptive_v20::{WinterAdaptiveV20Config, WinterAdaptiveV20Strategy};
+
+use chrono::{DateTime, Utc};
+use fluxion_types::config::ControlConfig;
+use fluxion_types::inverter::InverterOperationMode;
+use fluxion_types::pricing::TimeBlockPrice;
+pub use fluxion_types::scheduling::{BlockDebugInfo, StrategyEvaluation};
+use serde::{Deserialize, Serialize};
+
+/// Detailed energy flow information for a time block
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnergyFlows {
+    /// Energy purchased from grid (kWh)
+    pub grid_import_kwh: f32,
+
+    /// Energy exported to grid (kWh)
+    pub grid_export_kwh: f32,
+
+    /// Energy charged to battery (kWh)
+    pub battery_charge_kwh: f32,
+
+    /// Energy discharged from battery (kWh)
+    pub battery_discharge_kwh: f32,
+
+    /// Solar energy generated (kWh)
+    pub solar_generation_kwh: f32,
+
+    /// Household consumption (kWh)
+    pub household_consumption_kwh: f32,
+}
+
+impl Default for EnergyFlows {
+    fn default() -> Self {
+        Self {
+            grid_import_kwh: 0.0,
+            grid_export_kwh: 0.0,
+            battery_charge_kwh: 0.0,
+            battery_discharge_kwh: 0.0,
+            solar_generation_kwh: 0.0,
+            household_consumption_kwh: 0.0,
+        }
+    }
+}
+
+/// Assumptions and parameters used in strategy evaluation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assumptions {
+    /// Assumed solar generation for this block (kWh)
+    pub solar_forecast_kwh: f32,
+
+    /// Assumed household consumption for this block (kWh)
+    pub consumption_forecast_kwh: f32,
+
+    /// Current battery state of charge (%)
+    pub current_battery_soc: f32,
+
+    /// Battery round-trip efficiency (0.0 to 1.0)
+    pub battery_efficiency: f32,
+
+    /// Battery wear cost per kWh cycled (CZK/kWh)
+    pub battery_wear_cost_czk_per_kwh: f32,
+
+    /// Grid import price (CZK/kWh)
+    pub grid_import_price_czk_per_kwh: f32,
+
+    /// Grid export price (CZK/kWh)
+    pub grid_export_price_czk_per_kwh: f32,
+}
+
+impl Default for Assumptions {
+    fn default() -> Self {
+        Self {
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.25, // ~1 kWh per hour typical
+            current_battery_soc: 50.0,
+            battery_efficiency: 0.95,
+            battery_wear_cost_czk_per_kwh: 0.125,
+            grid_import_price_czk_per_kwh: 0.50,
+            grid_export_price_czk_per_kwh: 0.40,
+        }
+    }
+}
+
+/// Complete economic evaluation of a time block
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockEvaluation {
+    /// Time block start
+    pub block_start: DateTime<Utc>,
+
+    /// Duration in minutes (typically 15)
+    pub duration_minutes: u32,
+
+    /// Recommended operation mode
+    pub mode: InverterOperationMode,
+
+    /// Expected revenue from this block (CZK)
+    pub revenue_czk: f32,
+
+    /// Expected costs for this block (CZK)
+    pub cost_czk: f32,
+
+    /// Net profit (revenue - cost) (CZK)
+    pub net_profit_czk: f32,
+
+    /// Detailed energy flows
+    pub energy_flows: EnergyFlows,
+
+    /// Assumptions used in evaluation
+    pub assumptions: Assumptions,
+
+    /// Human-readable reason for this decision
+    pub reason: String,
+
+    /// Name of the strategy that generated this evaluation
+    pub strategy_name: String,
+
+    /// Unique identifier for the decision logic path
+    /// Format: "strategy_name:decision_point" for debugging
+    pub decision_uid: Option<String>,
+
+    /// Debug information (only populated when log_level = debug)
+    pub debug_info: Option<BlockDebugInfo>,
+}
+
+impl BlockEvaluation {
+    /// Create a new block evaluation with basic info
+    pub fn new(
+        block_start: DateTime<Utc>,
+        duration_minutes: u32,
+        mode: InverterOperationMode,
+        strategy_name: String,
+    ) -> Self {
+        Self {
+            block_start,
+            duration_minutes,
+            mode,
+            revenue_czk: 0.0,
+            cost_czk: 0.0,
+            net_profit_czk: 0.0,
+            energy_flows: EnergyFlows::default(),
+            assumptions: Assumptions::default(),
+            reason: String::new(),
+            strategy_name,
+            decision_uid: None,
+            debug_info: None,
+        }
+    }
+
+    /// Set the decision UID for tracking which logic path made this decision
+    pub fn with_decision_uid(mut self, uid: impl Into<String>) -> Self {
+        self.decision_uid = Some(uid.into());
+        self
+    }
+
+    /// Calculate net profit from revenue and cost
+    pub fn calculate_net_profit(&mut self) {
+        self.net_profit_czk = self.revenue_czk - self.cost_czk;
+    }
+}
+
+/// Context information for strategy evaluation
+#[derive(Debug, Clone)]
+pub struct EvaluationContext<'a> {
+    /// Price information for this block
+    pub price_block: &'a TimeBlockPrice,
+
+    /// Control configuration (battery parameters, constraints)
+    pub control_config: &'a ControlConfig,
+
+    /// Current battery state of charge (%)
+    pub current_battery_soc: f32,
+
+    /// Forecasted solar generation for this block (kWh)
+    pub solar_forecast_kwh: f32,
+
+    /// Forecasted household consumption for this block (kWh)
+    pub consumption_forecast_kwh: f32,
+
+    /// Price for selling to grid (CZK/kWh) - can differ from buying
+    pub grid_export_price_czk_per_kwh: f32,
+
+    /// All price blocks for today/tomorrow (for global price analysis)
+    pub all_price_blocks: Option<&'a [TimeBlockPrice]>,
+
+    /// Backup discharge minimum SOC from HA sensor (%)  
+    /// Read from number.<prefix>_backup_discharge_min_soc sensor
+    pub backup_discharge_min_soc: f32,
+
+    /// Grid import energy consumed today (kWh)
+    /// Read from sensor.<prefix>_today_s_import_energy sensor
+    pub grid_import_today_kwh: Option<f32>,
+
+    /// Total household consumption today (kWh)
+    /// Used to track progress against daily predicted consumption
+    pub consumption_today_kwh: Option<f32>,
+
+    /// Total solar production forecast for today (kWh)
+    /// Sum of all matching solar forecast sensors
+    pub solar_forecast_total_today_kwh: f32,
+
+    /// Remaining solar production forecast for today (kWh)
+    /// Helps strategies know if more solar is coming
+    pub solar_forecast_remaining_today_kwh: f32,
+
+    /// Solar production forecast for tomorrow (kWh)
+    /// Enables forward-looking decisions
+    pub solar_forecast_tomorrow_kwh: f32,
+
+    /// Weighted average price the battery was charged at (CZK/kWh)
+    /// Used to calculate arbitrage profit during discharge
+    /// Tracks cost basis of energy currently stored in battery
+    pub battery_avg_charge_price_czk_per_kwh: f32,
+
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Averaged over last 7 days of historical data
+    /// Enables strategies to understand when energy demand is highest
+    pub hourly_consumption_profile: Option<&'a [f32; 24]>,
+}
+
+/// Trait for economic battery operation strategies
+///
+/// Each strategy evaluates the profitability of operating the battery
+/// in various modes for a given time block, considering:
+/// - Energy prices (import/export)
+/// - Battery degradation costs
+/// - Round-trip efficiency losses
+/// - Solar generation forecasts
+/// - Consumption patterns
+/// - Opportunity costs
+pub trait EconomicStrategy: Send + Sync {
+    /// Get the name of this strategy
+    fn name(&self) -> &str;
+
+    /// Evaluate this strategy for a given time block
+    ///
+    /// Returns a `BlockEvaluation` with the recommended mode and
+    /// detailed economic analysis
+    fn evaluate(&self, context: &EvaluationContext) -> BlockEvaluation;
+
+    /// Check if this strategy is enabled
+    fn is_enabled(&self) -> bool {
+        true // By default, strategies are enabled
+    }
+}
+
+/// Helper functions for economic calculations
+pub mod economics {
+    /// Calculate cost of grid import
+    pub fn grid_import_cost(energy_kwh: f32, price_per_kwh: f32) -> f32 {
+        energy_kwh * price_per_kwh
+    }
+
+    /// Calculate revenue from grid export
+    pub fn grid_export_revenue(energy_kwh: f32, price_per_kwh: f32) -> f32 {
+        energy_kwh * price_per_kwh
+    }
+}

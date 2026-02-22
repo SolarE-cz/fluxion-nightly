@@ -110,7 +110,7 @@ config-control-min-consecutive-blocks = Min Consecutive Force Blocks
 config-control-min-consecutive-blocks-help = Minimum number of consecutive 15-minute blocks for force operations (prevents excessive EEPROM writes)
 
 config-control-default-battery-mode = Default Battery Mode
-config-control-default-battery-mode-help = Battery mode when not force charging/discharging (SelfUse, BackUpMode, or NoChargeNoDischarge)
+config-control-default-battery-mode-help = Battery mode when not force charging/discharging (SelfUse or BackUpMode)
 
 config-control-average-load = Average Household Load
 config-control-average-load-help = Average power consumption in kW (used for SOC predictions)

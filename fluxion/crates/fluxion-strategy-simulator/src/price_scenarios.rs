@@ -162,7 +162,6 @@ fn prices_to_blocks(date: NaiveDate, prices: &[f32]) -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: price,
             effective_price_czk_per_kwh: price,
-            spot_sell_price_czk_per_kwh: None,
         })
         .collect()
 }
@@ -204,7 +203,6 @@ fn generate_usual_day_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
-                spot_sell_price_czk_per_kwh: None,
             }
         })
         .collect()
@@ -239,7 +237,6 @@ fn generate_elevated_day_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
-                spot_sell_price_czk_per_kwh: None,
             }
         })
         .collect()
@@ -304,7 +301,6 @@ fn generate_volatile_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
-                spot_sell_price_czk_per_kwh: None,
             }
         })
         .collect()
@@ -343,7 +339,6 @@ fn generate_negative_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
-                spot_sell_price_czk_per_kwh: None,
             }
         })
         .collect()
@@ -389,7 +384,6 @@ fn generate_hdo_optimized_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
-                spot_sell_price_czk_per_kwh: None,
             }
         })
         .collect()

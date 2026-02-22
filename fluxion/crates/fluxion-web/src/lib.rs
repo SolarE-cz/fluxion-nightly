@@ -13,7 +13,6 @@
 mod backtest;
 mod config_api;
 mod plugin_api;
-pub mod remote_access;
 mod routes;
 mod simulator;
 mod user_control_api;
@@ -22,9 +21,6 @@ mod validation;
 pub use backtest::BacktestState;
 pub use config_api::ConfigApiState;
 pub use plugin_api::PluginApiState;
-pub use remote_access::{
-    MobileApiState, RemoteAccessApiState, mobile_api_routes, remote_access_routes,
-};
 use routes::{DashboardTemplate, LiveDataTemplate};
 pub use simulator::SimulatorState;
 pub use user_control_api::{UserControlApiState, UserControlUpdateSender};
@@ -39,7 +35,7 @@ use axum::{
     },
     routing::get,
 };
-use chrono::{Local, NaiveTime, Offset};
+use chrono::{Local, NaiveTime};
 use fluxion_core::{ConfigUpdateSender, WebQueryResponse, WebQuerySender};
 use fluxion_i18n::I18n;
 use fluxion_types::UserControlState;
@@ -258,7 +254,6 @@ pub async fn start_web_server(
     plugin_api_state: Option<PluginApiState>,
     scheduled_export_config: Option<ScheduledExportConfig>,
     user_control_api_state: Option<UserControlApiState>,
-    remote_access_state: Option<RemoteAccessApiState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn scheduled export task if configured
     if let Some(export_config) = scheduled_export_config {
@@ -269,11 +264,6 @@ pub async fn start_web_server(
     let user_control_state = user_control_api_state
         .as_ref()
         .map(|uc| Arc::clone(&uc.state));
-
-    // Pre-clone values needed for mobile API routes (before they're moved)
-    let mobile_query_sender = query_sender.clone();
-    let mobile_i18n = i18n.clone();
-    let mobile_uc_api = user_control_api_state.clone();
 
     let app_state = AppState {
         query_sender,
@@ -462,24 +452,9 @@ pub async fn start_web_server(
             );
     }
 
-    let mut app = app
+    let app = app
         .layer(CorsLayer::permissive()) // Allow HA Ingress
         .with_state(app_state);
-
-    // Add remote access routes (self-contained state, merged after main state)
-    if let Some(ra_state) = remote_access_state {
-        info!("Remote Access API enabled");
-        app = app.merge(remote_access_routes(ra_state));
-
-        // Add mobile-facing API routes (served over Tor to mobile devices)
-        let mobile_state = MobileApiState {
-            query_sender: mobile_query_sender.clone(),
-            i18n: mobile_i18n.clone(),
-            user_control_api_state: mobile_uc_api.clone(),
-            ui_version: env!("CARGO_PKG_VERSION").to_owned(),
-        };
-        app = app.merge(mobile_api_routes(mobile_state));
-    }
 
     let addr = format!("0.0.0.0:{port}");
     info!("🌐 Starting web server on {addr}");
@@ -606,16 +581,8 @@ struct ChartDataJson {
     is_historical: Vec<bool>,
     reasons: Vec<Option<String>>,
     decision_uids: Vec<Option<String>>,
-    /// Total effective price: spot + grid_fee + buy_fees
-    effective_prices: Vec<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hourly_consumption_profile: Option<Vec<f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    solar_forecast_remaining_today_kwh: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    solar_forecast_tomorrow_kwh: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    utc_offset_minutes: Option<i32>,
 }
 
 /// Chart data endpoint - returns JSON for chart updates (once per minute)
@@ -632,31 +599,6 @@ async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoRespo
 
             // Extract battery SOC from first inverter
             let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
-
-            // Extract solar forecast data
-            let solar_remaining = response
-                .solar_forecast
-                .as_ref()
-                .filter(|sf| sf.available)
-                .map(|sf| sf.remaining_today_kwh);
-            let solar_tomorrow = response
-                .solar_forecast
-                .as_ref()
-                .filter(|sf| sf.available)
-                .map(|sf| sf.tomorrow_kwh);
-
-            // Calculate UTC offset from timezone string
-            let utc_offset_minutes = response
-                .timezone
-                .as_ref()
-                .and_then(|tz_name| tz_name.parse::<chrono_tz::Tz>().ok())
-                .map(|tz| {
-                    let now = chrono::Utc::now().with_timezone(&tz);
-                    #[expect(clippy::integer_division)]
-                    {
-                        now.offset().fix().local_minus_utc() / 60
-                    }
-                });
 
             // Extract chart data from template
             if let Some(prices) = template.prices {
@@ -675,11 +617,7 @@ async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoRespo
                     is_historical: prices.chart_data.is_historical,
                     reasons: prices.chart_data.reasons,
                     decision_uids: prices.chart_data.decision_uids,
-                    effective_prices: prices.chart_data.effective_prices,
                     hourly_consumption_profile: prices.chart_data.hourly_consumption_profile,
-                    solar_forecast_remaining_today_kwh: solar_remaining,
-                    solar_forecast_tomorrow_kwh: solar_tomorrow,
-                    utc_offset_minutes,
                 };
                 Json(chart_json).into_response()
             } else {

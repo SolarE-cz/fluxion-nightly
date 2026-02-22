@@ -233,7 +233,7 @@ pub async fn set_restrictions(
 pub struct CreateSlotRequest {
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
-    pub mode: String, // "SelfUse", "ForceCharge", "ForceDischarge", "BackUpMode", "NoChargeNoDischarge"
+    pub mode: String, // "SelfUse", "ForceCharge", "ForceDischarge", "BackUpMode"
     pub note: Option<String>,
 }
 
@@ -397,7 +397,6 @@ fn parse_operation_mode(mode_str: &str) -> Option<InverterOperationMode> {
         "ForceCharge" => Some(InverterOperationMode::ForceCharge),
         "ForceDischarge" => Some(InverterOperationMode::ForceDischarge),
         "BackUpMode" => Some(InverterOperationMode::BackUpMode),
-        "NoChargeNoDischarge" => Some(InverterOperationMode::NoChargeNoDischarge),
         _ => None,
     }
 }

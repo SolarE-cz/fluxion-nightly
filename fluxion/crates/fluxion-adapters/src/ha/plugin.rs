@@ -477,67 +477,14 @@ pub fn spawn_hdo_fetcher(
     });
 }
 
-/// Resolve the HDO entity: try exact match first, then prefix search.
-/// This handles the CEZ HDO integration renaming sensors with a suffix.
-async fn resolve_hdo_entity(
-    client: &HomeAssistantClient,
-    configured_entity: &str,
-) -> Option<crate::ha::types::HaEntityState> {
-    // Try exact match first
-    match client.get_state(configured_entity).await {
-        Ok(state) => return Some(state),
-        Err(crate::ha::errors::HaError::EntityNotFound(_)) => {
-            tracing::info!(
-                "HDO entity '{}' not found, searching for entities with matching prefix...",
-                configured_entity
-            );
-        }
-        Err(e) => {
-            tracing::warn!("Failed to fetch HDO entity '{}': {}", configured_entity, e);
-            return None;
-        }
-    }
-
-    // Exact match failed - search all states for entities starting with the configured prefix
-    match client.get_all_states().await {
-        Ok(all_states) => {
-            let matching: Vec<_> = all_states
-                .into_iter()
-                .filter(|s| s.entity_id.starts_with(configured_entity))
-                .collect();
-
-            if matching.is_empty() {
-                tracing::warn!(
-                    "No HDO entities found matching prefix '{}'",
-                    configured_entity
-                );
-                None
-            } else {
-                tracing::info!(
-                    "Found {} HDO entities matching prefix '{}': {:?}. Using first: '{}'",
-                    matching.len(),
-                    configured_entity,
-                    matching.iter().map(|s| &s.entity_id).collect::<Vec<_>>(),
-                    matching[0].entity_id
-                );
-                Some(matching.into_iter().next().unwrap())
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to fetch all states for HDO prefix search: {}", e);
-            None
-        }
-    }
-}
-
 /// Helper function to fetch HDO data and send through channel
 async fn fetch_and_send_hdo(
     client: &HomeAssistantClient,
     entity_id: &str,
     sender: &crossbeam_channel::Sender<fluxion_core::async_systems::HdoUpdateMessage>,
 ) {
-    match resolve_hdo_entity(client, entity_id).await {
-        Some(state) => {
+    match client.get_state(entity_id).await {
+        Ok(state) => {
             // The HDO sensor typically stores schedule data in attributes
             // Try to serialize the full state (including attributes) as JSON
             let raw_data = if let Ok(json) = serde_json::to_string(&state) {
@@ -592,11 +539,8 @@ async fn fetch_and_send_hdo(
             };
             let _ = sender.send(message);
         }
-        None => {
-            tracing::warn!(
-                "⚠️ Failed to fetch HDO schedule from HA: no matching entity found for '{}'",
-                entity_id
-            );
+        Err(e) => {
+            tracing::warn!("⚠️ Failed to fetch HDO schedule from HA: {}", e);
         }
     }
 }

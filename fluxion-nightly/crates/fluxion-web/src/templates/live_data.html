@@ -1,0 +1,391 @@
+<div class="ha-card-grid">
+
+<!-- System Health -->
+<div class="card {% if !health.inverter_source || !health.price_source %}error{% endif %}">
+    <h2>🏥 {{ self.t("section-system") }}</h2>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-solar-power"></i>{{ self.t("inverter-connection") }}</span>
+        <span>
+            <span class="status-indicator {% if health.inverter_source %}status-online{% else %}status-offline{% endif %}"></span>
+            {% if health.inverter_source %}{{ self.t("status-online") }}{% else %}{{ self.t("status-offline") }}{% endif %}
+        </span>
+    </div>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-currency-usd"></i>{{ self.t("schedule-price") }}</span>
+        <span>
+            <span class="status-indicator {% if health.price_source %}status-online{% else %}status-offline{% endif %}"></span>
+            {% if health.price_source %}{{ self.t("status-online") }}{% else %}{{ self.t("status-offline") }}{% endif %}
+        </span>
+    </div>
+    {% if !health.errors.is_empty() %}
+    <div class="error-list">
+        {% for error in health.errors %}
+        <div class="error-item">⚠️ {{ error }}</div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    <div class="timestamp">Last update: {{ last_update_formatted }}</div>
+</div>
+
+<!-- Inverters Grid -->
+<div class="ha-card-grid-full">
+{% if !inverters.is_empty() %}
+<div class="grid">
+    {% for inverter in inverters %}
+    <!-- Inverter Card -->
+    <div class="card">
+        <h2>🔌 {{ inverter.id }}</h2>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-cog"></i>{{ self.t("inverter-mode") }}</span>
+            <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-") }}">
+                {{ inverter.mode }}
+            </span>
+        </div>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-transmission-tower"></i>{{ self.t("grid-power") }}</span>
+            <span class="stat-value">{{ inverter.grid_power_w }} {{ self.t("unit-watt") }}</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-solar-panel"></i>{{ self.t("pv-power") }}</span>
+            <span class="stat-value">{{ inverter.pv_power_w }} {{ self.t("unit-watt") }}</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-sitemap"></i>{{ self.t("inverter-topology") }}</span>
+            <span class="stat-value">{{ inverter.topology }}</span>
+        </div>
+        {% if let Some(load) = inverter.house_load_w %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-home-lightning-bolt"></i>{{ self.t("load-house") }}</span>
+            <span class="stat-value">{{ load }} {{ self.t("unit-watt") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(import) = inverter.grid_import_w %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-transmission-tower-import"></i>{{ self.t("grid-import-power") }}</span>
+            <span class="stat-value">{{ import }} {{ self.t("unit-watt") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(export) = inverter.grid_export_w %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-transmission-tower-export"></i>{{ self.t("grid-export-power") }}</span>
+            <span class="stat-value">{{ export }} {{ self.t("unit-watt") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(import_today) = inverter.grid_import_today_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-download"></i>{{ self.t("grid-import-today") }}</span>
+            <span class="stat-value">{{ import_today }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(ema) = inverter.grid_import_ema_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-trending-up"></i>Grid Import EMA (avg/day)</span>
+            <span class="stat-value">{{ ema }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(export_today) = inverter.grid_export_today_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-upload"></i>{{ self.t("grid-export-today") }}</span>
+            <span class="stat-value">{{ export_today }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(voltage) = inverter.inverter_voltage_v %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-lightning-bolt"></i>{{ self.t("inverter-voltage-total") }}</span>
+            <span class="stat-value">{{ voltage }} {{ self.t("unit-voltage") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(current) = inverter.inverter_current_a %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-current-ac"></i>{{ self.t("inverter-current-total") }}</span>
+            <span class="stat-value">{{ current }} {{ self.t("unit-ampere") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(power) = inverter.inverter_power_w %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-flash"></i>{{ self.t("inverter-power-total") }}</span>
+            <span class="stat-value">{{ power }} {{ self.t("unit-watt") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(freq) = inverter.inverter_frequency_hz %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-sine-wave"></i>{{ self.t("inverter-frequency") }}</span>
+            <span class="stat-value">{{ freq }} {{ self.t("unit-hertz") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(today) = inverter.today_solar_energy_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-weather-sunny"></i>{{ self.t("solar-energy-today") }}</span>
+            <span class="stat-value">{{ today }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(total) = inverter.total_solar_energy_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-solar-power-variant"></i>{{ self.t("solar-energy-total") }}</span>
+            <span class="stat-value">{{ total }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+    </div>
+    <!-- Battery Card -->
+    <div class="card">
+        <h2>🔋 Battery</h2>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-70"></i>{{ self.t("battery-soc") }}</span>
+            <span class="stat-value">{{ inverter.battery_soc }}{{ self.t("unit-percent") }}</span>
+        </div>
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-charging"></i>{{ self.t("battery-power") }}</span>
+            <span class="stat-value">{{ inverter.battery_power_w }} {{ self.t("unit-watt") }}</span>
+        </div>
+        {% if let Some(capacity) = inverter.battery_capacity_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-high"></i>{{ self.t("battery-capacity") }}</span>
+            <span class="stat-value">{{ capacity }} {{ self.t("unit-percent") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(input) = inverter.battery_input_energy_today_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-arrow-up"></i>{{ self.t("battery-input-today") }}</span>
+            <span class="stat-value">{{ input }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+        {% if let Some(output) = inverter.battery_output_energy_today_kwh %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-battery-arrow-down"></i>{{ self.t("battery-output-today") }}</span>
+            <span class="stat-value">{{ output }} {{ self.t("unit-kilowatt-hour") }}</span>
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="card warning">
+    <h2>⚠️ No Inverters</h2>
+    <p>No inverter data available. Waiting for system initialization...</p>
+    <div class="loading" style="margin-top: 10px;"></div>
+</div>
+{% endif %}
+</div><!-- End of ha-card-grid-full (inverters) -->
+
+<!-- Current Schedule -->
+{% if let Some(schedule) = schedule %}
+<div class="card info">
+    <h2>📅 {{ self.t("section-schedule") }}</h2>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-cog"></i>{{ self.t("inverter-mode") }}</span>
+        <span class="mode-badge mode-{{ schedule.current_mode.to_lowercase().replace(" ", "-") }}">
+            {{ schedule.current_mode }}
+        </span>
+    </div>
+    {% if let Some(strategy) = schedule.current_strategy %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-strategy"></i>Strategy</span>
+        <span class="strategy-badge">{{ strategy }}</span>
+    </div>
+    {% endif %}
+    {% if let Some(profit) = schedule.expected_profit %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-cash-check"></i>Expected Profit (Block)</span>
+        <span class="stat-value">{{ profit }} CZK</span>
+    </div>
+    {% endif %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-information"></i>{{ self.t("schedule-reason") }}</span>
+        <span>{{ schedule.current_reason }}</span>
+    </div>
+    {% if let Some(total_profit) = schedule.total_expected_profit %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-cash-multiple"></i>Total Expected Profit (Today)</span>
+        <span class="stat-value" style="font-weight: bold;">{{ total_profit }} CZK</span>
+    </div>
+    {% endif %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-calendar-today"></i>{{ self.t("schedule-current-block") }}</span>
+        <span class="stat-value">{{ schedule.blocks_today }}</span>
+    </div>
+    {% if let Some(next_fmt) = next_change_formatted %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-clock-outline"></i>{{ self.t("schedule-next-block") }}</span>
+        <span>{{ next_fmt }}</span>
+    </div>
+    {% endif %}
+    {% if schedule.current_mode == "Force-Charge" %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-battery-charging-100"></i>Target SOC</span>
+        <span class="stat-value">{{ schedule.target_soc_max }}%</span>
+    </div>
+    {% endif %}
+    {% if schedule.current_mode == "Force-Discharge" %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-battery-alert"></i>Min SOC</span>
+        <span class="stat-value">{{ schedule.target_soc_min }}%</span>
+    </div>
+    {% endif %}
+</div>
+{% else %}
+<div class="card warning">
+    <h2>📅 Schedule</h2>
+    <p>No schedule generated yet. Waiting for price data...</p>
+    <div class="loading" style="margin-top: 10px;"></div>
+</div>
+{% endif %}
+
+
+<!-- Price Information -->
+{% if let Some(prices) = prices %}
+<div class="card">
+    <h2>💰 Electricity Prices</h2>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-cash"></i>Current Price</span>
+        <span class="stat-value">{{ prices.current_price }} CZK/kWh</span>
+    </div>
+    <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📅 Today</h3>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Minimum</span>
+        <span class="stat-value">{{ prices.today_min_price }} CZK/kWh</span>
+    </div>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Maximum</span>
+        <span class="stat-value">{{ prices.today_max_price }} CZK/kWh</span>
+    </div>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Average</span>
+        <span class="stat-value">{{ prices.today_avg_price }} CZK/kWh</span>
+    </div>
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-bell-curve"></i>Median</span>
+        <span class="stat-value">{{ prices.today_median_price }} CZK/kWh</span>
+    </div>
+    <h3 style="margin-top: 15px; margin-bottom: 10px; font-size: 1.1em;">📆 Tomorrow</h3>
+    {% match prices.tomorrow_min_price %}
+    {% when Some with (min) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Minimum</span>
+        <span class="stat-value">{{ min }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-down-bold"></i>Minimum</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+    {% match prices.tomorrow_max_price %}
+    {% when Some with (max) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Maximum</span>
+        <span class="stat-value">{{ max }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-arrow-up-bold"></i>Maximum</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+    {% match prices.tomorrow_avg_price %}
+    {% when Some with (avg) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Average</span>
+        <span class="stat-value">{{ avg }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-line"></i>Average</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+    {% match prices.tomorrow_median_price %}
+    {% when Some with (median) %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-bell-curve"></i>Median</span>
+        <span class="stat-value">{{ median }} CZK/kWh</span>
+    </div>
+    {% when None %}
+    <div class="stat">
+        <span class="stat-label"><i class="mdi mdi-chart-bell-curve"></i>Median</span>
+        <span style="color: var(--text-secondary); font-size: 0.9em;">Not available yet</span>
+    </div>
+    {% endmatch %}
+</div>
+{% else %}
+<div class="card warning">
+    <h2>💰 Prices</h2>
+    <p>No price data available yet...</p>
+    <div class="loading" style="margin-top: 10px;"></div>
+</div>
+{% endif %}
+
+<!-- Consumption & Solar Forecast -->
+<div class="card">
+    <h2>📊 Energy & Solar</h2>
+    {% if let Some(stats) = consumption_stats %}
+    <h3 style="margin-top: 10px; margin-bottom: 8px; font-size: 1.0em;">🏠 Consumption</h3>
+    <div class="stat">
+        <span class="stat-label">Historical EMA ({{ stats.ema_days }} days)</span>
+        <span class="stat-value">
+            {% match stats.ema_kwh %}
+            {% when Some with (ema) %}
+            {{ ema }} kWh/day
+            {% when None %}
+            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+            {% endmatch %}
+        </span>
+    </div>
+    <div class="stat">
+        <span class="stat-label">Grid import today</span>
+        <span class="stat-value">
+            {% match stats.today_import_kwh %}
+            {% when Some with (today) %}
+            {{ today }} kWh
+            {% when None %}
+            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+            {% endmatch %}
+        </span>
+    </div>
+    <div class="stat">
+        <span class="stat-label">Grid import yesterday</span>
+        <span class="stat-value">
+            {% match stats.yesterday_import_kwh %}
+            {% when Some with (yest) %}
+            {{ yest }} kWh
+            {% when None %}
+            <span style="color: var(--text-secondary); font-size: 0.9em;">—</span>
+            {% endmatch %}
+        </span>
+    </div>
+    {% endif %}
+    {% if let Some(forecast) = solar_forecast %}
+    {% if forecast.available %}
+    <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
+    <div class="stat">
+        <span class="stat-label">Predicted Today</span>
+        <span class="stat-value">{{ format!("{:.1}", forecast.total_today_kwh) }} kWh</span>
+    </div>
+    {% if let Some(actual) = forecast.actual_today_kwh %}
+    <div class="stat">
+        <span class="stat-label">Actual Today</span>
+        <span class="stat-value">
+            {{ format!("{:.1}", actual) }} kWh
+            {% if let Some(accuracy) = forecast.accuracy_percent %}
+            <span style="font-size: 0.85em; margin-left: 6px; {% if *accuracy >= 0.0 %}color: var(--success-color, #4caf50);{% else %}color: var(--warning-color, #ff9800);{% endif %}">
+                ({% if *accuracy >= 0.0 %}+{% endif %}{{ format!("{:.1}", accuracy) }}%)
+            </span>
+            {% endif %}
+        </span>
+    </div>
+    {% endif %}
+    <div class="stat">
+        <span class="stat-label">Remaining Today</span>
+        <span class="stat-value">{{ format!("{:.1}", forecast.remaining_today_kwh) }} kWh</span>
+    </div>
+    <div class="stat">
+        <span class="stat-label">Tomorrow</span>
+        <span class="stat-value">{{ format!("{:.1}", forecast.tomorrow_kwh) }} kWh</span>
+    </div>
+    {% else %}
+    <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
+    <p style="color: var(--text-secondary); font-size: 0.9em;">No solar forecast data available.</p>
+    {% endif %}
+    {% endif %}
+</div>
+
+</div><!-- End of ha-card-grid -->

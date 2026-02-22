@@ -48,14 +48,6 @@ pub struct AppConfig {
     /// Solar forecast configuration
     #[serde(default, rename = "solar_forecast")]
     pub solar_forecast: SolarForecastConfig,
-
-    /// Remote access configuration
-    #[serde(default, rename = "remote_access")]
-    pub remote_access: RemoteAccessConfig,
-
-    /// Server heartbeat configuration
-    #[serde(default, rename = "server_heartbeat")]
-    pub server_heartbeat: ServerHeartbeatConfig,
 }
 
 /// Configuration for a single inverter
@@ -202,10 +194,9 @@ pub struct ControlConfig {
     pub min_consecutive_force_blocks: usize,
 
     /// Default battery operation mode when not force charging/discharging
-    /// Options: "SelfUse" (default), "BackUpMode", or "NoChargeNoDischarge"
+    /// Options: "SelfUse" (default) or "BackUpMode" (Solax-specific)
     /// - SelfUse: Normal self-consumption, battery used to minimize grid import
-    /// - BackUpMode: Battery reserved for power outages (Solax native backup mode)
-    /// - NoChargeNoDischarge: Hold battery charge, grid powers house directly
+    /// - BackUpMode: Prioritize battery reserve for power outages (Solax only)
     #[serde(default = "default_battery_mode")]
     pub default_battery_mode: String,
 }
@@ -317,10 +308,6 @@ pub struct StrategiesConfig {
     #[serde(default)]
     pub winter_adaptive_v9: WinterAdaptiveV9Config,
     #[serde(default)]
-    pub winter_adaptive_v10: WinterAdaptiveV10Config,
-    #[serde(default)]
-    pub winter_adaptive_v20: WinterAdaptiveV20Config,
-    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfig,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfig,
@@ -338,8 +325,6 @@ pub struct StrategiesConfig {
     pub self_use: StrategyEnabledConfig,
     #[serde(default)]
     pub seasonal: SeasonalConfig,
-    #[serde(default)]
-    pub fixed_price_arbitrage: FixedPriceArbitrageConfig,
 }
 
 fn default_strategy_priority() -> u8 {
@@ -945,209 +930,6 @@ impl Default for WinterAdaptiveV9Config {
     }
 }
 
-/// Winter Adaptive V10 Configuration - Dynamic Battery Budget Allocation
-/// V10 uses unified budget allocation instead of mode-based planning
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WinterAdaptiveV10Config {
-    pub enabled: bool,
-    #[serde(default = "default_v10_priority")]
-    pub priority: u8,
-    #[serde(default = "default_v10_target_battery_soc")]
-    pub target_battery_soc: f32,
-    #[serde(default = "default_v10_min_discharge_soc")]
-    pub min_discharge_soc: f32,
-    #[serde(default = "default_v10_battery_round_trip_efficiency")]
-    pub battery_round_trip_efficiency: f32,
-    #[serde(default = "default_true")]
-    pub negative_price_handling_enabled: bool,
-    #[serde(default = "default_v10_opportunistic_charge_threshold_czk")]
-    pub opportunistic_charge_threshold_czk: f32,
-    #[serde(default = "default_v10_min_export_spread_czk")]
-    pub min_export_spread_czk: f32,
-    #[serde(default = "default_v10_min_soc_after_export")]
-    pub min_soc_after_export: f32,
-    #[serde(default = "default_v10_solar_threshold_kwh")]
-    pub solar_threshold_kwh: f32,
-    #[serde(default = "default_v10_solar_confidence_factor")]
-    pub solar_confidence_factor: f32,
-    #[serde(default = "default_v10_min_savings_threshold_czk")]
-    pub min_savings_threshold_czk: f32,
-}
-
-fn default_v10_priority() -> u8 {
-    100
-}
-fn default_v10_target_battery_soc() -> f32 {
-    95.0
-}
-fn default_v10_min_discharge_soc() -> f32 {
-    10.0
-}
-fn default_v10_battery_round_trip_efficiency() -> f32 {
-    0.90
-}
-fn default_v10_opportunistic_charge_threshold_czk() -> f32 {
-    1.5
-}
-fn default_v10_min_export_spread_czk() -> f32 {
-    5.0
-}
-fn default_v10_min_soc_after_export() -> f32 {
-    35.0
-}
-fn default_v10_solar_threshold_kwh() -> f32 {
-    5.0
-}
-fn default_v10_solar_confidence_factor() -> f32 {
-    0.7
-}
-fn default_v10_min_savings_threshold_czk() -> f32 {
-    0.5
-}
-
-impl Default for WinterAdaptiveV10Config {
-    fn default() -> Self {
-        Self {
-            enabled: false, // V9 remains the default
-            priority: 100,
-            target_battery_soc: 95.0,
-            min_discharge_soc: 10.0,
-            battery_round_trip_efficiency: 0.90,
-            negative_price_handling_enabled: true,
-            opportunistic_charge_threshold_czk: 1.5,
-            min_export_spread_czk: 5.0,
-            min_soc_after_export: 35.0,
-            solar_threshold_kwh: 5.0,
-            solar_confidence_factor: 0.7,
-            min_savings_threshold_czk: 0.5,
-        }
-    }
-}
-
-/// Winter Adaptive V20 Configuration - Adaptive Budget Allocation
-/// V20 = V10 algorithm + DayMetrics-driven parameter resolution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct WinterAdaptiveV20Config {
-    pub enabled: bool,
-    #[serde(default = "default_v20_priority")]
-    pub priority: u8,
-    #[serde(default = "default_v20_target_battery_soc")]
-    pub target_battery_soc: f32,
-    #[serde(default = "default_v20_min_discharge_soc")]
-    pub min_discharge_soc: f32,
-    #[serde(default = "default_v20_battery_round_trip_efficiency")]
-    pub battery_round_trip_efficiency: f32,
-    #[serde(default = "default_true")]
-    pub negative_price_handling_enabled: bool,
-    #[serde(default = "default_v20_opportunistic_charge_threshold_czk")]
-    pub opportunistic_charge_threshold_czk: f32,
-    #[serde(default = "default_v20_min_export_spread_czk")]
-    pub min_export_spread_czk: f32,
-    #[serde(default = "default_v20_min_soc_after_export")]
-    pub min_soc_after_export: f32,
-    #[serde(default = "default_v20_solar_threshold_kwh")]
-    pub solar_threshold_kwh: f32,
-    #[serde(default = "default_v20_solar_confidence_factor")]
-    pub solar_confidence_factor: f32,
-    #[serde(default = "default_v20_min_savings_threshold_czk")]
-    pub min_savings_threshold_czk: f32,
-    // DayMetrics thresholds
-    #[serde(default = "default_v20_volatile_cv_threshold")]
-    pub volatile_cv_threshold: f32,
-    #[serde(default = "default_v20_expensive_level_threshold")]
-    pub expensive_level_threshold: f32,
-    #[serde(default = "default_v20_high_solar_ratio_threshold")]
-    pub high_solar_ratio_threshold: f32,
-    #[serde(default = "default_v20_low_solar_ratio_threshold")]
-    pub low_solar_ratio_threshold: f32,
-    #[serde(default = "default_v20_tomorrow_expensive_ratio")]
-    pub tomorrow_expensive_ratio: f32,
-    #[serde(default = "default_v20_tomorrow_cheap_ratio")]
-    pub tomorrow_cheap_ratio: f32,
-    #[serde(default = "default_v20_negative_price_fraction_threshold")]
-    pub negative_price_fraction_threshold: f32,
-}
-
-fn default_v20_priority() -> u8 {
-    100
-}
-fn default_v20_target_battery_soc() -> f32 {
-    95.0
-}
-fn default_v20_min_discharge_soc() -> f32 {
-    10.0
-}
-fn default_v20_battery_round_trip_efficiency() -> f32 {
-    0.90
-}
-fn default_v20_opportunistic_charge_threshold_czk() -> f32 {
-    1.5
-}
-fn default_v20_min_export_spread_czk() -> f32 {
-    3.0
-}
-fn default_v20_min_soc_after_export() -> f32 {
-    25.0
-}
-fn default_v20_solar_threshold_kwh() -> f32 {
-    5.0
-}
-fn default_v20_solar_confidence_factor() -> f32 {
-    0.7
-}
-fn default_v20_min_savings_threshold_czk() -> f32 {
-    0.5
-}
-fn default_v20_volatile_cv_threshold() -> f32 {
-    0.35
-}
-fn default_v20_expensive_level_threshold() -> f32 {
-    0.3
-}
-fn default_v20_high_solar_ratio_threshold() -> f32 {
-    1.1
-}
-fn default_v20_low_solar_ratio_threshold() -> f32 {
-    0.9
-}
-fn default_v20_tomorrow_expensive_ratio() -> f32 {
-    1.3
-}
-fn default_v20_tomorrow_cheap_ratio() -> f32 {
-    0.7
-}
-fn default_v20_negative_price_fraction_threshold() -> f32 {
-    0.0
-}
-
-impl Default for WinterAdaptiveV20Config {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            priority: 100,
-            target_battery_soc: 95.0,
-            min_discharge_soc: 10.0,
-            battery_round_trip_efficiency: 0.90,
-            negative_price_handling_enabled: true,
-            opportunistic_charge_threshold_czk: 1.5,
-            min_export_spread_czk: 5.0,
-            min_soc_after_export: 35.0,
-            solar_threshold_kwh: 5.0,
-            solar_confidence_factor: 0.7,
-            min_savings_threshold_czk: 0.5,
-            volatile_cv_threshold: 0.35,
-            expensive_level_threshold: 0.5,
-            high_solar_ratio_threshold: 1.1,
-            low_solar_ratio_threshold: 0.9,
-            tomorrow_expensive_ratio: 1.3,
-            tomorrow_cheap_ratio: 0.7,
-            negative_price_fraction_threshold: 0.0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinterPeakDischargeConfig {
     pub enabled: bool,
@@ -1275,38 +1057,6 @@ pub struct SeasonalConfig {
     pub force_season: Option<String>,
 }
 
-// ============================================================================
-// Fixed Price Arbitrage Strategy Configuration
-// ============================================================================
-
-/// Fixed Price Arbitrage - charges at fixed price, sells at high spot price
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FixedPriceArbitrageConfig {
-    pub enabled: bool,
-    #[serde(default = "default_fixed_price_arbitrage_priority")]
-    pub priority: u8,
-    #[serde(default = "default_fpa_min_profit_threshold")]
-    pub min_profit_threshold_czk: f32,
-}
-
-fn default_fixed_price_arbitrage_priority() -> u8 {
-    85
-}
-fn default_fpa_min_profit_threshold() -> f32 {
-    3.0
-}
-
-impl Default for FixedPriceArbitrageConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            priority: default_fixed_price_arbitrage_priority(),
-            min_profit_threshold_czk: default_fpa_min_profit_threshold(),
-        }
-    }
-}
-
 /// Solar forecast configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SolarForecastConfig {
@@ -1329,37 +1079,6 @@ pub struct SolarForecastConfig {
     /// Fetch interval in seconds
     #[serde(default)]
     pub fetch_interval_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
-pub struct RemoteAccessConfig {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ServerHeartbeatConfig {
-    pub enabled: bool,
-    pub server_url: String,
-    pub instance_id: String,
-    pub shared_secret: String,
-    pub friendly_name: Option<String>,
-    pub interval_seconds: u64,
-}
-
-impl Default for ServerHeartbeatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_url: String::new(),
-            instance_id: String::new(),
-            shared_secret: String::new(),
-            friendly_name: None,
-            interval_seconds: 300,
-        }
-    }
 }
 
 impl Default for AppConfig {
@@ -1416,8 +1135,6 @@ impl Default for AppConfig {
             strategies: StrategiesConfig::default(),
             history: ConsumptionHistoryConfig::default(),
             solar_forecast: SolarForecastConfig::default(),
-            remote_access: RemoteAccessConfig::default(),
-            server_heartbeat: ServerHeartbeatConfig::default(),
         }
     }
 }
@@ -1945,9 +1662,6 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     "BACKUPMODE" | "BACKUP" | "BACK_UP_MODE" => {
                         fluxion_core::InverterOperationMode::BackUpMode
                     }
-                    "NOCHARGENODISCHARGE" | "NO_CHARGE_NO_DISCHARGE" => {
-                        fluxion_core::InverterOperationMode::NoChargeNoDischarge
-                    }
                     _ => fluxion_core::InverterOperationMode::SelfUse, // Default or "SELFUSE"
                 },
             },
@@ -2092,6 +1806,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .min_discharge_spread_czk,
                     safety_margin_pct: app_config.strategies.winter_adaptive_v5.safety_margin_pct,
                 },
+                winter_adaptive_v6: fluxion_core::WinterAdaptiveV6ConfigCore::default(),
                 winter_adaptive_v7: fluxion_core::WinterAdaptiveV7ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v7.enabled,
                     priority: app_config.strategies.winter_adaptive_v7.priority,
@@ -2267,116 +1982,6 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .winter_adaptive_v9
                         .opportunistic_charge_threshold_czk,
                 },
-                winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
-                    enabled: app_config.strategies.winter_adaptive_v10.enabled,
-                    priority: app_config.strategies.winter_adaptive_v10.priority,
-                    target_battery_soc: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .target_battery_soc,
-                    min_discharge_soc: app_config.strategies.winter_adaptive_v10.min_discharge_soc,
-                    battery_round_trip_efficiency: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .battery_round_trip_efficiency,
-                    negative_price_handling_enabled: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .negative_price_handling_enabled,
-                    opportunistic_charge_threshold_czk: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .opportunistic_charge_threshold_czk,
-                    min_export_spread_czk: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .min_export_spread_czk,
-                    min_soc_after_export: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .min_soc_after_export,
-                    solar_threshold_kwh: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .solar_threshold_kwh,
-                    solar_confidence_factor: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .solar_confidence_factor,
-                    min_savings_threshold_czk: app_config
-                        .strategies
-                        .winter_adaptive_v10
-                        .min_savings_threshold_czk,
-                },
-                winter_adaptive_v20: fluxion_core::WinterAdaptiveV20ConfigCore {
-                    enabled: app_config.strategies.winter_adaptive_v20.enabled,
-                    priority: app_config.strategies.winter_adaptive_v20.priority,
-                    target_battery_soc: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .target_battery_soc,
-                    min_discharge_soc: app_config.strategies.winter_adaptive_v20.min_discharge_soc,
-                    battery_round_trip_efficiency: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .battery_round_trip_efficiency,
-                    negative_price_handling_enabled: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .negative_price_handling_enabled,
-                    opportunistic_charge_threshold_czk: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .opportunistic_charge_threshold_czk,
-                    min_export_spread_czk: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .min_export_spread_czk,
-                    min_soc_after_export: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .min_soc_after_export,
-                    solar_threshold_kwh: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .solar_threshold_kwh,
-                    solar_confidence_factor: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .solar_confidence_factor,
-                    min_savings_threshold_czk: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .min_savings_threshold_czk,
-                    volatile_cv_threshold: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .volatile_cv_threshold,
-                    expensive_level_threshold: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .expensive_level_threshold,
-                    high_solar_ratio_threshold: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .high_solar_ratio_threshold,
-                    low_solar_ratio_threshold: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .low_solar_ratio_threshold,
-                    tomorrow_expensive_ratio: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .tomorrow_expensive_ratio,
-                    tomorrow_cheap_ratio: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .tomorrow_cheap_ratio,
-                    negative_price_fraction_threshold: app_config
-                        .strategies
-                        .winter_adaptive_v20
-                        .negative_price_fraction_threshold,
-                },
                 winter_peak_discharge: fluxion_core::WinterPeakDischargeConfigCore {
                     enabled: app_config.strategies.winter_peak_discharge.enabled,
                     priority: app_config.strategies.winter_peak_discharge.priority,
@@ -2437,14 +2042,6 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     enabled: app_config.strategies.self_use.enabled,
                     priority: app_config.strategies.self_use.priority,
                 },
-                fixed_price_arbitrage: fluxion_core::FixedPriceArbitrageConfigCore {
-                    enabled: app_config.strategies.fixed_price_arbitrage.enabled,
-                    priority: app_config.strategies.fixed_price_arbitrage.priority,
-                    min_profit_threshold_czk: app_config
-                        .strategies
-                        .fixed_price_arbitrage
-                        .min_profit_threshold_czk,
-                },
             },
             history: fluxion_core::ConsumptionHistoryConfig {
                 consumption_entity: app_config.history.consumption_entity,
@@ -2486,9 +2083,6 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 } else {
                     app_config.solar_forecast.fetch_interval_seconds
                 },
-            },
-            remote_access: fluxion_core::RemoteAccessConfigCore {
-                enabled: app_config.remote_access.enabled,
             },
         }
     }

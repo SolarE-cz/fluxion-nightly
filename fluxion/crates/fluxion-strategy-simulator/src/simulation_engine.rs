@@ -248,37 +248,23 @@ impl SimulationEngine {
             .unwrap_or(block.price_czk_per_kwh);
 
         // Build price blocks for strategy context (all 96 with overrides applied)
-        // Use effective_price (spot + grid fees/HDO tariff) so strategies see true import cost
         let all_price_blocks: Vec<TimeBlockPrice> = state
             .day
             .blocks
             .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let spot = state
-                    .overrides
-                    .price_overrides
-                    .get(&i)
-                    .copied()
-                    .unwrap_or(b.price_czk_per_kwh);
-                let effective = spot + b.grid_fee_czk_per_kwh;
-                TimeBlockPrice {
-                    block_start: b.timestamp,
-                    duration_minutes: 15,
-                    price_czk_per_kwh: spot,
-                    effective_price_czk_per_kwh: effective,
-                    spot_sell_price_czk_per_kwh: None,
-                }
+            .map(|b| TimeBlockPrice {
+                block_start: b.timestamp,
+                duration_minutes: 15,
+                price_czk_per_kwh: b.price_czk_per_kwh,
+                effective_price_czk_per_kwh: b.price_czk_per_kwh,
             })
             .collect();
 
-        let effective_price = price + block.grid_fee_czk_per_kwh;
         let current_price_block = TimeBlockPrice {
             block_start: block.timestamp,
             duration_minutes: 15,
             price_czk_per_kwh: price,
-            effective_price_czk_per_kwh: effective_price,
-            spot_sell_price_czk_per_kwh: None,
+            effective_price_czk_per_kwh: price,
         };
 
         // Build control config

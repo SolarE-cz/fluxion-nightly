@@ -297,10 +297,7 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
                 0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
                 user_control_state,
-                params
-                    .consumption_history
-                    .hourly_profile()
-                    .map(|p| &p.hourly_avg_kwh),
+                params.consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
             );
 
             // Update schedule
@@ -459,10 +456,7 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                 0.0,
                 0.0,
                 Some(&params.user_control.state),
-                params
-                    .consumption_history
-                    .hourly_profile()
-                    .map(|p| &p.hourly_avg_kwh),
+                params.consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
             );
 
             // Update schedule
