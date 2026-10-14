@@ -302,8 +302,7 @@ impl DashboardTemplate {
                 let spot_price = block.price;
                 spot_prices.push(spot_price);
 
-                // Determine if block is in low tariff period based on HDO schedule
-                let block_time_str = block.timestamp.format("%H:%M").to_string();
+                let block_time_str = format_in_display_tz(block.timestamp, display_tz, "%H:%M");
                 let (grid_fee, tariff_type) = if let Some(hdo) = hdo_schedule {
                     // Log HDO info for first block only
                     if labels.len() == 1 {
@@ -313,7 +312,8 @@ impl DashboardTemplate {
                             hdo.low_tariff_periods
                         );
                     }
-                    let is_low = is_time_in_low_tariff(&block_time_str, &hdo.low_tariff_periods);
+                    let is_low =
+                        block_in_low_tariff(block.timestamp, display_tz, &hdo.low_tariff_periods);
                     // Log tariff decision for a few sample blocks
                     if labels.len() <= 5 || labels.len() % 20 == 0 {
                         tracing::debug!(
@@ -546,6 +546,11 @@ impl DashboardTemplate {
 }
 
 /// Check if a time (HH:MM format) falls within any of the low tariff periods
+/// HDO windows are local wall-clock times, so the block is matched in the display timezone.
+fn block_in_low_tariff(ts: DateTime<Utc>, tz: Option<Tz>, periods: &[(String, String)]) -> bool {
+    is_time_in_low_tariff(&format_in_display_tz(ts, tz, "%H:%M"), periods)
+}
+
 fn is_time_in_low_tariff(time_str: &str, periods: &[(String, String)]) -> bool {
     // Parse the block time
     let time_parts: Vec<&str> = time_str.split(':').collect();
@@ -715,6 +720,22 @@ mod tests {
             !is_time_in_low_tariff("16:45", &periods),
             "16:45 should be high"
         );
+    }
+
+    #[test]
+    fn test_block_in_low_tariff_uses_local_time() {
+        use chrono::TimeZone;
+
+        let periods = vec![
+            ("14:00".to_owned(), "16:00".to_owned()),
+            ("17:00".to_owned(), "24:00".to_owned()),
+        ];
+        let prague: Tz = "Europe/Prague".parse().unwrap();
+        // 13:00Z is 15:00 CEST (low); 14:00Z is 16:00 CEST (high).
+        let at = |h| Utc.with_ymd_and_hms(2026, 10, 14, h, 0, 0).unwrap();
+        assert!(block_in_low_tariff(at(13), Some(prague), &periods));
+        assert!(!block_in_low_tariff(at(14), Some(prague), &periods));
+        assert!(block_in_low_tariff(at(16), Some(prague), &periods));
     }
 
     #[test]

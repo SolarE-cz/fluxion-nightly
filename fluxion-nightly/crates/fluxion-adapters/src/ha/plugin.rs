@@ -528,7 +528,15 @@ pub fn select_hdo_entity<'a>(
         states
             .iter()
             .filter(|s| qualifies(s))
-            .min_by_key(|s| (!s.entity_id.starts_with(configured), s.entity_id.clone()))
+            // Prefer the configured prefix, then the most recently updated (a stale duplicate from an
+            // old integration entry loses), then the lowest entity_id for determinism.
+            .min_by_key(|s| {
+                (
+                    !s.entity_id.starts_with(configured),
+                    std::cmp::Reverse(s.last_updated.clone()),
+                    s.entity_id.clone(),
+                )
+            })
     };
 
     pick(is_hdo_schedule_entity)
@@ -992,6 +1000,20 @@ mod tests {
             last_changed: "2026-10-14T00:00:00+00:00".to_string(),
             last_updated: "2026-10-14T00:00:00+00:00".to_string(),
         }
+    }
+
+    #[test]
+    fn hdo_selection_prefers_most_recently_updated_duplicate() {
+        let mut stale = hdo_test_state("sensor.cez_hdo_schedule_5946", hdo_test_schedule_attrs());
+        stale.last_updated = "2026-10-14T00:28:07+00:00".to_string();
+        let mut fresh = hdo_test_state(
+            "sensor.cez_hdo_schedule_5946_evv1",
+            hdo_test_schedule_attrs(),
+        );
+        fresh.last_updated = "2026-10-14T01:24:08+00:00".to_string();
+        let states = vec![stale, fresh];
+        let chosen = select_hdo_entity(&states, "sensor.cez_hdo_raw_data").unwrap();
+        assert_eq!(chosen.entity_id, "sensor.cez_hdo_schedule_5946_evv1");
     }
 
     fn hdo_test_schedule_attrs() -> serde_json::Value {

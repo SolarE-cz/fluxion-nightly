@@ -10,6 +10,16 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.42] - 2026-10-14
+
+### Fixed
+
+- **Price chart HDO times.** The dashboard matched local HDO windows against UTC block times, so
+  high/low tariff colours and effective prices were drawn two hours late (CEST). Planning was not
+  affected; it already priced blocks in local time.
+- **Duplicate HDO sensors.** When two HDO sensors match (e.g. an old leftover set and the device's
+  set), FluxION now picks the most recently updated one instead of the first by name.
+
 ## [0.2.41] - 2026-10-14
 
 ### Changed
