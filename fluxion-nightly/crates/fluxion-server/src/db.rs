@@ -40,7 +40,10 @@ pub struct ClientRecord {
 }
 
 impl Database {
-    #[expect(clippy::too_many_lines, reason = "schema initialization with migrations")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "schema initialization with migrations"
+    )]
     pub fn open(path: &str) -> Result<Self> {
         if let Some(parent) = Path::new(path).parent()
             && !parent.as_os_str().is_empty()

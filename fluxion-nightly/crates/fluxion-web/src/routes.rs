@@ -11,8 +11,9 @@
 // For commercial licensing, please contact: info@solare.cz
 
 use askama::Template;
-use chrono::Timelike;
+use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use chrono_tz::Tz;
+use fluxion_core::web_bridge::TimezoneSource;
 use fluxion_core::{InverterData, ScheduleData, SystemHealthData, WebQueryResponse};
 use fluxion_i18n::I18n;
 use fluxion_types::UserControlState;
@@ -63,6 +64,8 @@ pub struct PvHistoryPoint {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ChartData {
     pub labels: Vec<String>,
+    /// Block start instants (RFC 3339, UTC), aligned with `labels`
+    pub block_starts_utc: Vec<String>,
     pub prices: Vec<f32>,
     pub modes: Vec<String>,
     pub target_socs: Vec<Option<f32>>,
@@ -123,6 +126,28 @@ impl LiveDataTemplate {
     }
 }
 
+/// Resolve the display timezone of a response.
+/// Returns `None` (UTC) when no usable timezone is known.
+pub fn display_timezone(response: &WebQueryResponse) -> (Option<Tz>, TimezoneSource) {
+    match response
+        .timezone
+        .as_deref()
+        .and_then(|name| name.parse::<Tz>().ok())
+    {
+        Some(tz) => (Some(tz), response.timezone_source),
+        None => (None, TimezoneSource::Unknown),
+    }
+}
+
+/// Format a timestamp in the display timezone, or in UTC when unknown.
+/// Each timestamp is converted individually, so DST offsets are per instant.
+fn format_in_display_tz(ts: DateTime<Utc>, tz: Option<Tz>, fmt: &str) -> String {
+    match tz {
+        Some(tz) => ts.with_timezone(&tz).format(fmt).to_string(),
+        None => ts.format(fmt).to_string(),
+    }
+}
+
 /// Dashboard template
 #[derive(Template)]
 #[template(path = "index.html", escape = "none")]
@@ -136,6 +161,12 @@ pub struct DashboardTemplate {
     pub i18n: Arc<I18n>,
     #[expect(dead_code, reason = "May be used in future template updates")]
     pub timezone: Option<String>,
+    /// True when no display timezone is known and times are shown in UTC
+    pub timezone_unknown: bool,
+    /// Home Assistant timezone name, when HA provides one (first option of the selector)
+    pub ha_timezone: Option<String>,
+    /// Zone abbreviation for the chart header ("UTC" when unknown)
+    pub display_tz_label: String,
     pub last_update_formatted: String,
     pub next_change_formatted: Option<String>,
     /// Ingress path prefix for HA Ingress support (e.g., "/hassio/ingress/641a79a3_fluxion")
@@ -166,42 +197,27 @@ impl DashboardTemplate {
         ingress_path: String,
         user_control: Option<UserControlState>,
     ) -> Self {
-        let timezone = response.timezone.clone();
-
-        // Format last update time in the correct timezone
-        let last_update_formatted = if let Some(tz_name) = &timezone {
-            if let Ok(tz) = tz_name.parse::<Tz>() {
-                response
-                    .health
-                    .last_update
-                    .with_timezone(&tz)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            } else {
-                response
-                    .health
-                    .last_update
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            }
+        let (display_tz, timezone_source) = display_timezone(&response);
+        let timezone_unknown = timezone_source == TimezoneSource::Unknown;
+        let ha_timezone = if timezone_source == TimezoneSource::HomeAssistant {
+            response.timezone.clone()
         } else {
-            response
-                .health
-                .last_update
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
+            None
         };
+        let display_tz_label = display_tz.map_or_else(
+            || "UTC".to_owned(),
+            |tz| Utc::now().with_timezone(&tz).format("%Z").to_string(),
+        );
+
+        // Format last update time in the display timezone
+        let last_update_formatted =
+            format_in_display_tz(response.health.last_update, display_tz, "%Y-%m-%d %H:%M:%S");
 
         // Format next change time if available
         let next_change_formatted = if let Some(ref schedule) = response.schedule {
-            schedule.next_change.map(|next| {
-                if let Some(tz_name) = &timezone
-                    && let Ok(tz) = tz_name.parse::<Tz>()
-                {
-                    return next.with_timezone(&tz).format("%H:%M:%S").to_string();
-                }
-                next.format("%H:%M:%S").to_string()
-            })
+            schedule
+                .next_change
+                .map(|next| format_in_display_tz(next, display_tz, "%H:%M:%S"))
         } else {
             None
         };
@@ -215,6 +231,7 @@ impl DashboardTemplate {
         // Prepare chart data for Chart.js from price data if available
         let prices = response.prices.map(|price_data| {
             let mut labels = Vec::new();
+            let mut block_starts_utc = Vec::new();
             let mut prices = Vec::new();
             let mut modes = Vec::new();
             let mut target_socs = Vec::new();
@@ -251,38 +268,18 @@ impl DashboardTemplate {
                 .and_then(|t| t.with_nanosecond(0))
                 .unwrap_or(now);
 
-            let current_time_label = if let Some(tz_name) = &timezone {
-                if let Ok(tz) = tz_name.parse::<Tz>() {
-                    Some(
-                        rounded_time
-                            .with_timezone(&tz)
-                            .format("%m-%d %H:%M")
-                            .to_string(),
-                    )
-                } else {
-                    Some(rounded_time.format("%m-%d %H:%M").to_string())
-                }
-            } else {
-                Some(rounded_time.format("%m-%d %H:%M").to_string())
-            };
+            let current_time_label = Some(format_in_display_tz(
+                rounded_time,
+                display_tz,
+                "%m-%d %H:%M",
+            ));
 
             for block in &price_data.blocks {
                 // Format time label in the correct timezone
-                let label = if let Some(tz_name) = &timezone {
-                    if let Ok(tz) = tz_name.parse::<Tz>() {
-                        block
-                            .timestamp
-                            .with_timezone(&tz)
-                            .format("%m-%d %H:%M")
-                            .to_string()
-                    } else {
-                        block.timestamp.format("%m-%d %H:%M").to_string()
-                    }
-                } else {
-                    block.timestamp.format("%m-%d %H:%M").to_string()
-                };
+                let label = format_in_display_tz(block.timestamp, display_tz, "%m-%d %H:%M");
 
                 labels.push(label);
+                block_starts_utc.push(block.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true));
                 prices.push(block.price);
                 target_socs.push(block.target_soc);
                 strategies.push(block.strategy.clone());
@@ -382,19 +379,8 @@ impl DashboardTemplate {
                     history
                         .iter()
                         .map(|point| {
-                            let label = if let Some(tz_name) = &timezone {
-                                if let Ok(tz) = tz_name.parse::<Tz>() {
-                                    point
-                                        .timestamp
-                                        .with_timezone(&tz)
-                                        .format("%m-%d %H:%M")
-                                        .to_string()
-                                } else {
-                                    point.timestamp.format("%m-%d %H:%M").to_string()
-                                }
-                            } else {
-                                point.timestamp.format("%m-%d %H:%M").to_string()
-                            };
+                            let label =
+                                format_in_display_tz(point.timestamp, display_tz, "%m-%d %H:%M");
                             SocHistoryPoint {
                                 label,
                                 soc: point.soc,
@@ -436,19 +422,8 @@ impl DashboardTemplate {
                     prediction
                         .iter()
                         .map(|point| {
-                            let label = if let Some(tz_name) = &timezone {
-                                if let Ok(tz) = tz_name.parse::<Tz>() {
-                                    point
-                                        .timestamp
-                                        .with_timezone(&tz)
-                                        .format("%m-%d %H:%M")
-                                        .to_string()
-                                } else {
-                                    point.timestamp.format("%m-%d %H:%M").to_string()
-                                }
-                            } else {
-                                point.timestamp.format("%m-%d %H:%M").to_string()
-                            };
+                            let label =
+                                format_in_display_tz(point.timestamp, display_tz, "%m-%d %H:%M");
                             SocPredictionPoint {
                                 label,
                                 soc: point.soc,
@@ -490,19 +465,8 @@ impl DashboardTemplate {
                     pv_history
                         .iter()
                         .map(|point| {
-                            let label = if let Some(tz_name) = &timezone {
-                                if let Ok(tz) = tz_name.parse::<Tz>() {
-                                    point
-                                        .timestamp
-                                        .with_timezone(&tz)
-                                        .format("%m-%d %H:%M")
-                                        .to_string()
-                                } else {
-                                    point.timestamp.format("%m-%d %H:%M").to_string()
-                                }
-                            } else {
-                                point.timestamp.format("%m-%d %H:%M").to_string()
-                            };
+                            let label =
+                                format_in_display_tz(point.timestamp, display_tz, "%m-%d %H:%M");
                             PvHistoryPoint {
                                 label,
                                 power_w: point.power_w,
@@ -527,6 +491,7 @@ impl DashboardTemplate {
                 tomorrow_median_price: price_data.tomorrow_median_price,
                 chart_data: ChartData {
                     labels,
+                    block_starts_utc,
                     prices,
                     modes,
                     target_socs,
@@ -567,6 +532,9 @@ impl DashboardTemplate {
             health: response.health,
             i18n,
             timezone: response.timezone,
+            timezone_unknown,
+            ha_timezone,
+            display_tz_label,
             last_update_formatted,
             next_change_formatted,
             ingress_path,
@@ -753,5 +721,83 @@ mod tests {
     fn test_is_time_in_low_tariff_empty_periods() {
         let periods: Vec<(String, String)> = vec![];
         assert!(!is_time_in_low_tariff("12:00", &periods));
+    }
+
+    fn response_with_timezone(timezone: Option<&str>, source: TimezoneSource) -> WebQueryResponse {
+        WebQueryResponse {
+            timestamp: Utc::now(),
+            debug_mode: false,
+            inverters: vec![],
+            schedule: None,
+            prices: None,
+            health: SystemHealthData {
+                inverter_source: true,
+                price_source: true,
+                last_update: Utc::now(),
+                errors: vec![],
+            },
+            timezone: timezone.map(str::to_owned),
+            timezone_source: source,
+            battery_soc_history: None,
+            battery_soc_prediction: None,
+            pv_generation_history: None,
+            consumption_stats: None,
+            hdo_schedule: None,
+            pricing_fees: None,
+            solar_forecast: None,
+        }
+    }
+
+    #[test]
+    fn display_timezone_reports_source() {
+        let (tz, source) = display_timezone(&response_with_timezone(
+            Some("Europe/Prague"),
+            TimezoneSource::HomeAssistant,
+        ));
+        assert_eq!(tz, Some(chrono_tz::Europe::Prague));
+        assert_eq!(source, TimezoneSource::HomeAssistant);
+
+        let (tz, source) = display_timezone(&response_with_timezone(
+            Some("Europe/Prague"),
+            TimezoneSource::Configured,
+        ));
+        assert_eq!(tz, Some(chrono_tz::Europe::Prague));
+        assert_eq!(source, TimezoneSource::Configured);
+
+        let (tz, source) = display_timezone(&response_with_timezone(None, TimezoneSource::Unknown));
+        assert_eq!(tz, None);
+        assert_eq!(source, TimezoneSource::Unknown);
+
+        // An unparseable name is treated as unknown (UTC)
+        let (tz, source) = display_timezone(&response_with_timezone(
+            Some("Mars/Olympus"),
+            TimezoneSource::Configured,
+        ));
+        assert_eq!(tz, None);
+        assert_eq!(source, TimezoneSource::Unknown);
+    }
+
+    #[test]
+    fn chart_labels_use_per_block_offset_across_dst_change() {
+        // Europe/Prague leaves CEST for CET on 2026-10-25 at 03:00 local (01:00Z)
+        let block_starts = [
+            "2026-10-24T22:00:00Z",
+            "2026-10-24T23:00:00Z",
+            "2026-10-25T00:00:00Z",
+            "2026-10-25T01:00:00Z",
+            "2026-10-25T02:00:00Z",
+            "2026-10-25T03:00:00Z",
+        ];
+        let labels: Vec<String> = block_starts
+            .iter()
+            .map(|s| {
+                let ts: DateTime<Utc> = s.parse().unwrap();
+                format_in_display_tz(ts, Some(chrono_tz::Europe::Prague), "%H:%M")
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            ["00:00", "01:00", "02:00", "02:00", "03:00", "04:00"]
+        );
     }
 }

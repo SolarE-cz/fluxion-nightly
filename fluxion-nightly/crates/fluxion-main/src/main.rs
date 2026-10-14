@@ -286,11 +286,8 @@ fn initialize_and_run() -> Result<()> {
     });
     let config_sender_for_web = config_update_sender.clone();
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
-    let remote_access_state = RemoteAccessApiState::new(
-        std::path::Path::new("./data"),
-        8099,
-        "FluxION".to_string(),
-    );
+    let remote_access_state =
+        RemoteAccessApiState::new(std::path::Path::new("./data"), 8099, "FluxION".to_string());
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -338,7 +335,8 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(UserControlResource::new(user_control_state))
         .insert_resource(user_control_update_channel)
         .init_resource::<fluxion_core::async_systems::BackupDischargeMinSoc>()
-        .init_resource::<fluxion_core::async_systems::HdoScheduleData>();
+        .init_resource::<fluxion_core::async_systems::HdoScheduleData>()
+        .init_resource::<fluxion_core::resources::GlobalHdoCache>();
 
     info!("✅ Starting main loop...");
 

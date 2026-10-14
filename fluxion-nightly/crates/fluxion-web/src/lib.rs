@@ -25,7 +25,7 @@ pub use plugin_api::PluginApiState;
 pub use remote_access::{
     MobileApiState, RemoteAccessApiState, mobile_api_routes, remote_access_routes,
 };
-use routes::{DashboardTemplate, LiveDataTemplate};
+use routes::{DashboardTemplate, LiveDataTemplate, display_timezone};
 pub use simulator::SimulatorState;
 pub use user_control_api::{UserControlApiState, UserControlUpdateSender};
 
@@ -593,6 +593,8 @@ async fn stream_handler(
 #[derive(Serialize)]
 struct ChartDataJson {
     labels: Vec<String>,
+    /// Block start instants (RFC 3339, UTC), aligned with `labels`
+    block_starts_utc: Vec<String>,
     prices: Vec<f32>,
     modes: Vec<String>,
     strategies: Vec<Option<String>>,
@@ -646,22 +648,19 @@ async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoRespo
                 .map(|sf| sf.tomorrow_kwh);
 
             // Calculate UTC offset from timezone string
-            let utc_offset_minutes = response
-                .timezone
-                .as_ref()
-                .and_then(|tz_name| tz_name.parse::<chrono_tz::Tz>().ok())
-                .map(|tz| {
-                    let now = chrono::Utc::now().with_timezone(&tz);
-                    #[expect(clippy::integer_division)]
-                    {
-                        now.offset().fix().local_minus_utc() / 60
-                    }
-                });
+            let utc_offset_minutes = display_timezone(&response).0.map(|tz| {
+                let now = chrono::Utc::now().with_timezone(&tz);
+                #[expect(clippy::integer_division)]
+                {
+                    now.offset().fix().local_minus_utc() / 60
+                }
+            });
 
             // Extract chart data from template
             if let Some(prices) = template.prices {
                 let chart_json = ChartDataJson {
                     labels: prices.chart_data.labels,
+                    block_starts_utc: prices.chart_data.block_starts_utc,
                     prices: prices.chart_data.prices,
                     modes: prices.chart_data.modes,
                     strategies: prices.chart_data.strategies,

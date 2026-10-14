@@ -436,6 +436,36 @@ pub fn trigger_battery_history_fetch_system(
     }
 }
 
+/// Keep the scheduler's HDO cache in sync with the HA HDO sensor and timezone.
+/// Runs before `update_prices_system`, so prices are computed with the current tariff.
+pub fn sync_hdo_cache_system(
+    hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
+    hdo_cache: Option<Res<crate::resources::GlobalHdoCache>>,
+    timezone: Option<Res<crate::resources::TimezoneConfig>>,
+) {
+    let (Some(hdo), Some(cache)) = (hdo_data, hdo_cache) else {
+        return;
+    };
+    let timezone_changed = timezone.as_ref().is_some_and(|tz| tz.is_changed());
+    if !hdo.is_changed() && !timezone_changed {
+        return;
+    }
+
+    if let Some(tz) = timezone.as_ref().and_then(|tz| tz.tz) {
+        cache.set_timezone(tz);
+    }
+
+    if hdo.is_changed()
+        && let Some(raw) = hdo.raw_data.as_deref()
+    {
+        let schedules = crate::strategy::pricing::parse_hdo_sensor_data(raw);
+        if !schedules.is_empty() {
+            debug!("HDO cache updated with {} day schedules", schedules.len());
+            cache.update(schedules);
+        }
+    }
+}
+
 /// Plugin to register all continuous operation systems
 pub struct ContinuousSystemsPlugin;
 
@@ -480,8 +510,73 @@ impl Plugin for ContinuousSystemsPlugin {
                     // Process web queries via message passing (ECS -> Web)
                     crate::web_bridge::web_query_system,
                     // New channel-based systems (non-blocking)
+                    sync_hdo_cache_system.before(crate::async_systems::update_prices_system),
                     crate::async_systems::update_prices_system,
                 ),
             );
+    }
+}
+
+#[cfg(test)]
+mod hdo_cache_sync_tests {
+    use super::*;
+    use crate::async_systems::HdoScheduleData;
+    use crate::resources::{GlobalHdoCache, TimezoneConfig};
+    use crate::scheduling::calculate_effective_prices;
+    use chrono::{TimeZone, Utc};
+    use fluxion_types::config::{PriceSchedule, PricingConfig};
+    use fluxion_types::pricing::TimeBlockPrice;
+
+    fn pricing() -> PricingConfig {
+        PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_string(),
+            tomorrow_price_entity: None,
+            use_spot_prices_to_buy: true,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        }
+    }
+
+    fn block(utc_hour: u32, spot: f32) -> TimeBlockPrice {
+        TimeBlockPrice {
+            block_start: Utc.with_ymd_and_hms(2026, 1, 14, utc_hour, 0, 0).unwrap(),
+            duration_minutes: 15,
+            price_czk_per_kwh: spot,
+            effective_price_czk_per_kwh: spot,
+            spot_sell_price_czk_per_kwh: None,
+        }
+    }
+
+    #[test]
+    fn test_scheduler_effective_price_uses_hdo_schedule_data() {
+        let raw = r#"{"data": {"signals": [{"signal": "EVV1", "datum": "14.01.2026",
+            "casy": "00:00-06:00; 07:00-09:00"}]}}"#;
+
+        let mut world = World::new();
+        world.insert_resource(HdoScheduleData {
+            raw_data: Some(raw.to_string()),
+            ..Default::default()
+        });
+        world.insert_resource(GlobalHdoCache::default());
+        world.insert_resource(TimezoneConfig::new(Some("Europe/Prague".to_string())));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(sync_hdo_cache_system);
+        schedule.run(&mut world);
+
+        let cache = world.resource::<GlobalHdoCache>();
+        // 02:00 UTC = 03:00 Prague (low window), 09:00 UTC = 10:00 Prague (high)
+        let mut blocks = vec![block(2, 2.0), block(9, 2.0)];
+        calculate_effective_prices(&mut blocks, Some(cache), &pricing());
+
+        // spot + low/high HDO fee + operator buy fee
+        assert!((blocks[0].effective_price_czk_per_kwh - 3.00).abs() < 0.001);
+        assert!((blocks[1].effective_price_czk_per_kwh - 4.30).abs() < 0.001);
     }
 }

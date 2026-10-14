@@ -271,67 +271,50 @@ pub fn aggregate_hourly_consumption(
     history_points: &[crate::traits::HistoryDataPoint],
 ) -> Option<HourlyConsumptionProfile> {
     use chrono::Timelike;
-    use std::collections::HashMap;
-
     if history_points.is_empty() {
         return None;
     }
 
-    // Group points by date (YYYY-MM-DD string key)
-    let mut by_date: HashMap<String, Vec<&crate::traits::HistoryDataPoint>> = HashMap::new();
+    // Max reading per absolute UTC hour. Deltas are taken against the previous consecutive
+    // hour across date boundaries, because the "today" sensor resets at *local* midnight,
+    // which is not a UTC date boundary.
+    let mut by_hour: std::collections::BTreeMap<chrono::DateTime<chrono::Utc>, f32> =
+        std::collections::BTreeMap::new();
     for point in history_points {
-        let date_key = point.timestamp.format("%Y-%m-%d").to_string();
-        by_date.entry(date_key).or_default().push(point);
+        let Some(hour_start) = point
+            .timestamp
+            .with_minute(0)
+            .and_then(|t| t.with_second(0))
+            .and_then(|t| t.with_nanosecond(0))
+        else {
+            continue;
+        };
+        by_hour
+            .entry(hour_start)
+            .and_modify(|max| *max = max.max(point.value))
+            .or_insert(point.value);
     }
 
-    // For each hour across all days, collect deltas
     let mut hour_deltas: Vec<Vec<f32>> = vec![Vec::new(); 24];
-    let mut total_days = 0usize;
-
-    for points in by_date.values() {
-        // Group points by hour within this day
-        let mut by_hour: HashMap<u32, f32> = HashMap::new();
-        for point in points {
-            let hour = point.timestamp.hour();
-            by_hour
-                .entry(hour)
-                .and_modify(|max| *max = max.max(point.value))
-                .or_insert(point.value);
-        }
-
-        if by_hour.is_empty() {
-            continue;
-        }
-        total_days += 1;
-
-        // Compute deltas for each hour
-        for h in 0..24u32 {
-            if let Some(&max_this_hour) = by_hour.get(&h) {
-                let delta = if h == 0 {
-                    // Sensor starts at 0 after midnight reset
-                    max_this_hour
-                } else {
-                    // Find the previous hour that has data
-                    let mut prev_max = None;
-                    for prev_h in (0..h).rev() {
-                        if let Some(&val) = by_hour.get(&prev_h) {
-                            prev_max = Some(val);
-                            break;
-                        }
-                    }
-                    match prev_max {
-                        Some(prev) => max_this_hour - prev,
-                        None => max_this_hour, // No previous hour data, treat like hour 0
-                    }
-                };
-
-                // Only include non-negative deltas (cumulative sensor should only go up)
-                if delta >= 0.0 {
-                    hour_deltas[h as usize].push(delta);
-                }
+    let mut days = std::collections::HashSet::new();
+    let mut prev: Option<(chrono::DateTime<chrono::Utc>, f32)> = None;
+    for (&hour_start, &max_this_hour) in &by_hour {
+        days.insert(hour_start.date_naive());
+        if let Some((prev_start, prev_max)) = prev
+            && hour_start - prev_start == chrono::Duration::hours(1)
+        {
+            let delta = max_this_hour - prev_max;
+            if delta >= 0.0 {
+                hour_deltas[hour_start.hour() as usize].push(delta);
+            } else if max_this_hour < 0.5 * prev_max {
+                // A large drop means the sensor reset at the start of this hour: the reading is
+                // the energy since the reset. Small drops are glitches and are skipped.
+                hour_deltas[hour_start.hour() as usize].push(max_this_hour);
             }
         }
+        prev = Some((hour_start, max_this_hour));
     }
+    let total_days = days.len();
 
     // Average each hour's deltas
     let mut hourly_avg_kwh = [0.0f32; 24];
@@ -470,5 +453,25 @@ mod tests {
         assert_eq!(summaries[0].consumption_kwh, 25.0); // Today
         assert_eq!(summaries[1].consumption_kwh, 22.0); // Yesterday
         assert_eq!(summaries[2].consumption_kwh, 20.0); // Two days ago
+    }
+
+    #[test]
+    fn test_hourly_profile_handles_local_midnight_reset() {
+        use chrono::{TimeZone, Utc};
+        // Constant 1 kWh/h; the cumulative "today" sensor resets at 23:00 UTC (local midnight, CET).
+        let mut points = Vec::new();
+        let start = Utc.with_ymd_and_hms(2026, 1, 10, 23, 0, 0).unwrap();
+        for i in 0..(5 * 24 * 4) {
+            let t = start + chrono::Duration::minutes(15 * i);
+            let minutes_since_reset = (t - start).num_minutes() % (24 * 60);
+            points.push(crate::traits::HistoryDataPoint {
+                timestamp: t,
+                value: (minutes_since_reset + 15) as f32 / 60.0,
+            });
+        }
+        let profile = aggregate_hourly_consumption(&points).unwrap();
+        for (h, kwh) in profile.hourly_avg_kwh.iter().enumerate() {
+            assert!((kwh - 1.0).abs() < 0.05, "hour {h}: {kwh}");
+        }
     }
 }

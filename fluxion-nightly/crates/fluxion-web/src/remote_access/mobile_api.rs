@@ -23,8 +23,8 @@ use fluxion_core::{
 };
 use fluxion_i18n::I18n;
 use fluxion_mobile_types::{
-    MobileChartPoint, MobileControlRequest, MobileControlResponse, MobileStateResponse,
-    MobileTimeSlot, MobileUserControl, VersionResponse, API_VERSION,
+    API_VERSION, MobileChartPoint, MobileControlRequest, MobileControlResponse,
+    MobileStateResponse, MobileTimeSlot, MobileUserControl, VersionResponse,
 };
 use serde::Deserialize;
 use std::sync::Arc;

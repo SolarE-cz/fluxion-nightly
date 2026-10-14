@@ -198,6 +198,7 @@ pub fn setup_async_workers(
 // Solar Forecast Resources
 // ============================================================================
 
+use chrono::{DateTime, Utc};
 use std::time::Instant;
 
 #[derive(Resource)]
@@ -211,8 +212,40 @@ pub struct SolarForecastData {
     /// Solar production forecast for tomorrow (kWh)
     pub tomorrow_kwh: f32,
 
+    /// Per-block PV forecast (UTC block start, kWh). Empty when unavailable.
+    pub block_kwh: Vec<(DateTime<Utc>, f32)>,
+
     /// Last successful update timestamp
     pub last_updated: Instant,
+}
+
+/// PV forecast (kWh) for each block start, 0.0 where unknown.
+/// Returns `None` when no per-block forecast is available.
+pub fn solar_block_forecast(
+    data: Option<&SolarForecastData>,
+    block_starts: &[DateTime<Utc>],
+) -> Option<Vec<f32>> {
+    let data = data?;
+    if data.block_kwh.is_empty() {
+        return None;
+    }
+    let by_key: std::collections::BTreeMap<DateTime<Utc>, f32> =
+        data.block_kwh.iter().copied().collect();
+    // Step-hold: a key covers the block starts up to (not including) one hour after it,
+    // so hourly keys fill all four 15-min blocks of their hour.
+    Some(
+        block_starts
+            .iter()
+            .map(|start| {
+                by_key
+                    .range(..=*start)
+                    .next_back()
+                    .filter(|(key, _)| *start - **key < chrono::Duration::minutes(60))
+                    .map(|(_, kwh)| *kwh)
+                    .unwrap_or(0.0)
+            })
+            .collect(),
+    )
 }
 
 impl Default for SolarForecastData {
@@ -221,6 +254,7 @@ impl Default for SolarForecastData {
             total_today_kwh: 0.0,
             remaining_today_kwh: 0.0,
             tomorrow_kwh: 0.0,
+            block_kwh: Vec::new(),
             last_updated: Instant::now(),
         }
     }
@@ -231,6 +265,7 @@ pub struct SolarForecastUpdate {
     pub total_today_kwh: f32,
     pub remaining_today_kwh: f32,
     pub tomorrow_kwh: f32,
+    pub block_kwh: Vec<(DateTime<Utc>, f32)>,
 }
 
 #[derive(Resource)]
@@ -241,4 +276,56 @@ pub struct SolarForecastSender {
 #[derive(Component)]
 pub struct SolarForecastChannel {
     pub receiver: crossbeam_channel::Receiver<SolarForecastUpdate>,
+}
+
+#[cfg(test)]
+mod solar_block_forecast_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn utc(h: u32, m: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 13, h, m, 0).unwrap()
+    }
+
+    fn data(block_kwh: Vec<(DateTime<Utc>, f32)>) -> SolarForecastData {
+        SolarForecastData {
+            block_kwh,
+            ..SolarForecastData::default()
+        }
+    }
+
+    #[test]
+    fn test_hourly_keys_fill_all_quarter_hour_blocks() {
+        let forecast = data(vec![(utc(10, 0), 0.3), (utc(11, 0), 0.5)]);
+        let starts = [
+            utc(10, 0),
+            utc(10, 15),
+            utc(10, 30),
+            utc(10, 45),
+            utc(11, 0),
+            utc(11, 15),
+            utc(11, 30),
+            utc(11, 45),
+            utc(12, 0),
+        ];
+
+        let values = solar_block_forecast(Some(&forecast), &starts).unwrap();
+
+        assert_eq!(values, vec![0.3, 0.3, 0.3, 0.3, 0.5, 0.5, 0.5, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn test_quarter_hour_keys_match_exactly() {
+        let forecast = data(vec![(utc(10, 0), 0.1), (utc(10, 15), 0.2)]);
+
+        let values = solar_block_forecast(Some(&forecast), &[utc(10, 0), utc(10, 15)]).unwrap();
+
+        assert_eq!(values, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn test_no_forecast_returns_none() {
+        assert!(solar_block_forecast(None, &[utc(10, 0)]).is_none());
+        assert!(solar_block_forecast(Some(&data(vec![])), &[utc(10, 0)]).is_none());
+    }
 }

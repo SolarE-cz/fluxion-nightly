@@ -257,6 +257,9 @@ pub struct SystemSettingsConfig {
     pub language: Language,
     #[serde(skip)]
     pub timezone: Option<String>, // Home Assistant timezone (fetched at runtime)
+    /// User-selected display timezone (IANA name), used when HA timezone is unknown
+    #[serde(default)]
+    pub display_timezone: Option<String>,
 }
 
 /// Strategies configuration for core module
@@ -278,6 +281,8 @@ pub struct StrategiesConfigCore {
     pub winter_adaptive_v8: WinterAdaptiveV8ConfigCore,
     #[serde(default)]
     pub winter_adaptive_v9: WinterAdaptiveV9ConfigCore,
+    #[serde(default)]
+    pub winter_reserve: WinterReserveConfigCore,
     #[serde(default)]
     pub winter_adaptive_v10: WinterAdaptiveV10ConfigCore,
     #[serde(default)]
@@ -936,6 +941,81 @@ impl Default for WinterAdaptiveV8ConfigCore {
             opportunistic_charge_threshold_czk: 1.5,
             solar_capacity_reservation_factor: 0.7,
             min_solar_for_reduction_kwh: 2.0,
+        }
+    }
+}
+
+/// Winter Reserve configuration (`strategies.winter_reserve`).
+/// Keeps enough battery for the night, buys in the cheapest blocks and exports
+/// at peaks only when the profit is real. Defaults mirror `WinterReserveParams`
+/// in fluxion-core.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinterReserveConfigCore {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Priority for conflict resolution (0-100, higher wins)
+    #[serde(default = "default_winter_reserve_priority")]
+    pub priority: u8,
+    /// Minimum profit (CZK/kWh) after all fees for arbitrage export (default: 3.0)
+    #[serde(default = "default_wr_min_arbitrage_profit")]
+    pub min_arbitrage_profit_czk: f32,
+    /// Sell price multiple of cheap_ref above which the night reserve is released (default: 2.0)
+    #[serde(default = "default_wr_insane_price_multiplier")]
+    pub insane_price_multiplier: f32,
+    /// Fraction of cheapest blocks averaged into cheap_ref (default: 0.20)
+    #[serde(default = "default_wr_cheap_percentile")]
+    pub cheap_percentile: f32,
+    /// Factor applied to forecast consumption (default: 1.10)
+    #[serde(default = "default_wr_load_safety_factor")]
+    pub load_safety_factor: f32,
+    /// Factor applied to forecast solar production (default: 0.70)
+    #[serde(default = "default_wr_pv_confidence")]
+    pub pv_confidence: f32,
+    /// Benefit (CZK) required to leave SelfUse for another mode (default: 0.10)
+    #[serde(default = "default_wr_min_mode_benefit")]
+    pub min_mode_benefit_czk: f32,
+    /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
+    #[serde(default = "default_wr_soc_resolution_pct")]
+    pub soc_resolution_pct: f32,
+}
+
+fn default_winter_reserve_priority() -> u8 {
+    120
+}
+fn default_wr_min_arbitrage_profit() -> f32 {
+    3.0
+}
+fn default_wr_insane_price_multiplier() -> f32 {
+    3.0
+}
+fn default_wr_cheap_percentile() -> f32 {
+    0.20
+}
+fn default_wr_load_safety_factor() -> f32 {
+    1.10
+}
+fn default_wr_pv_confidence() -> f32 {
+    0.70
+}
+fn default_wr_min_mode_benefit() -> f32 {
+    0.10
+}
+fn default_wr_soc_resolution_pct() -> f32 {
+    0.5
+}
+
+impl Default for WinterReserveConfigCore {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            priority: default_winter_reserve_priority(),
+            min_arbitrage_profit_czk: default_wr_min_arbitrage_profit(),
+            insane_price_multiplier: default_wr_insane_price_multiplier(),
+            cheap_percentile: default_wr_cheap_percentile(),
+            load_safety_factor: default_wr_load_safety_factor(),
+            pv_confidence: default_wr_pv_confidence(),
+            min_mode_benefit_czk: default_wr_min_mode_benefit(),
+            soc_resolution_pct: default_wr_soc_resolution_pct(),
         }
     }
 }

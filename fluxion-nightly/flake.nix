@@ -63,6 +63,14 @@
           ];
         };
 
+        # Rust toolchain with musl targets for static binary releases
+        rustToolchainMusl = (pkgs.rust-bin.fromRustupToolchainFile ./fluxion/rust-toolchain.toml).override {
+          targets = [
+            "x86_64-unknown-linux-musl"
+            "aarch64-unknown-linux-musl"
+          ];
+        };
+
         # Custom source filter to include .ftl locale files, .html templates, and .py scripts
         sourceFilter = path: type:
           let
@@ -168,21 +176,33 @@
         # Build Docker image for a specific architecture
         buildDockerImageFor = targetSystem:
           let
+            isNative = system == targetSystem;
+
+            # pkgsCross is the idiomatic nixpkgs way to get a cross-compilation
+            # package set. It reuses the already-fetched nixpkgs and correctly
+            # wires up the cross-compiler (aarch64-linux-gcc, binutils, etc.).
+            crossPkgs =
+              if isNative then pkgs
+              else if targetSystem == "aarch64-linux" then pkgs.pkgsCross.aarch64-multiplatform
+              else throw "Unsupported cross target: ${targetSystem}";
+
+            # The Rust stdlib for the target triple must be present in the toolchain.
+            # Without this override, rustc has no `core`/`std` for the target and
+            # fails with E0463 "can't find crate for `core`".
+            crossRustToolchain =
+              if isNative then rustToolchain
+              else
+                rustToolchain.override {
+                  targets = [ "aarch64-unknown-linux-gnu" ];
+                };
+
+            crossCraneLib = (crane.mkLib crossPkgs).overrideToolchain crossRustToolchain;
+
             fluxionBinary =
-              if system == targetSystem then
+              if isNative then
                 fluxion-main
               else
-              # Cross-compilation case
-                let
-                  crossPkgs = import nixpkgs {
-                    inherit system;
-                    overlays = [ (import rust-overlay) ];
-                    crossSystem = nixpkgs.lib.systems.examples.${targetSystem} or { config = targetSystem; };
-                  };
-                  crossCraneLib = crane.mkLib crossPkgs;
-                  crossCraneLibToolchain = crossCraneLib.overrideToolchain rustToolchain;
-                in
-                crossCraneLibToolchain.buildPackage (commonArgs // {
+                crossCraneLib.buildPackage (commonArgs // {
                   pname = "fluxion-main";
                   cargoBuildFlags = [ "--bin" "fluxion" ];
                   doCheck = false;
@@ -197,15 +217,14 @@
             name = "fluxion-ha";
             tag = arch;
 
-            # Use scratch as base - we'll reference HA base in documentation
             fromImage = null;
 
             copyToRoot = pkgs.buildEnv {
               name = "fluxion-root";
               paths = [
                 fluxionBinary
-                pkgs.bash
-                pkgs.coreutils
+                crossPkgs.bash # arch-correct: aarch64 bash when cross-compiling
+                crossPkgs.coreutils # arch-correct: aarch64 coreutils when cross-compiling
               ];
               pathsToLink = [ "/bin" ];
             };
@@ -306,6 +325,34 @@
             echo ""
             echo "Usage:"
             echo "  python3 ralph/scripts/c10_analysis.py    - Run C10 sweep analysis"
+          '';
+        };
+
+        # Musl static binary build shell (for release binary CI)
+        devShells.musl = pkgs.mkShell {
+          packages = [
+            rustToolchainMusl
+            # Native musl toolchain (for x86_64-unknown-linux-musl)
+            pkgs.musl
+            # aarch64 musl cross-compiler (for aarch64-unknown-linux-musl)
+            pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc
+          ];
+
+          # Tell cargo which linker to use for aarch64 musl cross-compilation
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER =
+            "${pkgs.pkgsCross.aarch64-multiplatform-musl.stdenv.cc}/bin/aarch64-unknown-linux-musl-cc";
+
+          shellHook = ''
+            echo "FluxION Musl Static Binary Build Environment"
+            echo "  Rust: $(rustc --version)"
+            echo ""
+            echo "Targets available:"
+            echo "  x86_64-unknown-linux-musl  (native)"
+            echo "  aarch64-unknown-linux-musl (cross)"
+            echo ""
+            echo "Build commands:"
+            echo "  cargo build --release --bin fluxion --target x86_64-unknown-linux-musl"
+            echo "  cargo build --release --bin fluxion --target aarch64-unknown-linux-musl"
           '';
         };
 
@@ -545,7 +592,7 @@
                 alias run-fluxion="run_fluxion"
                 alias fluxion-bin="echo $FLUXION_BIN"
                 PS1="\[\033[1;32m\][fluxion-test]\[\033[0m\] \w $ "
-                echo "Type 'run-fluxion' to start, or 'exit' to quit"
+                echo "Type 'run-fluxion' to start, or '"'"'exit'"'"' to quit"
               ')
             '');
           };
@@ -908,3 +955,4 @@
       }
     );
 }
+

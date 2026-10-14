@@ -128,6 +128,8 @@ pub fn update_prices_system(
     inverter_raw_state_query: Query<&RawInverterState>,
     plugin_manager_res: Res<PluginManagerResource>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
+    solar_forecast: Option<Res<super::SolarForecastData>>,
+    timezone_config: Option<Res<crate::resources::TimezoneConfig>>,
 ) {
     // Only fetch if cache is stale (non-blocking check)
     if !price_cache.is_stale() {
@@ -263,24 +265,38 @@ pub fn update_prices_system(
     let plugin_manager = plugin_manager_res.0.read();
     let hdo_raw_data = hdo_data.as_ref().and_then(|h| h.raw_data.clone());
     let user_control_state = user_control.as_ref().map(|uc| &uc.state);
+    // PV forecast per block (aligned with time_block_prices)
+    let block_starts: Vec<_> = new_prices
+        .time_block_prices
+        .iter()
+        .map(|b| b.block_start)
+        .collect();
+    let solar_forecast_per_block =
+        super::solar_block_forecast(solar_forecast.as_deref(), &block_starts);
+
     let new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
         &schedule_config,
         current_soc,
-        None, // Future: Add solar forecast integration (Solcast/Forecast.Solar API)
-        consumption_forecast.as_deref(), // Enhanced consumption forecast
+        solar_forecast_per_block.as_deref(), // PV forecast per block
+        consumption_forecast.as_deref(),     // Enhanced consumption forecast
         backup_discharge_min_soc,
         grid_import_today_kwh,
         &plugin_manager,
         hdo_raw_data,
-        0.0, // TODO: Wire up solar_forecast_total_today_kwh from SolarForecastData resource
-        0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
-        0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
+        solar_forecast.as_ref().map_or(0.0, |s| s.total_today_kwh),
+        solar_forecast
+            .as_ref()
+            .map_or(0.0, |s| s.remaining_today_kwh),
+        solar_forecast.as_ref().map_or(0.0, |s| s.tomorrow_kwh),
         user_control_state,
         consumption_history
             .hourly_profile()
             .map(|p| &p.hourly_avg_kwh),
+        timezone_config
+            .as_ref()
+            .and_then(|tz| tz.timezone.as_deref()),
     );
 
     // Update or create PriceAnalysis entity

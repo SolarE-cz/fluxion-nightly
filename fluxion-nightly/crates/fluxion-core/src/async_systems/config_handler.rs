@@ -114,6 +114,8 @@ pub struct ConfigEventParams<'w, 's> {
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
     plugin_manager_res: Res<'w, PluginManagerResource>,
     user_control: Option<Res<'w, crate::resources::UserControlResource>>,
+    solar_forecast: Option<Res<'w, super::SolarForecastData>>,
+    timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
 }
 
 /// System that processes config update events from the web UI
@@ -282,25 +284,45 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
             let plugin_manager = params.plugin_manager_res.0.read();
             let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
             let user_control_state = params.user_control.as_ref().map(|uc| &uc.state);
+            let block_starts: Vec<_> = price_data
+                .time_block_prices
+                .iter()
+                .map(|b| b.block_start)
+                .collect();
+            let solar_forecast =
+                super::solar_block_forecast(params.solar_forecast.as_deref(), &block_starts);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
                 current_soc,
-                None,                            // Future: Solar forecast
+                solar_forecast.as_deref(),       // PV forecast per block
                 consumption_forecast.as_deref(), // Enhanced consumption forecast
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
                 hdo_raw_data,
-                0.0, // TODO: Wire up solar_forecast_total_today_kwh from SolarForecastData resource
-                0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
-                0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
+                params
+                    .solar_forecast
+                    .as_ref()
+                    .map_or(0.0, |s| s.total_today_kwh),
+                params
+                    .solar_forecast
+                    .as_ref()
+                    .map_or(0.0, |s| s.remaining_today_kwh),
+                params
+                    .solar_forecast
+                    .as_ref()
+                    .map_or(0.0, |s| s.tomorrow_kwh),
                 user_control_state,
                 params
                     .consumption_history
                     .hourly_profile()
                     .map(|p| &p.hourly_avg_kwh),
+                params
+                    .timezone_config
+                    .as_ref()
+                    .and_then(|tz| tz.timezone.as_deref()),
             );
 
             // Update schedule
@@ -358,6 +380,8 @@ pub struct UserControlEventParams<'w, 's> {
     consumption_history: Res<'w, crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
     plugin_manager_res: Res<'w, PluginManagerResource>,
+    solar_forecast: Option<Res<'w, super::SolarForecastData>>,
+    timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
 }
 
 /// System that processes user control update events from the web UI
@@ -444,25 +468,45 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
             // Generate new schedule with updated user control
             let plugin_manager = params.plugin_manager_res.0.read();
             let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
+            let block_starts: Vec<_> = price_data
+                .time_block_prices
+                .iter()
+                .map(|b| b.block_start)
+                .collect();
+            let solar_forecast =
+                super::solar_block_forecast(params.solar_forecast.as_deref(), &block_starts);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
                 current_soc,
-                None,
+                solar_forecast.as_deref(),
                 consumption_forecast.as_deref(),
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
                 hdo_raw_data,
-                0.0,
-                0.0,
-                0.0,
+                params
+                    .solar_forecast
+                    .as_ref()
+                    .map_or(0.0, |s| s.total_today_kwh),
+                params
+                    .solar_forecast
+                    .as_ref()
+                    .map_or(0.0, |s| s.remaining_today_kwh),
+                params
+                    .solar_forecast
+                    .as_ref()
+                    .map_or(0.0, |s| s.tomorrow_kwh),
                 Some(&params.user_control.state),
                 params
                     .consumption_history
                     .hourly_profile()
                     .map(|p| &p.hourly_avg_kwh),
+                params
+                    .timezone_config
+                    .as_ref()
+                    .and_then(|tz| tz.timezone.as_deref()),
             );
 
             // Update schedule

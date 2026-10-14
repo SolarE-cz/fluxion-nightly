@@ -25,6 +25,7 @@ pub mod winter_adaptive_v5;
 pub mod winter_adaptive_v7;
 pub mod winter_adaptive_v8;
 pub mod winter_adaptive_v9;
+pub mod winter_reserve;
 
 // Re-export shared locking utilities
 pub use locking::{LockedBlock, ScheduleLockState};
@@ -266,6 +267,12 @@ pub struct EvaluationContext<'a> {
     /// Averaged over last 7 days of historical data
     /// Enables strategies to understand when energy demand is highest
     pub hourly_consumption_profile: Option<&'a [f32; 24]>,
+
+    /// Per-block raw forecasts aligned with `all_price_blocks` (None = unknown)
+    pub block_forecasts: Option<&'a [fluxion_plugins::protocol::BlockForecast]>,
+
+    /// Site timezone used for local-time decisions (None = unknown)
+    pub timezone: Option<chrono_tz::Tz>,
 }
 
 /// Trait for economic battery operation strategies

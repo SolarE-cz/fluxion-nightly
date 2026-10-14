@@ -241,6 +241,40 @@ pub struct SolarForecastInfo {
     pub available: bool,
 }
 
+/// Where the display timezone of a response came from
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimezoneSource {
+    /// Timezone reported by Home Assistant
+    HomeAssistant,
+    /// Timezone the user selected in Fluxion settings
+    Configured,
+    /// No timezone known; times are shown in UTC
+    #[default]
+    Unknown,
+}
+
+/// Resolve the display timezone: Home Assistant first, then the configured `display_timezone`
+pub fn resolve_display_timezone(
+    ha_timezone: Option<&str>,
+    configured: Option<&str>,
+) -> (Option<String>, TimezoneSource) {
+    // Only a name that parses as an IANA zone counts, so an invalid HA value
+    // falls through to the user's configured zone.
+    let non_empty = |tz: Option<&str>| {
+        tz.map(str::trim)
+            .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok())
+            .map(str::to_owned)
+    };
+    if let Some(tz) = non_empty(ha_timezone) {
+        (Some(tz), TimezoneSource::HomeAssistant)
+    } else if let Some(tz) = non_empty(configured) {
+        (Some(tz), TimezoneSource::Configured)
+    } else {
+        (None, TimezoneSource::Unknown)
+    }
+}
+
 /// Response containing ECS component data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebQueryResponse {
@@ -251,6 +285,9 @@ pub struct WebQueryResponse {
     pub prices: Option<PriceData>,
     pub health: SystemHealthData,
     pub timezone: Option<String>,
+    /// Where `timezone` came from (Home Assistant, configured, or unknown)
+    #[serde(default)]
+    pub timezone_source: TimezoneSource,
     pub battery_soc_history: Option<Vec<BatterySocHistoryPoint>>,
     pub battery_soc_prediction: Option<Vec<BatterySocPredictionPoint>>,
     pub pv_generation_history: Option<Vec<PvGenerationHistoryPoint>>,
@@ -1060,7 +1097,11 @@ fn build_dashboard_response(
 
     // Build pricing fees from config
     let pricing_fees = Some(PricingFees {
-        buy_fee_czk: system_config.pricing_config.spot_buy_fee_czk,
+        buy_fee_czk: if system_config.pricing_config.use_spot_prices_to_buy {
+            system_config.pricing_config.spot_buy_fee_czk
+        } else {
+            0.0
+        },
         sell_fee_czk: system_config.pricing_config.spot_sell_fee_czk,
     });
 
@@ -1108,6 +1149,13 @@ fn build_dashboard_response(
         debug!("☀️ Solar forecast resource not available in ECS");
     }
 
+    let (display_timezone, timezone_source) = resolve_display_timezone(
+        timezone_config
+            .and_then(|tz| tz.timezone.as_deref())
+            .or(system_config.system_config.timezone.as_deref()),
+        system_config.system_config.display_timezone.as_deref(),
+    );
+
     WebQueryResponse {
         timestamp: now,
         debug_mode: debug_config.is_enabled(),
@@ -1115,9 +1163,8 @@ fn build_dashboard_response(
         schedule: schedule_data,
         prices: price_data_result,
         health,
-        timezone: timezone_config
-            .and_then(|tz| tz.timezone.clone())
-            .or_else(|| system_config.system_config.timezone.clone()),
+        timezone: display_timezone,
+        timezone_source,
         battery_soc_history,
         battery_soc_prediction,
         pv_generation_history,
@@ -1157,5 +1204,49 @@ fn get_topology_string(inverter_id: &str, config: &SystemConfig) -> String {
         }
     } else {
         "Unknown".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_timezone_prefers_home_assistant() {
+        assert_eq!(
+            resolve_display_timezone(Some("Europe/Prague"), Some("Europe/Berlin")),
+            (
+                Some("Europe/Prague".to_owned()),
+                TimezoneSource::HomeAssistant
+            )
+        );
+    }
+
+    #[test]
+    fn display_timezone_falls_back_to_configured() {
+        assert_eq!(
+            resolve_display_timezone(None, Some("Europe/Berlin")),
+            (Some("Europe/Berlin".to_owned()), TimezoneSource::Configured)
+        );
+        assert_eq!(
+            resolve_display_timezone(Some("  "), Some("Europe/Berlin")),
+            (Some("Europe/Berlin".to_owned()), TimezoneSource::Configured)
+        );
+    }
+
+    #[test]
+    fn display_timezone_unknown_when_both_unset() {
+        assert_eq!(
+            resolve_display_timezone(Some("Mars/Olympus"), Some("Europe/Berlin")),
+            (Some("Europe/Berlin".to_owned()), TimezoneSource::Configured)
+        );
+        assert_eq!(
+            resolve_display_timezone(None, None),
+            (None, TimezoneSource::Unknown)
+        );
+        assert_eq!(
+            resolve_display_timezone(None, Some("")),
+            (None, TimezoneSource::Unknown)
+        );
     }
 }

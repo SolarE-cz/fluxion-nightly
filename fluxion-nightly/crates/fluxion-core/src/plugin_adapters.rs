@@ -25,6 +25,7 @@ use crate::strategy::{
     winter_adaptive_v9::{WinterAdaptiveV9Config, WinterAdaptiveV9Strategy},
     winter_adaptive_v10::{WinterAdaptiveV10Config, WinterAdaptiveV10Strategy},
     winter_adaptive_v20::{WinterAdaptiveV20Config, WinterAdaptiveV20Strategy},
+    winter_reserve::{WinterReserveParams, WinterReserveStrategy},
 };
 use fluxion_plugins::{BlockDecision, EvaluationRequest, Plugin, PluginManager};
 use fluxion_types::config::ControlConfig;
@@ -94,6 +95,13 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
                 .hourly_consumption_profile
                 .as_ref()
                 .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
+            block_forecasts: (!request.block_forecasts.is_empty()
+                && request.block_forecasts.len() == request.all_blocks.len())
+            .then_some(request.block_forecasts.as_slice()),
+            timezone: request
+                .timezone
+                .as_deref()
+                .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok()),
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -408,6 +416,25 @@ pub fn init_plugin_manager(
         control_config.clone(),
     )));
 
+    // Create Winter Reserve config from core config or defaults
+    let wr_core = strategies_config
+        .map(|sc| sc.winter_reserve.clone())
+        .unwrap_or_default();
+    let wr_params = WinterReserveParams {
+        min_arbitrage_profit_czk: wr_core.min_arbitrage_profit_czk,
+        insane_price_multiplier: wr_core.insane_price_multiplier,
+        cheap_percentile: wr_core.cheap_percentile,
+        load_safety_factor: wr_core.load_safety_factor,
+        pv_confidence: wr_core.pv_confidence,
+        min_mode_benefit_czk: wr_core.min_mode_benefit_czk,
+        soc_resolution_pct: wr_core.soc_resolution_pct,
+    };
+    manager.register(Arc::new(StrategyPlugin::new(
+        WinterReserveStrategy::new(wr_core.enabled, wr_params),
+        wr_core.priority,
+        control_config.clone(),
+    )));
+
     // Create Winter Adaptive V10 config from core config or defaults
     let mut v10_config = WinterAdaptiveV10Config::default();
     if let Some(sc) = strategies_config {
@@ -505,4 +532,22 @@ pub fn create_plugin_manager(
     let mut manager = PluginManager::new();
     init_plugin_manager(&mut manager, strategies_config, control_config);
     manager
+}
+
+#[cfg(test)]
+mod winter_reserve_registration_tests {
+    use super::*;
+    use fluxion_types::config::ControlConfig;
+
+    #[test]
+    fn test_default_config_registers_winter_reserve_at_priority_120() {
+        let manager = create_plugin_manager(None, &ControlConfig::default());
+
+        let plugins = manager.list_plugins();
+        let wr = plugins
+            .iter()
+            .find(|(name, _, _)| *name == "Winter-Reserve")
+            .expect("Winter-Reserve plugin should be registered");
+        assert_eq!(wr.1, 120);
+    }
 }

@@ -27,6 +27,7 @@ pub use fluxion_types::config::{
     WinterAdaptiveV3ConfigCore, WinterAdaptiveV4ConfigCore, WinterAdaptiveV5ConfigCore,
     WinterAdaptiveV7ConfigCore, WinterAdaptiveV8ConfigCore, WinterAdaptiveV9ConfigCore,
     WinterAdaptiveV10ConfigCore, WinterAdaptiveV20ConfigCore, WinterPeakDischargeConfigCore,
+    WinterReserveConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 
@@ -198,6 +199,11 @@ impl GlobalHdoCache {
     /// Check if a given time is in low tariff period
     pub fn is_low_tariff(&self, dt: chrono::DateTime<chrono::Utc>) -> Option<bool> {
         self.0.is_low_tariff(dt)
+    }
+
+    /// Set the local timezone used to match HDO windows
+    pub fn set_timezone(&self, tz: chrono_tz::Tz) {
+        self.0.set_timezone(tz)
     }
 }
 

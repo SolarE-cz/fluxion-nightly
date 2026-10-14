@@ -104,11 +104,10 @@ pub async fn heartbeat_handler(
         {
             Ok(snapshot_id) => {
                 if let Some(ref schedule) = snapshot.schedule
-                    && let Err(e) = state.db.insert_schedule_blocks(
-                        &request.instance_id,
-                        snapshot_id,
-                        schedule,
-                    )
+                    && let Err(e) =
+                        state
+                            .db
+                            .insert_schedule_blocks(&request.instance_id, snapshot_id, schedule)
                 {
                     warn!(error = %e, "Failed to insert schedule blocks");
                 }

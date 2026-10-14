@@ -47,6 +47,62 @@ if [ -f "$CONFIG_PATH" ]; then
   fi
 fi
 
-# Start FluxION
-bashio::log.info "Starting FluxION binary..."
+# ==============================================================================
+# Upgrader Configuration (Phase 5.1: Transition Mode)
+# ==============================================================================
+UPGRADER_CONFIG_PATH="/data/upgrader_config.json"
+FLUXION_UPGRADER_BIN="/usr/local/bin/fluxion-upgrader"
+
+# Initialize upgrader config from HA addon options on first boot
+if [ ! -f "$UPGRADER_CONFIG_PATH" ]; then
+  bashio::log.info "Creating upgrader configuration..."
+
+  AUTO_UPDATE=$(bashio::config 'auto_update' 'false')
+  RELEASE_BRANCH=$(bashio::config 'release_branch' 'nightly')
+  STAGING_TOKEN=$(bashio::config 'staging_token' '')
+
+  if [ -n "$STAGING_TOKEN" ]; then
+    TOKEN_JSON="\"$STAGING_TOKEN\""
+  else
+    TOKEN_JSON="null"
+  fi
+
+  cat >"$UPGRADER_CONFIG_PATH" <<EOF
+{
+  "auto_update": $AUTO_UPDATE,
+  "release_branch": "$RELEASE_BRANCH",
+  "staging_token": $TOKEN_JSON,
+  "check_interval_secs": 3600,
+  "fluxion_port": 8099,
+  "max_calm_wait_hours": 6
+}
+EOF
+  bashio::log.info "Upgrader config created at $UPGRADER_CONFIG_PATH"
+fi
+
+# Display upgrader configuration
+if [ -f "$UPGRADER_CONFIG_PATH" ]; then
+  UPGRADER_AUTO_UPDATE=$(jq -r '.auto_update' "$UPGRADER_CONFIG_PATH")
+  UPGRADER_RELEASE_BRANCH=$(jq -r '.release_branch' "$UPGRADER_CONFIG_PATH")
+
+  bashio::log.info "Upgrader configuration:"
+  bashio::log.info "  Auto update: $UPGRADER_AUTO_UPDATE"
+  bashio::log.info "  Release branch: $UPGRADER_RELEASE_BRANCH"
+fi
+
+# ==============================================================================
+# Start Binary (Phase 5.1: Transition - Check for upgrader)
+# ==============================================================================
+# Check if upgrader mode is available and enabled
+if [ -f "$FLUXION_UPGRADER_BIN" ] && [ -f "$UPGRADER_CONFIG_PATH" ]; then
+  UPGRADER_AUTO_UPDATE=$(jq -r '.auto_update' "$UPGRADER_CONFIG_PATH")
+
+  if [ "$UPGRADER_AUTO_UPDATE" = "true" ]; then
+    bashio::log.info "Starting in upgrader mode..."
+    exec "$FLUXION_UPGRADER_BIN"
+  fi
+fi
+
+# Start in legacy mode
+bashio::log.info "Starting FluxION binary (legacy mode)..."
 exec /usr/local/bin/fluxion-main

@@ -1422,11 +1422,16 @@
     {% endif %}
 
     <!-- Price Chart (Outside SSE update area - updates once per minute) -->
+    {% if timezone_unknown %}
+    <div class="timezone-banner" role="alert" style="padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary);">
+        Timezone unknown, times shown in UTC — <a href="#" onclick="openDisplayTimezoneSelector(event)">choose your timezone</a>
+    </div>
+    {% endif %}
     {% if let Some(prices) = prices %}
     <div class="card" id="chart-container">
         <h2>💰 Price Chart (48h)</h2>
         <div class="price-chart-container">
-            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h)</h3>
+            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h) <span class="tz-label" style="font-size: 0.7em; color: var(--text-secondary);">{{ display_tz_label }}</span></h3>
             <div class="price-legend">
                 <span><div class="legend-box charge"></div> Force Charge</span>
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
@@ -2379,7 +2384,6 @@
 
             // Baseline cost calculation: what grid-only consumption would cost minus solar self-consumption
             if (chartData.hourly_consumption_profile && chartData.effective_prices) {
-                const utcOffset = chartData.utc_offset_minutes || 0;
                 const solarToday = chartData.solar_forecast_remaining_today_kwh || 0;
                 const solarTomorrow = chartData.solar_forecast_tomorrow_kwh || 0;
 
@@ -2406,10 +2410,8 @@
                     const localHour = parseInt(match[3], 10);
                     const localMinute = parseInt(match[4], 10);
 
-                    // Convert local hour to UTC hour for consumption profile lookup
-                    let utcHour = localHour - Math.round(utcOffset / 60);
-                    if (utcHour < 0) utcHour += 24;
-                    if (utcHour >= 24) utcHour -= 24;
+                    // UTC hour from the block's UTC instant (per-block, so DST changes are handled)
+                    const utcHour = new Date(chartData.block_starts_utc[bi]).getUTCHours();
 
                     // Block consumption from hourly profile (15 min = 1/4 hour)
                     const consumptionKwh = chartData.hourly_consumption_profile[utcHour] / 4;
@@ -2577,7 +2579,7 @@
             {% endfor %}
         </div>
         {% endif %}
-        <div class="timestamp">Last update: {{ last_update_formatted }}</div>
+        <div class="timestamp">Last update: {{ last_update_formatted }} {{ display_tz_label }}</div>
     </div>
 
     <!-- Inverters Grid -->
@@ -3067,6 +3069,22 @@
                     </div>
                 </div>
 
+                <!-- Display Timezone Section -->
+                <div class="config-section" id="display-timezone-section">
+                    <div class="config-section-header" onclick="toggleConfigSection(this)">
+                        <h3 class="config-section-title">Display Timezone</h3>
+                    </div>
+                    <div class="config-section-content">
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="display_timezone">Timezone</label>
+                            <select id="display_timezone" class="config-form-input">
+                                <option value="">{% if let Some(ha) = ha_timezone %}Home Assistant ({{ ha }}){% else %}Not set{% endif %}</option>
+                            </select>
+                            <span class="config-form-help">Times are stored in UTC and shown in this timezone</span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Pricing Section -->
                 <div class="config-section">
                     <div class="config-section-header" onclick="toggleConfigSection(this)">
@@ -3114,6 +3132,60 @@ function toggleConfigSection(header) {
     section.classList.toggle('expanded');
 }
 
+// Fallback timezone list when Intl.supportedValuesOf is unavailable
+const FALLBACK_TIMEZONES = [
+    'UTC', 'Europe/Amsterdam', 'Europe/Athens', 'Europe/Belgrade', 'Europe/Berlin', 'Europe/Bratislava',
+    'Europe/Brussels', 'Europe/Bucharest', 'Europe/Budapest', 'Europe/Copenhagen', 'Europe/Dublin',
+    'Europe/Helsinki', 'Europe/Istanbul', 'Europe/Lisbon', 'Europe/London', 'Europe/Madrid', 'Europe/Moscow',
+    'Europe/Oslo', 'Europe/Paris', 'Europe/Prague', 'Europe/Riga', 'Europe/Rome', 'Europe/Sofia',
+    'Europe/Stockholm', 'Europe/Tallinn', 'Europe/Vienna', 'Europe/Vilnius', 'Europe/Warsaw', 'Europe/Zagreb',
+    'Europe/Zurich',
+];
+
+// Set when the user arrives via the "choose your timezone" banner
+let preselectBrowserTimezone = false;
+
+// Fill the display timezone selector; `configured` is the saved system.display_timezone
+function populateDisplayTimezoneSelect(configured) {
+    const select = document.getElementById('display_timezone');
+    if (!select) return;
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const zones = typeof Intl.supportedValuesOf === 'function'
+        ? Intl.supportedValuesOf('timeZone')
+        : FALLBACK_TIMEZONES;
+
+    // Keep the first option (HA or "Not set"), rebuild the IANA list
+    select.length = 1;
+    const addZone = (zone) => {
+        if (![...select.options].some(o => o.value === zone)) {
+            select.add(new Option(zone, zone));
+        }
+    };
+    zones.forEach(addZone);
+    if (configured) addZone(configured);
+
+    let selected = configured;
+    if (!selected && preselectBrowserTimezone) {
+        addZone(browserTz);
+        selected = browserTz;
+    }
+    select.value = selected || '';
+    preselectBrowserTimezone = false;
+}
+
+// Open the sidebar on the display timezone selector, preselecting the browser timezone
+function openDisplayTimezoneSelector(event) {
+    if (event) event.preventDefault();
+    preselectBrowserTimezone = true;
+    const sidebar = document.getElementById('config-sidebar');
+    if (sidebar.classList.contains('show')) {
+        loadConfigToSidebar();
+    } else {
+        toggleConfigSidebar();
+    }
+    document.getElementById('display-timezone-section')?.scrollIntoView({ behavior: 'smooth' });
+}
+
 // Load config into sidebar
 async function loadConfigToSidebar() {
     try {
@@ -3142,6 +3214,8 @@ async function loadConfigToSidebar() {
             document.getElementById('pricing_buy_fee').value = data.config.pricing.spot_buy_fee_czk || 0;
             document.getElementById('pricing_sell_fee').value = data.config.pricing.spot_sell_fee_czk || 0;
         }
+
+        populateDisplayTimezoneSelect(data.config.system?.display_timezone || '');
     } catch (error) {
         console.error('Failed to load config:', error);
         showConfigNotification('Failed to load config: ' + error.message, 'error');
@@ -3191,6 +3265,9 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
 
         data.config.pricing.spot_buy_fee_czk = parseFloat(document.getElementById('pricing_buy_fee').value);
         data.config.pricing.spot_sell_fee_czk = parseFloat(document.getElementById('pricing_sell_fee').value);
+
+        // Empty selection means "not set" (HA timezone is used when available)
+        data.config.system.display_timezone = document.getElementById('display_timezone').value || null;
 
         // Update config
         const updateResponse = await fetch('{{ ingress_path }}/api/config/update', {

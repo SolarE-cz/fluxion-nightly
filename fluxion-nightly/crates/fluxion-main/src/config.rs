@@ -295,6 +295,10 @@ pub struct SystemConfig {
     /// Home Assistant timezone (fetched from HA at runtime)
     #[serde(skip)]
     pub timezone: Option<String>,
+
+    /// User-selected display timezone (IANA name), used when HA timezone is unknown
+    #[serde(default)]
+    pub display_timezone: Option<String>,
 }
 
 /// Strategies configuration root
@@ -316,6 +320,8 @@ pub struct StrategiesConfig {
     pub winter_adaptive_v8: WinterAdaptiveV8Config,
     #[serde(default)]
     pub winter_adaptive_v9: WinterAdaptiveV9Config,
+    #[serde(default)]
+    pub winter_reserve: WinterReserveConfig,
     #[serde(default)]
     pub winter_adaptive_v10: WinterAdaptiveV10Config,
     #[serde(default)]
@@ -945,6 +951,38 @@ impl Default for WinterAdaptiveV9Config {
     }
 }
 
+/// Winter Reserve - keeps the night reserve, buys cheap and exports only real profit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterReserveConfig {
+    pub enabled: bool,
+    pub priority: u8,
+    pub min_arbitrage_profit_czk: f32,
+    pub insane_price_multiplier: f32,
+    pub cheap_percentile: f32,
+    pub load_safety_factor: f32,
+    pub pv_confidence: f32,
+    pub min_mode_benefit_czk: f32,
+    pub soc_resolution_pct: f32,
+}
+
+impl Default for WinterReserveConfig {
+    fn default() -> Self {
+        let core = fluxion_core::WinterReserveConfigCore::default();
+        Self {
+            enabled: core.enabled,
+            priority: core.priority,
+            min_arbitrage_profit_czk: core.min_arbitrage_profit_czk,
+            insane_price_multiplier: core.insane_price_multiplier,
+            cheap_percentile: core.cheap_percentile,
+            load_safety_factor: core.load_safety_factor,
+            pv_confidence: core.pv_confidence,
+            min_mode_benefit_czk: core.min_mode_benefit_czk,
+            soc_resolution_pct: core.soc_resolution_pct,
+        }
+    }
+}
+
 /// Winter Adaptive V10 Configuration - Dynamic Battery Budget Allocation
 /// V10 uses unified budget allocation instead of mode-based planning
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1412,6 +1450,7 @@ impl Default for AppConfig {
                 display_currency: "EUR".to_string(),
                 language: Language::English,
                 timezone: None, // Will be fetched from HA at runtime
+                display_timezone: None,
             },
             strategies: StrategiesConfig::default(),
             history: ConsumptionHistoryConfig::default(),
@@ -1957,6 +1996,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 display_currency,
                 language: app_config.system.language,
                 timezone: app_config.system.timezone,
+                display_timezone: app_config.system.display_timezone,
             },
             strategies_config: fluxion_core::StrategiesConfigCore {
                 winter_adaptive: fluxion_core::WinterAdaptiveConfigCore {
@@ -2266,6 +2306,23 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .strategies
                         .winter_adaptive_v9
                         .opportunistic_charge_threshold_czk,
+                },
+                winter_reserve: fluxion_core::WinterReserveConfigCore {
+                    enabled: app_config.strategies.winter_reserve.enabled,
+                    priority: app_config.strategies.winter_reserve.priority,
+                    min_arbitrage_profit_czk: app_config
+                        .strategies
+                        .winter_reserve
+                        .min_arbitrage_profit_czk,
+                    insane_price_multiplier: app_config
+                        .strategies
+                        .winter_reserve
+                        .insane_price_multiplier,
+                    cheap_percentile: app_config.strategies.winter_reserve.cheap_percentile,
+                    load_safety_factor: app_config.strategies.winter_reserve.load_safety_factor,
+                    pv_confidence: app_config.strategies.winter_reserve.pv_confidence,
+                    min_mode_benefit_czk: app_config.strategies.winter_reserve.min_mode_benefit_czk,
+                    soc_resolution_pct: app_config.strategies.winter_reserve.soc_resolution_pct,
                 },
                 winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v10.enabled,
@@ -2884,6 +2941,172 @@ mod tests {
         assert!(
             config.validate().is_ok(),
             "HA addon master/slave config should be valid"
+        );
+    }
+}
+
+#[cfg(test)]
+mod winter_reserve_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_winter_reserve_defaults_when_section_missing() {
+        // Saved add-on options from before Winter Reserve have no winter_reserve key
+        let strategies: StrategiesConfig = serde_json::from_str("{}").unwrap();
+        let wr = &strategies.winter_reserve;
+
+        assert!(wr.enabled);
+        assert_eq!(wr.priority, 120);
+        assert!((wr.min_arbitrage_profit_czk - 3.0).abs() < 1e-6);
+        assert!((wr.insane_price_multiplier - 3.0).abs() < 1e-6);
+        assert!((wr.cheap_percentile - 0.20).abs() < 1e-6);
+        assert!((wr.load_safety_factor - 1.10).abs() < 1e-6);
+        assert!((wr.pv_confidence - 0.70).abs() < 1e-6);
+        assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
+        assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_winter_reserve_custom_values_honoured() {
+        let json = r#"{
+            "winter_reserve": {
+                "enabled": false,
+                "priority": 90,
+                "min_arbitrage_profit_czk": 4.5,
+                "insane_price_multiplier": 3.0,
+                "cheap_percentile": 0.30,
+                "load_safety_factor": 1.2,
+                "pv_confidence": 0.5,
+                "min_mode_benefit_czk": 0.25,
+                "soc_resolution_pct": 1.0
+            }
+        }"#;
+        let strategies: StrategiesConfig = serde_json::from_str(json).unwrap();
+        let wr = &strategies.winter_reserve;
+
+        assert!(!wr.enabled);
+        assert_eq!(wr.priority, 90);
+        assert!((wr.min_arbitrage_profit_czk - 4.5).abs() < 1e-6);
+        assert!((wr.insane_price_multiplier - 3.0).abs() < 1e-6);
+        assert!((wr.cheap_percentile - 0.30).abs() < 1e-6);
+        assert!((wr.load_safety_factor - 1.2).abs() < 1e-6);
+        assert!((wr.pv_confidence - 0.5).abs() < 1e-6);
+        assert!((wr.min_mode_benefit_czk - 0.25).abs() < 1e-6);
+        assert!((wr.soc_resolution_pct - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn system_display_timezone_survives_config_update() {
+        // Config save path: the web UI posts the full config JSON with system.display_timezone set
+        let mut json = serde_json::to_value(AppConfig::default()).unwrap();
+        json["system"]["display_timezone"] = serde_json::json!("Europe/Prague");
+
+        let config: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.system.display_timezone.as_deref(),
+            Some("Europe/Prague")
+        );
+    }
+}
+
+#[cfg(test)]
+mod addon_schema_tests {
+    use std::collections::HashMap;
+
+    /// Minimal reader for the indentation-based YAML in fluxion/config.yaml.
+    /// Returns each `key: value` mapping line as (dotted path, unquoted value).
+    /// List items and keys without a value are skipped.
+    fn read_scalars(text: &str) -> HashMap<String, String> {
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut out = HashMap::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("- ") {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let Some((key, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().to_string();
+            let value = value.trim();
+            while stack.last().is_some_and(|(i, _)| *i >= indent) {
+                stack.pop();
+            }
+            if value.is_empty() {
+                stack.push((indent, key));
+                continue;
+            }
+            let path: Vec<&str> = stack
+                .iter()
+                .map(|(_, k)| k.as_str())
+                .chain(std::iter::once(key.as_str()))
+                .collect();
+            out.insert(path.join("."), value.trim_matches('"').to_string());
+        }
+        out
+    }
+
+    /// Parses `int(a,b)?` or `float(a,b)?` into optional (min, max) bounds.
+    /// Returns None for any other schema type.
+    fn parse_numeric_range(schema: &str) -> Option<(Option<f64>, Option<f64>)> {
+        let s = schema.strip_suffix('?').unwrap_or(schema);
+        let inner = s
+            .strip_prefix("int(")
+            .or_else(|| s.strip_prefix("float("))?
+            .strip_suffix(')')?;
+        let (lo, hi) = inner.split_once(',')?;
+        let bound = |b: &str| {
+            let b = b.trim();
+            (!b.is_empty()).then(|| b.parse::<f64>().expect("numeric schema bound"))
+        };
+        Some((bound(lo), bound(hi)))
+    }
+
+    #[test]
+    fn test_addon_option_defaults_within_schema_ranges() {
+        let entries = read_scalars(include_str!("../../../fluxion/config.yaml"));
+
+        let mut checked = 0;
+        let mut winter_reserve_checked = 0;
+        for (path, default) in entries
+            .iter()
+            .filter(|(p, v)| p.starts_with("options.") && !v.starts_with('['))
+        {
+            let rest = &path["options.".len()..];
+            let schema = entries
+                .get(&format!("schema.{rest}"))
+                .unwrap_or_else(|| panic!("option {path} has no schema entry"));
+            let Some((lo, hi)) = parse_numeric_range(schema) else {
+                continue;
+            };
+            let value: f64 = default
+                .parse()
+                .unwrap_or_else(|_| panic!("{path} default {default} is not numeric for {schema}"));
+            if let Some(lo) = lo {
+                assert!(
+                    value >= lo,
+                    "{path}: default {value} is below schema {schema}"
+                );
+            }
+            if let Some(hi) = hi {
+                assert!(
+                    value <= hi,
+                    "{path}: default {value} is above schema {schema}"
+                );
+            }
+            checked += 1;
+            if rest.starts_with("strategies.winter_reserve.") {
+                winter_reserve_checked += 1;
+            }
+        }
+
+        assert!(checked > 0, "no numeric options were checked");
+        // priority, insane_price_multiplier, cheap_percentile, load_safety_factor,
+        // pv_confidence, soc_resolution_pct
+        assert!(
+            winter_reserve_checked >= 6,
+            "winter_reserve numeric options were not all checked"
         );
     }
 }

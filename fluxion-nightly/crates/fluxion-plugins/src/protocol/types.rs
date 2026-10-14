@@ -64,6 +64,16 @@ pub struct ForecastData {
     pub grid_export_price_czk_per_kwh: f32,
 }
 
+/// Raw per-block forecast (no safety/confidence factors applied).
+/// Aligned index-for-index with `EvaluationRequest::all_blocks`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BlockForecast {
+    /// Expected solar generation in this block (kWh)
+    pub solar_kwh: f32,
+    /// Expected household consumption in this block (kWh)
+    pub consumption_kwh: f32,
+}
+
 /// Historical data for strategy analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoricalData {
@@ -113,6 +123,14 @@ pub struct EvaluationRequest {
     /// Used to calculate arbitrage profit during discharge
     #[serde(default)]
     pub battery_avg_charge_price_czk_per_kwh: f32,
+
+    /// Per-block forecasts aligned with `all_blocks` (empty = unknown)
+    #[serde(default)]
+    pub block_forecasts: Vec<BlockForecast>,
+
+    /// IANA timezone of the site, e.g. "Europe/Prague"
+    #[serde(default)]
+    pub timezone: Option<String>,
 }
 
 /// Operation mode decision

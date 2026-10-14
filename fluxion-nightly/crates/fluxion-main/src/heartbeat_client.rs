@@ -13,8 +13,8 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use fluxion_core::web_bridge::WebQueryResponse;
 use fluxion_core::WebQuerySender;
+use fluxion_core::web_bridge::WebQueryResponse;
 use fluxion_shared::heartbeat::{HeartbeatRequest, HeartbeatResponse, HeartbeatStatus};
 use fluxion_shared::telemetry::{
     ClientSyncData, InstanceTelemetry, InverterTelemetry, ScheduleBlockTelemetry,

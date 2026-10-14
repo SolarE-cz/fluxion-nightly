@@ -19,6 +19,7 @@ labels:
   org.opencontainers.image.title: FluxION ECS
 name: FluxION ECS (Nightly)
 options:
+  auto_update: false
   control:
     average_household_load_kw: 0.5
     battery_capacity_kwh: 23.0
@@ -40,8 +41,10 @@ options:
     spot_sell_fee_czk: 0.5
     use_spot_prices_to_buy: true
     use_spot_prices_to_sell: true
+  release_branch: nightly
   remote_access:
     enabled: false
+  staging_token: ''
   strategies:
     day_ahead_planning:
       enabled: false
@@ -148,7 +151,7 @@ options:
     winter_adaptive_v9:
       battery_round_trip_efficiency: 0.9
       cheap_block_percentile: 0.25
-      enabled: true
+      enabled: false
       min_arbitrage_spread_czk: 3.0
       min_discharge_soc: 10.0
       min_export_spread_czk: 5.0
@@ -172,12 +175,23 @@ options:
       min_spread_czk: 3.0
       solar_window_end_hour: 14
       solar_window_start_hour: 10
+    winter_reserve:
+      cheap_percentile: 0.2
+      enabled: true
+      insane_price_multiplier: 3.0
+      load_safety_factor: 1.1
+      min_arbitrage_profit_czk: 3.0
+      min_mode_benefit_czk: 0.1
+      priority: 120
+      pv_confidence: 0.7
+      soc_resolution_pct: 0.5
   system:
     debug_mode: true
     log_level: info
     update_interval_secs: 60
 panel_icon: mdi:solar-power
 schema:
+  auto_update: bool?
   control:
     average_household_load_kw: float(0,)?
     battery_capacity_kwh: float(0,)?
@@ -251,8 +265,10 @@ schema:
     spot_sell_fee_czk: float(0,)?
     use_spot_prices_to_buy: bool?
     use_spot_prices_to_sell: bool?
+  release_branch: list(staging|nightly|stable)?
   remote_access:
     enabled: bool?
+  staging_token: str?
   strategies:
     day_ahead_planning:
       enabled: bool?
@@ -383,11 +399,22 @@ schema:
       min_spread_czk: float?
       solar_window_end_hour: int(0,23)?
       solar_window_start_hour: int(0,23)?
+    winter_reserve:
+      cheap_percentile: float(0,0.5)?
+      enabled: bool?
+      insane_price_multiplier: float(0,10)?
+      load_safety_factor: float(0,10)?
+      min_arbitrage_profit_czk: float(0,)?
+      min_mode_benefit_czk: float?
+      priority: int(0,255)?
+      pv_confidence: float(0,1)?
+      soc_resolution_pct: float(0.1,5)?
   system:
     debug_mode: bool?
+    display_timezone: str?
     log_level: list(trace|debug|info|warning|error)?
     update_interval_secs: int(10,3600)?
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.37
+version: 0.2.40

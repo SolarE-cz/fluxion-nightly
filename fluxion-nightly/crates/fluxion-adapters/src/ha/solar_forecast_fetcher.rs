@@ -14,10 +14,12 @@ use crate::ha::HaClientResource;
 use crate::ha::client::HomeAssistantClient;
 use crate::ha::types::HaEntityState;
 use bevy_ecs::prelude::*;
+use chrono::{DateTime, Utc};
 use fluxion_core::SystemConfig;
 use fluxion_core::async_systems::{
     SolarForecastChannel, SolarForecastData, SolarForecastSender, SolarForecastUpdate,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -212,11 +214,21 @@ async fn fetch_and_send_solar_forecast(
     let remaining_today = fetch_and_sum_sensors(client, &cache.remaining_today).await;
     let tomorrow = fetch_and_sum_sensors(client, &cache.tomorrow).await;
 
+    // Per-block PV forecast from the today/tomorrow sensors' attributes
+    let forecast_sensor_ids: Vec<String> = cache
+        .total_today
+        .iter()
+        .chain(cache.tomorrow.iter())
+        .cloned()
+        .collect();
+    let block_kwh = fetch_block_kwh(client, &forecast_sensor_ids).await;
+
     // Send update
     let update = SolarForecastUpdate {
         total_today_kwh: total_today,
         remaining_today_kwh: remaining_today,
         tomorrow_kwh: tomorrow,
+        block_kwh,
     };
 
     tracing::debug!(
@@ -227,6 +239,75 @@ async fn fetch_and_send_solar_forecast(
     );
 
     let _ = sender.send(update);
+}
+
+/// Fetch per-block PV forecast (UTC block start, kWh) summed across the given sensors
+async fn fetch_block_kwh(
+    client: &HomeAssistantClient,
+    entity_ids: &[String],
+) -> Vec<(DateTime<Utc>, f32)> {
+    if entity_ids.is_empty() {
+        return Vec::new();
+    }
+
+    match client.get_states(entity_ids).await {
+        Ok(states) => block_kwh_from_states(&states),
+        Err(e) => {
+            tracing::warn!("⚠️ Failed to fetch solar forecast attributes: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Sum per-block PV kWh of all sensors, keyed by UTC block start
+fn block_kwh_from_states(states: &[HaEntityState]) -> Vec<(DateTime<Utc>, f32)> {
+    let mut per_block: BTreeMap<DateTime<Utc>, f32> = BTreeMap::new();
+    for state in states {
+        for (block_start, kwh) in sensor_block_kwh(&state.attributes) {
+            *per_block.entry(block_start).or_insert(0.0) += kwh;
+        }
+    }
+    per_block.into_iter().collect()
+}
+
+/// Per-block PV kWh for one sensor.
+/// Uses `watts` (W at 15-min block start) when present, otherwise `wh_period`
+/// (Wh per hour, split evenly over the four blocks of that hour).
+fn sensor_block_kwh(attributes: &serde_json::Value) -> Vec<(DateTime<Utc>, f32)> {
+    if let Some(watts) = attributes.get("watts").and_then(|v| v.as_object()) {
+        return watts
+            .iter()
+            .filter_map(|(ts, value)| {
+                let block_start = parse_forecast_timestamp(ts)?;
+                let w = value.as_f64()? as f32;
+                Some((block_start, w / 1000.0 * 0.25))
+            })
+            .collect();
+    }
+
+    if let Some(wh_period) = attributes.get("wh_period").and_then(|v| v.as_object()) {
+        let mut blocks = Vec::new();
+        for (ts, value) in wh_period {
+            let (Some(hour_start), Some(wh)) = (parse_forecast_timestamp(ts), value.as_f64())
+            else {
+                continue;
+            };
+            for quarter in 0..4 {
+                let block_start = hour_start + chrono::Duration::minutes(15 * quarter);
+                blocks.push((block_start, wh as f32 / 4000.0));
+            }
+        }
+        return blocks;
+    }
+
+    Vec::new()
+}
+
+/// Parse an ISO-8601 timestamp with offset (e.g. "2026-10-13T10:15:00+02:00") to UTC
+fn parse_forecast_timestamp(ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Fetch states for specific entity IDs and sum their values
@@ -295,6 +376,7 @@ pub fn poll_solar_forecast_channel(
             data.total_today_kwh = update.total_today_kwh;
             data.remaining_today_kwh = update.remaining_today_kwh;
             data.tomorrow_kwh = update.tomorrow_kwh;
+            data.block_kwh = update.block_kwh;
             data.last_updated = std::time::Instant::now();
         }
     }
@@ -371,6 +453,60 @@ mod tests {
             "sensor.energy_production_today2",
             "sensor.energy_production_today"
         ));
+    }
+
+    #[test]
+    fn test_block_kwh_sums_watts_and_wh_period_per_utc_block() {
+        let states: Vec<HaEntityState> = serde_json::from_value(serde_json::json!([
+            {
+                "entity_id": "sensor.energy_production_today_4",
+                "state": "5.0",
+                "attributes": {
+                    "watts": {
+                        "2026-10-13T10:00:00+02:00": 1000,
+                        "2026-10-13T10:15:00+02:00": 2000
+                    }
+                },
+                "last_changed": "2026-10-13T08:00:00+00:00",
+                "last_updated": "2026-10-13T08:00:00+00:00"
+            },
+            {
+                "entity_id": "sensor.energy_production_today_5",
+                "state": "2.0",
+                "attributes": {
+                    "watts": { "2026-10-13T10:15:00+02:00": 1000 }
+                },
+                "last_changed": "2026-10-13T08:00:00+00:00",
+                "last_updated": "2026-10-13T08:00:00+00:00"
+            },
+            {
+                "entity_id": "sensor.energy_production_tomorrow",
+                "state": "0.4",
+                "attributes": {
+                    "wh_period": { "2026-10-13T10:00:00+02:00": 400 }
+                },
+                "last_changed": "2026-10-13T08:00:00+00:00",
+                "last_updated": "2026-10-13T08:00:00+00:00"
+            }
+        ]))
+        .unwrap();
+
+        let blocks = block_kwh_from_states(&states);
+
+        let utc = |h: u32, m: u32| {
+            chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 10, 13, h, m, 0).unwrap()
+        };
+        assert_eq!(blocks.len(), 4);
+        let expected = [
+            (utc(8, 0), 0.25 + 0.1),
+            (utc(8, 15), 0.5 + 0.25 + 0.1),
+            (utc(8, 30), 0.1),
+            (utc(8, 45), 0.1),
+        ];
+        for ((start, kwh), (exp_start, exp_kwh)) in blocks.iter().zip(expected.iter()) {
+            assert_eq!(start, exp_start);
+            assert!((kwh - exp_kwh).abs() < 1e-5, "{start}: {kwh} != {exp_kwh}");
+        }
     }
 
     #[test]
