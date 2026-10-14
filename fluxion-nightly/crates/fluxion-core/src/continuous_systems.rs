@@ -12,7 +12,12 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use fluxion_types::config::ControlConfig;
+use fluxion_types::{VprMode, VprPhase};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 
@@ -23,6 +28,70 @@ use crate::{
     traits::{InverterDataSource, PriceDataSource},
 };
 use std::time::Instant;
+
+/// Where the export limit to restore is persisted while curtailed (survives restarts).
+pub const EXPORT_LIMIT_RESTORE_PATH: &str = "/data/export_limit_restore.json";
+
+/// Export curtailment state. `restore_limits_w` has an entry for every curtailed inverter.
+#[derive(Resource, Debug, Default)]
+pub struct ExportCurtailmentState {
+    /// Per inverter id: export limit (W) to restore when curtailment is no longer wanted.
+    pub restore_limits_w: BTreeMap<String, u32>,
+    /// Old single-value file: the master's restore limit, moved to the master on the first run.
+    pub legacy_restore_limit_w: Option<u32>,
+    /// Limit last written per inverter, watched for read-back drift.
+    pub limit_watch: BTreeMap<String, ExportLimitWatch>,
+    /// Where `restore_limits_w` is persisted. `None` keeps it in memory only.
+    pub persist_path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ExportLimitRestoreFile {
+    #[serde(default)]
+    restore_limits_w: BTreeMap<String, u32>,
+    /// Old single-value format (master only), read but never written
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_limit_w: Option<u32>,
+}
+
+impl ExportCurtailmentState {
+    /// Load persisted restore limits (if any) so a restart while curtailed restores them.
+    pub fn load(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<ExportLimitRestoreFile>(&json).ok())
+            .unwrap_or_default();
+        Self {
+            restore_limits_w: file.restore_limits_w,
+            legacy_restore_limit_w: file.restore_limit_w,
+            persist_path: Some(path),
+            ..Default::default()
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let result = if self.restore_limits_w.is_empty() {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            serde_json::to_string(&ExportLimitRestoreFile {
+                restore_limits_w: self.restore_limits_w.clone(),
+                restore_limit_w: None,
+            })
+            .map_err(std::io::Error::other)
+            .and_then(|json| std::fs::write(path, json))
+        };
+        if let Err(e) = result {
+            warn!("Failed to persist export limit state to {:?}: {}", path, e);
+        }
+    }
+}
 
 /// Wrapper resource for the price data source
 #[derive(Resource)]
@@ -61,6 +130,227 @@ pub struct InitialModeSyncTracker {
 ///
 /// On initial startup, compares against ACTUAL inverter mode and applies immediately.
 /// After initial sync, uses debounce interval between mode changes.
+/// Map a VPR option to the FluxION mode (SolaX mapping from the legacy levers contract).
+/// `None` means no override.
+pub fn vpr_inverter_mode(mode: VprMode) -> Option<InverterOperationMode> {
+    match mode {
+        VprMode::None => None,
+        VprMode::Normal => Some(InverterOperationMode::SelfUse),
+        VprMode::DischargeBattery => Some(InverterOperationMode::ForceDischarge),
+        VprMode::ChargeBattery | VprMode::ChargeFromGrid => {
+            Some(InverterOperationMode::ForceCharge)
+        }
+        VprMode::NoDischarge => Some(InverterOperationMode::BackUpMode),
+        VprMode::SellToGrid => Some(InverterOperationMode::FeedinPriority),
+    }
+}
+
+/// SOC safety for a mode change: true when the change must be skipped.
+fn soc_blocks_mode(mode: InverterOperationMode, soc: f32, control: &ControlConfig) -> bool {
+    (mode == InverterOperationMode::ForceCharge && soc >= control.max_battery_soc)
+        || (mode == InverterOperationMode::ForceDischarge && soc <= control.min_battery_soc)
+}
+
+/// Max wait for the first lever sync before inverter writes proceed (startup only).
+const LEVERS_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Startup state for lever-gated writes: when the first run happened, and whether the wait was logged.
+#[derive(Default)]
+pub struct LeversStartup {
+    started: Option<Instant>,
+    logged: bool,
+}
+
+/// True while the lever sync is expected but not yet available, within the startup wait.
+/// Writes (modes and curtailment) are skipped then.
+fn lever_startup_wait(
+    levers: Option<&crate::resources::UserLeversResource>,
+    startup: &mut LeversStartup,
+    now: Instant,
+) -> bool {
+    let started = *startup.started.get_or_insert(now);
+    let Some(levers) = levers else {
+        return false;
+    };
+    if !levers.sync_expected
+        || levers.available
+        || now.saturating_duration_since(started) >= LEVERS_STARTUP_WAIT
+    {
+        return false;
+    }
+    if !startup.logged {
+        info!("⏳ Waiting for the lever sync before writing inverter modes (max 120 s)");
+        startup.logged = true;
+    }
+    true
+}
+
+/// Manual modes: the SolaX work mode "Manual Mode" with a manual sub-mode (Force Charge,
+/// Force Discharge, Stop Charge and Discharge).
+fn is_manual_mode(mode: InverterOperationMode) -> bool {
+    matches!(
+        mode,
+        InverterOperationMode::ForceCharge
+            | InverterOperationMode::ForceDischarge
+            | InverterOperationMode::NoChargeNoDischarge
+    )
+}
+
+/// Whether the hardware read-back matches the expected mode. When the manual sub-mode could not
+/// be read, a ForceCharge read-back may be any Manual mode, so it matches every Manual mode.
+fn readback_matches(
+    state: &crate::traits::GenericInverterState,
+    expected: InverterOperationMode,
+) -> bool {
+    if state.work_mode_ambiguous && state.work_mode == InverterOperationMode::ForceCharge {
+        return is_manual_mode(expected);
+    }
+    state.work_mode == expected
+}
+
+/// Drift watch for one inverter's mode: confirms a hardware mismatch over two state reads at
+/// least 30 s apart, then allows one re-apply per 5 minutes.
+#[derive(Debug, Default, Clone)]
+pub struct ModeDriftWatch {
+    first_mismatch_at: Option<DateTime<Utc>>,
+    mismatched_reads: u32,
+    last_read_at: Option<DateTime<Utc>>,
+    last_resend_at: Option<DateTime<Utc>>,
+}
+
+impl ModeDriftWatch {
+    /// Feed one state read (`read_at` is the read time). Returns true when a re-apply is due.
+    fn observe(&mut self, read_at: DateTime<Utc>, matches: bool, now: DateTime<Utc>) -> bool {
+        if self.last_read_at == Some(read_at) {
+            return false;
+        }
+        self.last_read_at = Some(read_at);
+        if matches {
+            self.mismatched_reads = 0;
+            self.first_mismatch_at = None;
+            return false;
+        }
+        let first = *self.first_mismatch_at.get_or_insert(read_at);
+        self.mismatched_reads += 1;
+        if self.mismatched_reads < 2 || read_at - first < chrono::Duration::seconds(30) {
+            return false;
+        }
+        self.mismatched_reads = 0;
+        self.first_mismatch_at = None;
+        if self
+            .last_resend_at
+            .is_some_and(|t| now - t < chrono::Duration::minutes(5))
+        {
+            return false;
+        }
+        self.last_resend_at = Some(now);
+        true
+    }
+}
+
+/// Read-back watch for one inverter's export limit, active once we have written it.
+#[derive(Debug, Default, Clone)]
+pub struct ExportLimitWatch {
+    /// Limit last written (0 while curtailed, the restore value after restoring)
+    pub intended_w: u32,
+    /// Watching is active from the first write until the read-back matches a restore once
+    written: bool,
+    /// True while curtailed (intended 0 W); a restore is watched only until it is confirmed
+    curtailed: bool,
+    /// Rewrites issued since the last write (stops after `MAX_EXPORT_REWRITES`)
+    rewrites: u32,
+    /// Already warned that this inverter is skipped (reset when curtailment is not wanted)
+    skip_warned: bool,
+    mismatched_reads: u32,
+    last_read_at: Option<DateTime<Utc>>,
+    last_rewrite_at: Option<DateTime<Utc>>,
+}
+
+/// Rewrites of an export limit that the read-back does not confirm before watching stops.
+const MAX_EXPORT_REWRITES: u32 = 5;
+
+/// Outcome of one export limit read-back check.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reassert {
+    Hold,
+    Rewrite,
+    /// Not confirmed after `MAX_EXPORT_REWRITES` rewrites: watching stops (logged once)
+    GiveUp,
+}
+
+impl ExportLimitWatch {
+    /// Feed one state read. Two consecutive mismatched reads trigger a rewrite, at most one per
+    /// minute.
+    fn observe(
+        &mut self,
+        read_at: DateTime<Utc>,
+        read_back_w: Option<u32>,
+        now: DateTime<Utc>,
+    ) -> Reassert {
+        let Some(read_back) = read_back_w.filter(|_| self.written) else {
+            return Reassert::Hold;
+        };
+        if self.last_read_at == Some(read_at) {
+            return Reassert::Hold;
+        }
+        self.last_read_at = Some(read_at);
+        if read_back == self.intended_w {
+            self.mismatched_reads = 0;
+            if !self.curtailed {
+                // Restore confirmed: stop watching so a later owner change is never overwritten
+                self.written = false;
+            }
+            return Reassert::Hold;
+        }
+        self.mismatched_reads += 1;
+        if self.mismatched_reads < 2 {
+            return Reassert::Hold;
+        }
+        if self
+            .last_rewrite_at
+            .is_some_and(|t| now - t < chrono::Duration::minutes(1))
+        {
+            return Reassert::Hold;
+        }
+        self.mismatched_reads = 0;
+        if self.rewrites >= MAX_EXPORT_REWRITES {
+            self.written = false;
+            return Reassert::GiveUp;
+        }
+        self.rewrites += 1;
+        self.last_rewrite_at = Some(now);
+        Reassert::Rewrite
+    }
+}
+
+/// Send `SetExportLimit`, or log it in debug mode.
+fn write_export_limit(
+    async_writer: &crate::resources::AsyncInverterWriter,
+    debug: bool,
+    inverter_id: &str,
+    limit_w: u32,
+) {
+    if debug {
+        info!(
+            "🔧 [DEBUG] Would set export limit of {} to {} W",
+            inverter_id, limit_w
+        );
+    } else {
+        async_writer.write_command_async(
+            inverter_id.to_string(),
+            InverterCommand::SetExportLimit(limit_w),
+        );
+    }
+}
+
+/// System that executes scheduled mode changes
+/// Runs every update cycle to check if mode changes are needed
+///
+/// Priority: VPR (one-time window, applies even with the kill switch on) > kill switch
+/// (Self-Use once, then nothing) > fixed slots > schedule.
+///
+/// On initial startup, compares against ACTUAL inverter mode and applies immediately.
+/// After initial sync, uses debounce interval between mode changes.
 #[expect(clippy::too_many_arguments)]
 pub fn schedule_execution_system(
     schedule_query: Query<&OperationSchedule>,
@@ -76,44 +366,139 @@ pub fn schedule_execution_system(
     system_config: Res<crate::resources::SystemConfig>,
     mut sync_tracker: ResMut<InitialModeSyncTracker>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
+    levers: Option<Res<crate::resources::UserLeversResource>>,
+    timezone: Option<Res<crate::resources::TimezoneConfig>>,
+    mut debug_was_enabled: Local<Option<bool>>,
+    mut vpr_was_active: Local<bool>,
+    mut kill_was_active: Local<bool>,
+    mut lever_startup: Local<LeversStartup>,
+    mut drift: Local<BTreeMap<String, ModeDriftWatch>>,
 ) {
     let now = Utc::now();
 
-    // Check if FluxION is disabled by user
-    // When disabled: set all inverters to SelfUse and stop sending mode commands
-    if let Some(ref uc) = user_control
-        && !uc.state.enabled
-    {
-        for (mut current_mode, inverter, _, _) in current_mode_query.iter_mut() {
-            if current_mode.mode != InverterOperationMode::SelfUse {
-                if debug.enabled {
-                    info!(
-                        "🔧 [DEBUG] FluxION disabled - would set {} to SelfUse (currently {:?})",
-                        inverter.id, current_mode.mode
-                    );
-                } else {
-                    info!(
-                        "⏸️ FluxION disabled by user - setting {} to SelfUse",
+    // Debug mode switched off at runtime: CurrentMode already equals the plan, so the
+    // sync tracker is cleared to compare against the real hardware mode and send.
+    if *debug_was_enabled == Some(true) && !debug.enabled {
+        info!("🔓 Debug mode turned off — resyncing inverter modes");
+        sync_tracker.synced_inverters.clear();
+    }
+    *debug_was_enabled = Some(debug.enabled);
+
+    // Startup: wait (max 120 s) for the first lever sync before writing any mode
+    if lever_startup_wait(levers.as_deref(), &mut lever_startup, Instant::now()) {
+        return;
+    }
+
+    let tz: chrono_tz::Tz = timezone
+        .as_ref()
+        .and_then(|t| t.tz)
+        .unwrap_or(chrono_tz::UTC);
+    let levers = levers.filter(|l| l.available).map(|l| l.levers);
+
+    // VPR: highest priority, applied only while its window is active
+    let vpr_override: Option<(InverterOperationMode, String)> = levers
+        .and_then(|l| l.vpr)
+        .filter(|w| w.phase(now, &tz) == VprPhase::Active)
+        .and_then(|w| {
+            vpr_inverter_mode(w.mode).map(|mode| (mode, format!("VPR: {}", w.mode.option())))
+        });
+    let vpr_exited = *vpr_was_active && vpr_override.is_none();
+    *vpr_was_active = vpr_override.is_some();
+
+    // Kill switch: user disabled FluxION, or the "Zakázat Automatizaci" lever
+    let kill_switch = user_control.as_ref().is_some_and(|uc| !uc.state.enabled)
+        || levers.is_some_and(|l| l.automation_disabled);
+
+    // Kill switch turned off: the owner may have set modes by hand, so resync against hardware
+    if *kill_was_active && !kill_switch {
+        info!("▶️ Automation re-enabled — resyncing inverter modes");
+        sync_tracker.synced_inverters.clear();
+    }
+    *kill_was_active = kill_switch;
+
+    // Kill switch: VPR while active, otherwise SelfUse once, then no more mode commands
+    if kill_switch {
+        for (mut current_mode, inverter, battery_status, raw_state) in current_mode_query.iter_mut()
+        {
+            // No state read yet: nothing to compare with, so skip without marking synced
+            let Some(raw) = raw_state else {
+                continue;
+            };
+            let (target, reason) = match &vpr_override {
+                Some((mode, reason)) => (*mode, reason.clone()),
+                None => (
+                    InverterOperationMode::SelfUse,
+                    "FluxION disabled by user".to_string(),
+                ),
+            };
+            // Not synced yet (startup or after a resync): compare with the hardware mode
+            let is_initial_sync = !sync_tracker.synced_inverters.contains(&inverter.id);
+            let compared = if is_initial_sync {
+                raw.state.work_mode
+            } else {
+                current_mode.mode
+            };
+            // Initial sync against an ambiguous Manual read-back: re-apply a Manual target (idempotent)
+            let ambiguous_manual_resync = is_initial_sync
+                && is_manual_mode(target)
+                && raw.state.work_mode_ambiguous
+                && raw.state.work_mode == InverterOperationMode::ForceCharge;
+            if compared == target && !ambiguous_manual_resync {
+                sync_tracker.synced_inverters.insert(inverter.id.clone());
+                continue;
+            }
+            if vpr_override.is_some() {
+                let Some(battery) = battery_status else {
+                    warn!(
+                        "Skipping VPR for {}: no battery status available (safety constraint)",
                         inverter.id
                     );
-                    let command = InverterCommand::SetMode(InverterOperationMode::SelfUse);
-                    async_writer.write_command_async(inverter.id.clone(), command);
+                    continue;
+                };
+                if soc_blocks_mode(
+                    target,
+                    battery.soc_percent as f32,
+                    &system_config.control_config,
+                ) {
+                    debug!("Skipping VPR {:?} for {}: SOC safety", target, inverter.id);
+                    continue;
                 }
-                current_mode.mode = InverterOperationMode::SelfUse;
-                current_mode.set_at = now;
-                current_mode.reason = "FluxION disabled by user".to_string();
             }
+            if debug.enabled {
+                info!(
+                    "🔧 [DEBUG] {} - would set {} to {:?} (currently {:?})",
+                    reason, inverter.id, target, current_mode.mode
+                );
+            } else {
+                info!("⏸️ {} - setting {} to {:?}", reason, inverter.id, target);
+                let command = InverterCommand::SetMode(target);
+                async_writer.write_command_async(inverter.id.clone(), command);
+            }
+            current_mode.mode = target;
+            current_mode.set_at = now;
+            current_mode.reason = reason;
+            sync_tracker.synced_inverters.insert(inverter.id.clone());
         }
         return; // Stop - no more mode commands while disabled
     }
 
-    // Get the current schedule
-    let schedule = match schedule_query.single() {
-        Ok(s) => s,
-        Err(_) => {
-            trace!("No schedule available yet");
-            return;
-        }
+    // The VPR window replaces the schedule; otherwise the current schedule block applies
+    let schedule = schedule_query.single().ok();
+    if vpr_override.is_none() && schedule.is_none() {
+        trace!("No schedule available yet");
+        return;
+    }
+    let planned: Option<ScheduledMode> = match &vpr_override {
+        Some((mode, reason)) => Some(ScheduledMode {
+            block_start: now,
+            duration_minutes: 0,
+            target_inverters: None,
+            mode: *mode,
+            reason: reason.clone(),
+            decision_uid: None,
+            debug_info: None,
+        }),
+        None => schedule.and_then(|s| s.get_current_mode(now)).cloned(),
     };
 
     // Process each inverter
@@ -143,14 +528,15 @@ pub fn schedule_execution_system(
                 }
             }
 
-            // Get current scheduled mode
-            if let Some(scheduled_mode) = schedule.get_current_mode(now) {
-                // Clone the scheduled mode so we can potentially modify it
-                let mut effective_mode = scheduled_mode.clone();
+            // Get current scheduled mode (or VPR)
+            if let Some(scheduled_mode) = planned.clone() {
+                // Owned copy so the fixed slot override can modify it
+                let mut effective_mode = scheduled_mode;
 
                 // Check if user has a fixed slot override active RIGHT NOW
-                // This ensures newly created slots take effect immediately
-                if let Some(ref uc) = user_control
+                // This ensures newly created slots take effect immediately (never over VPR)
+                if vpr_override.is_none()
+                    && let Some(ref uc) = user_control
                     && let Some(fixed_slot) = uc.state.get_fixed_slot_at(now)
                     && effective_mode.mode != fixed_slot.mode
                 {
@@ -176,6 +562,9 @@ pub fn schedule_execution_system(
                 // Check if this is the initial sync for this inverter
                 let is_initial_sync = !sync_tracker.synced_inverters.contains(&inverter.id);
 
+                // VPR entry and the first schedule block after VPR bypass the debounce
+                let bypass_debounce = is_initial_sync || vpr_override.is_some() || vpr_exited;
+
                 // Get actual inverter mode from hardware (if available)
                 let actual_mode = raw_state.map(|r| r.state.work_mode);
 
@@ -188,11 +577,51 @@ pub fn schedule_execution_system(
                     current_mode.mode
                 };
 
+                // Drift: the hardware disagrees with the tracked mode although the plan agrees with
+                // it (e.g. another controller rewrote it). Never in debug mode.
+                if !is_initial_sync
+                    && !debug.enabled
+                    && scheduled_mode.mode == current_mode.mode
+                    && let Some(raw) = raw_state
+                    && drift.entry(inverter.id.clone()).or_default().observe(
+                        raw.last_updated,
+                        readback_matches(&raw.state, current_mode.mode),
+                        now,
+                    )
+                {
+                    let soc_ok = battery_status.is_some_and(|b| {
+                        !soc_blocks_mode(
+                            current_mode.mode,
+                            b.soc_percent as f32,
+                            &system_config.control_config,
+                        )
+                    });
+                    if soc_ok {
+                        warn!(
+                            "⚠️ Inverter mode drifted to {:?} (expected {:?}) — re-applying",
+                            raw.state.work_mode, current_mode.mode
+                        );
+                        async_writer.write_command_async(
+                            inverter.id.clone(),
+                            InverterCommand::SetMode(current_mode.mode),
+                        );
+                        current_mode.set_at = now;
+                    } else {
+                        debug!("Skipping drift re-apply for {}: SOC safety", inverter.id);
+                    }
+                }
+
                 // Check if mode change is needed
-                if scheduled_mode.mode != effective_current_mode {
+                let ambiguous_manual_resync = is_initial_sync
+                    && is_manual_mode(scheduled_mode.mode)
+                    && raw_state.is_some_and(|r| {
+                        r.state.work_mode_ambiguous
+                            && r.state.work_mode == InverterOperationMode::ForceCharge
+                    });
+                if scheduled_mode.mode != effective_current_mode || ambiguous_manual_resync {
                     // On initial sync: bypass debounce to apply plan immediately
                     // After initial sync: check minimum interval
-                    if !is_initial_sync && !can_change_mode(&current_mode, &config, now) {
+                    if !bypass_debounce && !can_change_mode(&current_mode, &config, now) {
                         debug!(
                             "Skipping mode change for {}: too soon since last change",
                             inverter.id
@@ -310,6 +739,183 @@ pub fn schedule_execution_system(
                 }
             }
         }
+    }
+}
+
+/// Curtail export (SolaX export limit 0 W) in blocks whose sell price is at or below the
+/// threshold, and restore each curtailed inverter's own limit once curtailment is not wanted.
+/// Not wanted while the kill switch is on, while an active VPR sells to the grid, without a sell
+/// price, or during the lever sync startup wait.
+#[expect(clippy::too_many_arguments)]
+pub fn export_curtailment_system(
+    async_writer: Res<crate::resources::AsyncInverterWriter>,
+    inverter_query: Query<(&Inverter, Option<&RawInverterState>)>,
+    price_query: Query<&SpotPriceData>,
+    system_config: Res<crate::resources::SystemConfig>,
+    debug: Res<DebugModeConfig>,
+    user_control: Option<Res<crate::resources::UserControlResource>>,
+    levers: Option<Res<crate::resources::UserLeversResource>>,
+    timezone: Option<Res<crate::resources::TimezoneConfig>>,
+    mut state: ResMut<ExportCurtailmentState>,
+    mut debug_state: Local<ExportCurtailmentState>,
+    mut startup: Local<LeversStartup>,
+) {
+    let now = Utc::now();
+    if lever_startup_wait(levers.as_deref(), &mut startup, Instant::now()) {
+        return;
+    }
+    let control: &ControlConfig = &system_config.control_config;
+    let threshold = control.export_curtail_at_or_below_czk;
+    let tz: chrono_tz::Tz = timezone
+        .as_ref()
+        .and_then(|t| t.tz)
+        .unwrap_or(chrono_tz::UTC);
+    let levers = levers.filter(|l| l.available).map(|l| l.levers);
+
+    let kill_switch = user_control.as_ref().is_some_and(|uc| !uc.state.enabled)
+        || levers.as_ref().is_some_and(|l| l.automation_disabled);
+    let sells_to_grid = levers
+        .as_ref()
+        .and_then(|l| l.vpr)
+        .filter(|w| w.phase(now, &tz) == VprPhase::Active)
+        .is_some_and(|w| w.mode == VprMode::SellToGrid);
+
+    let sell_price = price_query.single().ok().and_then(|prices| {
+        prices
+            .time_block_prices
+            .iter()
+            .find(|block| {
+                let block_end =
+                    block.block_start + chrono::Duration::minutes(block.duration_minutes as i64);
+                now >= block.block_start && now < block_end
+            })
+            .and_then(|block| block.spot_sell_price_czk_per_kwh)
+    });
+
+    let curtail_wanted = control.export_curtailment_enabled
+        && !kill_switch
+        && !sells_to_grid
+        && sell_price.is_some_and(|price| price <= threshold);
+
+    // Debug mode keeps its own in-memory would-be state and never touches the real one
+    let export: &mut ExportCurtailmentState = if debug.enabled {
+        &mut debug_state
+    } else {
+        &mut state
+    };
+    let mut changed = false;
+
+    // Old single-value file: the master's restore limit
+    if let Some(limit_w) = export.legacy_restore_limit_w.take() {
+        let targets: Vec<String> = system_config
+            .inverters
+            .iter()
+            .filter(|i| !matches!(i.topology, crate::resources::InverterTopology::Slave { .. }))
+            .map(|i| i.id.clone())
+            .collect();
+        if targets.is_empty() {
+            warn!(
+                "Export limit restore file has no inverter to restore, dropping {} W",
+                limit_w
+            );
+        }
+        for id in targets {
+            export.restore_limits_w.entry(id).or_insert(limit_w);
+        }
+        changed = true;
+    }
+
+    for (inverter, raw_state) in inverter_query.iter() {
+        let topology = system_config
+            .inverters
+            .iter()
+            .find(|i| i.id == inverter.id)
+            .map(|i| &i.topology);
+        if matches!(
+            topology,
+            Some(crate::resources::InverterTopology::Slave { .. })
+        ) {
+            continue;
+        }
+        let read_back = raw_state.and_then(|raw| raw.state.export_limit_w);
+        let watch = export.limit_watch.entry(inverter.id.clone()).or_default();
+        if !curtail_wanted {
+            watch.skip_warned = false;
+        }
+
+        if !curtail_wanted && let Some(restore_w) = export.restore_limits_w.remove(&inverter.id) {
+            info!("✅ Export restored to {} W ({})", restore_w, inverter.id);
+            write_export_limit(&async_writer, debug.enabled, &inverter.id, restore_w);
+            watch.intended_w = restore_w;
+            watch.written = true;
+            watch.curtailed = false;
+            watch.rewrites = 0;
+            changed = true;
+        } else if curtail_wanted && !export.restore_limits_w.contains_key(&inverter.id) {
+            let restore_w = match read_back {
+                Some(limit_w) if limit_w > 0 => Some(limit_w),
+                Some(_) => {
+                    if !watch.skip_warned {
+                        warn!(
+                            "Export limit of {} is already 0 W, not curtailing it",
+                            inverter.id
+                        );
+                        watch.skip_warned = true;
+                    }
+                    None
+                }
+                None => {
+                    warn!(
+                        "Export limit of {} is unknown, restoring to maximum_export_power_w ({} W)",
+                        inverter.id, control.maximum_export_power_w
+                    );
+                    Some(control.maximum_export_power_w)
+                }
+            };
+            if let Some(restore_w) = restore_w {
+                info!(
+                    "🚫 Export curtailed (sell {:.3} ≤ {:.3}) for {}",
+                    sell_price.unwrap_or_default(),
+                    threshold,
+                    inverter.id
+                );
+                export
+                    .restore_limits_w
+                    .insert(inverter.id.clone(), restore_w);
+                write_export_limit(&async_writer, debug.enabled, &inverter.id, 0);
+                watch.intended_w = 0;
+                watch.written = true;
+                watch.curtailed = true;
+                watch.rewrites = 0;
+                changed = true;
+            }
+        }
+
+        // Re-assert: the read-back differs from what we wrote (never in debug mode)
+        if !debug.enabled
+            && let Some(raw) = raw_state
+        {
+            match watch.observe(raw.last_updated, read_back, now) {
+                Reassert::Hold => {}
+                Reassert::Rewrite => {
+                    warn!(
+                        "⚠️ Export limit of {} reads {:?} W, expected {} W — rewriting",
+                        inverter.id, read_back, watch.intended_w
+                    );
+                    write_export_limit(&async_writer, false, &inverter.id, watch.intended_w);
+                }
+                Reassert::GiveUp => {
+                    warn!(
+                        "⚠️ Export limit of {} still reads {:?} W after {} rewrites (expected {} W), stopped watching",
+                        inverter.id, read_back, MAX_EXPORT_REWRITES, watch.intended_w
+                    );
+                }
+            }
+        }
+    }
+
+    if changed {
+        export.persist();
     }
 }
 
@@ -482,6 +1088,8 @@ impl Plugin for ContinuousSystemsPlugin {
             .init_resource::<crate::components::ConsumptionHistory>()
             // Initialize mode sync tracker for initial sync bypass
             .init_resource::<InitialModeSyncTracker>()
+            // Persisted export limit to restore (a restart while curtailed restores it)
+            .insert_resource(ExportCurtailmentState::load(EXPORT_LIMIT_RESTORE_PATH))
             .add_systems(
                 Startup,
                 (
@@ -505,6 +1113,7 @@ impl Plugin for ContinuousSystemsPlugin {
                     crate::async_systems::decompose_inverter_state,
                     // Keep schedule execution but update to use channels
                     schedule_execution_system,
+                    export_curtailment_system,
                     // Trigger battery history fetch periodically
                     trigger_battery_history_fetch_system,
                     // Process web queries via message passing (ECS -> Web)
@@ -578,5 +1187,1320 @@ mod hdo_cache_sync_tests {
         // spot + low/high HDO fee + operator buy fee
         assert!((blocks[0].effective_price_czk_per_kwh - 3.00).abs() < 0.001);
         assert!((blocks[1].effective_price_czk_per_kwh - 4.30).abs() < 0.001);
+    }
+}
+
+#[cfg(test)]
+mod levers_execution_tests {
+    use super::*;
+    use crate::execution::ExecutionConfig;
+    use crate::resources::{
+        AsyncInverterWriter, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
+        SystemConfig, SystemSettingsConfig, UserControlResource, UserLeversResource,
+    };
+    use crate::traits::{GenericInverterState, InverterDataSource};
+    use async_trait::async_trait;
+    use chrono::{DateTime, Duration};
+    use fluxion_i18n::Language;
+    use fluxion_types::levers::VprWindow;
+    use fluxion_types::pricing::TimeBlockPrice;
+    use fluxion_types::{UserControlState, UserLevers};
+    use std::sync::Mutex;
+
+    /// Records every command the scheduler and curtailment systems send.
+    #[derive(Default)]
+    struct RecordingSource {
+        commands: Arc<Mutex<Vec<(String, InverterCommand)>>>,
+    }
+
+    #[async_trait]
+    impl InverterDataSource for RecordingSource {
+        async fn read_state(&self, _inverter_id: &str) -> anyhow::Result<GenericInverterState> {
+            Ok(GenericInverterState::default())
+        }
+
+        async fn write_command(
+            &self,
+            inverter_id: &str,
+            command: &InverterCommand,
+        ) -> anyhow::Result<()> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push((inverter_id.to_string(), command.clone()));
+            Ok(())
+        }
+
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn name(&self) -> &str {
+            "recording"
+        }
+    }
+
+    fn system_config(max_export_w: u32) -> SystemConfig {
+        SystemConfig {
+            inverters: vec![InverterConfig {
+                id: "inv1".to_string(),
+                inverter_type: fluxion_types::InverterType::Solax,
+                entity_prefix: "solax".to_string(),
+                topology: InverterTopology::Independent,
+            }],
+            pricing_config: PricingConfig {
+                spot_price_entity: "sensor.spot_price".to_string(),
+                tomorrow_price_entity: None,
+                use_spot_prices_to_buy: true,
+                use_spot_prices_to_sell: true,
+                fixed_buy_price_czk: PriceSchedule::Flat(4.0),
+                fixed_sell_price_czk: PriceSchedule::Flat(2.0),
+                spot_buy_fee_czk: 0.5,
+                spot_sell_fee_czk: 0.5,
+                hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+                hdo_low_tariff_czk: 0.50,
+                hdo_high_tariff_czk: 1.80,
+            },
+            control_config: fluxion_types::ControlConfig {
+                maximum_export_power_w: max_export_w,
+                ..Default::default()
+            },
+            system_config: SystemSettingsConfig {
+                update_interval_secs: 60,
+                debug_mode: false,
+                display_currency: fluxion_types::config::Currency::CZK,
+                language: Language::English,
+                timezone: None,
+                display_timezone: None,
+            },
+            strategies_config: Default::default(),
+            history: Default::default(),
+            solar_forecast: Default::default(),
+            remote_access: Default::default(),
+        }
+    }
+
+    struct Harness {
+        world: World,
+        schedule: Schedule,
+        commands: Arc<Mutex<Vec<(String, InverterCommand)>>>,
+    }
+
+    /// One inverter in SelfUse on hardware, a battery at 50 % and the given schedule blocks.
+    fn harness(blocks: Vec<ScheduledMode>, debug: bool) -> Harness {
+        let source = RecordingSource::default();
+        let commands = source.commands.clone();
+        let now = Utc::now();
+
+        let mut world = World::new();
+        world.insert_resource(AsyncInverterWriter::new(Arc::new(source)));
+        world.insert_resource(ExecutionConfig {
+            min_mode_change_interval_secs: 300,
+        });
+        world.insert_resource(DebugModeConfig {
+            enabled: debug,
+            ..Default::default()
+        });
+        world.insert_resource(system_config(8000));
+        world.insert_resource(InitialModeSyncTracker::default());
+        world.insert_resource(UserControlResource::new(UserControlState::default()));
+        world.insert_resource(UserLeversResource {
+            levers: UserLevers::default(),
+            available: true,
+            sync_expected: false,
+        });
+        world.spawn((
+            Inverter {
+                id: "inv1".to_string(),
+                inverter_type: fluxion_types::InverterType::Solax,
+            },
+            CurrentMode::default(),
+            BatteryStatus {
+                soc_percent: 50,
+                ..Default::default()
+            },
+            RawInverterState {
+                state: GenericInverterState {
+                    work_mode: InverterOperationMode::SelfUse,
+                    ..Default::default()
+                },
+                last_updated: now,
+            },
+        ));
+        world.spawn(OperationSchedule {
+            scheduled_blocks: blocks,
+            generated_at: now,
+            based_on_price_version: now,
+        });
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(schedule_execution_system);
+        Harness {
+            world,
+            schedule,
+            commands,
+        }
+    }
+
+    impl Harness {
+        fn run(&mut self) {
+            self.schedule.run(&mut self.world);
+        }
+
+        /// Fire-and-forget writes run on the tokio runtime; let them finish first.
+        async fn sent_modes(&self) -> Vec<InverterOperationMode> {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(_, c)| match c {
+                    InverterCommand::SetMode(mode) => Some(*mode),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn set_levers(&mut self, levers: UserLevers) {
+            self.world.resource_mut::<UserLeversResource>().levers = levers;
+        }
+
+        /// Hardware read-back (the RawInverterState of the inverter), taken at `read_at`.
+        fn set_hardware(&mut self, mode: InverterOperationMode, read_at: DateTime<Utc>) {
+            let mut query = self.world.query::<&mut RawInverterState>();
+            for mut raw in query.iter_mut(&mut self.world) {
+                raw.state.work_mode = mode;
+                raw.last_updated = read_at;
+            }
+        }
+
+        /// Hardware read-back as SolaX reports Manual Mode with an unreadable sub-mode.
+        fn set_hardware_ambiguous(&mut self, read_at: DateTime<Utc>) {
+            let mut query = self.world.query::<&mut RawInverterState>();
+            for mut raw in query.iter_mut(&mut self.world) {
+                raw.state.work_mode = InverterOperationMode::ForceCharge;
+                raw.state.work_mode_ambiguous = true;
+                raw.last_updated = read_at;
+            }
+        }
+
+        fn set_current(&mut self, mode: InverterOperationMode) {
+            let mut query = self.world.query::<&mut CurrentMode>();
+            for mut current in query.iter_mut(&mut self.world) {
+                current.mode = mode;
+            }
+        }
+
+        fn mark_synced(&mut self) {
+            self.world
+                .resource_mut::<InitialModeSyncTracker>()
+                .synced_inverters
+                .insert("inv1".to_string());
+        }
+
+        fn current_mode(&mut self) -> CurrentMode {
+            let mut query = self.world.query::<&CurrentMode>();
+            query.single(&self.world).unwrap().clone()
+        }
+    }
+
+    fn block(start: DateTime<Utc>, mode: InverterOperationMode) -> ScheduledMode {
+        ScheduledMode {
+            block_start: start,
+            duration_minutes: 60,
+            target_inverters: None,
+            mode,
+            reason: "schedule".to_string(),
+            decision_uid: None,
+            debug_info: None,
+        }
+    }
+
+    /// A VPR window covering the whole UTC day, so the tests do not depend on the time of day.
+    fn vpr_all_day(mode: VprMode) -> VprWindow {
+        VprWindow {
+            mode,
+            from_local: chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            until_local: chrono::NaiveTime::from_hms_opt(23, 59, 0).unwrap(),
+            set_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn vpr_mode_mapping_follows_contract() {
+        assert_eq!(vpr_inverter_mode(VprMode::None), None);
+        assert_eq!(
+            vpr_inverter_mode(VprMode::Normal),
+            Some(InverterOperationMode::SelfUse)
+        );
+        assert_eq!(
+            vpr_inverter_mode(VprMode::NoDischarge),
+            Some(InverterOperationMode::BackUpMode)
+        );
+        assert_eq!(
+            vpr_inverter_mode(VprMode::ChargeFromGrid),
+            Some(InverterOperationMode::ForceCharge)
+        );
+        assert_eq!(
+            vpr_inverter_mode(VprMode::SellToGrid),
+            Some(InverterOperationMode::FeedinPriority)
+        );
+    }
+
+    #[tokio::test]
+    async fn vpr_active_overrides_schedule_and_bypasses_debounce() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        // Already synced and changed just now: only the VPR bypass can send a change.
+        h.world
+            .resource_mut::<InitialModeSyncTracker>()
+            .synced_inverters
+            .insert("inv1".to_string());
+        {
+            let mut query = h.world.query::<&mut CurrentMode>();
+            for mut mode in query.iter_mut(&mut h.world) {
+                mode.set_at = now;
+            }
+        }
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::ChargeBattery)),
+            ..Default::default()
+        });
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+        assert_eq!(h.current_mode().reason, "VPR: Nabíjení baterie");
+    }
+
+    #[tokio::test]
+    async fn vpr_with_kill_switch_writes_once_then_selfuse_after_expiry() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::ChargeBattery)),
+            automation_disabled: true,
+            ..Default::default()
+        });
+
+        h.run();
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+
+        // The window has passed (set two days ago, one-minute window): SelfUse once, then nothing.
+        h.set_levers(UserLevers {
+            vpr: Some(VprWindow {
+                mode: VprMode::ChargeBattery,
+                from_local: chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                until_local: chrono::NaiveTime::from_hms_opt(0, 1, 0).unwrap(),
+                set_at: now - Duration::days(2),
+            }),
+            automation_disabled: true,
+            ..Default::default()
+        });
+        h.run();
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![
+                InverterOperationMode::ForceCharge,
+                InverterOperationMode::SelfUse
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_without_vpr_sets_selfuse_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        {
+            h.set_hardware(InverterOperationMode::ForceCharge, now);
+        }
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+
+        h.run();
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn debug_mode_sends_nothing() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            true,
+        );
+
+        h.run();
+
+        assert!(h.sent_modes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn debug_off_at_runtime_resyncs_and_sends_scheduled_mode() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            true,
+        );
+
+        // Debug on: the plan is applied to CurrentMode only, nothing is sent.
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        // Debug off: CurrentMode already matches the plan, so the resync must compare
+        // against the hardware (SelfUse) and send.
+        h.world.resource_mut::<DebugModeConfig>().enabled = false;
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_restart_with_hardware_discharge_sends_selfuse_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        h.set_hardware(InverterOperationMode::ForceDischarge, now);
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+
+        h.run();
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_debug_then_live_sends_selfuse() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            true,
+        );
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        h.world.resource_mut::<DebugModeConfig>().enabled = false;
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_off_resyncs_against_hardware() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        // The owner sets ForceCharge by hand while the kill switch is on
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.set_levers(UserLevers::default());
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_lever_sync_then_proceeds() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        h.world.resource_mut::<UserLeversResource>().sync_expected = true;
+        h.world.resource_mut::<UserLeversResource>().available = false;
+
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        h.world.resource_mut::<UserLeversResource>().available = true;
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn drift_confirmed_by_two_reads_resends_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::SelfUse);
+
+        // Node-RED wrote Self Use over our ForceCharge: first read, then a read 40 s later
+        h.set_hardware(
+            InverterOperationMode::ForceCharge,
+            now - Duration::seconds(40),
+        );
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.run();
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn drift_single_transient_read_does_nothing() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::SelfUse);
+
+        h.set_hardware(
+            InverterOperationMode::ForceCharge,
+            now - Duration::seconds(40),
+        );
+        h.run();
+        h.set_hardware(InverterOperationMode::SelfUse, now);
+        h.run();
+
+        assert!(h.sent_modes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drift_is_ignored_while_kill_switch_is_on() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::SelfUse);
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+
+        h.set_hardware(
+            InverterOperationMode::ForceCharge,
+            now - Duration::seconds(40),
+        );
+        h.run();
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.run();
+
+        assert!(h.sent_modes().await.is_empty());
+    }
+
+    #[test]
+    fn readback_is_exact_unless_sub_mode_is_unreadable() {
+        let exact = |mode| crate::traits::GenericInverterState {
+            work_mode: mode,
+            ..Default::default()
+        };
+        let ambiguous = crate::traits::GenericInverterState {
+            work_mode: InverterOperationMode::ForceCharge,
+            work_mode_ambiguous: true,
+            ..Default::default()
+        };
+        // Exact read: no Manual mode matches another
+        assert!(!readback_matches(
+            &exact(InverterOperationMode::ForceCharge),
+            InverterOperationMode::ForceDischarge
+        ));
+        assert!(!readback_matches(
+            &exact(InverterOperationMode::NoChargeNoDischarge),
+            InverterOperationMode::ForceCharge
+        ));
+        assert!(readback_matches(
+            &exact(InverterOperationMode::ForceDischarge),
+            InverterOperationMode::ForceDischarge
+        ));
+        // Unreadable sub-mode: ForceCharge matches every Manual mode, never SelfUse
+        assert!(readback_matches(
+            &ambiguous,
+            InverterOperationMode::NoChargeNoDischarge
+        ));
+        assert!(readback_matches(
+            &ambiguous,
+            InverterOperationMode::ForceDischarge
+        ));
+        assert!(!readback_matches(
+            &ambiguous,
+            InverterOperationMode::SelfUse
+        ));
+    }
+
+    #[test]
+    fn mode_drift_watch_needs_two_reads_30s_apart_and_rate_limits() {
+        let t0 = Utc::now();
+        let mut watch = ModeDriftWatch::default();
+        // Two mismatched reads 10 s apart: not yet
+        assert!(!watch.observe(t0, false, t0));
+        assert!(!watch.observe(t0 + Duration::seconds(10), false, t0));
+        // Third read 30 s after the first: confirmed
+        assert!(watch.observe(
+            t0 + Duration::seconds(30),
+            false,
+            t0 + Duration::seconds(30)
+        ));
+        // Confirmed again soon after: rate-limited to one per 5 minutes
+        assert!(!watch.observe(
+            t0 + Duration::seconds(35),
+            false,
+            t0 + Duration::seconds(35)
+        ));
+        assert!(!watch.observe(
+            t0 + Duration::seconds(65),
+            false,
+            t0 + Duration::seconds(65)
+        ));
+        // Five minutes after the last re-apply, two fresh mismatched reads 30 s apart: re-apply
+        let later = t0 + Duration::minutes(5) + Duration::seconds(30);
+        assert!(!watch.observe(
+            later - Duration::seconds(30),
+            false,
+            later - Duration::seconds(30)
+        ));
+        assert!(watch.observe(later, false, later));
+    }
+
+    #[test]
+    fn export_limit_watch_stops_after_restore_is_confirmed() {
+        let t0 = Utc::now();
+        let mut watch = ExportLimitWatch {
+            intended_w: 8000,
+            written: true,
+            curtailed: false,
+            ..Default::default()
+        };
+        assert_eq!(watch.observe(t0, Some(8000), t0), Reassert::Hold);
+        assert_eq!(
+            watch.observe(t0 + Duration::seconds(5), Some(5000), t0),
+            Reassert::Hold
+        );
+        // Confirmed once: no further watching, so an owner's later change is left alone
+        assert_eq!(
+            watch.observe(t0 + Duration::seconds(10), Some(8000), t0),
+            Reassert::Hold
+        );
+        assert!(!watch.written);
+        assert_eq!(
+            watch.observe(t0 + Duration::seconds(15), Some(5000), t0),
+            Reassert::Hold
+        );
+    }
+
+    #[test]
+    fn export_limit_watch_rewrites_after_two_mismatches_once_a_minute() {
+        let t0 = Utc::now();
+        let mut watch = ExportLimitWatch {
+            intended_w: 0,
+            written: true,
+            curtailed: true,
+            ..Default::default()
+        };
+        assert_eq!(watch.observe(t0, Some(8000), t0), Reassert::Hold);
+        assert_eq!(
+            watch.observe(
+                t0 + Duration::seconds(5),
+                Some(8000),
+                t0 + Duration::seconds(5)
+            ),
+            Reassert::Rewrite
+        );
+        assert_eq!(
+            watch.observe(
+                t0 + Duration::seconds(10),
+                Some(8000),
+                t0 + Duration::seconds(10)
+            ),
+            Reassert::Hold
+        );
+        assert_eq!(
+            watch.observe(
+                t0 + Duration::seconds(15),
+                Some(8000),
+                t0 + Duration::seconds(15)
+            ),
+            Reassert::Hold
+        );
+        // A minute after the last rewrite the next mismatch rewrites again, not sooner
+        assert_eq!(
+            watch.observe(
+                t0 + Duration::seconds(65),
+                Some(8000),
+                t0 + Duration::seconds(65)
+            ),
+            Reassert::Rewrite
+        );
+        assert_eq!(
+            watch.observe(
+                t0 + Duration::seconds(70),
+                Some(8000),
+                t0 + Duration::seconds(70)
+            ),
+            Reassert::Hold
+        );
+    }
+
+    #[test]
+    fn export_limit_watch_gives_up_after_five_unconfirmed_rewrites() {
+        let t0 = Utc::now();
+        let mut watch = ExportLimitWatch {
+            intended_w: 0,
+            written: true,
+            curtailed: true,
+            ..Default::default()
+        };
+        let mut outcomes = Vec::new();
+        for minute in 0..6 {
+            let base = t0 + Duration::minutes(minute);
+            outcomes.push(watch.observe(base, Some(8000), base));
+            outcomes.push(watch.observe(
+                base + Duration::seconds(5),
+                Some(8000),
+                base + Duration::seconds(5),
+            ));
+        }
+        let rewrites = outcomes.iter().filter(|o| **o == Reassert::Rewrite).count();
+        assert_eq!(rewrites, 5);
+        assert_eq!(
+            outcomes.iter().filter(|o| **o == Reassert::GiveUp).count(),
+            1
+        );
+        assert!(!watch.written);
+        // Stopped: no further rewrites or warnings
+        assert_eq!(
+            watch.observe(
+                t0 + Duration::minutes(9),
+                Some(8000),
+                t0 + Duration::minutes(9)
+            ),
+            Reassert::Hold
+        );
+    }
+
+    #[test]
+    fn startup_wait_is_bounded_to_120_seconds() {
+        let now = Instant::now();
+        let mut startup = LeversStartup::default();
+        let levers = UserLeversResource {
+            sync_expected: true,
+            available: false,
+            ..Default::default()
+        };
+        assert!(lever_startup_wait(Some(&levers), &mut startup, now));
+        assert!(lever_startup_wait(
+            Some(&levers),
+            &mut startup,
+            now + std::time::Duration::from_secs(119)
+        ));
+        assert!(!lever_startup_wait(
+            Some(&levers),
+            &mut startup,
+            now + std::time::Duration::from_secs(121)
+        ));
+        assert!(!lever_startup_wait(None, &mut startup, now));
+    }
+
+    #[tokio::test]
+    async fn hold_plan_with_exact_hold_readback_does_not_resend() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::NoChargeNoDischarge,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::NoChargeNoDischarge);
+
+        h.set_hardware(
+            InverterOperationMode::NoChargeNoDischarge,
+            now - Duration::seconds(40),
+        );
+        h.run();
+        h.set_hardware(InverterOperationMode::NoChargeNoDischarge, now);
+        h.run();
+        h.run();
+
+        assert!(h.sent_modes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hold_plan_with_selfuse_readback_resends_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::NoChargeNoDischarge,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::NoChargeNoDischarge);
+
+        h.set_hardware(InverterOperationMode::SelfUse, now - Duration::seconds(40));
+        h.run();
+        h.set_hardware(InverterOperationMode::SelfUse, now);
+        h.run();
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::NoChargeNoDischarge]
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_plan_with_ambiguous_forcecharge_readback_does_not_resend() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::NoChargeNoDischarge,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::NoChargeNoDischarge);
+
+        h.set_hardware_ambiguous(now - Duration::seconds(40));
+        h.run();
+        h.set_hardware_ambiguous(now);
+        h.run();
+
+        assert!(h.sent_modes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_sync_with_ambiguous_manual_readback_resends_manual_target() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        h.set_current(InverterOperationMode::ForceCharge);
+        h.set_hardware_ambiguous(now);
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_off_resync_sends_forcecharge_over_exact_forcedischarge() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        // The owner sets Force Discharge by hand while the kill switch is on
+        h.set_hardware(InverterOperationMode::ForceDischarge, now);
+        h.set_levers(UserLevers::default());
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_vpr_resends_manual_target_over_ambiguous_readback_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::ChargeBattery)),
+            automation_disabled: true,
+            ..Default::default()
+        });
+        // Hardware reads Manual Mode with an unreadable sub-mode, so it may already be Force Charge
+        h.set_hardware_ambiguous(now);
+
+        h.run();
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_skips_inverter_without_state_and_does_not_sync_it() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        let inverter = h
+            .world
+            .query_filtered::<Entity, With<RawInverterState>>()
+            .single(&h.world)
+            .unwrap();
+        h.world.entity_mut(inverter).remove::<RawInverterState>();
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+        assert!(
+            h.world
+                .resource::<InitialModeSyncTracker>()
+                .synced_inverters
+                .is_empty()
+        );
+
+        // State arrives: hardware ForceCharge is corrected to SelfUse
+        h.world.entity_mut(inverter).insert(RawInverterState {
+            state: GenericInverterState {
+                work_mode: InverterOperationMode::ForceCharge,
+                ..Default::default()
+            },
+            last_updated: now,
+        });
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// Export curtailment world: one inverter reading `read_back_w` (master or independent) and a
+    /// sell price of `sell` in the current block.
+    struct ExportHarness {
+        world: World,
+        schedule: Schedule,
+        commands: Arc<Mutex<Vec<(String, InverterCommand)>>>,
+    }
+
+    fn sell_price_data(now: DateTime<Utc>, sell: Option<f32>) -> SpotPriceData {
+        SpotPriceData {
+            time_block_prices: vec![TimeBlockPrice {
+                block_start: now - Duration::minutes(1),
+                duration_minutes: 15,
+                price_czk_per_kwh: 1.0,
+                effective_price_czk_per_kwh: 1.5,
+                spot_sell_price_czk_per_kwh: sell,
+            }],
+            block_duration_minutes: 15,
+            fetched_at: now,
+            ha_last_updated: now,
+        }
+    }
+
+    fn export_harness(read_back_w: Option<u32>, master: bool, sell: Option<f32>) -> ExportHarness {
+        let source = RecordingSource::default();
+        let commands = source.commands.clone();
+        let now = Utc::now();
+        let mut world = World::new();
+        world.insert_resource(AsyncInverterWriter::new(Arc::new(source)));
+        world.insert_resource(DebugModeConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let mut config = system_config(8000);
+        if master {
+            config.inverters[0].topology = InverterTopology::Master {
+                slave_ids: Vec::new(),
+            };
+        }
+        world.insert_resource(config);
+        world.insert_resource(ExportCurtailmentState::default());
+        world.spawn((
+            Inverter {
+                id: "inv1".to_string(),
+                inverter_type: fluxion_types::InverterType::Solax,
+            },
+            RawInverterState {
+                state: GenericInverterState {
+                    export_limit_w: read_back_w,
+                    ..Default::default()
+                },
+                last_updated: now,
+            },
+        ));
+        world.spawn(sell_price_data(now, sell));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(export_curtailment_system);
+        ExportHarness {
+            world,
+            schedule,
+            commands,
+        }
+    }
+
+    impl ExportHarness {
+        fn run(&mut self) {
+            self.schedule.run(&mut self.world);
+        }
+
+        /// (inverter id, limit) of every SetExportLimit sent so far.
+        async fn sent(&self) -> Vec<(String, u32)> {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(id, c)| match c {
+                    InverterCommand::SetExportLimit(w) => Some((id.clone(), *w)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn set_sell(&mut self, sell: Option<f32>) {
+            let now = Utc::now();
+            let mut query = self.world.query::<&mut SpotPriceData>();
+            for mut data in query.iter_mut(&mut self.world) {
+                *data = sell_price_data(now, sell);
+            }
+        }
+
+        fn set_read_back(&mut self, read_back_w: Option<u32>, read_at: DateTime<Utc>) {
+            let mut query = self.world.query::<&mut RawInverterState>();
+            for mut raw in query.iter_mut(&mut self.world) {
+                raw.state.export_limit_w = read_back_w;
+                raw.last_updated = read_at;
+            }
+        }
+    }
+
+    fn restore_entry(h: &ExportHarness) -> Option<u32> {
+        h.world
+            .resource::<ExportCurtailmentState>()
+            .restore_limits_w
+            .get("inv1")
+            .copied()
+    }
+
+    #[tokio::test]
+    async fn export_curtailed_at_negative_price_and_restored_once() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+
+        h.run();
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        h.set_sell(Some(1.0));
+        h.run();
+        h.run();
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
+        assert_eq!(restore_entry(&h), None);
+    }
+
+    #[tokio::test]
+    async fn export_debug_mode_never_changes_state_or_sends() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.world.resource_mut::<DebugModeConfig>().enabled = true;
+
+        h.run();
+        assert!(h.sent().await.is_empty());
+        assert_eq!(restore_entry(&h), None);
+
+        h.world.resource_mut::<DebugModeConfig>().enabled = false;
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+    }
+
+    #[tokio::test]
+    async fn export_missing_sell_price_restores() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        h.set_sell(None);
+        h.run();
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_kill_switch_restores_once_and_blocks_curtailment() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        h.world.insert_resource(UserLeversResource {
+            levers: UserLevers {
+                automation_disabled: true,
+                ..Default::default()
+            },
+            available: true,
+            sync_expected: false,
+        });
+        h.run();
+        h.run();
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_vpr_sell_to_grid_blocks_curtailment() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.world.insert_resource(UserLeversResource {
+            levers: UserLevers {
+                vpr: Some(vpr_all_day(VprMode::SellToGrid)),
+                ..Default::default()
+            },
+            available: true,
+            sync_expected: false,
+        });
+
+        h.run();
+
+        assert!(h.sent().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_legacy_restore_file_goes_to_master() {
+        let mut h = export_harness(Some(0), true, Some(1.0));
+        h.world.insert_resource(ExportCurtailmentState {
+            legacy_restore_limit_w: Some(8000),
+            ..Default::default()
+        });
+
+        h.run();
+
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 8000)]);
+    }
+
+    #[tokio::test]
+    async fn export_legacy_restore_file_goes_to_independent_inverter() {
+        let mut h = export_harness(Some(0), false, Some(1.0));
+        h.world.insert_resource(ExportCurtailmentState {
+            legacy_restore_limit_w: Some(8000),
+            ..Default::default()
+        });
+
+        h.run();
+
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 8000)]);
+    }
+
+    #[tokio::test]
+    async fn export_unknown_limit_falls_back_for_independent_inverter() {
+        let mut h = export_harness(None, false, Some(-0.1));
+
+        h.run();
+
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+        assert_eq!(restore_entry(&h), Some(8000));
+    }
+
+    #[tokio::test]
+    async fn export_zero_read_back_at_startup_still_restores_entry() {
+        let mut h = export_harness(Some(0), false, Some(1.0));
+        h.world
+            .resource_mut::<ExportCurtailmentState>()
+            .restore_limits_w
+            .insert("inv1".to_string(), 8000);
+
+        h.run();
+
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 8000)]);
+        assert_eq!(restore_entry(&h), None);
+    }
+
+    #[tokio::test]
+    async fn export_inverter_already_at_zero_is_skipped() {
+        let mut h = export_harness(Some(0), false, Some(-0.1));
+
+        h.run();
+        h.run();
+
+        assert!(h.sent().await.is_empty());
+        assert_eq!(restore_entry(&h), None);
+    }
+
+    #[tokio::test]
+    async fn export_owner_change_after_confirmed_restore_is_not_overwritten() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        h.set_read_back(Some(0), now + Duration::seconds(1));
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        // Price positive again: restore to 8000 W, then the read-back confirms it
+        h.set_sell(Some(1.0));
+        h.run();
+        h.set_read_back(Some(8000), now + Duration::seconds(2));
+        h.run();
+        // The owner sets 5000 W by hand: FluxION must not write
+        h.set_read_back(Some(5000), now + Duration::seconds(3));
+        h.run();
+        h.set_read_back(Some(5000), now + Duration::seconds(4));
+        h.run();
+
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_read_back_drift_is_rewritten() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        // The inverter still reads 8000 W on two consecutive reads
+        h.set_read_back(Some(8000), now + Duration::seconds(1));
+        h.run();
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn export_limit_restore_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "fluxion-export-limit-test-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut state = ExportCurtailmentState {
+            persist_path: Some(path.clone()),
+            ..Default::default()
+        };
+        state.restore_limits_w.insert("inv1".to_string(), 8000);
+        state.persist();
+
+        let loaded = ExportCurtailmentState::load(path.clone());
+        assert_eq!(loaded.restore_limits_w.get("inv1"), Some(&8000));
+        assert_eq!(loaded.legacy_restore_limit_w, None);
+
+        state.restore_limits_w.clear();
+        state.persist();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn export_limit_old_single_value_file_is_read_as_legacy() {
+        let path = std::env::temp_dir().join(format!(
+            "fluxion-export-limit-legacy-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"{"restore_limit_w": 8000}"#).unwrap();
+
+        let loaded = ExportCurtailmentState::load(path.clone());
+        assert!(loaded.restore_limits_w.is_empty());
+        assert_eq!(loaded.legacy_restore_limit_w, Some(8000));
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -21,6 +21,7 @@ pub mod execution;
 pub mod plugin_adapters;
 pub mod pricing;
 pub mod resources;
+pub mod savings;
 pub mod scheduling;
 pub mod strategy;
 pub mod traits;

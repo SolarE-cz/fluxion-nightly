@@ -10,20 +10,21 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+use crate::resources::UserLeversResource;
 use crate::strategy::BlockEvaluation;
 use crate::strategy::winter_reserve::WinterReserveStrategy;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use fluent::fluent_args;
 use fluxion_i18n::I18n;
 use fluxion_plugins::{
     BatteryState, BlockDecision, BlockForecast, EvaluationRequest, ForecastData, HistoricalData,
     OperationMode, PluginManager, PriceBlock,
 };
-use fluxion_types::UserControlState;
 use fluxion_types::config::{ControlConfig, Currency, PricingConfig};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
+use fluxion_types::{UserControlState, UserLevers};
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
@@ -129,13 +130,21 @@ pub fn calculate_effective_prices(
             pricing_config.hdo_high_tariff_czk
         };
 
-        // Buy price = spot price + HDO grid fee + operator buy fee
-        let buy_fee = if pricing_config.use_spot_prices_to_buy {
-            pricing_config.spot_buy_fee_czk
+        // Buy price = energy price + HDO grid fee (+ operator buy fee on spot).
+        // Fixed buy: the configured price at the block's local time replaces spot.
+        let (energy_price, buy_fee) = if pricing_config.use_spot_prices_to_buy {
+            (block.price_czk_per_kwh, pricing_config.spot_buy_fee_czk)
         } else {
-            0.0
+            let tz = hdo_cache.map_or(chrono_tz::UTC, |cache| cache.timezone());
+            let local = block.block_start.with_timezone(&tz);
+            (
+                pricing_config
+                    .fixed_buy_price_czk
+                    .get_price_at(local.hour(), local.minute()),
+                0.0,
+            )
         };
-        block.effective_price_czk_per_kwh = block.price_czk_per_kwh + grid_fee + buy_fee;
+        block.effective_price_czk_per_kwh = energy_price + grid_fee + buy_fee;
     }
 
     debug!(
@@ -217,6 +226,7 @@ pub fn generate_schedule_with_optimizer(
     user_control: Option<&UserControlState>,
     hourly_consumption_profile: Option<&[f32; 24]>,
     timezone: Option<&str>,
+    user_levers: Option<&UserLevers>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
@@ -325,6 +335,7 @@ pub fn generate_schedule_with_optimizer(
                 consumption_forecast,
             ),
             timezone,
+            user_levers,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -469,6 +480,7 @@ pub fn generate_schedule_with_optimizer(
                 consumption_forecast,
             ),
             timezone,
+            user_levers,
         );
 
         // Get decision from plugin manager
@@ -511,7 +523,9 @@ pub fn generate_schedule_with_optimizer(
                 battery_energy_kwh += charge_kwh * control_config.battery_efficiency;
                 battery_total_cost_czk += charge_cost;
             }
-            InverterOperationMode::ForceDischarge | InverterOperationMode::SelfUse => {
+            InverterOperationMode::ForceDischarge
+            | InverterOperationMode::SelfUse
+            | InverterOperationMode::FeedinPriority => {
                 // Estimate discharge based on mode
                 let discharge_kwh = if evaluation.mode == InverterOperationMode::ForceDischarge {
                     // Force discharge at export rate
@@ -794,6 +808,7 @@ pub fn check_soc_constraints(
         }
         InverterOperationMode::SelfUse
         | InverterOperationMode::BackUpMode
+        | InverterOperationMode::FeedinPriority
         | InverterOperationMode::NoChargeNoDischarge => {
             // Self-use, Backup Mode, and NoChargeNoDischarge are always allowed
         }
@@ -924,7 +939,9 @@ fn update_soc_prediction(
                 crate::components::calculate_soc_change(energy_kwh, battery_capacity);
             new_soc -= soc_decrease;
         }
-        InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+        InverterOperationMode::SelfUse
+        | InverterOperationMode::BackUpMode
+        | InverterOperationMode::FeedinPriority => {
             // Calculate net load (already in kWh for the block)
             let net_load = consumption_kwh - solar_kwh;
 
@@ -992,6 +1009,7 @@ fn create_evaluation_request(
     hourly_consumption_profile: Option<&[f32; 24]>,
     block_forecasts: Vec<BlockForecast>,
     timezone: Option<&str>,
+    user_levers: Option<&UserLevers>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -1038,7 +1056,13 @@ fn create_evaluation_request(
         battery_avg_charge_price_czk_per_kwh,
         block_forecasts,
         timezone: timezone.map(str::to_owned),
+        user_levers: user_levers.copied(),
     }
+}
+
+/// The levers the planner may use: `None` until the first successful HA sync.
+pub fn active_user_levers(res: Option<&UserLeversResource>) -> Option<&UserLevers> {
+    res.filter(|r| r.available).map(|r| &r.levers)
 }
 
 /// Convert a plugin decision back to a BlockEvaluation for compatibility
@@ -1188,6 +1212,7 @@ mod tests {
             None,
             None,
             Some("Europe/Prague"),
+            None,
         );
 
         let requests = plugin.requests.lock().unwrap();
@@ -1255,6 +1280,47 @@ mod tests {
         assert!((blocks[1].effective_price_czk_per_kwh - 4.30).abs() < 0.001);
     }
 
+    #[test]
+    fn test_effective_price_fixed_buy_uses_local_time_schedule() {
+        let cache = GlobalHdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
+            low_tariff_ranges: vec![HdoTimeRange {
+                start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            }],
+        }]);
+        // Hourly fixed price in local time: 3.0 CZK at 03:00, 6.0 CZK at 08:00
+        let mut hourly = vec![4.0; 24];
+        hourly[3] = 3.0;
+        hourly[8] = 6.0;
+        let pricing = PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_string(),
+            tomorrow_price_entity: None,
+            use_spot_prices_to_buy: false,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Hourly(hourly),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        };
+
+        // 02:00 UTC = 03:00 Prague (low tariff), 07:00 UTC = 08:00 Prague (high tariff).
+        // Spot (-5.0 / 20.0) must not leak into the buy price.
+        let mut blocks = vec![
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 2, 0, 0).unwrap(), -5.0),
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap(), 20.0),
+        ];
+        calculate_effective_prices(&mut blocks, Some(&cache), &pricing);
+
+        // buy = fixed price at local hour + HDO fee, no operator spot fee
+        assert!((blocks[0].effective_price_czk_per_kwh - 3.50).abs() < 0.001);
+        assert!((blocks[1].effective_price_czk_per_kwh - 7.80).abs() < 0.001);
+    }
+
     fn short_run_block(start: DateTime<Utc>, mode: InverterOperationMode) -> ScheduledMode {
         ScheduledMode {
             block_start: start,
@@ -1298,5 +1364,70 @@ mod tests {
             schedule.scheduled_blocks[2].mode,
             control.default_battery_mode
         );
+    }
+
+    #[test]
+    fn test_schedule_request_carries_user_levers_only_when_available() {
+        let now = Utc::now();
+        let blocks: Vec<TimeBlockPrice> = (0..2)
+            .map(|i| TimeBlockPrice {
+                block_start: now + ChronoDuration::minutes(15 * i),
+                duration_minutes: 15,
+                price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.5,
+                spot_sell_price_czk_per_kwh: Some(2.0),
+            })
+            .collect();
+        let levers = UserLevers {
+            force_charge_at_or_below_czk: Some(1.0),
+            ..UserLevers::default()
+        };
+        let synced = UserLeversResource {
+            levers,
+            available: true,
+            sync_expected: true,
+        };
+        let not_synced = UserLeversResource {
+            levers,
+            available: false,
+            sync_expected: true,
+        };
+
+        let run = |res: Option<&UserLeversResource>| {
+            let plugin = Arc::new(RecordingPlugin {
+                requests: Mutex::new(Vec::new()),
+            });
+            let mut manager = PluginManager::new();
+            manager.register(plugin.clone());
+            generate_schedule_with_optimizer(
+                &blocks,
+                &ControlConfig::default(),
+                &ScheduleConfig::default(),
+                50.0,
+                None,
+                None,
+                10.0,
+                None,
+                &manager,
+                None,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+                None,
+                active_user_levers(res),
+            );
+            plugin
+        };
+
+        let requests = run(Some(&synced)).requests.lock().unwrap().clone();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|r| r.user_levers == Some(levers)));
+
+        let requests = run(Some(&not_synced)).requests.lock().unwrap().clone();
+        assert!(requests.iter().all(|r| r.user_levers.is_none()));
+        let requests = run(None).requests.lock().unwrap().clone();
+        assert!(requests.iter().all(|r| r.user_levers.is_none()));
     }
 }

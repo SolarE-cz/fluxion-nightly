@@ -1557,6 +1557,7 @@ impl EconomicStrategy for WinterAdaptiveV2Strategy {
             }
             InverterOperationMode::SelfUse
             | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
             | InverterOperationMode::NoChargeNoDischarge => {
                 // Calculate net consumption accounting for solar
                 // Negative consumption means excess power (solar > load)

@@ -263,6 +263,7 @@ fn simulate_winter_adaptive(
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let evaluation = strategy.evaluate(&context);
@@ -283,6 +284,7 @@ fn simulate_winter_adaptive(
             }
             InverterOperationMode::SelfUse
             | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
             | InverterOperationMode::NoChargeNoDischarge => {
                 // Self-use logic for other modes
                 let net_load = load_kw - pv_kw;

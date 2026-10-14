@@ -549,6 +549,7 @@ impl EconomicStrategy for WinterAdaptiveV4Strategy {
             }
             InverterOperationMode::SelfUse
             | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
             | InverterOperationMode::NoChargeNoDischarge => {
                 let usable_battery_kwh = ((context.current_battery_soc
                     - context.control_config.hardware_min_battery_soc)

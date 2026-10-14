@@ -19,8 +19,8 @@ use crate::{
     config_events::{ConfigSection, UserControlChangeType},
     debug::DebugModeConfig,
     pricing::analyze_prices,
-    resources::{SystemConfig, UserControlResource},
-    scheduling::{ScheduleConfig, generate_schedule_with_optimizer},
+    resources::{SystemConfig, UserControlResource, UserLeversResource},
+    scheduling::{ScheduleConfig, active_user_levers, generate_schedule_with_optimizer},
     web_bridge::{ConfigUpdateChannel, UserControlUpdateChannel},
 };
 
@@ -116,6 +116,7 @@ pub struct ConfigEventParams<'w, 's> {
     user_control: Option<Res<'w, crate::resources::UserControlResource>>,
     solar_forecast: Option<Res<'w, super::SolarForecastData>>,
     timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
+    user_levers: Option<Res<'w, UserLeversResource>>,
 }
 
 /// System that processes config update events from the web UI
@@ -323,6 +324,7 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                     .timezone_config
                     .as_ref()
                     .and_then(|tz| tz.timezone.as_deref()),
+                active_user_levers(params.user_levers.as_deref()),
             );
 
             // Update schedule
@@ -382,6 +384,7 @@ pub struct UserControlEventParams<'w, 's> {
     plugin_manager_res: Res<'w, PluginManagerResource>,
     solar_forecast: Option<Res<'w, super::SolarForecastData>>,
     timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
+    user_levers: Option<Res<'w, UserLeversResource>>,
 }
 
 /// System that processes user control update events from the web UI
@@ -507,6 +510,7 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                     .timezone_config
                     .as_ref()
                     .and_then(|tz| tz.timezone.as_deref()),
+                active_user_levers(params.user_levers.as_deref()),
             );
 
             // Update schedule

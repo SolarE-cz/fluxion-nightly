@@ -65,6 +65,13 @@ pub struct GenericInverterState {
     /// Is inverter reachable?
     pub online: bool,
 
+    /// Live export limit (W) from the inverter's export control number, when readable
+    pub export_limit_w: Option<u32>,
+
+    /// True when `work_mode` is ForceCharge but the vendor's manual sub-mode could not be read,
+    /// so the real mode may be any Manual mode (Force Charge, Force Discharge or Hold)
+    pub work_mode_ambiguous: bool,
+
     // ============= Load & Grid Detailed (Optional) =============
     /// House/load consumption (W)
     pub house_load_w: Option<f32>,
@@ -245,6 +252,17 @@ pub trait VendorEntityMapper: Send + Sync {
 
     /// Map vendor-specific work mode value to generic operation mode
     fn map_mode_from_vendor(&self, vendor_mode: i32) -> Option<InverterOperationMode>;
+
+    /// Entity holding the vendor's manual sub-mode (e.g. Solax manual_mode_select), if any.
+    /// Needed when the work mode value alone cannot tell Force Charge, Force Discharge and Hold.
+    fn get_manual_mode_entity(&self, _inverter_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Map the state of the manual sub-mode entity to the generic mode.
+    fn map_manual_sub_mode(&self, _option: &str) -> Option<InverterOperationMode> {
+        None
+    }
 
     /// Get the entity ID for work mode control (Required)
     /// Example: "select.{inverter_id}_charger_use_mode"

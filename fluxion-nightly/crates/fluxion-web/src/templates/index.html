@@ -1438,6 +1438,7 @@
                 <span><div class="legend-box backup"></div> Back Up Mode</span>
                 <span><div class="legend-box no-charge-discharge"></div> No Charge/Discharge</span>
                 <span><div class="legend-box self-use"></div> Self-Use</span>
+                <span><div class="legend-box feedin-priority"></div> Feed-in Priority</span>
                 <span><div class="legend-box hdo-low"></div> HDO Low Tariff</span>
                 <span><div class="legend-box hdo-high"></div> HDO High Tariff</span>
                 {% if let Some(inv) = inverters.first() %}
@@ -1756,7 +1757,6 @@
                                         const mode = chartData.modes[idx];
                                         const targetSoc = chartData.target_socs[idx];
                                         const strategy = chartData.strategies[idx];
-                                        const profit = chartData.profits[idx];
                                         const debugInfo = chartData.debug_info ? chartData.debug_info[idx] : null;
                                         const isHistorical = chartData.is_historical && chartData.is_historical[idx];
 
@@ -1797,11 +1797,6 @@
 
                                         if (strategy) {
                                             lines.push(`Strategy: ${strategy}`);
-                                        }
-
-                                        if (profit !== null && profit !== undefined) {
-                                            const profitColor = profit >= 0 ? '✓' : '✗';
-                                            lines.push(`${profitColor} Expected Profit: ${profit.toFixed(2)} CZK`);
                                         }
 
                                         if (targetSoc !== null && targetSoc !== undefined) {
@@ -2066,7 +2061,6 @@
                         <th style="padding: 8px; text-align: left;"><i class="mdi mdi-cash"></i> Price</th>
                         <th style="padding: 8px; text-align: left;"><i class="mdi mdi-cog"></i> Mode</th>
                         <th style="padding: 8px; text-align: left;"><i class="mdi mdi-strategy"></i> Strategy</th>
-                        <th style="padding: 8px; text-align: right;"><i class="mdi mdi-trending-up"></i> Profit</th>
                         <th class="verbose-col" style="padding: 8px; text-align: left; display: none;"><i class="mdi mdi-identifier"></i> UID</th>
                         <th class="verbose-col" style="padding: 8px; text-align: left; display: none;"><i class="mdi mdi-comment-text-outline"></i> Reason</th>
                     </tr>
@@ -2207,7 +2201,6 @@
                 prices: [chartData.prices[i]],
                 mode: mode,
                 strategies: [chartData.strategies[i]],
-                profits: [chartData.profits[i]],
                 reasons: [chartData.reasons ? chartData.reasons[i] : null],
                 decision_uids: [chartData.decision_uids ? chartData.decision_uids[i] : null],
                 blockCount: 1
@@ -2219,7 +2212,6 @@
                 group.endLabel = chartData.labels[i];
                 group.prices.push(chartData.prices[i]);
                 group.strategies.push(chartData.strategies[i]);
-                group.profits.push(chartData.profits[i]);
                 group.reasons.push(chartData.reasons ? chartData.reasons[i] : null);
                 group.decision_uids.push(chartData.decision_uids ? chartData.decision_uids[i] : null);
                 group.blockCount++;
@@ -2289,29 +2281,6 @@
             }
             row.appendChild(tdStrategy);
 
-            // Profit (sum for grouped blocks)
-            const tdProfit = document.createElement('td');
-            tdProfit.style.padding = '8px';
-            tdProfit.style.textAlign = 'right';
-            tdProfit.style.fontWeight = 'bold';
-            const validProfits = group.profits.filter(p => p !== null && p !== undefined);
-            if (validProfits.length > 0) {
-                const totalProfit = validProfits.reduce((sum, p) => sum + p, 0);
-                const profitSpan = document.createElement('span');
-                profitSpan.style.color = totalProfit >= 0 ? '#4caf50' : '#f44336';
-                profitSpan.textContent = totalProfit.toFixed(2) + ' CZK';
-                if (group.blockCount > 1) {
-                    profitSpan.title = `Total for ${group.blockCount} blocks`;
-                }
-                tdProfit.appendChild(profitSpan);
-            } else {
-                const dash = document.createElement('span');
-                dash.style.color = '#666';
-                dash.textContent = '—';
-                tdProfit.appendChild(dash);
-            }
-            row.appendChild(tdProfit);
-
             // UID (verbose)
             const tdUid = document.createElement('td');
             tdUid.className = 'verbose-col';
@@ -2338,186 +2307,6 @@
             tbody.appendChild(row);
         }
 
-        // Summary row with total profit
-        const allProfits = groups.flatMap(g => g.profits.filter(p => p !== null && p !== undefined));
-        if (allProfits.length > 0) {
-            const grandTotal = allProfits.reduce((sum, p) => sum + p, 0);
-            const summaryRow = document.createElement('tr');
-            summaryRow.style.borderTop = '2px solid rgba(255,255,255,0.15)';
-            summaryRow.style.background = 'rgba(255,255,255,0.03)';
-
-            // Empty cells for Time, Price, Mode, Strategy
-            for (let c = 0; c < 4; c++) {
-                const td = document.createElement('td');
-                td.style.padding = '8px';
-                if (c === 0) {
-                    td.style.fontWeight = '600';
-                    td.style.color = 'var(--text-secondary)';
-                    td.textContent = 'Total';
-                }
-                summaryRow.appendChild(td);
-            }
-
-            // Total profit cell
-            const tdTotal = document.createElement('td');
-            tdTotal.style.padding = '8px';
-            tdTotal.style.textAlign = 'right';
-            tdTotal.style.fontWeight = 'bold';
-            tdTotal.style.fontSize = '1.05em';
-            const totalSpan = document.createElement('span');
-            totalSpan.style.color = grandTotal >= 0 ? '#4caf50' : '#f44336';
-            totalSpan.textContent = grandTotal.toFixed(2) + ' CZK';
-            tdTotal.appendChild(totalSpan);
-            summaryRow.appendChild(tdTotal);
-
-            // Empty verbose cells
-            const verboseDisplay = document.getElementById('verbose-schedule')?.checked ? '' : 'none';
-            for (let c = 0; c < 2; c++) {
-                const td = document.createElement('td');
-                td.className = 'verbose-col';
-                td.style.display = verboseDisplay;
-                td.style.padding = '8px';
-                summaryRow.appendChild(td);
-            }
-
-            tbody.appendChild(summaryRow);
-
-            // Baseline cost calculation: what grid-only consumption would cost minus solar self-consumption
-            if (chartData.hourly_consumption_profile && chartData.effective_prices) {
-                const solarToday = chartData.solar_forecast_remaining_today_kwh || 0;
-                const solarTomorrow = chartData.solar_forecast_tomorrow_kwh || 0;
-
-                // Determine which date label counts as "today" vs "tomorrow"
-                // Use the first upcoming block's date as "today"
-                const firstLabel = chartData.labels[startIndex];
-                const todayDateStr = firstLabel ? firstLabel.split(' ')[0] : null;
-
-                // Collect solar weights and consumption per block, grouped by date
-                let baselineCost = 0;
-                const todayWeights = [];
-                const tomorrowWeights = [];
-
-                for (let bi = startIndex; bi < maxBlocks; bi++) {
-                    const label = chartData.labels[bi];
-                    if (!label) continue;
-
-                    // Parse local hour and minute from label "MM-DD HH:MM"
-                    const match = label.match(/(\d{2})-(\d{2})\s+(\d{2}):(\d{2})$/);
-                    if (!match) continue;
-
-                    const blockMonth = parseInt(match[1], 10);
-                    const blockDay = parseInt(match[2], 10);
-                    const localHour = parseInt(match[3], 10);
-                    const localMinute = parseInt(match[4], 10);
-
-                    // UTC hour from the block's UTC instant (per-block, so DST changes are handled)
-                    const utcHour = new Date(chartData.block_starts_utc[bi]).getUTCHours();
-
-                    // Block consumption from hourly profile (15 min = 1/4 hour)
-                    const consumptionKwh = chartData.hourly_consumption_profile[utcHour] / 4;
-
-                    // Determine if this block is today or tomorrow
-                    const blockDateStr = label.split(' ')[0];
-                    const isToday = (blockDateStr === todayDateStr);
-
-                    // Compute solar weight for this block
-                    const sun = getSunHours(blockMonth, blockDay);
-                    const sunriseMin = sun.sunrise * 60;
-                    const sunsetMin = sun.sunset * 60;
-                    const blockMinOfDay = localHour * 60 + localMinute;
-                    const weight = getSolarWeight(blockMinOfDay, sunriseMin, sunsetMin);
-
-                    if (isToday) {
-                        todayWeights.push({ idx: bi, weight, consumptionKwh });
-                    } else {
-                        tomorrowWeights.push({ idx: bi, weight, consumptionKwh });
-                    }
-                }
-
-                // Distribute solar production across blocks proportionally to their weights
-                function computeBaselineCost(blocks, totalSolarKwh) {
-                    const totalWeight = blocks.reduce((s, b) => s + b.weight, 0);
-                    let cost = 0;
-                    for (const b of blocks) {
-                        const solarKwh = (totalWeight > 0) ? totalSolarKwh * (b.weight / totalWeight) : 0;
-                        const netConsumption = Math.max(0, b.consumptionKwh - solarKwh);
-                        cost += netConsumption * chartData.effective_prices[b.idx];
-                    }
-                    return cost;
-                }
-
-                baselineCost = computeBaselineCost(todayWeights, solarToday)
-                             + computeBaselineCost(tomorrowWeights, solarTomorrow);
-
-                // Baseline row
-                const baselineRow = document.createElement('tr');
-                baselineRow.style.background = 'rgba(255,255,255,0.03)';
-                for (let c = 0; c < 4; c++) {
-                    const td = document.createElement('td');
-                    td.style.padding = '8px';
-                    if (c === 0) {
-                        td.style.fontWeight = '600';
-                        td.style.color = 'var(--text-secondary)';
-                        td.textContent = 'Baseline';
-                        td.title = 'Cost if all consumption bought from grid (minus solar self-consumption)';
-                    }
-                    baselineRow.appendChild(td);
-                }
-                const tdBaseline = document.createElement('td');
-                tdBaseline.style.padding = '8px';
-                tdBaseline.style.textAlign = 'right';
-                tdBaseline.style.fontWeight = 'bold';
-                tdBaseline.style.fontSize = '1.05em';
-                tdBaseline.style.color = '#f44336';
-                tdBaseline.textContent = (-baselineCost).toFixed(2) + ' CZK';
-                baselineRow.appendChild(tdBaseline);
-                // Verbose cells
-                for (let c = 0; c < 2; c++) {
-                    const td = document.createElement('td');
-                    td.className = 'verbose-col';
-                    td.style.display = verboseDisplay;
-                    td.style.padding = '8px';
-                    baselineRow.appendChild(td);
-                }
-                tbody.appendChild(baselineRow);
-
-                // Savings row
-                const savings = Math.abs(baselineCost) - Math.abs(grandTotal);
-                const savingsPercent = baselineCost !== 0 ? (savings / Math.abs(baselineCost) * 100) : 0;
-                const savingsRow = document.createElement('tr');
-                savingsRow.style.background = 'rgba(255,255,255,0.03)';
-                for (let c = 0; c < 4; c++) {
-                    const td = document.createElement('td');
-                    td.style.padding = '8px';
-                    if (c === 0) {
-                        td.style.fontWeight = '600';
-                        td.style.color = 'var(--text-secondary)';
-                        td.textContent = 'Savings';
-                        td.title = 'Difference between baseline grid cost and battery strategy cost';
-                    }
-                    savingsRow.appendChild(td);
-                }
-                const tdSavings = document.createElement('td');
-                tdSavings.style.padding = '8px';
-                tdSavings.style.textAlign = 'right';
-                tdSavings.style.fontWeight = 'bold';
-                tdSavings.style.fontSize = '1.05em';
-                const savingsSpan = document.createElement('span');
-                savingsSpan.style.color = savings >= 0 ? '#4caf50' : '#f44336';
-                savingsSpan.textContent = savings.toFixed(2) + ' CZK (' + savingsPercent.toFixed(0) + '%)';
-                tdSavings.appendChild(savingsSpan);
-                savingsRow.appendChild(tdSavings);
-                // Verbose cells
-                for (let c = 0; c < 2; c++) {
-                    const td = document.createElement('td');
-                    td.className = 'verbose-col';
-                    td.style.display = verboseDisplay;
-                    td.style.padding = '8px';
-                    savingsRow.appendChild(td);
-                }
-                tbody.appendChild(savingsRow);
-            }
-        }
     }
 
     // Verbose checkbox toggle

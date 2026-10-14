@@ -273,6 +273,9 @@ pub struct EvaluationContext<'a> {
 
     /// Site timezone used for local-time decisions (None = unknown)
     pub timezone: Option<chrono_tz::Tz>,
+
+    /// User levers from the HA helpers (None = not synced; apply no lever rules)
+    pub user_levers: Option<&'a fluxion_types::UserLevers>,
 }
 
 /// Trait for economic battery operation strategies

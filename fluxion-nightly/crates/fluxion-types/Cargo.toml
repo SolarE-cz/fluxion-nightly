@@ -9,3 +9,6 @@ chrono.workspace = true
 bevy_ecs.workspace = true
 anyhow.workspace = true
 fluxion-i18n = { path = "../fluxion-i18n" }
+
+[dev-dependencies]
+chrono-tz.workspace = true

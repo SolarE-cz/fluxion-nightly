@@ -82,6 +82,18 @@ impl PriceSchedule {
     }
 }
 
+impl PriceSchedule {
+    /// Price at a local wall-clock time: 96 entries are 15-minute blocks, anything else is hourly.
+    pub fn get_price_at(&self, local_hour: u32, local_minute: u32) -> f32 {
+        match self {
+            PriceSchedule::Hourly(prices) if prices.len() == 96 => {
+                prices[(local_hour * 4 + local_minute / 15) as usize % 96]
+            }
+            _ => self.get_price(local_hour as usize),
+        }
+    }
+}
+
 impl Default for PriceSchedule {
     fn default() -> Self {
         PriceSchedule::Flat(0.0)
@@ -178,6 +190,15 @@ pub struct ControlConfig {
     /// Default: SelfUse (normal self-consumption mode)
     #[serde(default = "default_battery_operation_mode")]
     pub default_battery_mode: InverterOperationMode,
+
+    /// Curtail export (SolaX export limit 0 W) in blocks whose sell price is at or below
+    /// `export_curtail_at_or_below_czk`. Default: true
+    #[serde(default = "default_export_curtailment_enabled")]
+    pub export_curtailment_enabled: bool,
+
+    /// Sell price (CZK/kWh) at or below which export is curtailed. Default: 0.0
+    #[serde(default = "default_export_curtail_at_or_below_czk")]
+    pub export_curtail_at_or_below_czk: f32,
 }
 
 // Default value functions for serde
@@ -204,6 +225,14 @@ fn default_min_consecutive_force_blocks() -> usize {
 fn default_battery_operation_mode() -> InverterOperationMode {
     InverterOperationMode::SelfUse
 }
+fn default_export_curtailment_enabled() -> bool {
+    true
+}
+
+fn default_export_curtail_at_or_below_czk() -> f32 {
+    0.0
+}
+
 fn default_spot_buy_fee() -> f32 {
     0.5
 }
@@ -243,6 +272,8 @@ impl Default for ControlConfig {
             evening_peak_start_hour: 17,
             min_consecutive_force_blocks: 2,
             default_battery_mode: InverterOperationMode::SelfUse,
+            export_curtailment_enabled: true,
+            export_curtail_at_or_below_czk: 0.0,
         }
     }
 }
@@ -1598,5 +1629,19 @@ impl Currency {
             Currency::USD => "$",
             Currency::CZK => "Kč",
         }
+    }
+}
+
+#[cfg(test)]
+mod price_schedule_tests {
+    use super::PriceSchedule;
+
+    #[test]
+    fn get_price_at_hourly_and_quarter_schedules() {
+        assert_eq!(PriceSchedule::Flat(5.0).get_price_at(13, 45), 5.0);
+        let hourly = PriceSchedule::Hourly((0..24).map(|h| h as f32).collect());
+        assert_eq!(hourly.get_price_at(13, 45), 13.0);
+        let quarters = PriceSchedule::Hourly((0..96).map(|q| q as f32).collect());
+        assert_eq!(quarters.get_price_at(13, 45), 55.0);
     }
 }

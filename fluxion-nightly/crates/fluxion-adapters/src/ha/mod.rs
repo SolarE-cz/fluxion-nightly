@@ -13,9 +13,11 @@
 pub mod adapters;
 pub mod client;
 pub mod errors;
+pub mod levers;
 pub mod plugin;
 pub mod solar_forecast_fetcher;
 pub mod types;
+pub mod ws;
 
 pub use adapters::{
     ConfigurablePriceDataSource, CzSpotPriceAdapter, HaConsumptionHistoryAdapter,

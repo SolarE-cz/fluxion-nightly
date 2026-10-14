@@ -422,6 +422,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 hourly_consumption_profile: None,
                 block_forecasts: None,
                 timezone: None,
+                user_levers: None,
             };
 
             let evaluation = state.strategy.evaluate(&context);

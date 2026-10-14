@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 fluxion-core = { path = "../fluxion-core" }
+fluxion-types = { path = "../fluxion-types" }
 bevy_ecs.workspace = true
 bevy_app.workspace = true
 bevy_log.workspace = true
@@ -21,6 +22,8 @@ chrono-tz.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
 crossbeam-channel.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 urlencoding = "2.1"
 
 [dev-dependencies]

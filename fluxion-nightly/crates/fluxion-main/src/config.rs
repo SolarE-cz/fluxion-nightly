@@ -56,6 +56,23 @@ pub struct AppConfig {
     /// Server heartbeat configuration
     #[serde(default, rename = "server_heartbeat")]
     pub server_heartbeat: ServerHeartbeatConfig,
+
+    /// User levers (HA helpers) configuration
+    #[serde(default)]
+    pub levers: LeversConfig,
+}
+
+/// Legacy FluxION levers: FluxION creates and polls the FVE-Automatizace helpers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LeversConfig {
+    pub enabled: bool,
+}
+
+impl Default for LeversConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Configuration for a single inverter
@@ -208,6 +225,15 @@ pub struct ControlConfig {
     /// - NoChargeNoDischarge: Hold battery charge, grid powers house directly
     #[serde(default = "default_battery_mode")]
     pub default_battery_mode: String,
+
+    /// Curtail export (SolaX export limit 0 W) in blocks whose sell price is at or below
+    /// `export_curtail_at_or_below_czk`. Options: true (default), false
+    #[serde(default = "default_export_curtailment_enabled")]
+    pub export_curtailment_enabled: bool,
+
+    /// Sell price (CZK/kWh) at or below which export is curtailed. Default: 0.0
+    #[serde(default = "default_export_curtail_at_or_below_czk")]
+    pub export_curtail_at_or_below_czk: f32,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -244,6 +270,14 @@ fn default_min_consecutive_force_blocks() -> usize {
 
 fn default_battery_mode() -> String {
     "SelfUse".to_string() // Default to self-use mode for backward compatibility
+}
+
+fn default_export_curtailment_enabled() -> bool {
+    true
+}
+
+fn default_export_curtail_at_or_below_czk() -> f32 {
+    0.0
 }
 
 fn default_spot_buy_fee() -> f32 {
@@ -1440,6 +1474,8 @@ impl Default for AppConfig {
                 hardware_min_battery_soc: default_hardware_min_soc(),
                 min_consecutive_force_blocks: default_min_consecutive_force_blocks(),
                 default_battery_mode: default_battery_mode(),
+                export_curtailment_enabled: default_export_curtailment_enabled(),
+                export_curtail_at_or_below_czk: default_export_curtail_at_or_below_czk(),
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -1457,6 +1493,7 @@ impl Default for AppConfig {
             solar_forecast: SolarForecastConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             server_heartbeat: ServerHeartbeatConfig::default(),
+            levers: LeversConfig::default(),
         }
     }
 }
@@ -1989,6 +2026,8 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     }
                     _ => fluxion_core::InverterOperationMode::SelfUse, // Default or "SELFUSE"
                 },
+                export_curtailment_enabled: app_config.control.export_curtailment_enabled,
+                export_curtail_at_or_below_czk: app_config.control.export_curtail_at_or_below_czk,
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,

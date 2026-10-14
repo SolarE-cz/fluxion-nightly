@@ -1796,6 +1796,7 @@ mod tests {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let eval = strategy.evaluate(&context);
@@ -1844,6 +1845,7 @@ mod tests {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let eval = strategy.evaluate(&context);
@@ -1918,6 +1920,7 @@ mod tests {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let eval = strategy.evaluate(&context);
@@ -2360,6 +2363,7 @@ mod tests {
                 hourly_consumption_profile: None,
                 block_forecasts: None,
                 timezone: None,
+                user_levers: None,
             };
 
             let eval = strategy.evaluate(&context);

@@ -162,6 +162,7 @@ fn test_v2_waits_for_cheapest_blocks() {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let eval = v1_strategy.evaluate(&context);
@@ -200,6 +201,7 @@ fn test_v2_waits_for_cheapest_blocks() {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

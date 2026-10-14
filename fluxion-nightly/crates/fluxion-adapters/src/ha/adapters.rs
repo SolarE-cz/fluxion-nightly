@@ -82,6 +82,19 @@ impl HomeAssistantInverterAdapter {
         self.read_sensor_float(&entity).await.ok()
     }
 
+    /// Helper to read the vendor's manual sub-mode; `None` when unavailable or not recognised
+    async fn read_manual_sub_mode(&self, entity_id: &str) -> Option<InverterOperationMode> {
+        let state = self.client.get_state(entity_id).await.ok()?;
+        let mode = self.mapper.map_manual_sub_mode(&state.state);
+        if mode.is_none() {
+            debug!(
+                "⚠️ [ADAPTER] Manual sub-mode '{}' not readable from {}",
+                state.state, entity_id
+            );
+        }
+        mode
+    }
+
     /// Helper to read work mode entity and map to generic mode
     async fn read_work_mode(&self, entity_id: &str) -> Result<InverterOperationMode> {
         debug!("🔧 [ADAPTER] Reading work mode: {}", entity_id);
@@ -153,9 +166,19 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             .read_sensor_float(&self.mapper.get_pv_power_entity(inverter_id))
             .await?;
 
-        // Read current work mode
+        // Read current work mode. ForceCharge may be a Manual sub-mode: read the sub-mode exactly,
+        // and mark the value ambiguous when that entity cannot be read.
         let work_mode_entity = self.mapper.get_work_mode_entity(inverter_id);
-        let work_mode = self.read_work_mode(&work_mode_entity).await?;
+        let mut work_mode = self.read_work_mode(&work_mode_entity).await?;
+        let mut work_mode_ambiguous = false;
+        if work_mode == InverterOperationMode::ForceCharge
+            && let Some(manual_entity) = self.mapper.get_manual_mode_entity(inverter_id)
+        {
+            match self.read_manual_sub_mode(&manual_entity).await {
+                Some(exact) => work_mode = exact,
+                None => work_mode_ambiguous = true,
+            }
+        }
 
         // Read optional Load & Grid detailed sensors
         let house_load_w = self
@@ -231,6 +254,14 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             })
             .await;
 
+        // Live export limit (for restoring it after curtailment)
+        let export_limit_w = self
+            .read_optional_sensor(inverter_id, |id| {
+                Some(self.mapper.get_export_limit_entity(id))
+            })
+            .await
+            .map(|limit| limit.max(0.0) as u32);
+
         let state = GenericInverterState {
             inverter_id: inverter_id.to_string(),
             battery_soc,
@@ -239,6 +270,8 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             battery_power_w: battery_power,
             pv_power_w: pv_power,
             online: true,
+            export_limit_w,
+            work_mode_ambiguous,
             // Load & Grid detailed
             house_load_w,
             grid_import_w,
@@ -836,6 +869,7 @@ mod tests {
                 InverterOperationMode::ForceCharge => 2,
                 InverterOperationMode::ForceDischarge => 3,
                 InverterOperationMode::NoChargeNoDischarge => 5,
+                InverterOperationMode::FeedinPriority => 4,
             }
         }
 

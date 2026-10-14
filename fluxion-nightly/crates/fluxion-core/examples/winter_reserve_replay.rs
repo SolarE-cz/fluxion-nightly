@@ -90,6 +90,8 @@ fn mode_index(mode: PlanMode) -> usize {
         PlanMode::Charge => 1,
         PlanMode::Hold => 2,
         PlanMode::Export => 3,
+        // The replay passes no user levers, so the planner never produces NoDischarge.
+        PlanMode::NoDischarge => unreachable!("replay runs without user levers"),
     }
 }
 
@@ -283,6 +285,11 @@ fn run() -> Result<(), String> {
             sell_czk: row.sell,
             load_kwh: row.load,
             pv_kwh: row.pv,
+            force_charge: false,
+            no_discharge: false,
+            force_charge_at_or_below_czk: None,
+            export_min_soc_pct: None,
+            export_allowed: true,
         };
         let su_out = simulate_block(PlanMode::SelfUse, e_su, &actual_block, e_min, &battery);
         acc.su.cost += su_out.grid_import_kwh * row.buy - su_out.grid_export_kwh * row.sell;
@@ -347,6 +354,11 @@ fn run() -> Result<(), String> {
                         sell_czk: later.sell,
                         load_kwh: load_fc * params.load_safety_factor,
                         pv_kwh: later.pv * params.pv_confidence * noise,
+                        force_charge: false,
+                        no_discharge: false,
+                        force_charge_at_or_below_czk: None,
+                        export_min_soc_pct: None,
+                        export_allowed: true,
                     });
                     if later.gap_after {
                         break;

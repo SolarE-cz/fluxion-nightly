@@ -165,6 +165,7 @@ fn debug_v2_charge_scheduling() {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

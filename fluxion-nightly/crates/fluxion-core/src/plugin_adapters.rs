@@ -102,6 +102,7 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
                 .timezone
                 .as_deref()
                 .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok()),
+            user_levers: request.user_levers.as_ref(),
         };
 
         let eval = self.strategy.evaluate(&context);

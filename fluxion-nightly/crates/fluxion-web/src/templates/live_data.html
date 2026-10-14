@@ -183,12 +183,6 @@
         <span class="strategy-badge">{{ strategy }}</span>
     </div>
     {% endif %}
-    {% if let Some(profit) = schedule.expected_profit %}
-    <div class="stat">
-        <span class="stat-label"><i class="mdi mdi-cash-check"></i>Expected Profit (Block)</span>
-        <span class="stat-value">{{ profit }} CZK</span>
-    </div>
-    {% endif %}
     <div class="stat">
         <span class="stat-label"><i class="mdi mdi-information"></i>{{ self.t("schedule-reason") }}</span>
         <span>{{ schedule.current_reason }}</span>

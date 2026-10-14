@@ -113,6 +113,9 @@ pub enum InverterOperationMode {
     /// Grid powers the house directly. SOC stays constant.
     /// On Solax, implemented as Manual Mode + Stop Charge and Discharge.
     NoChargeNoDischarge,
+    /// Feed-in priority: PV power goes to the grid first, battery used only as a fallback.
+    /// On Solax, implemented as charger_use_mode=FeedinPriority (no manual sub-mode).
+    FeedinPriority,
 }
 
 impl std::fmt::Display for InverterOperationMode {
@@ -123,6 +126,7 @@ impl std::fmt::Display for InverterOperationMode {
             Self::ForceCharge => write!(f, "Force-Charge"),
             Self::ForceDischarge => write!(f, "Force-Discharge"),
             Self::NoChargeNoDischarge => write!(f, "No Charge/Discharge"),
+            Self::FeedinPriority => write!(f, "Feed-in Priority"),
         }
     }
 }

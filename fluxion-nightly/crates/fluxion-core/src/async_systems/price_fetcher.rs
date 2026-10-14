@@ -20,8 +20,10 @@ use crate::{
     components::*,
     pricing::analyze_prices,
     resources::SystemConfig,
-    scheduling::{ScheduleConfig, generate_schedule_with_optimizer},
+    scheduling::{ScheduleConfig, active_user_levers, generate_schedule_with_optimizer},
+    strategy::winter_reserve::planner_levers,
 };
+use fluxion_types::UserLevers;
 use fluxion_types::config::ControlConfig;
 
 use super::BackupDischargeMinSoc;
@@ -113,6 +115,7 @@ pub fn setup_price_cache(mut commands: Commands, price_source: Res<PriceDataSour
 /// Simplified system that updates prices using direct cache access
 /// Replaces the complex channel polling with on-demand fetching
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::type_complexity)]
 pub fn update_prices_system(
     price_cache: Res<crate::resources::PriceCache>,
     mut commands: Commands,
@@ -129,10 +132,18 @@ pub fn update_prices_system(
     plugin_manager_res: Res<PluginManagerResource>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
     solar_forecast: Option<Res<super::SolarForecastData>>,
-    timezone_config: Option<Res<crate::resources::TimezoneConfig>>,
+    (timezone_config, user_levers, mut last_planner_levers): (
+        Option<Res<crate::resources::TimezoneConfig>>,
+        Option<Res<crate::resources::UserLeversResource>>,
+        Local<Option<UserLevers>>,
+    ),
 ) {
+    // A change of the planner levers regenerates the schedule even when prices are fresh
+    let planner_levers_now = planner_levers(active_user_levers(user_levers.as_deref()));
+    let levers_changed = planner_levers_now != *last_planner_levers;
+
     // Only fetch if cache is stale (non-blocking check)
-    if !price_cache.is_stale() {
+    if !price_cache.is_stale() && !levers_changed {
         return;
     }
 
@@ -221,6 +232,8 @@ pub fn update_prices_system(
         return;
     }
 
+    *last_planner_levers = planner_levers_now;
+
     // Get current battery SOC from raw inverter state (more reliable than BatteryStatus component)
     let current_soc = inverter_raw_state_query
         .iter()
@@ -297,6 +310,7 @@ pub fn update_prices_system(
         timezone_config
             .as_ref()
             .and_then(|tz| tz.timezone.as_deref()),
+        active_user_levers(user_levers.as_deref()),
     );
 
     // Update or create PriceAnalysis entity

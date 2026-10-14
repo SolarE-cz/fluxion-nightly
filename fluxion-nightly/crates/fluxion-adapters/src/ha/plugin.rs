@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ha::client::HomeAssistantClient;
+use crate::ha::levers;
 use crate::ha::solar_forecast_fetcher;
 
 /// Resource: configuration for Home Assistant API access
@@ -102,12 +103,16 @@ impl Plugin for HaPlugin {
         app.insert_resource(HaConfig::default())
             .insert_resource(HaPollTicker::default())
             .add_message::<HaSelectWrite>()
+            .init_resource::<fluxion_core::resources::UserLeversResource>()
+            .init_resource::<levers::LeversChannel>()
+            .insert_resource(levers::LeversSyncConfig::default())
             .add_systems(Startup, ha_init_config_system)
             // Use PostStartup for fetchers that depend on resources created via Commands
             // in setup_async_workers (which runs in Startup). Commands are deferred, so
             // resources like HdoSender/BackupSocSender aren't available until PostStartup.
             .add_systems(PostStartup, spawn_backup_soc_fetcher)
             .add_systems(PostStartup, spawn_hdo_fetcher)
+            .add_systems(PostStartup, levers::spawn_levers_sync)
             .add_systems(
                 PostStartup,
                 solar_forecast_fetcher::spawn_solar_forecast_fetcher,
@@ -117,6 +122,7 @@ impl Plugin for HaPlugin {
             .add_systems(Update, timezone_sync_system)
             .add_systems(Update, poll_backup_soc_channel)
             .add_systems(Update, poll_hdo_channel)
+            .add_systems(Update, levers::poll_levers_channel)
             .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel);
     }
 }

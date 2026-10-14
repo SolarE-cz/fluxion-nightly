@@ -310,6 +310,11 @@ fn initialize_and_run() -> Result<()> {
     // Create Bevy app with full configuration
     info!("🎮 Starting ECS application...");
 
+    let levers_sync_config = fluxion_adapters::ha::levers::LeversSyncConfig {
+        enabled: config.levers.enabled,
+        ..Default::default()
+    };
+
     let mut app = App::new();
     app
         // Add TaskPoolPlugin to initialize async task pools
@@ -317,6 +322,7 @@ fn initialize_and_run() -> Result<()> {
         // Add ScheduleRunnerPlugin for headless operation
         .add_plugins(ScheduleRunnerPlugin::run_loop(Duration::from_millis(100)))
         .add_plugins((FluxionCorePlugin, HaPlugin))
+        .insert_resource(levers_sync_config)
         .insert_resource(config)
         .insert_resource(system_config)
         .insert_resource(debug_config)

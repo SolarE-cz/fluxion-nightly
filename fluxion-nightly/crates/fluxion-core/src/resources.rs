@@ -201,6 +201,11 @@ impl GlobalHdoCache {
         self.0.is_low_tariff(dt)
     }
 
+    /// Local timezone used to match HDO windows (the site timezone)
+    pub fn timezone(&self) -> chrono_tz::Tz {
+        self.0.timezone()
+    }
+
     /// Set the local timezone used to match HDO windows
     pub fn set_timezone(&self, tz: chrono_tz::Tz) {
         self.0.set_timezone(tz)
@@ -495,6 +500,17 @@ impl StateReadTimer {
 // ============= User Control Resource =============
 
 pub use fluxion_types::{FixedTimeSlot, UserControlState};
+
+/// Lever values synced from the HA helpers (see `docs/legacy-levers/CONTRACT.md`).
+/// `available` is false until the first successful sync; consumers then apply no lever rules.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct UserLeversResource {
+    pub levers: fluxion_types::UserLevers,
+    pub available: bool,
+    /// True when the lever sync is enabled and running. Execution waits for `available` (max 120 s)
+    /// before writing any mode, so a kill switch that is on is seen before the planner writes.
+    pub sync_expected: bool,
+}
 
 /// Resource for user control state.
 ///

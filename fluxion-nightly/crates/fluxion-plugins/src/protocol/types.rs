@@ -131,6 +131,10 @@ pub struct EvaluationRequest {
     /// IANA timezone of the site, e.g. "Europe/Prague"
     #[serde(default)]
     pub timezone: Option<String>,
+
+    /// User levers from Home Assistant; `None` until the first successful sync
+    #[serde(default)]
+    pub user_levers: Option<fluxion_types::UserLevers>,
 }
 
 /// Operation mode decision
@@ -158,6 +162,11 @@ impl From<fluxion_types::inverter::InverterOperationMode> for OperationMode {
             fluxion_types::inverter::InverterOperationMode::BackUpMode => Self::BackUpMode,
             fluxion_types::inverter::InverterOperationMode::NoChargeNoDischarge => {
                 Self::NoChargeNoDischarge
+            }
+            // The plugin protocol has no feed-in priority mode: fall back to Self-Use.
+            fluxion_types::inverter::InverterOperationMode::FeedinPriority => {
+                tracing::warn!("Plugin protocol cannot express Feed-in Priority, using Self-Use");
+                Self::SelfUse
             }
         }
     }

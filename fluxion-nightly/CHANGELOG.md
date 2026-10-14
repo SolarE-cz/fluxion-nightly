@@ -10,6 +10,41 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.43] - 2026-10-14
+
+### Added
+
+- **FVE-Automatizace levers in FluxION.** FluxION creates its own HA helpers ("FluxION …") for the
+  manual work mode (VPR) with start/stop, the automation kill switch, morning/evening discharge
+  hours and minimum SOC, and the force-charge / no-discharge price thresholds. Values are copied
+  once from the Node-RED entities (the VPR itself is not copied). Node-RED is no longer needed for
+  inverter control.
+- **VPR (manual work mode)** has the highest priority, also above the kill switch. It is a one-time
+  window: it is applied once and reset to "Žádný" when it ends. A window across midnight survives an
+  HA restart.
+- **Kill switch.** With "FluxION Zakázat automatizaci" on, FluxION sets Self Use once and then
+  leaves the inverter alone (VPR still applies). Turning it off re-reads the inverter's real mode.
+- **Planner levers.** Price ≤ force-charge threshold → charge; price ≤ no-discharge threshold → Back
+  Up (no discharge); morning/evening discharge limit export to the best N hours of each window and
+  never below the set SOC. Lever changes re-plan immediately.
+- **"Prodej do sítě"** maps to SolaX Feed-in Priority.
+- **Export curtailment.** At sell price ≤ `control.export_curtail_at_or_below_czk` (default 0) the
+  export limit is set to 0 W and the inverter's previous limit is restored afterwards.
+- **Fixed buy price.** With `use_spot_prices_to_buy: false` the planner uses `fixed_buy_price_czk`
+  at local time plus the HDO distribution fee.
+
+### Fixed
+
+- **Debug → live** switched at runtime now applies the planned mode immediately.
+- **Mode drift.** If another controller changes the inverter mode, FluxION re-applies its mode (at
+  most every 5 minutes; never while the kill switch is on). SolaX manual sub-modes are read exactly.
+- **Chart battery forecast** uses the 7-day load profile, the PV forecast and a night window from
+  yesterday's PV, so the SOC line falls through the evening and night.
+
+### Changed
+
+- The per-block "profit" is no longer shown; a daily saving against plain self-use follows.
+
 ## [0.2.42] - 2026-10-14
 
 ### Fixed

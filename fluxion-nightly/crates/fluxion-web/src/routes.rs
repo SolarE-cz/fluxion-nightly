@@ -344,8 +344,10 @@ impl DashboardTemplate {
                 };
                 buy_fees.push(buy_fee);
 
-                // Calculate effective price
-                let effective_price = spot_price + grid_fee + buy_fee;
+                // The planner's buy price when known (covers fixed buy pricing); else spot + fees
+                let effective_price = block
+                    .effective_buy_price
+                    .unwrap_or(spot_price + grid_fee + buy_fee);
                 effective_prices.push(effective_price);
             }
 

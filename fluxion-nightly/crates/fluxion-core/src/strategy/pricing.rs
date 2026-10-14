@@ -86,6 +86,11 @@ impl HdoCache {
         }
     }
 
+    /// Local timezone of the HDO windows (the site timezone)
+    pub fn timezone(&self) -> Tz {
+        *self.timezone.read().unwrap()
+    }
+
     /// Set the local timezone of the HDO windows and convert the cached schedules again
     pub fn set_timezone(&self, tz: Tz) {
         *self.timezone.write().unwrap() = tz;

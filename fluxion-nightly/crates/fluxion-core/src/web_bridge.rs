@@ -405,6 +405,9 @@ pub struct PriceData {
 pub struct PriceBlockData {
     pub timestamp: DateTime<Utc>,
     pub price: f32,
+    /// Buy price the planner used (energy + HDO fee + operator fee; fixed price when not on spot)
+    #[serde(default)]
+    pub effective_buy_price: Option<f32>,
     pub block_type: String,           // "charge", "discharge", "self-use"
     pub target_soc: Option<f32>,      // Target SOC for charge/discharge blocks
     pub strategy: Option<String>,     // Strategy that chose this mode
@@ -768,6 +771,7 @@ fn build_dashboard_response(
                                     InverterOperationMode::ForceCharge => "charge",
                                     InverterOperationMode::ForceDischarge => "discharge",
                                     InverterOperationMode::SelfUse => "self-use",
+                                    InverterOperationMode::FeedinPriority => "feedin-priority",
                                     InverterOperationMode::BackUpMode => "backup",
                                     InverterOperationMode::NoChargeNoDischarge => {
                                         "no-charge-discharge"
@@ -782,6 +786,7 @@ fn build_dashboard_response(
                                     }
                                     InverterOperationMode::SelfUse
                                     | InverterOperationMode::BackUpMode
+                                    | InverterOperationMode::FeedinPriority
                                     | InverterOperationMode::NoChargeNoDischarge => None,
                                 };
                                 (
@@ -843,6 +848,7 @@ fn build_dashboard_response(
                         PriceBlockData {
                             timestamp: block.block_start,
                             price: block.price_czk_per_kwh,
+                            effective_buy_price: Some(block.effective_price_czk_per_kwh),
                             block_type,
                             target_soc,
                             strategy,
@@ -1024,6 +1030,18 @@ fn build_dashboard_response(
         pv_generation_history.is_some()
     );
 
+    let (display_timezone, timezone_source) = resolve_display_timezone(
+        timezone_config
+            .and_then(|tz| tz.timezone.as_deref())
+            .or(system_config.system_config.timezone.as_deref()),
+        system_config.system_config.display_timezone.as_deref(),
+    );
+    // Night detection and yesterday's PV use local time; UTC when no timezone is known
+    let prediction_timezone = display_timezone
+        .as_deref()
+        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::UTC);
+
     // Calculate battery SOC predictions based on schedule
     let battery_soc_prediction = schedule.single().ok().and_then(|sched| {
         // Get current battery SOC from first inverter
@@ -1032,19 +1050,50 @@ fn build_dashboard_response(
             .map(|inv| inv.battery_soc)
             .unwrap_or(50.0);
 
-        // Get current house load and PV power for accurate self-use predictions
+        // Get current house load and PV power (fallback only, near-term blocks)
         let house_load_w = inverter_data.first().and_then(|inv| inv.house_load_w);
         let pv_power_w = inverter_data.first().map(|inv| inv.pv_power_w);
 
+        // Per-block inputs: 7-day load profile, PV forecast and yesterday's PV history
+        let block_starts: Vec<DateTime<Utc>> = sched
+            .scheduled_blocks
+            .iter()
+            .map(|b| b.block_start)
+            .collect();
+        let solar_block_kwh =
+            crate::async_systems::solar_block_forecast(solar_forecast_data, &block_starts);
+        let pv_history_w: Vec<(DateTime<Utc>, f32)> = pv_generation_history
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| (p.timestamp, p.power_w))
+            .collect();
+        let hourly_load_profile_kwh = consumption_stats
+            .as_ref()
+            .and_then(|stats| stats.hourly_consumption_profile.as_deref());
+        let prediction_sources = crate::components::battery_predictor::PredictionSources {
+            now,
+            timezone: prediction_timezone,
+            hourly_load_profile_kwh,
+            solar_block_kwh: solar_block_kwh.as_deref(),
+            pv_history_w: &pv_history_w,
+            current_house_load_w: house_load_w,
+            current_pv_power_w: pv_power_w,
+            average_household_load_kw: system_config.control_config.average_household_load_kw,
+        };
+        let inputs = crate::components::battery_predictor::build_prediction_inputs(
+            sched,
+            &prediction_sources,
+        );
+
         // Generate prediction using configured charge/discharge rates
-        let prediction = crate::components::predict_battery_soc(
+        let prediction = crate::components::battery_predictor::predict_battery_soc_with_inputs(
             sched,
             &system_config.control_config,
             current_soc,
             Some(system_config.control_config.max_battery_charge_rate_kw), // Use configured charge rate
             Some(system_config.control_config.max_battery_charge_rate_kw), // Use same for discharge
-            house_load_w,
-            pv_power_w,
+            &inputs,
         );
 
         if prediction.is_empty() {
@@ -1148,13 +1197,6 @@ fn build_dashboard_response(
     if solar_forecast.is_none() {
         debug!("☀️ Solar forecast resource not available in ECS");
     }
-
-    let (display_timezone, timezone_source) = resolve_display_timezone(
-        timezone_config
-            .and_then(|tz| tz.timezone.as_deref())
-            .or(system_config.system_config.timezone.as_deref()),
-        system_config.system_config.display_timezone.as_deref(),
-    );
 
     WebQueryResponse {
         timestamp: now,

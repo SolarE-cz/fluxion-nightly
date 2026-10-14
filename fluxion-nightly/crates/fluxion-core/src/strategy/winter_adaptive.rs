@@ -1494,6 +1494,7 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
             }
             InverterOperationMode::SelfUse
             | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
             | InverterOperationMode::NoChargeNoDischarge => {
                 // Estimate profit based on usable battery capacity vs consumption
                 // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
@@ -1617,6 +1618,7 @@ mod tests {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         // Evaluate
@@ -1704,6 +1706,7 @@ mod tests {
             hourly_consumption_profile: None,
             block_forecasts: None,
             timezone: None,
+            user_levers: None,
         };
 
         // Evaluate

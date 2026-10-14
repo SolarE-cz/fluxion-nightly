@@ -92,6 +92,16 @@ impl HomeAssistantClient {
         Self::new(base_url, token)
     }
 
+    /// Base URL of the REST API, e.g. `http://supervisor/core`
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Long-lived access token (also used for the websocket API)
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     /// Get the state of a specific entity
     pub async fn get_state(&self, entity_id: &str) -> HaResult<HaEntityState> {
         let url = format!("{}/api/states/{}", self.base_url, entity_id);

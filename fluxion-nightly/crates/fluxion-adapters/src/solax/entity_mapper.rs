@@ -49,8 +49,25 @@ impl VendorEntityMapper for SolaxEntityMapper {
             // The manual_mode_select entity differentiates between them
             InverterOperationMode::ForceCharge => SolaxChargerUseMode::ManualMode,
             InverterOperationMode::ForceDischarge => SolaxChargerUseMode::ManualMode,
+            // Feed-in priority is a charger_use_mode of its own, no manual sub-mode
+            InverterOperationMode::FeedinPriority => SolaxChargerUseMode::FeedinPriority,
         };
         charger_mode.to_i32()
+    }
+
+    fn get_manual_mode_entity(&self, inverter_id: &str) -> Option<String> {
+        Some(format!("select.{inverter_id}_manual_mode_select"))
+    }
+
+    fn map_manual_sub_mode(&self, option: &str) -> Option<InverterOperationMode> {
+        // Same option strings as the writes (SolaxManualMode serde names)
+        let manual: SolaxManualMode =
+            serde_json::from_value(serde_json::Value::String(option.to_string())).ok()?;
+        Some(match manual {
+            SolaxManualMode::StopChargeAndDischarge => InverterOperationMode::NoChargeNoDischarge,
+            SolaxManualMode::ForceCharge => InverterOperationMode::ForceCharge,
+            SolaxManualMode::ForceDischarge => InverterOperationMode::ForceDischarge,
+        })
     }
 
     fn map_mode_from_vendor(&self, vendor_mode: i32) -> Option<InverterOperationMode> {
@@ -59,16 +76,15 @@ impl VendorEntityMapper for SolaxEntityMapper {
 
         match charger_mode {
             SolaxChargerUseMode::SelfUseMode => Some(InverterOperationMode::SelfUse),
+            // Read-back: hardware reporting Feedin Priority is recognised on initial sync
+            SolaxChargerUseMode::FeedinPriority => Some(InverterOperationMode::FeedinPriority),
             // Native Solax BackUpMode (value 2) maps directly to generic BackUpMode
             SolaxChargerUseMode::BackUpMode => Some(InverterOperationMode::BackUpMode),
-            // ManualMode can be NoChargeNoDischarge (stop charge/discharge), ForceCharge or ForceDischarge
-            // Future: Read manual_mode_select entity to determine actual mode
-            // Current behavior: Default to ForceCharge (safe assumption for most cases)
-            // Improvement would require reading select.{inverter_id}_manual_mode_select
-            // and mapping SolaxManualMode enum to the correct InverterOperationMode
+            // ManualMode can be NoChargeNoDischarge (stop charge/discharge), ForceCharge or ForceDischarge.
+            // The manual_mode_select entity tells them apart (see map_manual_sub_mode); without it
+            // ForceCharge is the ambiguous default.
             SolaxChargerUseMode::ManualMode => Some(InverterOperationMode::ForceCharge),
             // Other modes not mapped to generic modes
-            SolaxChargerUseMode::FeedinPriority => None,
             SolaxChargerUseMode::PeakShaving => None,
             SolaxChargerUseMode::SmartSchedule => None,
         }
@@ -98,6 +114,7 @@ impl VendorEntityMapper for SolaxEntityMapper {
             // Both ForceCharge and ForceDischarge use ManualMode
             InverterOperationMode::ForceCharge => SolaxChargerUseMode::ManualMode,
             InverterOperationMode::ForceDischarge => SolaxChargerUseMode::ManualMode,
+            InverterOperationMode::FeedinPriority => SolaxChargerUseMode::FeedinPriority,
         };
 
         // Step 2: Map to manual_mode_select (only needed for ManualMode-based modes)
@@ -109,8 +126,10 @@ impl VendorEntityMapper for SolaxEntityMapper {
             }
             InverterOperationMode::ForceCharge => Some(SolaxManualMode::ForceCharge),
             InverterOperationMode::ForceDischarge => Some(SolaxManualMode::ForceDischarge),
-            // SelfUse and BackUpMode don't use ManualMode, no manual_mode_select needed
-            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => None,
+            // SelfUse, BackUpMode and FeedinPriority don't use ManualMode, no manual_mode_select needed
+            InverterOperationMode::SelfUse
+            | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority => None,
         };
 
         // Build entity changes
@@ -406,6 +425,14 @@ impl VendorEntityMapper for SolaxUltraEntityMapper {
         SolaxEntityMapper::new().map_mode_from_vendor(vendor_mode)
     }
 
+    fn get_manual_mode_entity(&self, inverter_id: &str) -> Option<String> {
+        SolaxEntityMapper::new().get_manual_mode_entity(inverter_id)
+    }
+
+    fn map_manual_sub_mode(&self, option: &str) -> Option<InverterOperationMode> {
+        SolaxEntityMapper::new().map_manual_sub_mode(option)
+    }
+
     fn get_work_mode_entity(&self, inverter_id: &str) -> String {
         SolaxEntityMapper::new().get_work_mode_entity(inverter_id)
     }
@@ -675,8 +702,11 @@ mod tests {
             mapper.map_mode_from_vendor(3),
             Some(InverterOperationMode::ForceCharge)
         );
-        // Other modes not mapped
-        assert_eq!(mapper.map_mode_from_vendor(1), None); // FeedinPriority
+        // FeedinPriority (1) maps to generic FeedinPriority
+        assert_eq!(
+            mapper.map_mode_from_vendor(1),
+            Some(InverterOperationMode::FeedinPriority)
+        );
         // BackUpMode (2) maps directly to generic BackUpMode
         assert_eq!(
             mapper.map_mode_from_vendor(2),
@@ -820,6 +850,33 @@ mod tests {
         assert_eq!(
             mapper.get_battery_soc_entity("solax_inverter_1"),
             "sensor.solax_inverter_1_battery_capacity"
+        );
+    }
+}
+
+#[cfg(test)]
+mod manual_sub_mode_tests {
+    use super::*;
+
+    #[test]
+    fn manual_sub_mode_options_map_to_exact_modes() {
+        let mapper = SolaxEntityMapper::new();
+        assert_eq!(
+            mapper.map_manual_sub_mode("Force Charge"),
+            Some(InverterOperationMode::ForceCharge)
+        );
+        assert_eq!(
+            mapper.map_manual_sub_mode("Force Discharge"),
+            Some(InverterOperationMode::ForceDischarge)
+        );
+        assert_eq!(
+            mapper.map_manual_sub_mode("Stop Charge and Discharge"),
+            Some(InverterOperationMode::NoChargeNoDischarge)
+        );
+        assert_eq!(mapper.map_manual_sub_mode("unavailable"), None);
+        assert_eq!(
+            mapper.get_manual_mode_entity("my_solax").as_deref(),
+            Some("select.my_solax_manual_mode_select")
         );
     }
 }

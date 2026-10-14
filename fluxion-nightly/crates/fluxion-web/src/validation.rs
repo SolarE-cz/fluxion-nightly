@@ -165,6 +165,14 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
         });
     }
 
+    if !control.export_curtail_at_or_below_czk.is_finite() {
+        errors.push(ValidationIssue {
+            field: "control.export_curtail_at_or_below_czk".to_owned(),
+            message: "Export curtailment price must be a number".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
     // ============= Pricing Settings =============
     let pricing = &config.pricing_config;
 
