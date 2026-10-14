@@ -66,6 +66,7 @@ fn test_config_update_flow() {
         history: Default::default(),
         solar_forecast: Default::default(),
         remote_access: Default::default(),
+        notifications: Default::default(),
     };
 
     // Create config update channel
@@ -183,6 +184,7 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
         history: Default::default(),
         solar_forecast: Default::default(),
         remote_access: Default::default(),
+        notifications: Default::default(),
     };
 
     // Create config update channel

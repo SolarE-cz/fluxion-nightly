@@ -611,6 +611,18 @@ pub trait ConsumptionHistoryDataSource: Send + Sync {
         end_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<HistoryDataPoint>>;
 
+    /// Fetch history, with `minimal` requesting responses without attributes. Sources that
+    /// cannot reduce the response fall back to `get_history`.
+    async fn get_history_with(
+        &self,
+        entity_id: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
+        _minimal: bool,
+    ) -> Result<Vec<HistoryDataPoint>> {
+        self.get_history(entity_id, start_time, end_time).await
+    }
+
     /// Check if data source is available
     async fn health_check(&self) -> Result<bool>;
 

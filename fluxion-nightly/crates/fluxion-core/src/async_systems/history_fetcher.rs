@@ -15,7 +15,7 @@ use bevy_ecs::prelude::*;
 use futures_timer::Delay;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     async_tasks::*,
@@ -186,18 +186,37 @@ async fn fetch_consumption_history(
     let house_load_profile = match &config.house_load_power_entity {
         Some(entity) => {
             info!("   Fetching house load from: {}", entity);
-            let power_history = source
-                .get_history(
+            match source
+                .get_history_with(
                     entity,
                     now - chrono::Duration::days(HOUSE_LOAD_HISTORY_DAYS),
                     Some(now),
+                    true,
                 )
                 .await
-                .unwrap_or_else(|e| {
-                    error!("❌ Failed to fetch house load history: {e}");
-                    Vec::new()
-                });
-            crate::components::aggregate_hourly_house_load(&power_history)
+            {
+                Ok(power_history) => {
+                    let profile = crate::components::aggregate_hourly_house_load(&power_history);
+                    if profile.as_ref().is_none_or(|p| {
+                        p.days_averaged
+                            < crate::components::consumption_history::MIN_HOUSE_LOAD_DAYS
+                    }) {
+                        warn!(
+                            "House load history for {} has too little data for a profile ({} points), using the import profile instead",
+                            entity,
+                            power_history.len()
+                        );
+                    }
+                    profile
+                }
+                Err(e) => {
+                    warn!(
+                        "House load history for {} could not be fetched, using the import profile instead: {e}",
+                        entity
+                    );
+                    None
+                }
+            }
         }
         None => None,
     };

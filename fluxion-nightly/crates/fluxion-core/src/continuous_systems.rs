@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use fluxion_types::config::ControlConfig;
 use fluxion_types::{VprMode, VprPhase};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
@@ -151,6 +151,14 @@ fn soc_blocks_mode(mode: InverterOperationMode, soc: f32, control: &ControlConfi
         || (mode == InverterOperationMode::ForceDischarge && soc <= control.min_battery_soc)
 }
 
+/// Once-per-activation warnings of the schedule system (kept in one `Local` to stay within the
+/// Bevy system parameter limit).
+#[derive(Default)]
+pub struct ScheduleWarnings {
+    vpr_discharge: bool,
+    fixed_slots: BTreeSet<String>,
+}
+
 /// Defence in depth: ForceDischarge is never sent while `control.force_discharge_enabled` is false.
 /// The mode actually sent is returned (SelfUse instead of ForceDischarge).
 fn permitted_mode(
@@ -274,6 +282,13 @@ pub struct ExportLimitWatch {
     written: bool,
     /// True while curtailed (intended 0 W); a restore is watched only until it is confirmed
     curtailed: bool,
+    /// A restore was written and the read-back has not confirmed it yet
+    restore_pending: bool,
+    /// When the last write was sent (paces restore retries)
+    last_write_at: Option<DateTime<Utc>>,
+    /// Restore give-ups since the last confirmed restore or curtailment (the stored limit is
+    /// dropped after `MAX_RESTORE_GIVE_UPS`)
+    restore_give_ups: u32,
     /// Rewrites issued since the last write (stops after `MAX_EXPORT_REWRITES`)
     rewrites: u32,
     /// Already warned that this inverter is skipped (reset when curtailment is not wanted)
@@ -286,11 +301,16 @@ pub struct ExportLimitWatch {
 /// Rewrites of an export limit that the read-back does not confirm before watching stops.
 const MAX_EXPORT_REWRITES: u32 = 5;
 
+/// Restore give-ups before the stored pre-curtail limit is dropped (no endless restore cycle).
+const MAX_RESTORE_GIVE_UPS: u32 = 3;
+
 /// Outcome of one export limit read-back check.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reassert {
     Hold,
     Rewrite,
+    /// The read-back confirmed a restore: the stored limit is no longer needed
+    Confirmed,
     /// Not confirmed after `MAX_EXPORT_REWRITES` rewrites: watching stops (logged once)
     GiveUp,
 }
@@ -316,6 +336,7 @@ impl ExportLimitWatch {
             if !self.curtailed {
                 // Restore confirmed: stop watching so a later owner change is never overwritten
                 self.written = false;
+                return Reassert::Confirmed;
             }
             return Reassert::Hold;
         }
@@ -421,7 +442,7 @@ pub fn schedule_execution_system(
     mut kill_was_active: Local<bool>,
     mut lever_startup: Local<LeversStartup>,
     mut drift: Local<BTreeMap<String, ModeDriftWatch>>,
-    mut vpr_discharge_warned: Local<bool>,
+    mut warned: Local<ScheduleWarnings>,
 ) {
     let now = Utc::now();
     let force_discharge_enabled = system_config.control_config.force_discharge_enabled;
@@ -455,11 +476,11 @@ pub fn schedule_execution_system(
         .map(|(mode, reason)| {
             // VPR "Vybíjení baterie" is a Force Discharge: blocked while it is disabled
             if mode == InverterOperationMode::ForceDischarge && !force_discharge_enabled {
-                if !*vpr_discharge_warned {
+                if !warned.vpr_discharge {
                     warn!(
                         "VPR Vybíjení baterie blocked: force discharge disabled (control.force_discharge_enabled)"
                     );
-                    *vpr_discharge_warned = true;
+                    warned.vpr_discharge = true;
                 }
                 (InverterOperationMode::SelfUse, reason)
             } else {
@@ -467,7 +488,7 @@ pub fn schedule_execution_system(
             }
         });
     if vpr_override.is_none() {
-        *vpr_discharge_warned = false;
+        warned.vpr_discharge = false;
     }
     let vpr_exited = *vpr_was_active && vpr_override.is_none();
     *vpr_was_active = vpr_override.is_some();
@@ -606,17 +627,32 @@ pub fn schedule_execution_system(
                 if vpr_override.is_none()
                     && let Some(ref uc) = user_control
                     && let Some(fixed_slot) = uc.state.get_fixed_slot_at(now)
-                    && effective_mode.mode != fixed_slot.mode
                 {
-                    info!(
-                        "🔒 Fixed slot override active: {} -> {:?} (slot: {})",
-                        effective_mode.mode, fixed_slot.mode, fixed_slot.id
-                    );
-                    effective_mode.mode = fixed_slot.mode;
-                    effective_mode.reason = format!(
-                        "Fixed slot: {}",
-                        fixed_slot.note.as_deref().unwrap_or("User override")
-                    );
+                    // Force discharge is gated here too: a ForceDischarge slot runs as Self-Use
+                    let slot_mode = if fixed_slot.mode == InverterOperationMode::ForceDischarge
+                        && !force_discharge_enabled
+                    {
+                        if warned.fixed_slots.insert(fixed_slot.id.clone()) {
+                            warn!(
+                                "Fixed slot {} ForceDischarge blocked: force discharge disabled (control.force_discharge_enabled), running Self-Use",
+                                fixed_slot.id
+                            );
+                        }
+                        InverterOperationMode::SelfUse
+                    } else {
+                        fixed_slot.mode
+                    };
+                    if effective_mode.mode != slot_mode {
+                        info!(
+                            "🔒 Fixed slot override active: {} -> {:?} (slot: {})",
+                            effective_mode.mode, slot_mode, fixed_slot.id
+                        );
+                        effective_mode.mode = slot_mode;
+                        effective_mode.reason = format!(
+                            "Fixed slot: {}",
+                            fixed_slot.note.as_deref().unwrap_or("User override")
+                        );
+                    }
                 }
 
                 // Check if this scheduled mode applies to this inverter
@@ -921,7 +957,16 @@ pub fn export_curtailment_system(
             watch.skip_warned = false;
         }
 
-        if !curtail_wanted && let Some(restore_w) = export.restore_limits_w.remove(&inverter.id) {
+        // Restore: the stored limit stays until the read-back confirms it, so a refused write is
+        // retried and never lost. A restore is retried at most once a minute after a give-up.
+        let retry_due = watch
+            .last_write_at
+            .is_none_or(|t| now - t >= chrono::Duration::minutes(1));
+        if !curtail_wanted
+            && let Some(restore_w) = export.restore_limits_w.get(&inverter.id).copied()
+            && !watch.restore_pending
+            && (watch.curtailed || retry_due)
+        {
             // Restore to the exact limit read back before curtailing (clamped on write)
             let written_w = write_export_limit(
                 &async_writer,
@@ -931,38 +976,44 @@ pub fn export_curtailment_system(
                 &inverter.id,
                 restore_w,
             );
-            info!("✅ Export restored to {} W ({})", written_w, inverter.id);
+            info!("✅ Export restore sent: {} W ({})", written_w, inverter.id);
             watch.intended_w = written_w;
             watch.written = true;
             watch.curtailed = false;
+            watch.restore_pending = true;
+            watch.last_write_at = Some(now);
             watch.rewrites = 0;
-            changed = true;
-        } else if curtail_wanted && !export.restore_limits_w.contains_key(&inverter.id) {
-            // Curtail only from a known limit that is above the curtail target
-            let curtail_from = match read_back {
-                Some(limit_w) if limit_w > 0 && control.export_limit_min_w < limit_w => {
-                    Some(limit_w)
-                }
-                Some(limit_w) => {
-                    if !watch.skip_warned {
-                        warn!(
-                            "Export limit of {} is {} W, not above the curtail target {} W; not curtailing",
-                            inverter.id, limit_w, control.export_limit_min_w
-                        );
-                        watch.skip_warned = true;
+            watch.mismatched_reads = 0;
+        } else if curtail_wanted && !watch.curtailed {
+            // A stored limit (restore not yet confirmed) is the pre-curtail value to keep
+            let curtail_from = match export.restore_limits_w.get(&inverter.id).copied() {
+                Some(stored_w) => Some(stored_w),
+                None => match read_back {
+                    // Curtail only from a known limit that is above the curtail target
+                    Some(limit_w) if limit_w > 0 && control.export_limit_min_w < limit_w => {
+                        Some(limit_w)
                     }
-                    None
-                }
-                None => {
-                    if !watch.skip_warned {
-                        warn!(
-                            "Export limit of {} is unknown, not curtailing it (no restore value)",
-                            inverter.id
-                        );
-                        watch.skip_warned = true;
+                    Some(limit_w) => {
+                        if !watch.skip_warned {
+                            warn!(
+                                "Export limit of {} is {} W, not above the curtail target {} W; not curtailing",
+                                inverter.id, limit_w, control.export_limit_min_w
+                            );
+                            watch.skip_warned = true;
+                        }
+                        None
                     }
-                    None
-                }
+                    None => {
+                        if !watch.skip_warned {
+                            warn!(
+                                "Export limit of {} is unknown, not curtailing it (no restore value)",
+                                inverter.id
+                            );
+                            watch.skip_warned = true;
+                        }
+                        None
+                    }
+                },
             };
             if let Some(restore_w) = curtail_from {
                 info!(
@@ -985,7 +1036,10 @@ pub fn export_curtailment_system(
                 watch.intended_w = written_w;
                 watch.written = true;
                 watch.curtailed = true;
+                watch.restore_pending = false;
+                watch.restore_give_ups = 0;
                 watch.rewrites = 0;
+                watch.mismatched_reads = 0;
                 changed = true;
             }
         }
@@ -994,8 +1048,41 @@ pub fn export_curtailment_system(
         if !debug.enabled
             && let Some(raw) = raw_state
         {
-            match watch.observe(raw.last_updated, read_back, now) {
+            // A restore read back between the curtail target and the restore target is the
+            // owner's own limit: stop watching and drop the stored value
+            let owner_choice = read_back.filter(|&w| {
+                watch.written
+                    && !watch.curtailed
+                    && w > control.export_limit_min_w
+                    && w < watch.intended_w
+            });
+            let reassert = if let Some(owner_w) = owner_choice {
+                info!(
+                    "Export limit of {} reads {} W, below the restore target {} W: treating it as the owner's choice, not restoring",
+                    inverter.id, owner_w, watch.intended_w
+                );
+                watch.written = false;
+                watch.restore_pending = false;
+                watch.restore_give_ups = 0;
+                export.restore_limits_w.remove(&inverter.id);
+                changed = true;
+                Reassert::Hold
+            } else {
+                watch.observe(raw.last_updated, read_back, now)
+            };
+            match reassert {
                 Reassert::Hold => {}
+                Reassert::Confirmed => {
+                    if export.restore_limits_w.remove(&inverter.id).is_some() {
+                        info!(
+                            "✅ Export limit of {} confirmed at {:?} W",
+                            inverter.id, read_back
+                        );
+                        changed = true;
+                    }
+                    watch.restore_pending = false;
+                    watch.restore_give_ups = 0;
+                }
                 Reassert::Rewrite => {
                     warn!(
                         "⚠️ Export limit of {} reads {:?} W, expected {} W — rewriting",
@@ -1011,10 +1098,37 @@ pub fn export_curtailment_system(
                     );
                 }
                 Reassert::GiveUp => {
-                    warn!(
-                        "⚠️ Export limit of {} still reads {:?} W after {} rewrites (expected {} W), stopped watching",
-                        inverter.id, read_back, MAX_EXPORT_REWRITES, watch.intended_w
-                    );
+                    if watch.restore_pending {
+                        watch.restore_give_ups += 1;
+                        watch.restore_pending = false;
+                        watch.curtailed = false;
+                        if watch.restore_give_ups >= MAX_RESTORE_GIVE_UPS {
+                            // Stop the restore cycle: the stored value is dropped, the limit is left as read
+                            error!(
+                                "❌ Export restore of {} not confirmed after {} give-ups (reads {:?} W, expected {} W), dropping the stored limit {:?} W; the limit is left as the inverter reports it",
+                                inverter.id,
+                                watch.restore_give_ups,
+                                read_back,
+                                watch.intended_w,
+                                export.restore_limits_w.get(&inverter.id)
+                            );
+                            export.restore_limits_w.remove(&inverter.id);
+                            watch.restore_give_ups = 0;
+                            changed = true;
+                        } else {
+                            // The stored limit is kept; the restore is retried after a minute
+                            watch.last_write_at = Some(now);
+                            warn!(
+                                "⚠️ Export restore of {} not confirmed after {} rewrites (reads {:?} W, expected {} W), keeping it for retry",
+                                inverter.id, MAX_EXPORT_REWRITES, read_back, watch.intended_w
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "⚠️ Export limit of {} still reads {:?} W after {} rewrites (expected {} W), stopped watching",
+                            inverter.id, read_back, MAX_EXPORT_REWRITES, watch.intended_w
+                        );
+                    }
                 }
             }
         }
@@ -1383,6 +1497,7 @@ mod levers_execution_tests {
             history: Default::default(),
             solar_forecast: Default::default(),
             remote_access: Default::default(),
+            notifications: Default::default(),
         }
     }
 
@@ -1964,17 +2079,18 @@ mod levers_execution_tests {
             curtailed: false,
             ..Default::default()
         };
-        assert_eq!(watch.observe(t0, Some(8000), t0), Reassert::Hold);
+        // The first read already matches the restore value: confirmed once
+        assert_eq!(watch.observe(t0, Some(8000), t0), Reassert::Confirmed);
+        assert!(!watch.written);
+        // No further watching, so an owner's later change is left alone
         assert_eq!(
             watch.observe(t0 + Duration::seconds(5), Some(5000), t0),
             Reassert::Hold
         );
-        // Confirmed once: no further watching, so an owner's later change is left alone
         assert_eq!(
             watch.observe(t0 + Duration::seconds(10), Some(8000), t0),
             Reassert::Hold
         );
-        assert!(!watch.written);
         assert_eq!(
             watch.observe(t0 + Duration::seconds(15), Some(5000), t0),
             Reassert::Hold
@@ -2381,6 +2497,44 @@ mod levers_execution_tests {
         );
     }
 
+    #[tokio::test]
+    async fn fixed_slot_force_discharge_runs_as_selfuse_once_when_disabled() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::ForceCharge);
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .fixed_time_slots
+            .push(fluxion_types::FixedTimeSlot {
+                id: "slot1".to_string(),
+                from: now - Duration::hours(1),
+                to: now + Duration::hours(1),
+                mode: InverterOperationMode::ForceDischarge,
+                note: None,
+                created_at: now,
+            });
+
+        // Six 5-minute steps (30 simulated minutes): each step is past the mode-change debounce
+        for _ in 0..6 {
+            let past = Utc::now() - Duration::minutes(6);
+            let mut query = h.world.query::<&mut CurrentMode>();
+            for mut current in query.iter_mut(&mut h.world) {
+                current.set_at = past;
+            }
+            h.run();
+        }
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
     /// Export curtailment world: one inverter reading `read_back_w` (master or independent) and a
     /// sell price of `sell` in the current block.
     struct ExportHarness {
@@ -2491,6 +2645,29 @@ mod levers_execution_tests {
             }
         }
 
+        /// Simulates a minute passing between two rewrites of the export limit.
+        fn reset_rewrite_pacing(&mut self) {
+            if let Some(watch) = self
+                .world
+                .resource_mut::<ExportCurtailmentState>()
+                .limit_watch
+                .get_mut("inv1")
+            {
+                watch.last_rewrite_at = None;
+            }
+        }
+
+        fn set_last_write_at(&mut self, at: DateTime<Utc>) {
+            if let Some(watch) = self
+                .world
+                .resource_mut::<ExportCurtailmentState>()
+                .limit_watch
+                .get_mut("inv1")
+            {
+                watch.last_write_at = Some(at);
+            }
+        }
+
         fn set_control(&mut self, edit: impl FnOnce(&mut fluxion_types::ControlConfig)) {
             edit(&mut self.world.resource_mut::<SystemConfig>().control_config);
         }
@@ -2519,6 +2696,10 @@ mod levers_execution_tests {
             h.sent().await,
             vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
         );
+        // Kept until a fresh read-back confirms the restore
+        assert_eq!(restore_entry(&h), Some(8000));
+        h.set_read_back(Some(8000), Utc::now() + Duration::seconds(1));
+        h.run();
         assert_eq!(restore_entry(&h), None);
     }
 
@@ -2718,8 +2899,12 @@ mod levers_execution_tests {
             .insert("inv1".to_string(), 8000);
 
         h.run();
-
         assert_eq!(h.sent().await, vec![("inv1".to_string(), 8000)]);
+        // Kept until the read-back confirms the restore
+        assert_eq!(restore_entry(&h), Some(8000));
+
+        h.set_read_back(Some(8000), Utc::now() + Duration::seconds(1));
+        h.run();
         assert_eq!(restore_entry(&h), None);
     }
 
@@ -2732,6 +2917,132 @@ mod levers_execution_tests {
 
         assert!(h.sent().await.is_empty());
         assert_eq!(restore_entry(&h), None);
+    }
+
+    #[tokio::test]
+    async fn export_restore_is_kept_until_confirmed_and_retried_after_give_up() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        // Price positive again: the restore is sent, but the read-back stays at 0 W
+        h.set_sell(Some(1.0));
+        h.set_read_back(Some(0), now + Duration::seconds(1));
+        h.run();
+        assert_eq!(restore_entry(&h), Some(8000));
+
+        // Five rewrites, then the sixth unconfirmed pair gives up
+        for i in 0..6 {
+            h.reset_rewrite_pacing();
+            h.set_read_back(Some(0), now + Duration::seconds(2 + 2 * i));
+            h.run();
+            h.set_read_back(Some(0), now + Duration::seconds(3 + 2 * i));
+            h.run();
+        }
+        // Given up: the stored limit is kept and nothing is re-sent right away
+        assert_eq!(restore_entry(&h), Some(8000));
+        h.run();
+
+        // A minute later the restore is retried, still clamped and kept
+        h.set_last_write_at(now - Duration::minutes(2));
+        h.run();
+        assert_eq!(restore_entry(&h), Some(8000));
+
+        // 1 curtail + 1 restore + 5 rewrites + 1 retry
+        let mut expected = vec![("inv1".to_string(), 0)];
+        expected.extend(std::iter::repeat_n(("inv1".to_string(), 8000), 7));
+        assert_eq!(h.sent().await, expected);
+    }
+
+    #[tokio::test]
+    async fn export_restore_is_dropped_after_three_give_ups() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        // Price positive again: the restore is sent, but the read-back stays at 0 W
+        h.set_sell(Some(1.0));
+        let mut t = 1;
+        h.set_read_back(Some(0), now + Duration::seconds(t));
+        t += 1;
+        h.run();
+
+        for cycle in 1..=3 {
+            // Five rewrites, then the sixth unconfirmed pair gives up
+            for _ in 0..6 {
+                h.reset_rewrite_pacing();
+                h.set_read_back(Some(0), now + Duration::seconds(t));
+                t += 1;
+                h.run();
+                h.set_read_back(Some(0), now + Duration::seconds(t));
+                t += 1;
+                h.run();
+            }
+            if cycle < 3 {
+                // Kept for retry after a give-up, then restored again
+                assert_eq!(restore_entry(&h), Some(8000));
+                h.set_last_write_at(Utc::now() - Duration::minutes(2));
+                h.run();
+            }
+        }
+
+        // Third give-up: the stored value is dropped and nothing is re-sent
+        assert_eq!(restore_entry(&h), None);
+        h.run();
+        h.run();
+
+        // 1 curtail + 3 restores + 15 rewrites
+        let mut expected = vec![("inv1".to_string(), 0)];
+        expected.extend(std::iter::repeat_n(("inv1".to_string(), 8000), 18));
+        assert_eq!(h.sent().await, expected);
+    }
+
+    #[tokio::test]
+    async fn export_write_resets_mismatch_count_single_mismatch_does_not_rewrite() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        // Curtail write: the first read (8000 W) mismatches the 0 W target once
+        h.run();
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
+
+        // Restore write: the single mismatching read (0 W against 8000 W) must not rewrite
+        h.set_sell(Some(1.0));
+        h.set_read_back(Some(0), now + Duration::seconds(1));
+        h.run();
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
+        assert_eq!(restore_entry(&h), Some(8000));
+    }
+
+    #[tokio::test]
+    async fn export_read_back_below_restore_target_is_owner_choice() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
+        // Curtailed limit confirmed, so no stale mismatch carries into the restore
+        h.set_sell(Some(1.0));
+        h.set_read_back(Some(0), now + Duration::seconds(2));
+        h.run();
+        assert_eq!(restore_entry(&h), Some(8000));
+
+        // The owner sets 6000 W: between the curtail target (0 W) and the restore target (8000 W)
+        h.set_read_back(Some(6000), now + Duration::seconds(3));
+        h.run();
+        assert_eq!(restore_entry(&h), None);
+
+        // Stays put: no rewrite toward 8000 W
+        h.set_read_back(Some(6000), now + Duration::seconds(4));
+        h.run();
+        h.set_read_back(Some(6000), now + Duration::seconds(5));
+        h.run();
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
     }
 
     #[tokio::test]
@@ -2748,6 +3059,7 @@ mod levers_execution_tests {
         h.run();
         h.set_read_back(Some(8000), now + Duration::seconds(2));
         h.run();
+        assert_eq!(restore_entry(&h), None);
         // The owner sets 5000 W by hand: FluxION must not write
         h.set_read_back(Some(5000), now + Duration::seconds(3));
         h.run();

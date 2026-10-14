@@ -18,6 +18,10 @@ use serde_json::Value;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
 
+/// Timeout for history requests: a 7-day history with full state can take well over the 10 s
+/// default that applies to every other request
+const HISTORY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Home Assistant REST API client
 #[derive(Clone)]
 pub struct HomeAssistantClient {
@@ -241,6 +245,47 @@ impl HomeAssistantClient {
         }
     }
 
+    /// Write an entity state via `POST /api/states/{entity_id}`.
+    ///
+    /// Used to publish FluxION's own `sensor.fluxion_*` entities. Retries and auth
+    /// handling match `call_service`.
+    pub async fn set_state(&self, entity_id: &str, state: &str, attributes: Value) -> HaResult<()> {
+        let url = format!("{}/api/states/{}", self.base_url, entity_id);
+        let body = serde_json::json!({
+            "state": state,
+            "attributes": attributes,
+        });
+        debug!("   URL: {}", url);
+
+        let response = self
+            .retry_request(|| async {
+                self.client
+                    .post(&url)
+                    .bearer_auth(&self.token)
+                    .json(&body)
+                    .send()
+                    .await
+            })
+            .await?;
+
+        let status = response.status();
+        match status {
+            StatusCode::OK | StatusCode::CREATED => Ok(()),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                error!("❌ [HA STATE] Authentication failed for: {}", entity_id);
+                Err(HaError::AuthenticationFailed)
+            }
+            _status => {
+                let message = response.text().await.unwrap_or_default();
+                error!("❌ [HA STATE] Failed: {} (status: {})", entity_id, status);
+                Err(HaError::ApiError {
+                    status: status.as_u16(),
+                    message,
+                })
+            }
+        }
+    }
+
     /// Health check - ping HA API
     pub async fn ping(&self) -> HaResult<bool> {
         let url = format!("{}/api/", self.base_url);
@@ -334,27 +379,40 @@ impl HomeAssistantClient {
         start_time: DateTime<Utc>,
         end_time: Option<DateTime<Utc>>,
     ) -> HaResult<Vec<HistoryDataPoint>> {
+        self.get_history_with(entity_id, start_time, end_time, false)
+            .await
+    }
+
+    /// Get historical data, with `minimal` requesting responses without attributes (only the
+    /// state and last_updated are read, so this is much smaller for long ranges)
+    pub async fn get_history_with(
+        &self,
+        entity_id: &str,
+        start_time: DateTime<Utc>,
+        end_time: Option<DateTime<Utc>>,
+        minimal: bool,
+    ) -> HaResult<Vec<HistoryDataPoint>> {
         let end = end_time.unwrap_or_else(Utc::now);
 
         // HA history API expects ISO 8601 timestamps
-        // Format: /api/history/period/{start}?filter_entity_id={entity}&end_time={end}
         let start_str = start_time.to_rfc3339();
         let end_str = end.to_rfc3339();
 
-        // URL-encode the end_time parameter since it contains special characters
-        let end_encoded = urlencoding::encode(&end_str);
-
-        let url = format!(
-            "{}/api/history/period/{}?filter_entity_id={}&end_time={}",
-            self.base_url, start_str, entity_id, end_encoded
-        );
+        let url = history_url(&self.base_url, entity_id, &start_str, &end_str, minimal);
 
         debug!("📊 [HA HISTORY] Fetching history for: {}", entity_id);
         debug!("   Time range: {} to {}", start_str, end_str);
         debug!("   URL: {}", url);
 
         let response = self
-            .retry_request(|| async { self.client.get(&url).bearer_auth(&self.token).send().await })
+            .retry_request(|| async {
+                self.client
+                    .get(&url)
+                    .bearer_auth(&self.token)
+                    .timeout(HISTORY_TIMEOUT)
+                    .send()
+                    .await
+            })
             .await?;
 
         match response.status() {
@@ -368,26 +426,7 @@ impl HomeAssistantClient {
                 }
 
                 // Take the first array (should be the only one since we filtered by entity_id)
-                let entity_history = &history[0];
-
-                // Parse into data points
-                let mut data_points = Vec::new();
-                for state in entity_history {
-                    // Try to parse the state as a float
-                    if let Ok(value) = state.state.parse::<f32>() {
-                        // Parse the timestamp
-                        if let Ok(timestamp) = DateTime::parse_from_rfc3339(&state.last_updated) {
-                            data_points.push(HistoryDataPoint {
-                                timestamp: timestamp.with_timezone(&Utc),
-                                value,
-                            });
-                        } else {
-                            trace!("Could not parse timestamp: {}", state.last_updated);
-                        }
-                    } else {
-                        trace!("Skipping non-numeric state: {}", state.state);
-                    }
-                }
+                let data_points = parse_history_states(&history[0]);
 
                 info!(
                     "✅ [HA HISTORY] Retrieved {} data points for {}",
@@ -452,11 +491,135 @@ impl HomeAssistantClient {
     }
 }
 
+/// Converts HA history states into numeric data points. The timestamp is `last_updated` when HA
+/// sent it, otherwise `last_changed` (minimal responses omit `last_updated`).
+fn parse_history_states(states: &[HaHistoryState]) -> Vec<HistoryDataPoint> {
+    let mut data_points = Vec::new();
+    for state in states {
+        // Try to parse the state as a float
+        if let Ok(value) = state.state.parse::<f32>() {
+            let raw_timestamp = state.last_updated.as_deref().unwrap_or(&state.last_changed);
+            // Parse the timestamp
+            if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw_timestamp) {
+                data_points.push(HistoryDataPoint {
+                    timestamp: timestamp.with_timezone(&Utc),
+                    value,
+                });
+            } else {
+                trace!("Could not parse timestamp: {}", raw_timestamp);
+            }
+        } else {
+            trace!("Skipping non-numeric state: {}", state.state);
+        }
+    }
+    data_points
+}
+
+/// Builds the HA history URL: `/api/history/period/{start}` filtered by entity and end time.
+/// `minimal` adds `minimal_response&no_attributes`.
+fn history_url(
+    base_url: &str,
+    entity_id: &str,
+    start_str: &str,
+    end_str: &str,
+    minimal: bool,
+) -> String {
+    // URL-encode the end_time parameter since it contains special characters
+    let end_encoded = urlencoding::encode(end_str);
+    let mut url = format!(
+        "{}/api/history/period/{}?filter_entity_id={}&end_time={}",
+        base_url, start_str, entity_id, end_encoded
+    );
+    if minimal {
+        url.push_str("&minimal_response&no_attributes");
+    }
+    url
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
     use serde_json::json;
+
+    #[test]
+    fn history_url_adds_minimal_params_only_when_requested() {
+        let base = "http://ha.local:8123";
+        let start = "2026-10-07T00:00:00+00:00";
+        let end = "2026-10-14T00:00:00+00:00";
+
+        let full = history_url(base, "sensor.house_load", start, end, false);
+        assert_eq!(
+            full,
+            "http://ha.local:8123/api/history/period/2026-10-07T00:00:00+00:00?filter_entity_id=sensor.house_load&end_time=2026-10-14T00%3A00%3A00%2B00%3A00"
+        );
+        assert!(!full.contains("minimal_response"));
+        assert!(!full.contains("no_attributes"));
+
+        let minimal = history_url(base, "sensor.house_load", start, end, true);
+        assert_eq!(
+            minimal,
+            "http://ha.local:8123/api/history/period/2026-10-07T00:00:00+00:00?filter_entity_id=sensor.house_load&end_time=2026-10-14T00%3A00%3A00%2B00%3A00&minimal_response&no_attributes"
+        );
+    }
+
+    #[test]
+    fn parses_real_minimal_response_body() {
+        // Shape HA returns with minimal_response&no_attributes: only the first state is a full object
+        let body = r#"[[{"entity_id":"sensor.solax_house_load","state":"512","attributes":{},"last_changed":"2026-10-14T10:00:00+00:00","last_updated":"2026-10-14T10:00:00+00:00"},{"state":"640","last_changed":"2026-10-14T10:00:12+00:00"},{"state":"700","last_changed":"2026-10-14T10:00:24+00:00"}]]"#;
+        let history: Vec<Vec<HaHistoryState>> = serde_json::from_str(body).unwrap();
+
+        let points = parse_history_states(&history[0]);
+
+        assert_eq!(points.len(), 3);
+        assert_eq!(points[0].value, 512.0);
+        assert_eq!(
+            points[0].timestamp.to_rfc3339(),
+            "2026-10-14T10:00:00+00:00"
+        );
+        assert_eq!(points[1].value, 640.0);
+        assert_eq!(
+            points[1].timestamp.to_rfc3339(),
+            "2026-10-14T10:00:12+00:00"
+        );
+        assert_eq!(points[2].value, 700.0);
+        assert_eq!(
+            points[2].timestamp.to_rfc3339(),
+            "2026-10-14T10:00:24+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_history_with_minimal_parses_minimal_response() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("GET", Matcher::Regex(r"^/api/history/period/".to_string()))
+            .match_query(Matcher::Regex(
+                r"filter_entity_id=sensor\.solax_house_load&end_time=[^&]+&minimal_response&no_attributes$"
+                    .to_string(),
+            ))
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[[{"entity_id":"sensor.solax_house_load","state":"512","attributes":{},"last_changed":"2026-10-14T10:00:00+00:00","last_updated":"2026-10-14T10:00:00+00:00"},{"state":"640","last_changed":"2026-10-14T10:00:12+00:00"},{"state":"700","last_changed":"2026-10-14T10:00:24+00:00"}]]"#)
+            .create_async()
+            .await;
+
+        let client = HomeAssistantClient::new(server.url(), "test_token").unwrap();
+        let start: DateTime<Utc> = "2026-10-07T00:00:00Z".parse().unwrap();
+        let end: DateTime<Utc> = "2026-10-14T00:00:00Z".parse().unwrap();
+        let points = client
+            .get_history_with("sensor.solax_house_load", start, Some(end), true)
+            .await
+            .unwrap();
+
+        assert_eq!(points.len(), 3);
+        assert_eq!(
+            points[2].timestamp.to_rfc3339(),
+            "2026-10-14T10:00:24+00:00"
+        );
+        mock.assert_async().await;
+    }
 
     #[tokio::test]
     async fn test_get_state_success() {
@@ -523,6 +686,33 @@ mod tests {
             .call_service(
                 "select.select_option",
                 json!({"entity_id": "select.test", "option": "value"}),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_set_state_posts_state_and_attributes() {
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/api/states/sensor.fluxion_aktivni_pracovni_rezim")
+            .match_header("authorization", "Bearer test_token")
+            .match_body(Matcher::Json(json!({
+                "state": "Běžný režim",
+                "attributes": {"source": "plan", "icon": "mdi:home-battery"}
+            })))
+            .with_status(201)
+            .create_async()
+            .await;
+
+        let client = HomeAssistantClient::new(server.url(), "test_token").unwrap();
+        let result = client
+            .set_state(
+                "sensor.fluxion_aktivni_pracovni_rezim",
+                "Běžný režim",
+                json!({"source": "plan", "icon": "mdi:home-battery"}),
             )
             .await;
 

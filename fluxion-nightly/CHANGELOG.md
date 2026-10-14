@@ -10,6 +10,33 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.45] - 2026-10-14
+
+### Added
+
+- **Node-RED dashboard entities.** FluxION publishes `sensor.fluxion_pv_work_mode_plan` (same
+  attributes as Node-RED's `sensor.pv_work_mode_plan`: `date`, `blocks`, `prices`, `price_stats`),
+  `sensor.fluxion_aktivni_pracovni_rezim` and `sensor.fluxion_prum_nocni_vyuziti_baterie`.
+  Dashboard cards only need their entity ids changed. `prices` covers today.
+- **Inverter lock guard (SolaX).** When `select.<id>_lock_state` reads "Locked", FluxION creates
+  one persistent notification; with `control.auto_unlock_inverter: true` (default off) it selects
+  "Unlocked" once, never in debug mode.
+- **Daily plan notification** at 00:15 with `notifications.daily_plan: true` (default off).
+
+### Fixed
+
+- **House-load profile now actually loads.** The 7-day history request timed out after 10 s; it
+  now uses a minimal response with a 60 s timeout. A fallback to the import profile logs a warning
+  with the reason.
+- **Profile robustness.** Hours with no data take their neighbours' average instead of 0; the 75th
+  percentile is capped at 1.5× the mean so a few EV-charging days don't make the planner hold all
+  day.
+- A blocked Force Discharge fixed slot no longer resends Self Use every 5 minutes.
+- Enabling force discharge no longer blocks saving the configuration (it is a warning).
+- An export-limit restore is kept until confirmed, gives up after three rounds, and respects a
+  lower limit set by the owner.
+- Lever migration after an HA restart no longer skips untouched helpers.
+
 ## [0.2.44] - 2026-10-14
 
 ### Fixed

@@ -60,6 +60,18 @@ pub struct AppConfig {
     /// User levers (HA helpers) configuration
     #[serde(default)]
     pub levers: LeversConfig,
+
+    /// Persistent notifications configuration
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+/// Persistent notifications created by FluxION in Home Assistant
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Create a notification with today's plan at 00:15 local. Default: false
+    pub daily_plan: bool,
 }
 
 /// Legacy FluxION levers: FluxION creates and polls the FVE-Automatizace helpers
@@ -253,6 +265,11 @@ pub struct ControlConfig {
     /// per-site export limit exists. Default: false
     #[serde(default)]
     pub force_discharge_enabled: bool,
+
+    /// SolaX only: select "Unlocked" once per lock event when the inverter reads "Locked"
+    /// (never in debug mode). Default: false (notify only)
+    #[serde(default)]
+    pub auto_unlock_inverter: bool,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -1514,6 +1531,7 @@ impl Default for AppConfig {
                 export_limit_hard_cap_w: None,
                 export_limit_min_w: default_export_limit_min_w(),
                 force_discharge_enabled: false,
+                auto_unlock_inverter: false,
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -1532,6 +1550,7 @@ impl Default for AppConfig {
             remote_access: RemoteAccessConfig::default(),
             server_heartbeat: ServerHeartbeatConfig::default(),
             levers: LeversConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -2070,6 +2089,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 export_limit_hard_cap_w: app_config.control.export_limit_hard_cap_w,
                 export_limit_min_w: app_config.control.export_limit_min_w,
                 force_discharge_enabled: app_config.control.force_discharge_enabled,
+                auto_unlock_inverter: app_config.control.auto_unlock_inverter,
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,
@@ -2637,6 +2657,9 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
             },
             remote_access: fluxion_core::RemoteAccessConfigCore {
                 enabled: app_config.remote_access.enabled,
+            },
+            notifications: fluxion_core::NotificationsConfigCore {
+                daily_plan: app_config.notifications.daily_plan,
             },
         }
     }

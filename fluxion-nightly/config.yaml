@@ -21,6 +21,7 @@ name: FluxION ECS (Nightly)
 options:
   auto_update: false
   control:
+    auto_unlock_inverter: false
     average_household_load_kw: 0.5
     battery_capacity_kwh: 23.0
     export_curtail_at_or_below_czk: 0.0
@@ -42,6 +43,8 @@ options:
     vendor: solax
   levers:
     enabled: true
+  notifications:
+    daily_plan: false
   pricing:
     fixed_buy_prices: []
     fixed_sell_prices: []
@@ -202,6 +205,7 @@ panel_icon: mdi:solar-power
 schema:
   auto_update: bool?
   control:
+    auto_unlock_inverter: bool?
     average_household_load_kw: float(0,)?
     battery_capacity_kwh: float(0,)?
     export_curtail_at_or_below_czk: float?
@@ -228,6 +232,8 @@ schema:
     vendor: list(solax|solax-ultra)?
   levers:
     enabled: bool?
+  notifications:
+    daily_plan: bool?
   pricing:
     fixed_buy_prices:
     - float?
@@ -436,4 +442,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.44
+version: 0.2.45

@@ -105,6 +105,8 @@ impl Plugin for HaPlugin {
             .add_message::<HaSelectWrite>()
             .init_resource::<fluxion_core::resources::UserLeversResource>()
             .init_resource::<levers::LeversChannel>()
+            .init_resource::<super::dashboard_entities::DashboardChannels>()
+            .init_resource::<super::dashboard_entities::DashboardState>()
             .insert_resource(levers::LeversSyncConfig::default())
             .add_systems(Startup, ha_init_config_system)
             // Use PostStartup for fetchers that depend on resources created via Commands
@@ -123,7 +125,17 @@ impl Plugin for HaPlugin {
             .add_systems(Update, poll_backup_soc_channel)
             .add_systems(Update, poll_hdo_channel)
             .add_systems(Update, levers::poll_levers_channel)
-            .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel);
+            .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel)
+            .add_systems(
+                Update,
+                (
+                    super::dashboard_entities::publish_dashboard_entities_system,
+                    super::dashboard_entities::night_usage_system,
+                    super::dashboard_entities::poll_lock_state_system,
+                    super::dashboard_entities::lock_guard_system,
+                    super::dashboard_entities::daily_plan_notification_system,
+                ),
+            );
     }
 }
 

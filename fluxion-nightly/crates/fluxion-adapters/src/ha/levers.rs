@@ -798,23 +798,20 @@ pub enum SourceDecision<'a> {
     TimedOutDefault,
 }
 
-/// The owner changed a created helper before its migration ran. The value differs from what it was
-/// created with, or it changed more than a minute after creation. Time helpers have no value in
-/// their create payload, so only the time of the change counts for them.
-pub fn user_edited(spec: &HelperSpec, state: &HaEntityState, created_at: DateTime<Utc>) -> bool {
+/// The owner changed a created helper before its migration ran: its value differs from the value it
+/// was created with. `last_changed` is not used: HA resets it on restart. Time helpers have no value
+/// in their create payload, so midnight stands for "untouched".
+pub fn user_edited(spec: &HelperSpec, state: &HaEntityState) -> bool {
     if !usable(state) {
         return false;
     }
-    let value_changed = match spec.kind {
+    match spec.kind {
         // Created with HA's default: the first option, the minimum, off.
         HelperKind::Select => state.state != VprMode::OPTIONS[0],
         HelperKind::Number { min, .. } => parse_number(&state.state) != Some(min),
         HelperKind::Switch => state.state != "off",
-        HelperKind::Time => false,
-    };
-    let changed_later = parse_last_changed(&state.last_changed)
-        .is_some_and(|at| at > created_at + TimeDelta::seconds(60));
-    value_changed || changed_later
+        HelperKind::Time => parse_ha_time(&state.state) != Some(NaiveTime::MIN),
+    }
 }
 
 /// Decide the migration source. An entity that is absent from HA is a fresh site without
@@ -861,7 +858,7 @@ async fn migrate_pending(client: &HomeAssistantClient, setup: &mut HelperSetup) 
         // Checked before any write, including the 24 h default: a helper the owner set by hand keeps
         // its value.
         let current = states.iter().find(|s| s.entity_id == entity_id);
-        if current.is_some_and(|state| user_edited(&spec, state, created_at)) {
+        if current.is_some_and(|state| user_edited(&spec, state)) {
             info!(
                 "🎛️ {} was changed by the user — migration skipped",
                 spec.name
@@ -1785,7 +1782,7 @@ mod tests {
         let source = state("number.x", "60.0", "2026-10-14T09:00:00+00:00");
         // Owner set 4 on the helper before the source was usable.
         let edited = state("input_number.h", "4.0", "2026-10-14T10:30:00+00:00");
-        assert!(user_edited(&HELPERS[4], &edited, created));
+        assert!(user_edited(&HELPERS[4], &edited));
         // The copy would have been written here; the gate stops it before decide_source.
         assert_eq!(
             decide_source(Some(&source), created, now),
@@ -1803,7 +1800,7 @@ mod tests {
             SourceDecision::TimedOutDefault
         );
         let edited = state("input_number.h", "4.0", "2026-10-14T20:00:00+00:00");
-        assert!(user_edited(&HELPERS[4], &edited, created));
+        assert!(user_edited(&HELPERS[4], &edited));
     }
 
     #[test]
@@ -1811,9 +1808,9 @@ mod tests {
         let created: DateTime<Utc> = "2026-10-14T10:00:00Z".parse().unwrap();
         // Created at the minimum (0 h) and never changed.
         let untouched = state("input_number.h", "0.0", "2026-10-14T10:00:00+00:00");
-        assert!(!user_edited(&HELPERS[4], &untouched, created));
+        assert!(!user_edited(&HELPERS[4], &untouched));
         let untouched_select = state("input_select.v", "Žádný", "2026-10-14T10:00:00+00:00");
-        assert!(!user_edited(&HELPERS[0], &untouched_select, created));
+        assert!(!user_edited(&HELPERS[0], &untouched_select));
         // Copy path and 24 h default path both still write for an untouched helper.
         let source = state("number.x", "60.0", "2026-10-14T09:00:00+00:00");
         assert_eq!(
@@ -1828,28 +1825,46 @@ mod tests {
     }
 
     #[test]
-    fn user_edited_by_value_or_late_change() {
+    fn ha_restart_does_not_make_untouched_helper_user_edited() {
+        // HA restarted long after creation: last_changed is the restart time, the value untouched.
         let created: DateTime<Utc> = "2026-10-14T10:00:00Z".parse().unwrap();
-        // A select moved off Žádný is an edit even if the change is recent.
+        let restarted = "2026-10-14T18:00:00+00:00";
+        for (spec, value) in [
+            (&HELPERS[4], "0.0"),
+            (&HELPERS[0], "Žádný"),
+            (&HELPERS[1], "00:00:00"),
+            (&HELPERS[3], "off"),
+        ] {
+            let st = state("input_x.h", value, restarted);
+            assert!(!user_edited(spec, &st), "{}", spec.name);
+        }
+        // The Node-RED copy still runs for it.
+        let source = state("number.x", "60.0", "2026-10-14T09:00:00+00:00");
+        assert_eq!(
+            decide_source(Some(&source), created, created + TimeDelta::hours(8)),
+            SourceDecision::Value("60.0")
+        );
+    }
+
+    #[test]
+    fn user_edited_by_value() {
+        // A select moved off Žádný is an edit.
         let select = state(
             "input_select.v",
             "Prodej do sítě",
             "2026-10-14T10:00:10+00:00",
         );
-        assert!(user_edited(&HELPERS[0], &select, created));
-        // Same value, but changed well after creation.
-        let late = state("input_number.h", "0.0", "2026-10-14T10:05:00+00:00");
-        assert!(user_edited(&HELPERS[4], &late, created));
-        // Within the first minute is still creation.
-        let early = state("input_number.h", "0.0", "2026-10-14T10:00:59+00:00");
-        assert!(!user_edited(&HELPERS[4], &early, created));
-        // Time helper: the value is not compared, only the change time.
-        let time_late = state("input_datetime.t", "15:00:00", "2026-10-14T11:00:00+00:00");
-        assert!(user_edited(&HELPERS[1], &time_late, created));
-        let time_early = state("input_datetime.t", "15:00:00", "2026-10-14T10:00:00+00:00");
-        assert!(!user_edited(&HELPERS[1], &time_early, created));
+        assert!(user_edited(&HELPERS[0], &select));
+        // A number moved off its minimum is an edit, whenever it changed.
+        let number = state("input_number.h", "3.0", "2026-10-14T10:00:10+00:00");
+        assert!(user_edited(&HELPERS[4], &number));
+        // Time helper: midnight is untouched, any other time is an edit.
+        let time_set = state("input_datetime.t", "15:00:00", "2026-10-14T11:00:00+00:00");
+        assert!(user_edited(&HELPERS[1], &time_set));
+        let time_midnight = state("input_datetime.t", "00:00:00", "2026-10-14T11:00:00+00:00");
+        assert!(!user_edited(&HELPERS[1], &time_midnight));
         // An unavailable helper cannot be judged: not treated as edited.
         let gone = state("input_number.h", "unavailable", "2026-10-14T12:00:00+00:00");
-        assert!(!user_edited(&HELPERS[4], &gone, created));
+        assert!(!user_edited(&HELPERS[4], &gone));
     }
 }

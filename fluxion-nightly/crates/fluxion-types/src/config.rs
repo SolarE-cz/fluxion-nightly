@@ -37,6 +37,8 @@ pub struct SystemConfig {
     pub solar_forecast: SolarForecastConfigCore,
     #[serde(default, rename = "remote_access")]
     pub remote_access: RemoteAccessConfigCore,
+    #[serde(default, rename = "notifications")]
+    pub notifications: NotificationsConfigCore,
 }
 
 /// Configuration for a single inverter
@@ -218,6 +220,11 @@ pub struct ControlConfig {
     /// limit exists: a SolaX Force Discharge runs at full battery power. Default: false
     #[serde(default)]
     pub force_discharge_enabled: bool,
+
+    /// SolaX only: when the inverter lock state reads "Locked", select "Unlocked" once per
+    /// lock event (never in debug mode). Default: false (notify only)
+    #[serde(default)]
+    pub auto_unlock_inverter: bool,
 }
 
 // Default value functions for serde
@@ -305,6 +312,7 @@ impl Default for ControlConfig {
             export_limit_hard_cap_w: None,
             export_limit_min_w: 0,
             force_discharge_enabled: false,
+            auto_unlock_inverter: false,
         }
     }
 }
@@ -1474,6 +1482,14 @@ impl Default for WinterAdaptiveV20ConfigCore {
 #[serde(default)]
 pub struct RemoteAccessConfigCore {
     pub enabled: bool,
+}
+
+/// Persistent-notification options (Home Assistant notifications created by FluxION)
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfigCore {
+    /// Create a persistent notification with today's plan at 00:15 local. Default: false
+    pub daily_plan: bool,
 }
 
 // ============================================================================

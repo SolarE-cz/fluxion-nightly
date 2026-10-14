@@ -875,9 +875,20 @@ impl fluxion_core::traits::ConsumptionHistoryDataSource for HaConsumptionHistory
         start_time: chrono::DateTime<chrono::Utc>,
         end_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<fluxion_core::traits::HistoryDataPoint>> {
+        self.get_history_with(entity_id, start_time, end_time, false)
+            .await
+    }
+
+    async fn get_history_with(
+        &self,
+        entity_id: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
+        minimal: bool,
+    ) -> Result<Vec<fluxion_core::traits::HistoryDataPoint>> {
         let ha_history = self
             .client
-            .get_history(entity_id, start_time, end_time)
+            .get_history_with(entity_id, start_time, end_time, minimal)
             .await
             .context("Failed to fetch history from HA")?;
 

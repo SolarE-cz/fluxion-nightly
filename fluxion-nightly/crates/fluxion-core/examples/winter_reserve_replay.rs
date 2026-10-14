@@ -27,19 +27,19 @@
 
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
+use fluxion_core::components::{
+    HourlyConsumptionProfile, aggregate_hourly_house_load, pick_hourly_profile,
+};
 use fluxion_core::strategy::winter_reserve::{
     BatteryParams, PlanBlock, PlanMode, WinterReserveParams, plan, simulate_block,
 };
+use fluxion_core::traits::HistoryDataPoint;
+use fluxion_types::ControlConfig;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::process::ExitCode;
-
-/// Planner load margin of the house-load profile (`control.planner_load_margin` default)
-const PLANNER_LOAD_MARGIN: f32 = 1.10;
-/// Days of house-load data before the house-load profile replaces the import one
-const MIN_HOUSE_LOAD_DAYS: usize = 3;
 
 /// Which load forecast the planner sees.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -50,14 +50,6 @@ enum ProfileSource {
     Import,
     /// Hourly UTC profile of house load: max(mean, p75) times the planner margin
     House,
-}
-
-/// Hourly UTC load profile (kWh per hour) built from the 7 local days before a decision day.
-struct HourlyLoad {
-    mean: [f32; 24],
-    p75: [f32; 24],
-    /// Days with at least one full UTC hour of data
-    days: usize,
 }
 
 #[derive(Deserialize)]
@@ -85,50 +77,66 @@ struct Block {
     export_kwh: Option<f32>,
 }
 
-/// Linear-interpolated percentile `q` of a non-empty slice. Sorts the slice.
-fn percentile(values: &mut [f32], q: f32) -> f32 {
-    values.sort_by(f32::total_cmp);
-    let pos = q * (values.len() - 1) as f32;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    values[lo] + (values[hi] - values[lo]) * (pos - lo as f32)
+/// The hourly profile the live fetcher builds on `day` from the 7 local days before it, with the
+/// shared functions. House load: `pick_hourly_profile` of the house-load profile and the import one.
+/// `Import`: the import profile without p75, as the old source had (mean only).
+fn live_load_profile(
+    rows: &[Row],
+    day: NaiveDate,
+    source: ProfileSource,
+) -> Option<HourlyConsumptionProfile> {
+    if source == ProfileSource::Forecast {
+        return None;
+    }
+    let window_start = day - Duration::days(7);
+    // Each block is one sample at its start: its mean power in W (kWh per 15 min x 4000). The
+    // sample holds until the next block, so the time-weighted hourly mean equals kWh/h. The first
+    // block of `day` closes the last block before it.
+    let samples = |value: fn(&Row) -> f32| -> Vec<HistoryDataPoint> {
+        let mut points: Vec<HistoryDataPoint> = rows
+            .iter()
+            .filter(|r| {
+                let d = r.local.date_naive();
+                d >= window_start && d < day
+            })
+            .map(|r| HistoryDataPoint {
+                timestamp: r.start,
+                value: value(r) * 4000.0,
+            })
+            .collect();
+        if let Some(first) = rows.iter().find(|r| r.local.date_naive() == day) {
+            points.push(HistoryDataPoint {
+                timestamp: first.start,
+                value: value(first) * 4000.0,
+            });
+        }
+        points
+    };
+    let import = aggregate_hourly_house_load(&samples(|r| r.import)).map(|mut p| {
+        p.hourly_p75_kwh = None;
+        p
+    });
+    match source {
+        ProfileSource::House => {
+            let house = aggregate_hourly_house_load(&samples(|r| r.load));
+            pick_hourly_profile(house, import)
+        }
+        _ => import,
+    }
 }
 
-/// Builds the hourly UTC profile of `value` (kWh per block) from the 7 local days before
-/// `decision_day`. Only full UTC hours (4 blocks) count, as the live fetcher works on hours.
-fn hourly_load(rows: &[Row], decision_day: NaiveDate, value: fn(&Row) -> f32) -> HourlyLoad {
-    let mut hours: BTreeMap<(NaiveDate, u32), (f32, u32)> = BTreeMap::new();
-    for row in rows {
-        let day = row.local.date_naive();
-        if day >= decision_day || day < decision_day - Duration::days(7) {
-            continue;
-        }
-        let entry = hours
-            .entry((row.start.date_naive(), row.start.hour()))
-            .or_insert((0.0, 0));
-        entry.0 += value(row);
-        entry.1 += 1;
+/// Load of one planned block (kWh), as the live planner computes it from the profile: with p75,
+/// max(mean, p75) times the planner margin; otherwise mean times the safety factor.
+fn planner_block_load(
+    profile: &HourlyConsumptionProfile,
+    hour: usize,
+    load_safety_factor: f32,
+    planner_load_margin: f32,
+) -> f32 {
+    match profile.hourly_p75_kwh {
+        Some(p75) => profile.hourly_avg_kwh[hour].max(p75[hour]) * 0.25 * planner_load_margin,
+        None => profile.hourly_avg_kwh[hour] * 0.25 * load_safety_factor,
     }
-    let mut per_day: BTreeMap<NaiveDate, [Option<f32>; 24]> = BTreeMap::new();
-    for ((day, hour), (kwh, blocks)) in hours {
-        if blocks == 4 {
-            per_day.entry(day).or_insert([None; 24])[hour as usize] = Some(kwh);
-        }
-    }
-    let mut out = HourlyLoad {
-        mean: [0.0; 24],
-        p75: [0.0; 24],
-        days: per_day.len(),
-    };
-    for h in 0..24 {
-        let mut values: Vec<f32> = per_day.values().filter_map(|d| d[h]).collect();
-        if values.is_empty() {
-            continue;
-        }
-        out.mean[h] = values.iter().sum::<f32>() / values.len() as f32;
-        out.p75[h] = percentile(&mut values, 0.75);
-    }
-    out
 }
 
 /// One block after parsing, with local time resolved.
@@ -437,8 +445,8 @@ fn run() -> Result<(), String> {
                 } else {
                     day
                 };
-                let import_prof = hourly_load(&rows, day, |r| r.import);
-                let house_prof = hourly_load(&rows, day, |r| r.load);
+                let live_profile = live_load_profile(&rows, day, profile)
+                    .filter(|p| p.hourly_avg_kwh.iter().sum::<f32>() > 0.0);
                 let mut horizon: Vec<PlanBlock> = Vec::new();
                 for (j, later) in rows.iter().enumerate().skip(i) {
                     if later.local.date_naive() > horizon_end_day {
@@ -447,22 +455,15 @@ fn run() -> Result<(), String> {
                     let Some(load_fc) = forecast_load(i, j, &mut fallback_blocks) else {
                         break;
                     };
-                    let hour = later.start.hour() as usize;
                     let fallback_kwh = load_fc * params.load_safety_factor;
-                    let import_kwh = if import_prof.days > 0 {
-                        import_prof.mean[hour] * 0.25 * params.load_safety_factor
-                    } else {
-                        fallback_kwh
-                    };
-                    let load_kwh = match profile {
-                        ProfileSource::Forecast => fallback_kwh,
-                        ProfileSource::Import => import_kwh,
-                        ProfileSource::House if house_prof.days >= MIN_HOUSE_LOAD_DAYS => {
-                            house_prof.mean[hour].max(house_prof.p75[hour])
-                                * 0.25
-                                * PLANNER_LOAD_MARGIN
-                        }
-                        ProfileSource::House => import_kwh,
+                    let load_kwh = match &live_profile {
+                        Some(p) => planner_block_load(
+                            p,
+                            later.start.hour() as usize,
+                            params.load_safety_factor,
+                            ControlConfig::default().planner_load_margin,
+                        ),
+                        None => fallback_kwh,
                     };
                     let noise = if pv_noise && j > i {
                         pv_noise_factor(j)

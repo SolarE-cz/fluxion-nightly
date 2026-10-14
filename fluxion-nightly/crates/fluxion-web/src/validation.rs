@@ -182,7 +182,7 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
     }
 
     if control.force_discharge_enabled {
-        errors.push(ValidationIssue {
+        warnings.push(ValidationIssue {
             field: "control.force_discharge_enabled".to_owned(),
             message: "Battery force discharge is enabled and is not yet capped to the export limit"
                 .to_owned(),
@@ -300,7 +300,7 @@ mod tests {
         ConsumptionHistoryConfig, ControlConfig, PricingConfig, StrategiesConfigCore, SystemConfig,
         SystemSettingsConfig,
     };
-    use fluxion_types::config::RemoteAccessConfigCore;
+    use fluxion_types::config::{NotificationsConfigCore, RemoteAccessConfigCore};
 
     fn default_config() -> SystemConfig {
         SystemConfig {
@@ -331,7 +331,21 @@ mod tests {
             history: ConsumptionHistoryConfig::default(),
             solar_forecast: fluxion_core::resources::SolarForecastConfigCore::default(),
             remote_access: RemoteAccessConfigCore::default(),
+            notifications: NotificationsConfigCore::default(),
         }
+    }
+
+    #[test]
+    fn force_discharge_enabled_is_a_warning_and_does_not_block_saving() {
+        let mut config = default_config();
+        config.control_config.force_discharge_enabled = true;
+        let (errors, warnings) = validate_config(&config);
+        assert!(errors.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "control.force_discharge_enabled")
+        );
     }
 
     #[test]

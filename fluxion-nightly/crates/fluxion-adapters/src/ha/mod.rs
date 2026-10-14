@@ -12,6 +12,7 @@
 
 pub mod adapters;
 pub mod client;
+pub mod dashboard_entities;
 pub mod errors;
 pub mod levers;
 pub mod plugin;

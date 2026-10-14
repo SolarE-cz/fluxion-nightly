@@ -339,13 +339,20 @@ pub const MIN_HOUSE_LOAD_DAYS: usize = 3;
 /// Gaps longer than this between house-load samples are not integrated.
 const HOUSE_LOAD_MAX_GAP_MINUTES: i64 = 30;
 
+/// Per-hour p75 is capped at this multiple of the hourly mean. The margin covers evening
+/// variability; rare spikes (EV charging, heat-pump boosts on a few days) must not drive the
+/// planner's load, so one or two such days cannot pull p75 far above a normal day.
+const HOUSE_LOAD_P75_CAP_FACTOR: f32 = 1.5;
+
 /// Hourly house-load profile from a house-load power sensor (W).
 ///
 /// Each sample holds until the next one (time-weighted). Negative readings are clamped to 0 and
 /// intervals longer than 30 min are skipped. For each UTC day and hour the time-weighted mean power
 /// in kW (which equals kWh/h) is taken over the covered part of that hour. `hourly_avg_kwh` is the
-/// mean of those values across days and `hourly_p75_kwh` their 75th percentile across days.
-/// Returns None if there are no samples.
+/// mean of those values across days and `hourly_p75_kwh` their 75th percentile across days, capped
+/// at `HOUSE_LOAD_P75_CAP_FACTOR` times the mean. An hour with no samples on any day takes the mean
+/// of its neighbouring hours (wrapping around midnight), or the mean of all observed hours when both
+/// neighbours are empty; its p75 equals that value. Returns None if there are no samples.
 pub fn aggregate_hourly_house_load(
     power_points: &[crate::traits::HistoryDataPoint],
 ) -> Option<HourlyConsumptionProfile> {
@@ -396,15 +403,38 @@ pub fn aggregate_hourly_house_load(
         return None;
     }
 
-    let mut hourly_avg_kwh = [0.0f32; 24];
-    let mut hourly_p75_kwh = [0.0f32; 24];
-    for h in 0..24 {
+    // Observed hours: (mean, capped p75)
+    let mut observed: [Option<(f32, f32)>; 24] = [None; 24];
+    for (h, slot) in observed.iter_mut().enumerate() {
         let mut values: Vec<f32> = days.values().filter_map(|d| d[h]).collect();
         if values.is_empty() {
             continue;
         }
-        hourly_avg_kwh[h] = values.iter().sum::<f32>() / values.len() as f32;
-        hourly_p75_kwh[h] = percentile(&mut values, 0.75);
+        let mean = values.iter().sum::<f32>() / values.len() as f32;
+        let p75 = percentile(&mut values, 0.75).min(mean * HOUSE_LOAD_P75_CAP_FACTOR);
+        *slot = Some((mean, p75));
+    }
+    let observed_means: Vec<f32> = observed.iter().flatten().map(|(mean, _)| *mean).collect();
+    let all_hours_mean = observed_means.iter().sum::<f32>() / observed_means.len() as f32;
+
+    let mut hourly_avg_kwh = [0.0f32; 24];
+    let mut hourly_p75_kwh = [0.0f32; 24];
+    for h in 0..24 {
+        let (mean, p75) = match observed[h] {
+            Some(values) => values,
+            None => {
+                let prev = observed[(h + 23) % 24].map(|(mean, _)| mean);
+                let next = observed[(h + 1) % 24].map(|(mean, _)| mean);
+                let fill = match (prev, next) {
+                    (Some(a), Some(b)) => (a + b) / 2.0,
+                    (Some(a), None) | (None, Some(a)) => a,
+                    (None, None) => all_hours_mean,
+                };
+                (fill, fill)
+            }
+        };
+        hourly_avg_kwh[h] = mean;
+        hourly_p75_kwh[h] = p75;
     }
 
     Some(HourlyConsumptionProfile {
@@ -602,8 +632,9 @@ mod tests {
         assert_eq!(profile.days_averaged, 1);
         // Energy 1/3 + 1.5 = 11/6 kWh over 5/6 h covered = 2.2 kW
         assert!((profile.hourly_avg_kwh[10] - 2.2).abs() < 1e-3);
-        assert_eq!(profile.hourly_avg_kwh[11], 0.0);
-        assert_eq!(profile.hourly_p75_kwh.unwrap()[11], 0.0);
+        // Hour 11 has no samples on its own: it takes hour 10 (the only observed neighbour)
+        assert!((profile.hourly_avg_kwh[11] - 2.2).abs() < 1e-3);
+        assert!((profile.hourly_p75_kwh.unwrap()[11] - 2.2).abs() < 1e-3);
     }
 
     #[test]
@@ -622,6 +653,67 @@ mod tests {
         // Linear interpolation: position 0.75 * 6 = 4.5 between 5 and 6
         let p75 = profile.hourly_p75_kwh.unwrap();
         assert!((p75[8] - 5.5).abs() < 1e-3, "p75 {}", p75[8]);
+    }
+
+    /// Samples at h:00 and h:30 with constant `watts` for each (hour, watts) pair on one day.
+    fn hourly_samples(day: u32, hours: &[(u32, f32)]) -> Vec<HistoryDataPoint> {
+        hours
+            .iter()
+            .flat_map(|&(h, watts)| {
+                [
+                    power_point(day, h, 0, watts),
+                    power_point(day, h, 30, watts),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn house_load_empty_hour_takes_neighbour_mean() {
+        // Hours 0-23 with (h+1) kW, except hour 12 which has no samples: neighbours 11 (12 kW)
+        // and 13 (14 kW) give 13 kW
+        let hours: Vec<(u32, f32)> = (0..24)
+            .filter(|h| *h != 12)
+            .map(|h| (h, (h + 1) as f32 * 1000.0))
+            .collect();
+        let profile = aggregate_hourly_house_load(&hourly_samples(14, &hours)).unwrap();
+        assert!((profile.hourly_avg_kwh[12] - 13.0).abs() < 1e-3);
+        assert!((profile.hourly_p75_kwh.unwrap()[12] - 13.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn house_load_empty_hour_wraps_around_midnight() {
+        // Hour 0 has no samples; its neighbours are 23 (4 kW) and 1 (2 kW)
+        let points = hourly_samples(14, &[(23, 4000.0), (1, 2000.0)]);
+        let profile = aggregate_hourly_house_load(&points).unwrap();
+        assert!((profile.hourly_avg_kwh[0] - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn house_load_empty_hour_without_observed_neighbours_uses_all_hours_mean() {
+        // Only hours 5 (2 kW) and 17 (6 kW) have data; hour 12 has no observed neighbour
+        let points = hourly_samples(14, &[(5, 2000.0), (17, 6000.0)]);
+        let profile = aggregate_hourly_house_load(&points).unwrap();
+        assert!((profile.hourly_avg_kwh[12] - 4.0).abs() < 1e-3);
+        assert!((profile.hourly_p75_kwh.unwrap()[12] - 4.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn house_load_p75_is_capped_at_1_5_times_mean_on_spike_days() {
+        // Seven days at hour 8: five days at 0.8 kW, two spike days at 11 kW.
+        // Raw p75 = 5.9 kW; mean = 3.714 kW, so the cap 1.5 x mean = 5.571 kW applies.
+        let mut points = Vec::new();
+        for (i, day) in (14..=20).enumerate() {
+            let watts = if i >= 5 { 11000.0 } else { 800.0 };
+            points.push(power_point(day, 8, 0, watts));
+            points.push(power_point(day, 8, 30, watts));
+            points.push(power_point(day, 9, 0, watts));
+        }
+        let profile = aggregate_hourly_house_load(&points).unwrap();
+        let mean = (5.0 * 0.8 + 2.0 * 11.0) / 7.0;
+        assert!((profile.hourly_avg_kwh[8] - mean).abs() < 1e-3);
+        let p75 = profile.hourly_p75_kwh.unwrap()[8];
+        assert!((p75 - 1.5 * mean).abs() < 1e-3, "p75 {p75}");
     }
 
     #[test]
