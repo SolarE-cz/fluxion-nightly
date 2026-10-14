@@ -29,7 +29,7 @@
 
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 // ============================================================================
@@ -264,6 +264,77 @@ fn parse_time(s: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
+/// Parse the CEZ HDO schedule sensor's `attributes.schedule[]` entries
+/// (`{"start": "2026-10-14T17:00:00+02:00", "end": "2026-10-15T00:00:00+02:00", "tariff": "NT", "value": 1}`).
+///
+/// Times are taken as written (the local wall-clock of the entry's own offset).
+/// NT entries (or `value == 1`) become low tariff ranges, grouped by local start date and merged.
+/// An end on a later day runs to end of day, stored as 23:59:59 like `casy` "17:00-24:00".
+pub fn parse_hdo_schedule_attribute(entries: &[serde_json::Value]) -> Vec<HdoDaySchedule> {
+    let Some(end_of_day) = NaiveTime::from_hms_opt(23, 59, 59) else {
+        return Vec::new();
+    };
+
+    let mut by_day: BTreeMap<NaiveDate, Vec<HdoTimeRange>> = BTreeMap::new();
+    for entry in entries {
+        let is_low = entry.get("tariff").and_then(|t| t.as_str()) == Some("NT")
+            || entry.get("value").and_then(|v| v.as_i64()) == Some(1);
+        if !is_low {
+            continue;
+        }
+
+        let parse_rfc3339 = |key: &str| {
+            entry
+                .get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        };
+        let (Some(start), Some(end)) = (parse_rfc3339("start"), parse_rfc3339("end")) else {
+            continue;
+        };
+
+        let date = start.date_naive();
+        let end_time = if end.date_naive() > date {
+            end_of_day
+        } else {
+            end.time()
+        };
+        if end_time <= start.time() {
+            continue;
+        }
+
+        by_day.entry(date).or_default().push(HdoTimeRange {
+            start: start.time(),
+            end: end_time,
+        });
+    }
+
+    by_day
+        .into_iter()
+        .map(|(date, ranges)| HdoDaySchedule {
+            date,
+            low_tariff_ranges: merge_time_ranges(ranges),
+        })
+        .collect()
+}
+
+/// Sort time ranges and merge overlapping or adjacent ones
+fn merge_time_ranges(mut ranges: Vec<HdoTimeRange>) -> Vec<HdoTimeRange> {
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<HdoTimeRange> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => {
+                if range.end > last.end {
+                    last.end = range.end;
+                }
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
 /// Parse HDO sensor data from raw JSON format
 ///
 /// Supports multiple formats:
@@ -284,6 +355,19 @@ pub fn parse_hdo_sensor_data(raw_data: &str) -> Vec<HdoDaySchedule> {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw_data) else {
         return schedules;
     };
+
+    // Preferred: the schedule sensor's attributes.schedule[] (RFC 3339 local times).
+    // Falls through to the signals paths below when it yields no low tariff ranges.
+    if let Some(entries) = json
+        .get("attributes")
+        .and_then(|a| a.get("schedule"))
+        .and_then(|s| s.as_array())
+    {
+        schedules = parse_hdo_schedule_attribute(entries);
+        if !schedules.is_empty() {
+            return schedules;
+        }
+    }
 
     // Try multiple paths to find the signals array:
     // 1. attributes.raw_json.data.data.signals (new cez_hdo_raw_data sensor)
@@ -640,6 +724,55 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 1, 22).unwrap()
         );
         assert_eq!(schedules[1].low_tariff_ranges.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_hdo_schedule_attribute_matches_casy() {
+        // attributes.schedule[] of sensor.cez_hdo_schedule_*; NT entries are the low tariff
+        let schedule_json = r#"{
+            "state": "2026-10-14T00:00:00+02:00",
+            "attributes": {
+                "signal": "EVV1",
+                "days": 7,
+                "schedule": [
+                    {"start": "2026-10-14T00:00:00+02:00", "end": "2026-10-14T06:00:00+02:00", "tariff": "NT", "value": 1},
+                    {"start": "2026-10-14T06:00:00+02:00", "end": "2026-10-14T07:00:00+02:00", "tariff": "VT", "value": 0},
+                    {"start": "2026-10-14T07:00:00+02:00", "end": "2026-10-14T09:00:00+02:00", "tariff": "NT", "value": 1},
+                    {"start": "2026-10-14T09:00:00+02:00", "end": "2026-10-14T17:00:00+02:00", "tariff": "VT", "value": 0},
+                    {"start": "2026-10-14T17:00:00+02:00", "end": "2026-10-15T00:00:00+02:00", "tariff": "NT", "value": 1},
+                    {"start": "2026-10-15T00:00:00+02:00", "end": "2026-10-15T06:00:00+02:00", "tariff": "NT", "value": 1}
+                ]
+            }
+        }"#;
+        let casy_json = r#"{
+            "data": {"signals": [
+                {"signal": "EVV1", "datum": "14.10.2026", "casy": "00:00-06:00;   07:00-09:00;   17:00-24:00"},
+                {"signal": "EVV1", "datum": "15.10.2026", "casy": "00:00-06:00"}
+            ]}
+        }"#;
+
+        let from_schedule = parse_hdo_sensor_data(schedule_json);
+        let from_casy = parse_hdo_sensor_data(casy_json);
+        assert_eq!(from_schedule.len(), 2);
+        assert_eq!(from_schedule.len(), from_casy.len());
+        for (a, b) in from_schedule.iter().zip(from_casy.iter()) {
+            assert_eq!(a.date, b.date);
+            let a_ranges: Vec<_> = a
+                .low_tariff_ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect();
+            let b_ranges: Vec<_> = b
+                .low_tariff_ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect();
+            assert_eq!(a_ranges, b_ranges);
+        }
+        // 17:00 -> next-day 00:00 is stored as 17:00-23:59:59 on the start date
+        let last = from_schedule[0].low_tariff_ranges.last().unwrap();
+        assert_eq!(last.start, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
+        assert_eq!(last.end, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
     }
 
     #[test]

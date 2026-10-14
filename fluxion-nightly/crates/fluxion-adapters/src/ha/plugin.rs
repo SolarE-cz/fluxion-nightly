@@ -461,73 +461,128 @@ pub fn spawn_hdo_fetcher(
     );
 
     tokio::spawn(async move {
+        let mut discovery = HdoDiscovery::default();
+
         // Fetch immediately on startup
         tracing::debug!(
             "📊 Fetching initial HDO schedule from HA: {}",
             hdo_sensor_entity
         );
-        fetch_and_send_hdo(&client, &hdo_sensor_entity, &sender).await;
+        fetch_and_send_hdo(&client, &hdo_sensor_entity, &sender, &mut discovery).await;
 
         // Poll every 60 minutes (HDO schedules typically update daily)
         loop {
             tokio::time::sleep(Duration::from_secs(3600)).await;
             tracing::debug!("📊 Polling HDO schedule from HA: {}", hdo_sensor_entity);
-            fetch_and_send_hdo(&client, &hdo_sensor_entity, &sender).await;
+            fetch_and_send_hdo(&client, &hdo_sensor_entity, &sender, &mut discovery).await;
         }
     });
 }
 
-/// Resolve the HDO entity: try exact match first, then prefix search.
-/// This handles the CEZ HDO integration renaming sensors with a suffix.
+/// Discovery state kept across polls, so the chosen entity and the "not found" warning log once
+#[derive(Default)]
+struct HdoDiscovery {
+    chosen: Option<String>,
+    warned_missing: bool,
+}
+
+/// Entity carries the CEZ HDO schedule as `attributes.schedule[]` (`start`, `end`, `tariff` per entry)
+fn is_hdo_schedule_entity(state: &crate::ha::types::HaEntityState) -> bool {
+    state
+        .attributes
+        .get("schedule")
+        .and_then(|s| s.as_array())
+        .is_some_and(|entries| {
+            !entries.is_empty()
+                && entries.iter().all(|e| {
+                    e.get("start").is_some() && e.get("end").is_some() && e.get("tariff").is_some()
+                })
+        })
+}
+
+/// Entity carries the raw CEZ HDO signals at `attributes.raw_json.data.data.signals`
+fn is_hdo_raw_entity(state: &crate::ha::types::HaEntityState) -> bool {
+    state
+        .attributes
+        .get("raw_json")
+        .and_then(|r| r.get("data"))
+        .and_then(|d| d.get("data"))
+        .and_then(|d| d.get("signals"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|signals| !signals.is_empty())
+}
+
+/// Pick the HDO entity from all HA states. Chooses by content, not by name, so renamed sensors work.
+/// Order: the configured ID if present; then schedule entities; then raw-signal entities;
+/// then any entity whose ID starts with the configured value. Within a tier, one whose ID starts
+/// with the configured value wins, then the lowest entity ID.
+pub fn select_hdo_entity<'a>(
+    states: &'a [crate::ha::types::HaEntityState],
+    configured: &str,
+) -> Option<&'a crate::ha::types::HaEntityState> {
+    if let Some(exact) = states.iter().find(|s| s.entity_id == configured) {
+        return Some(exact);
+    }
+
+    let pick = |qualifies: fn(&crate::ha::types::HaEntityState) -> bool| {
+        states
+            .iter()
+            .filter(|s| qualifies(s))
+            .min_by_key(|s| (!s.entity_id.starts_with(configured), s.entity_id.clone()))
+    };
+
+    pick(is_hdo_schedule_entity)
+        .or_else(|| pick(is_hdo_raw_entity))
+        .or_else(|| {
+            states
+                .iter()
+                .filter(|s| s.entity_id.starts_with(configured))
+                .min_by_key(|s| s.entity_id.clone())
+        })
+}
+
+/// Resolve the HDO entity from one HA states fetch (no per-entity lookup, so no "not found" error log)
 async fn resolve_hdo_entity(
     client: &HomeAssistantClient,
     configured_entity: &str,
+    discovery: &mut HdoDiscovery,
 ) -> Option<crate::ha::types::HaEntityState> {
-    // Try exact match first
-    match client.get_state(configured_entity).await {
-        Ok(state) => return Some(state),
-        Err(crate::ha::errors::HaError::EntityNotFound(_)) => {
-            tracing::info!(
-                "HDO entity '{}' not found, searching for entities with matching prefix...",
-                configured_entity
-            );
-        }
+    let states = match client.get_all_states().await {
+        Ok(states) => states,
         Err(e) => {
-            tracing::warn!("Failed to fetch HDO entity '{}': {}", configured_entity, e);
+            tracing::warn!("Failed to fetch HA states for HDO discovery: {}", e);
             return None;
         }
+    };
+
+    let Some(state) = select_hdo_entity(&states, configured_entity) else {
+        if !discovery.warned_missing {
+            tracing::warn!(
+                "No HDO entity found for '{}': no entity has an HDO schedule or signals attribute",
+                configured_entity
+            );
+            discovery.warned_missing = true;
+        }
+        return None;
+    };
+    discovery.warned_missing = false;
+
+    if discovery.chosen.as_deref() != Some(state.entity_id.as_str()) {
+        let candidates: Vec<&str> = states
+            .iter()
+            .filter(|s| is_hdo_schedule_entity(s) || is_hdo_raw_entity(s))
+            .map(|s| s.entity_id.as_str())
+            .collect();
+        tracing::info!(
+            "HDO entity for '{}' resolved to '{}' (candidates: {:?})",
+            configured_entity,
+            state.entity_id,
+            candidates
+        );
+        discovery.chosen = Some(state.entity_id.clone());
     }
 
-    // Exact match failed - search all states for entities starting with the configured prefix
-    match client.get_all_states().await {
-        Ok(all_states) => {
-            let matching: Vec<_> = all_states
-                .into_iter()
-                .filter(|s| s.entity_id.starts_with(configured_entity))
-                .collect();
-
-            if matching.is_empty() {
-                tracing::warn!(
-                    "No HDO entities found matching prefix '{}'",
-                    configured_entity
-                );
-                None
-            } else {
-                tracing::info!(
-                    "Found {} HDO entities matching prefix '{}': {:?}. Using first: '{}'",
-                    matching.len(),
-                    configured_entity,
-                    matching.iter().map(|s| &s.entity_id).collect::<Vec<_>>(),
-                    matching[0].entity_id
-                );
-                Some(matching.into_iter().next().unwrap())
-            }
-        }
-        Err(e) => {
-            tracing::warn!("Failed to fetch all states for HDO prefix search: {}", e);
-            None
-        }
-    }
+    Some(state.clone())
 }
 
 /// Helper function to fetch HDO data and send through channel
@@ -535,8 +590,9 @@ async fn fetch_and_send_hdo(
     client: &HomeAssistantClient,
     entity_id: &str,
     sender: &crossbeam_channel::Sender<fluxion_core::async_systems::HdoUpdateMessage>,
+    discovery: &mut HdoDiscovery,
 ) {
-    match resolve_hdo_entity(client, entity_id).await {
+    match resolve_hdo_entity(client, entity_id, discovery).await {
         Some(state) => {
             // The HDO sensor typically stores schedule data in attributes
             // Try to serialize the full state (including attributes) as JSON
@@ -601,6 +657,16 @@ async fn fetch_and_send_hdo(
     }
 }
 
+/// Format an HDO time as "HH:MM"; the end-of-day value (23:59:59) shows as "24:00" like `casy`
+fn hdo_time_label(time: chrono::NaiveTime) -> String {
+    use chrono::Timelike;
+    if time.hour() == 23 && time.minute() == 59 && time.second() == 59 {
+        "24:00".to_string()
+    } else {
+        format!("{:02}:{:02}", time.hour(), time.minute())
+    }
+}
+
 /// Parse low tariff time periods from HA entity state
 /// Supports multiple formats:
 /// - "casy": "00:00-06:00; 07:00-09:00; ..." (Czech CEZ format)
@@ -643,6 +709,27 @@ fn parse_hdo_periods_from_state(state: &crate::ha::types::HaEntityState) -> Vec<
                 tracing::debug!("HDO: Found periods in '{}' attribute", attr_name);
                 break;
             }
+        }
+    }
+
+    // CEZ schedule sensor: attributes.schedule[] (RFC 3339 entries).
+    // Like the signals paths, use the first day only.
+    if periods.is_empty()
+        && let Some(entries) = state.attributes.get("schedule").and_then(|s| s.as_array())
+        && let Some(day) = fluxion_core::strategy::pricing::parse_hdo_schedule_attribute(entries)
+            .into_iter()
+            .next()
+    {
+        periods = day
+            .low_tariff_ranges
+            .iter()
+            .map(|r| (hdo_time_label(r.start), hdo_time_label(r.end)))
+            .collect();
+        if !periods.is_empty() {
+            tracing::debug!(
+                "HDO: Found periods in 'schedule' attribute (date: {})",
+                day.date
+            );
         }
     }
 
@@ -892,6 +979,104 @@ mod tests {
         assert_eq!(periods.len(), 2);
         assert_eq!(periods[0], ("00:00".to_string(), "06:00".to_string()));
         assert_eq!(periods[1], ("22:00".to_string(), "24:00".to_string()));
+    }
+
+    fn hdo_test_state(
+        entity_id: &str,
+        attributes: serde_json::Value,
+    ) -> crate::ha::types::HaEntityState {
+        crate::ha::types::HaEntityState {
+            entity_id: entity_id.to_string(),
+            state: "2026-10-14T00:00:00+02:00".to_string(),
+            attributes,
+            last_changed: "2026-10-14T00:00:00+00:00".to_string(),
+            last_updated: "2026-10-14T00:00:00+00:00".to_string(),
+        }
+    }
+
+    fn hdo_test_schedule_attrs() -> serde_json::Value {
+        serde_json::json!({
+            "signal": "EVV1",
+            "days": 7,
+            "schedule": [
+                {"start": "2026-10-14T00:00:00+02:00", "end": "2026-10-14T06:00:00+02:00", "tariff": "NT", "value": 1},
+                {"start": "2026-10-14T06:00:00+02:00", "end": "2026-10-14T07:00:00+02:00", "tariff": "VT", "value": 0},
+                {"start": "2026-10-14T17:00:00+02:00", "end": "2026-10-15T00:00:00+02:00", "tariff": "NT", "value": 1}
+            ]
+        })
+    }
+
+    fn hdo_test_raw_attrs() -> serde_json::Value {
+        serde_json::json!({
+            "raw_json": {"data": {"data": {"signals": [
+                {"signal": "EVV1", "datum": "14.10.2026", "casy": "00:00-06:00; 07:00-09:00"}
+            ]}}}
+        })
+    }
+
+    #[test]
+    fn test_select_hdo_entity_prefers_schedule_over_default_name() {
+        let states = vec![
+            hdo_test_state("sensor.cez_hdo_raw_data_5946_evv1", hdo_test_raw_attrs()),
+            hdo_test_state(
+                "sensor.cez_hdo_schedule_5946_evv1",
+                hdo_test_schedule_attrs(),
+            ),
+            hdo_test_state(
+                "sensor.outdoor_temperature",
+                serde_json::json!({"unit": "C"}),
+            ),
+        ];
+        let picked = select_hdo_entity(&states, "sensor.cez_hdo_raw_data").unwrap();
+        assert_eq!(picked.entity_id, "sensor.cez_hdo_schedule_5946_evv1");
+    }
+
+    #[test]
+    fn test_select_hdo_entity_exact_configured_id_wins() {
+        let states = vec![
+            hdo_test_state("sensor.cez_hdo_raw_data_5946_evv1", hdo_test_raw_attrs()),
+            hdo_test_state(
+                "sensor.cez_hdo_schedule_5946_evv1",
+                hdo_test_schedule_attrs(),
+            ),
+        ];
+        let picked = select_hdo_entity(&states, "sensor.cez_hdo_raw_data_5946_evv1").unwrap();
+        assert_eq!(picked.entity_id, "sensor.cez_hdo_raw_data_5946_evv1");
+    }
+
+    #[test]
+    fn test_select_hdo_entity_finds_renamed_schedule_sensor() {
+        let states = vec![
+            hdo_test_state(
+                "sensor.outdoor_temperature",
+                serde_json::json!({"unit": "C"}),
+            ),
+            hdo_test_state("sensor.my_tariff", hdo_test_schedule_attrs()),
+        ];
+        let picked = select_hdo_entity(&states, "sensor.cez_hdo_raw_data").unwrap();
+        assert_eq!(picked.entity_id, "sensor.my_tariff");
+    }
+
+    #[test]
+    fn test_select_hdo_entity_none_when_nothing_matches() {
+        let states = vec![hdo_test_state(
+            "sensor.outdoor_temperature",
+            serde_json::json!({"unit": "C"}),
+        )];
+        assert!(select_hdo_entity(&states, "sensor.cez_hdo_raw_data").is_none());
+    }
+
+    #[test]
+    fn test_parse_hdo_periods_from_schedule_attribute() {
+        let state = hdo_test_state("sensor.my_tariff", hdo_test_schedule_attrs());
+        let periods = parse_hdo_periods_from_state(&state);
+        assert_eq!(
+            periods,
+            vec![
+                ("00:00".to_string(), "06:00".to_string()),
+                ("17:00".to_string(), "24:00".to_string()),
+            ]
+        );
     }
 
     /// Test that empty/invalid attributes return no periods

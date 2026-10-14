@@ -10,6 +10,21 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.41] - 2026-10-14
+
+### Changed
+
+- **HDO auto-detection.** FluxION finds the ČEZ HDO sensor by its content, not its name. It prefers
+  a sensor with a `schedule` attribute (the "HDO schedule" sensor), then one with `raw_json`
+  signals, then the configured name prefix. This works with site-specific suffixes (`_5946_evv1`)
+  and renamed entities. The chosen entity is logged once.
+- The `schedule` attribute (explicit NT/VT windows with UTC offsets) is parsed as an HDO source.
+
+### Fixed
+
+- The add-on no longer logs `ERROR Entity not found: sensor.cez_hdo_raw_data` on every HDO poll when
+  the entity has a suffix.
+
 ## [0.2.40] - 2026-10-14
 
 ### Added
