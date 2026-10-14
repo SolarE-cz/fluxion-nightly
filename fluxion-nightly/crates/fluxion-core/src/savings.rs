@@ -162,6 +162,7 @@ mod tests {
             wear_cost_czk_per_kwh: 0.125,
             max_export_kw: 9.5,
             export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: false,
         }
     }
 

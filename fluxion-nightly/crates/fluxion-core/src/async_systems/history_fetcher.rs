@@ -23,6 +23,9 @@ use crate::{
     resources::{ConsumptionHistoryConfig, ConsumptionHistoryDataSourceResource},
 };
 
+/// Days of house-load power history used for the hourly load profile
+const HOUSE_LOAD_HISTORY_DAYS: i64 = 7;
+
 /// Spawns the consumption history fetcher worker task
 pub fn spawn_history_fetcher_worker(
     commands: &mut Commands,
@@ -178,8 +181,28 @@ async fn fetch_consumption_history(
     let summaries =
         crate::components::aggregate_daily_consumption(&consumption_history, &solar_history);
 
-    // Compute hourly consumption profile
-    let hourly_profile = crate::components::aggregate_hourly_consumption(&consumption_history);
+    // Compute hourly consumption profile: house-load power when configured and it has enough days
+    let consumption_profile = crate::components::aggregate_hourly_consumption(&consumption_history);
+    let house_load_profile = match &config.house_load_power_entity {
+        Some(entity) => {
+            info!("   Fetching house load from: {}", entity);
+            let power_history = source
+                .get_history(
+                    entity,
+                    now - chrono::Duration::days(HOUSE_LOAD_HISTORY_DAYS),
+                    Some(now),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    error!("❌ Failed to fetch house load history: {e}");
+                    Vec::new()
+                });
+            crate::components::aggregate_hourly_house_load(&power_history)
+        }
+        None => None,
+    };
+    let hourly_profile =
+        crate::components::pick_hourly_profile(house_load_profile, consumption_profile);
 
     info!(
         "✅ Aggregated {} daily summaries, hourly profile: {}",
@@ -190,6 +213,12 @@ async fn fetch_consumption_history(
             "none"
         }
     );
+    if let Some(profile) = &hourly_profile {
+        info!(
+            "📊 Hourly load profile ({} days) mean kWh/h {:?} p75 {:?}",
+            profile.days_averaged, profile.hourly_avg_kwh, profile.hourly_p75_kwh
+        );
+    }
 
     // Send to channel
     let update = ConsumptionHistoryUpdate {

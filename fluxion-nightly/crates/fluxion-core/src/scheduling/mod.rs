@@ -184,6 +184,30 @@ impl Default for ScheduleConfig {
     }
 }
 
+/// Force discharge stays off until a capped discharge method exists (`control.force_discharge_enabled`):
+/// ForceDischarge blocks become Self-Use. Returns how many blocks were converted.
+pub fn gate_force_discharge(blocks: &mut [ScheduledMode], enabled: bool) -> usize {
+    if enabled {
+        return 0;
+    }
+    let mut converted = 0;
+    for block in blocks
+        .iter_mut()
+        .filter(|b| b.mode == InverterOperationMode::ForceDischarge)
+    {
+        block.mode = InverterOperationMode::SelfUse;
+        block.reason = format!("{} (force discharge disabled)", block.reason);
+        converted += 1;
+    }
+    if converted > 0 {
+        info!(
+            "Force discharge disabled (control.force_discharge_enabled): {} discharge block(s) converted to Self-Use",
+            converted
+        );
+    }
+    converted
+}
+
 /// Generate an operation schedule using the economic optimizer
 ///
 /// This function uses the economic optimization architecture where multiple strategies
@@ -225,6 +249,7 @@ pub fn generate_schedule_with_optimizer(
     solar_forecast_tomorrow_kwh: f32,
     user_control: Option<&UserControlState>,
     hourly_consumption_profile: Option<&[f32; 24]>,
+    hourly_consumption_p75: Option<&[f32; 24]>,
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
 ) -> OperationSchedule {
@@ -329,6 +354,7 @@ pub fn generate_schedule_with_optimizer(
             solar_forecast_tomorrow_kwh,
             avg_charge_price,
             hourly_consumption_profile,
+            hourly_consumption_p75,
             remaining_block_forecasts(
                 relevant_blocks.iter().skip(local_idx).map(|(i, _)| *i),
                 solar_forecast,
@@ -474,6 +500,7 @@ pub fn generate_schedule_with_optimizer(
             solar_forecast_tomorrow_kwh,
             avg_charge_price,
             hourly_consumption_profile,
+            hourly_consumption_p75,
             remaining_block_forecasts(
                 relevant_blocks.iter().skip(local_idx).map(|(i, _)| *i),
                 solar_forecast,
@@ -598,6 +625,11 @@ pub fn generate_schedule_with_optimizer(
             debug_info: evaluation.debug_info,
         });
     }
+
+    gate_force_discharge(
+        &mut scheduled_blocks,
+        control_config.force_discharge_enabled,
+    );
 
     let mut schedule = OperationSchedule {
         scheduled_blocks,
@@ -1007,6 +1039,7 @@ fn create_evaluation_request(
     solar_forecast_tomorrow_kwh: f32,
     battery_avg_charge_price_czk_per_kwh: f32,
     hourly_consumption_profile: Option<&[f32; 24]>,
+    hourly_consumption_p75: Option<&[f32; 24]>,
     block_forecasts: Vec<BlockForecast>,
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
@@ -1047,6 +1080,7 @@ fn create_evaluation_request(
             grid_import_today_kwh,
             consumption_today_kwh: None, // TODO: Track actual consumption
             hourly_consumption_profile: hourly_consumption_profile.map(|p| p.to_vec()),
+            hourly_consumption_p75: hourly_consumption_p75.map(|p| p.to_vec()),
         },
         backup_discharge_min_soc,
         hdo_raw_data,
@@ -1209,6 +1243,7 @@ mod tests {
             0.0,
             0.0,
             0.0,
+            None,
             None,
             None,
             Some("Europe/Prague"),
@@ -1416,6 +1451,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 active_user_levers(res),
             );
             plugin
@@ -1429,5 +1465,45 @@ mod tests {
         assert!(requests.iter().all(|r| r.user_levers.is_none()));
         let requests = run(None).requests.lock().unwrap().clone();
         assert!(requests.iter().all(|r| r.user_levers.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod force_discharge_gate_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn block(mode: InverterOperationMode) -> ScheduledMode {
+        ScheduledMode {
+            block_start: Utc::now(),
+            duration_minutes: 15,
+            target_inverters: None,
+            mode,
+            reason: "plan".to_string(),
+            decision_uid: None,
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn gate_converts_force_discharge_blocks_when_disabled() {
+        let mut blocks = vec![
+            block(InverterOperationMode::ForceDischarge),
+            block(InverterOperationMode::ForceCharge),
+        ];
+
+        assert_eq!(gate_force_discharge(&mut blocks, false), 1);
+
+        assert_eq!(blocks[0].mode, InverterOperationMode::SelfUse);
+        assert!(blocks[0].reason.contains("force discharge disabled"));
+        assert_eq!(blocks[1].mode, InverterOperationMode::ForceCharge);
+    }
+
+    #[test]
+    fn gate_keeps_force_discharge_blocks_when_enabled() {
+        let mut blocks = vec![block(InverterOperationMode::ForceDischarge)];
+
+        assert_eq!(gate_force_discharge(&mut blocks, true), 0);
+        assert_eq!(blocks[0].mode, InverterOperationMode::ForceDischarge);
     }
 }

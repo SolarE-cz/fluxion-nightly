@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use chrono_tz::Tz;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ha::client::HomeAssistantClient;
 use fluxion_core::pricing::parse_spot_price_response;
@@ -144,6 +144,20 @@ impl HomeAssistantInverterAdapter {
     }
 }
 
+/// The `max` attribute of a number entity (the largest value the inverter accepts), if present.
+pub fn number_max_attribute(attributes: &serde_json::Value) -> Option<u32> {
+    attributes
+        .get("max")?
+        .as_f64()
+        .map(|max| max.max(0.0) as u32)
+}
+
+/// Whether an export limit may be written: only when the entity's `max` is known and the limit
+/// does not exceed it (fail closed).
+pub fn export_limit_allowed(limit_w: u32, max_w: Option<u32>) -> bool {
+    max_w.is_some_and(|max| limit_w <= max)
+}
+
 #[async_trait]
 impl InverterDataSource for HomeAssistantInverterAdapter {
     async fn read_state(&self, inverter_id: &str) -> Result<GenericInverterState> {
@@ -254,13 +268,22 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             })
             .await;
 
-        // Live export limit (for restoring it after curtailment)
-        let export_limit_w = self
-            .read_optional_sensor(inverter_id, |id| {
-                Some(self.mapper.get_export_limit_entity(id))
-            })
-            .await
-            .map(|limit| limit.max(0.0) as u32);
+        // Live export limit and the entity's own maximum, from one state read
+        let export_limit_entity = self.mapper.get_export_limit_entity(inverter_id);
+        let (export_limit_w, export_limit_max_w) =
+            match self.client.get_state(&export_limit_entity).await {
+                Ok(state) => (
+                    state.state.parse::<f32>().ok().map(|v| v.max(0.0) as u32),
+                    number_max_attribute(&state.attributes),
+                ),
+                Err(e) => {
+                    debug!(
+                        "Export limit entity {} unreadable: {}",
+                        export_limit_entity, e
+                    );
+                    (None, None)
+                }
+            };
 
         let state = GenericInverterState {
             inverter_id: inverter_id.to_string(),
@@ -271,6 +294,7 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             pv_power_w: pv_power,
             online: true,
             export_limit_w,
+            export_limit_max_w,
             work_mode_ambiguous,
             // Load & Grid detailed
             house_load_w,
@@ -372,6 +396,35 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             }
             InverterCommand::SetExportLimit(limit_w) => {
                 let entity_id = self.mapper.get_export_limit_entity(inverter_id);
+
+                // Final guard, fail closed: the entity max is read just before writing, and the
+                // write is refused unless that max is known and not exceeded
+                let max_w = match self.client.get_state(&entity_id).await {
+                    Ok(state) => number_max_attribute(&state.attributes),
+                    Err(e) => {
+                        error!(
+                            "🛑 [ADAPTER] Refusing export limit {}W for {}: cannot read entity max: {}",
+                            limit_w, inverter_id, e
+                        );
+                        anyhow::bail!(
+                            "Refused export limit {}W for {}: cannot read entity max",
+                            limit_w,
+                            inverter_id
+                        );
+                    }
+                };
+                if !export_limit_allowed(*limit_w, max_w) {
+                    error!(
+                        "🛑 [ADAPTER] Refusing export limit {}W for {}: entity max {:?}W",
+                        limit_w, inverter_id, max_w
+                    );
+                    anyhow::bail!(
+                        "Refused export limit {}W for {}: entity max {:?}W",
+                        limit_w,
+                        inverter_id,
+                        max_w
+                    );
+                }
 
                 debug!("   Entity: {}", entity_id);
                 debug!("   Limit: {}W", limit_w);
@@ -937,5 +990,34 @@ mod tests {
         let adapter = CzSpotPriceAdapter::new(client, "sensor.current_spot_electricity_prices");
         assert_eq!(adapter.name(), "CzSpotPrice");
         assert_eq!(adapter.entity_id, "sensor.current_spot_electricity_prices");
+    }
+}
+
+#[cfg(test)]
+mod export_limit_guard_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn max_attribute_is_read_from_number_entity() {
+        assert_eq!(
+            number_max_attribute(&json!({"min": 0, "max": 10000.0, "step": 10})),
+            Some(10000)
+        );
+        assert_eq!(number_max_attribute(&json!({"min": 0})), None);
+    }
+
+    #[test]
+    fn guard_allows_only_values_within_known_max() {
+        assert!(export_limit_allowed(6000, Some(6000)));
+        assert!(export_limit_allowed(0, Some(6000)));
+        assert!(!export_limit_allowed(6001, Some(6000)));
+    }
+
+    #[test]
+    fn guard_fails_closed_without_known_max() {
+        // The entity max cannot be read: the write is refused
+        assert!(!export_limit_allowed(0, None));
+        assert!(!export_limit_allowed(9000, None));
     }
 }

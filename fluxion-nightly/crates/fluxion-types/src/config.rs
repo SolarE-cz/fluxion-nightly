@@ -150,6 +150,10 @@ pub struct ControlConfig {
     /// Average household consumption (kW) used for battery SOC predictions
     /// This is used as a fallback when actual load data is not available
     pub average_household_load_kw: f32,
+    /// Multiplier on the house-load profile used by the Winter Reserve planner (1.0-1.5).
+    /// Applied to max(mean, p75) when the p75 profile is available. Chart predictions do not use it.
+    #[serde(default = "default_planner_load_margin")]
+    pub planner_load_margin: f32,
     /// Hardware minimum battery SOC enforced by inverter firmware
     /// This is the absolute floor that predictions should use
     #[serde(default = "default_hardware_min_soc")]
@@ -192,13 +196,28 @@ pub struct ControlConfig {
     pub default_battery_mode: InverterOperationMode,
 
     /// Curtail export (SolaX export limit 0 W) in blocks whose sell price is at or below
-    /// `export_curtail_at_or_below_czk`. Default: true
+    /// `export_curtail_at_or_below_czk`. Default: false (opt-in per site)
     #[serde(default = "default_export_curtailment_enabled")]
     pub export_curtailment_enabled: bool,
 
     /// Sell price (CZK/kWh) at or below which export is curtailed. Default: 0.0
     #[serde(default = "default_export_curtail_at_or_below_czk")]
     pub export_curtail_at_or_below_czk: f32,
+
+    /// Hard cap (W) on every export limit FluxION writes. None: no cap beyond
+    /// `maximum_export_power_w` and the inverter's own maximum. Default: None
+    #[serde(default)]
+    pub export_limit_hard_cap_w: Option<u32>,
+
+    /// Export limit (W) while curtailed. Node-RED used 10 W on SolaX Ultra sites because 0 W
+    /// misbehaves there. Default: 0
+    #[serde(default = "default_export_limit_min_w")]
+    pub export_limit_min_w: u32,
+
+    /// Allow battery Force Discharge. Off until a discharge method capped to the per-site export
+    /// limit exists: a SolaX Force Discharge runs at full battery power. Default: false
+    #[serde(default)]
+    pub force_discharge_enabled: bool,
 }
 
 // Default value functions for serde
@@ -226,11 +245,19 @@ fn default_battery_operation_mode() -> InverterOperationMode {
     InverterOperationMode::SelfUse
 }
 fn default_export_curtailment_enabled() -> bool {
-    true
+    // Opt-in per site until an attended hardware test
+    false
+}
+
+fn default_planner_load_margin() -> f32 {
+    1.10
 }
 
 fn default_export_curtail_at_or_below_czk() -> f32 {
     0.0
+}
+fn default_export_limit_min_w() -> u32 {
+    0
 }
 
 fn default_spot_buy_fee() -> f32 {
@@ -265,6 +292,7 @@ impl Default for ControlConfig {
             battery_efficiency: 0.95,
             min_mode_change_interval_secs: 300,
             average_household_load_kw: 1.0,
+            planner_load_margin: default_planner_load_margin(),
             hardware_min_battery_soc: 10.0,
             grid_export_fee_czk_per_kwh: 0.5,
             max_battery_charge_rate_kw: 10.0,
@@ -272,8 +300,11 @@ impl Default for ControlConfig {
             evening_peak_start_hour: 17,
             min_consecutive_force_blocks: 2,
             default_battery_mode: InverterOperationMode::SelfUse,
-            export_curtailment_enabled: true,
+            export_curtailment_enabled: false,
             export_curtail_at_or_below_czk: 0.0,
+            export_limit_hard_cap_w: None,
+            export_limit_min_w: 0,
+            force_discharge_enabled: false,
         }
     }
 }

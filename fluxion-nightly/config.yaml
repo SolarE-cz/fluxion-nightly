@@ -24,12 +24,17 @@ options:
     average_household_load_kw: 0.5
     battery_capacity_kwh: 23.0
     export_curtail_at_or_below_czk: 0.0
-    export_curtailment_enabled: true
+    export_curtailment_enabled: false
+    export_limit_min_w: 0
     force_charge_hours: 4
+    force_discharge_enabled: false
     force_discharge_hours: 2
     max_battery_charge_rate_kw: 5.0
     max_battery_soc: 100
     min_battery_soc: 10
+    planner_load_margin: 1.1
+  history:
+    house_load_power_entity: ''
   inverters:
   - entity_prefix: solax
     id: solax
@@ -201,12 +206,18 @@ schema:
     battery_capacity_kwh: float(0,)?
     export_curtail_at_or_below_czk: float?
     export_curtailment_enabled: bool?
+    export_limit_hard_cap_w: int(0,)?
+    export_limit_min_w: int(0,)?
     force_charge_hours: int(0,24)?
+    force_discharge_enabled: bool?
     force_discharge_hours: int(0,24)?
     max_battery_charge_rate_kw: float(0,)?
     max_battery_soc: float(0,100)?
     maximum_export_power_w: int(0,)
     min_battery_soc: float(0,100)?
+    planner_load_margin: float(1.0,1.5)?
+  history:
+    house_load_power_entity: str?
   inverters:
   - entity_prefix: str
     id: str
@@ -425,4 +436,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.43
+version: 0.2.44

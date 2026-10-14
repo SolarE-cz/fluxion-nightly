@@ -210,6 +210,11 @@ pub struct ControlConfig {
     #[serde(default = "default_average_household_load")]
     pub average_household_load_kw: f32,
 
+    /// Multiplier on the house-load profile used by the Winter Reserve planner (1.0-1.5).
+    /// Applied to max(mean, p75) of the house-load profile. Default: 1.10
+    #[serde(default = "default_planner_load_margin")]
+    pub planner_load_margin: f32,
+
     /// Minimum number of consecutive 15-minute blocks required for force-charge/discharge operations
     /// Single-block force operations can cause excessive inverter EEPROM writes.
     /// Default: 2 blocks (30 minutes minimum duration)
@@ -227,13 +232,27 @@ pub struct ControlConfig {
     pub default_battery_mode: String,
 
     /// Curtail export (SolaX export limit 0 W) in blocks whose sell price is at or below
-    /// `export_curtail_at_or_below_czk`. Options: true (default), false
+    /// `export_curtail_at_or_below_czk`. Options: true, false (default: false, opt-in per site)
     #[serde(default = "default_export_curtailment_enabled")]
     pub export_curtailment_enabled: bool,
 
     /// Sell price (CZK/kWh) at or below which export is curtailed. Default: 0.0
     #[serde(default = "default_export_curtail_at_or_below_czk")]
     pub export_curtail_at_or_below_czk: f32,
+
+    /// Hard cap (W) on every export limit FluxION writes. Unset: no cap beyond
+    /// `maximum_export_power_w` and the inverter's own maximum.
+    #[serde(default)]
+    pub export_limit_hard_cap_w: Option<u32>,
+
+    /// Export limit (W) while curtailed. Default: 0
+    #[serde(default = "default_export_limit_min_w")]
+    pub export_limit_min_w: u32,
+
+    /// Allow battery Force Discharge (Manual Mode). Off until a discharge method capped to the
+    /// per-site export limit exists. Default: false
+    #[serde(default)]
+    pub force_discharge_enabled: bool,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -256,6 +275,10 @@ fn default_average_household_load() -> f32 {
     0.5 // 500W typical household consumption
 }
 
+fn default_planner_load_margin() -> f32 {
+    1.10
+}
+
 fn default_hardware_min_soc() -> f32 {
     10.0 // Typical hardware minimum SOC enforced by inverter firmware
 }
@@ -273,11 +296,16 @@ fn default_battery_mode() -> String {
 }
 
 fn default_export_curtailment_enabled() -> bool {
-    true
+    // Opt-in per site until an attended hardware test
+    false
 }
 
 fn default_export_curtail_at_or_below_czk() -> f32 {
     0.0
+}
+
+fn default_export_limit_min_w() -> u32 {
+    0
 }
 
 fn default_spot_buy_fee() -> f32 {
@@ -1306,6 +1334,11 @@ pub struct ConsumptionHistoryConfig {
     #[serde(default = "default_solar_production_entity")]
     pub solar_production_entity: String,
 
+    /// Home Assistant entity ID for house load power in W. Empty or unset: derived from the
+    /// inverter entity mapper (e.g., "sensor.solax_house_load" on SolaX).
+    #[serde(default)]
+    pub house_load_power_entity: Option<String>,
+
     /// Number of days to track for EMA calculation
     #[serde(default = "default_ema_days")]
     pub ema_days: usize,
@@ -1320,6 +1353,7 @@ impl Default for ConsumptionHistoryConfig {
         Self {
             consumption_entity: default_consumption_entity(),
             solar_production_entity: default_solar_production_entity(),
+            house_load_power_entity: None,
             ema_days: default_ema_days(),
             seasonal_detection_days: default_seasonal_detection_days(),
         }
@@ -1471,11 +1505,15 @@ impl Default for AppConfig {
                 battery_efficiency: default_battery_efficiency(),
                 min_mode_change_interval_secs: default_min_mode_change_interval(),
                 average_household_load_kw: default_average_household_load(),
+                planner_load_margin: default_planner_load_margin(),
                 hardware_min_battery_soc: default_hardware_min_soc(),
                 min_consecutive_force_blocks: default_min_consecutive_force_blocks(),
                 default_battery_mode: default_battery_mode(),
                 export_curtailment_enabled: default_export_curtailment_enabled(),
                 export_curtail_at_or_below_czk: default_export_curtail_at_or_below_czk(),
+                export_limit_hard_cap_w: None,
+                export_limit_min_w: default_export_limit_min_w(),
+                force_discharge_enabled: false,
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -2003,6 +2041,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 battery_efficiency: app_config.control.battery_efficiency,
                 min_mode_change_interval_secs: app_config.control.min_mode_change_interval_secs,
                 average_household_load_kw: app_config.control.average_household_load_kw,
+                planner_load_margin: app_config.control.planner_load_margin,
                 hardware_min_battery_soc: app_config.control.hardware_min_battery_soc,
                 grid_export_fee_czk_per_kwh: 0.5, // Fixed export fee (TODO: make configurable)
                 max_battery_charge_rate_kw: app_config.control.max_battery_charge_rate_kw,
@@ -2028,6 +2067,9 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 },
                 export_curtailment_enabled: app_config.control.export_curtailment_enabled,
                 export_curtail_at_or_below_czk: app_config.control.export_curtail_at_or_below_czk,
+                export_limit_hard_cap_w: app_config.control.export_limit_hard_cap_w,
+                export_limit_min_w: app_config.control.export_limit_min_w,
+                force_discharge_enabled: app_config.control.force_discharge_enabled,
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,
@@ -2545,6 +2587,16 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
             history: fluxion_core::ConsumptionHistoryConfig {
                 consumption_entity: app_config.history.consumption_entity,
                 solar_production_entity: app_config.history.solar_production_entity,
+                house_load_power_entity: app_config
+                    .history
+                    .house_load_power_entity
+                    .filter(|entity| !entity.trim().is_empty())
+                    .or_else(|| {
+                        app_config.inverters.first().and_then(|inv| {
+                            fluxion_adapters::solax::create_entity_mapper(inv.inverter_type)
+                                .get_house_load_entity(&inv.id)
+                        })
+                    }),
                 ema_days: app_config.history.ema_days,
                 seasonal_detection_days: app_config.history.seasonal_detection_days,
             },

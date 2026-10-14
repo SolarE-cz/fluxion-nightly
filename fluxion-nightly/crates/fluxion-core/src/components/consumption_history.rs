@@ -189,6 +189,7 @@ impl ConsumptionHistory {
         self.hourly_profile = Some(HourlyConsumptionProfile {
             hourly_avg_kwh: [hourly_avg; 24],
             days_averaged: num_days,
+            hourly_p75_kwh: None,
         });
     }
 }
@@ -328,7 +329,110 @@ pub fn aggregate_hourly_consumption(
     Some(HourlyConsumptionProfile {
         hourly_avg_kwh,
         days_averaged: total_days,
+        hourly_p75_kwh: None,
     })
+}
+
+/// Minimum number of days of house-load data before its profile replaces the consumption one.
+pub const MIN_HOUSE_LOAD_DAYS: usize = 3;
+
+/// Gaps longer than this between house-load samples are not integrated.
+const HOUSE_LOAD_MAX_GAP_MINUTES: i64 = 30;
+
+/// Hourly house-load profile from a house-load power sensor (W).
+///
+/// Each sample holds until the next one (time-weighted). Negative readings are clamped to 0 and
+/// intervals longer than 30 min are skipped. For each UTC day and hour the time-weighted mean power
+/// in kW (which equals kWh/h) is taken over the covered part of that hour. `hourly_avg_kwh` is the
+/// mean of those values across days and `hourly_p75_kwh` their 75th percentile across days.
+/// Returns None if there are no samples.
+pub fn aggregate_hourly_house_load(
+    power_points: &[crate::traits::HistoryDataPoint],
+) -> Option<HourlyConsumptionProfile> {
+    use chrono::Timelike;
+    use std::collections::BTreeMap;
+
+    let mut sorted: Vec<&crate::traits::HistoryDataPoint> = power_points.iter().collect();
+    sorted.sort_by_key(|p| p.timestamp);
+
+    // (UTC day, hour) -> (energy kWh, covered hours)
+    let mut cells: BTreeMap<(chrono::NaiveDate, u32), (f64, f64)> = BTreeMap::new();
+    for pair in sorted.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let gap = b.timestamp - a.timestamp;
+        if gap <= Duration::zero() || gap > Duration::minutes(HOUSE_LOAD_MAX_GAP_MINUTES) {
+            continue;
+        }
+        let kw = f64::from(a.value.max(0.0)) / 1000.0;
+        let mut t = a.timestamp;
+        while t < b.timestamp {
+            let Some(hour_start) = t
+                .date_naive()
+                .and_hms_opt(t.hour(), 0, 0)
+                .map(|d| d.and_utc())
+            else {
+                break;
+            };
+            let segment_end = (hour_start + Duration::hours(1)).min(b.timestamp);
+            let hours = (segment_end - t).num_milliseconds() as f64 / 3_600_000.0;
+            let cell = cells
+                .entry((t.date_naive(), t.hour()))
+                .or_insert((0.0, 0.0));
+            cell.0 += kw * hours;
+            cell.1 += hours;
+            t = segment_end;
+        }
+    }
+
+    // UTC day -> mean kW per hour (None where the day has no data for that hour)
+    let mut days: BTreeMap<chrono::NaiveDate, [Option<f32>; 24]> = BTreeMap::new();
+    for ((day, hour), (energy_kwh, hours)) in cells {
+        if hours > 0.0 {
+            days.entry(day).or_insert([None; 24])[hour as usize] =
+                Some((energy_kwh / hours) as f32);
+        }
+    }
+    if days.is_empty() {
+        return None;
+    }
+
+    let mut hourly_avg_kwh = [0.0f32; 24];
+    let mut hourly_p75_kwh = [0.0f32; 24];
+    for h in 0..24 {
+        let mut values: Vec<f32> = days.values().filter_map(|d| d[h]).collect();
+        if values.is_empty() {
+            continue;
+        }
+        hourly_avg_kwh[h] = values.iter().sum::<f32>() / values.len() as f32;
+        hourly_p75_kwh[h] = percentile(&mut values, 0.75);
+    }
+
+    Some(HourlyConsumptionProfile {
+        hourly_avg_kwh,
+        days_averaged: days.len(),
+        hourly_p75_kwh: Some(hourly_p75_kwh),
+    })
+}
+
+/// Linear-interpolated percentile `q` (0..=1) of a non-empty slice. Sorts the slice.
+fn percentile(values: &mut [f32], q: f32) -> f32 {
+    values.sort_by(f32::total_cmp);
+    let pos = q * (values.len() - 1) as f32;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    values[lo] + (values[hi] - values[lo]) * (pos - lo as f32)
+}
+
+/// Picks the hourly profile used by the planner and the predictor: the house-load profile when it
+/// has at least `MIN_HOUSE_LOAD_DAYS` days of data, otherwise the consumption-based profile.
+pub fn pick_hourly_profile(
+    house_load: Option<HourlyConsumptionProfile>,
+    consumption: Option<HourlyConsumptionProfile>,
+) -> Option<HourlyConsumptionProfile> {
+    match house_load {
+        Some(profile) if profile.days_averaged >= MIN_HOUSE_LOAD_DAYS => Some(profile),
+        _ => consumption,
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +577,82 @@ mod tests {
         for (h, kwh) in profile.hourly_avg_kwh.iter().enumerate() {
             assert!((kwh - 1.0).abs() < 0.05, "hour {h}: {kwh}");
         }
+    }
+
+    fn power_point(day: u32, hour: u32, minute: u32, watts: f32) -> HistoryDataPoint {
+        use chrono::TimeZone;
+        HistoryDataPoint {
+            timestamp: chrono::Utc
+                .with_ymd_and_hms(2026, 10, day, hour, minute, 0)
+                .unwrap(),
+            value: watts,
+        }
+    }
+
+    #[test]
+    fn house_load_is_time_weighted_and_skips_gaps() {
+        // 10:00 1 kW for 20 min, 10:20 3 kW for 30 min, then a 50 min gap (not integrated)
+        let points = vec![
+            power_point(14, 10, 0, 1000.0),
+            power_point(14, 10, 20, 3000.0),
+            power_point(14, 10, 50, 2000.0),
+            power_point(14, 11, 40, 500.0),
+        ];
+        let profile = aggregate_hourly_house_load(&points).unwrap();
+        assert_eq!(profile.days_averaged, 1);
+        // Energy 1/3 + 1.5 = 11/6 kWh over 5/6 h covered = 2.2 kW
+        assert!((profile.hourly_avg_kwh[10] - 2.2).abs() < 1e-3);
+        assert_eq!(profile.hourly_avg_kwh[11], 0.0);
+        assert_eq!(profile.hourly_p75_kwh.unwrap()[11], 0.0);
+    }
+
+    #[test]
+    fn house_load_p75_across_seven_days() {
+        // Hour 8 holds a constant 1..7 kW on each of 7 days
+        let mut points = Vec::new();
+        for (i, day) in (14..=20).enumerate() {
+            let kw = (i + 1) as f32 * 1000.0;
+            points.push(power_point(day, 8, 0, kw));
+            points.push(power_point(day, 8, 30, kw));
+            points.push(power_point(day, 9, 0, kw));
+        }
+        let profile = aggregate_hourly_house_load(&points).unwrap();
+        assert_eq!(profile.days_averaged, 7);
+        assert!((profile.hourly_avg_kwh[8] - 4.0).abs() < 1e-3);
+        // Linear interpolation: position 0.75 * 6 = 4.5 between 5 and 6
+        let p75 = profile.hourly_p75_kwh.unwrap();
+        assert!((p75[8] - 5.5).abs() < 1e-3, "p75 {}", p75[8]);
+    }
+
+    #[test]
+    fn house_load_negative_is_clamped_to_zero() {
+        let points = vec![
+            power_point(14, 8, 0, -500.0),
+            power_point(14, 8, 30, -500.0),
+            power_point(14, 9, 0, 0.0),
+        ];
+        let profile = aggregate_hourly_house_load(&points).unwrap();
+        assert_eq!(profile.hourly_avg_kwh[8], 0.0);
+        assert_eq!(profile.hourly_p75_kwh.unwrap()[8], 0.0);
+    }
+
+    #[test]
+    fn house_load_empty_is_none() {
+        assert!(aggregate_hourly_house_load(&[]).is_none());
+    }
+
+    #[test]
+    fn pick_profile_falls_back_below_three_days() {
+        let profile = |days| HourlyConsumptionProfile {
+            hourly_avg_kwh: [1.0; 24],
+            days_averaged: days,
+            hourly_p75_kwh: None,
+        };
+        let consumption = Some(profile(7));
+        let picked = pick_hourly_profile(Some(profile(2)), consumption.clone()).unwrap();
+        assert_eq!(picked.days_averaged, 7);
+        let picked = pick_hourly_profile(Some(profile(3)), consumption).unwrap();
+        assert_eq!(picked.days_averaged, 3);
+        assert!(pick_hourly_profile(None, None).is_none());
     }
 }

@@ -68,6 +68,9 @@ pub struct GenericInverterState {
     /// Live export limit (W) from the inverter's export control number, when readable
     pub export_limit_w: Option<u32>,
 
+    /// Maximum the inverter accepts for the export limit (the entity's `max` attribute)
+    pub export_limit_max_w: Option<u32>,
+
     /// True when `work_mode` is ForceCharge but the vendor's manual sub-mode could not be read,
     /// so the real mode may be any Manual mode (Force Charge, Force Discharge or Hold)
     pub work_mode_ambiguous: bool,

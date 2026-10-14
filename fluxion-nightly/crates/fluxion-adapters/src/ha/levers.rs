@@ -798,6 +798,25 @@ pub enum SourceDecision<'a> {
     TimedOutDefault,
 }
 
+/// The owner changed a created helper before its migration ran. The value differs from what it was
+/// created with, or it changed more than a minute after creation. Time helpers have no value in
+/// their create payload, so only the time of the change counts for them.
+pub fn user_edited(spec: &HelperSpec, state: &HaEntityState, created_at: DateTime<Utc>) -> bool {
+    if !usable(state) {
+        return false;
+    }
+    let value_changed = match spec.kind {
+        // Created with HA's default: the first option, the minimum, off.
+        HelperKind::Select => state.state != VprMode::OPTIONS[0],
+        HelperKind::Number { min, .. } => parse_number(&state.state) != Some(min),
+        HelperKind::Switch => state.state != "off",
+        HelperKind::Time => false,
+    };
+    let changed_later = parse_last_changed(&state.last_changed)
+        .is_some_and(|at| at > created_at + TimeDelta::seconds(60));
+    value_changed || changed_later
+}
+
 /// Decide the migration source. An entity that is absent from HA is a fresh site without
 /// Node-RED. A present but unavailable/unknown entity (Node-RED still starting) is waited for, up
 /// to [`SOURCE_WAIT_LIMIT`] after the helper was created.
@@ -839,6 +858,17 @@ async fn migrate_pending(client: &HomeAssistantClient, setup: &mut HelperSetup) 
             continue;
         };
         let created_at = setup.created_at_or_insert(spec.name, now);
+        // Checked before any write, including the 24 h default: a helper the owner set by hand keeps
+        // its value.
+        let current = states.iter().find(|s| s.entity_id == entity_id);
+        if current.is_some_and(|state| user_edited(&spec, state, created_at)) {
+            info!(
+                "🎛️ {} was changed by the user — migration skipped",
+                spec.name
+            );
+            setup.mark_migrated(spec.name);
+            continue;
+        }
         let source = spec
             .source
             .and_then(|src| states.iter().find(|s| s.entity_id == src));
@@ -1746,5 +1776,80 @@ mod tests {
         let levers = build_user_levers(&states, &ids, now(), &memory);
         assert!(levers.automation_disabled);
         assert!(levers.vpr.is_some());
+    }
+
+    #[test]
+    fn user_edited_helper_is_not_overwritten_on_copy_path() {
+        let created: DateTime<Utc> = "2026-10-14T10:00:00Z".parse().unwrap();
+        let now = created + TimeDelta::hours(1);
+        let source = state("number.x", "60.0", "2026-10-14T09:00:00+00:00");
+        // Owner set 4 on the helper before the source was usable.
+        let edited = state("input_number.h", "4.0", "2026-10-14T10:30:00+00:00");
+        assert!(user_edited(&HELPERS[4], &edited, created));
+        // The copy would have been written here; the gate stops it before decide_source.
+        assert_eq!(
+            decide_source(Some(&source), created, now),
+            SourceDecision::Value("60.0")
+        );
+    }
+
+    #[test]
+    fn user_edited_helper_is_not_overwritten_by_24h_default() {
+        let created: DateTime<Utc> = "2026-10-14T10:00:00Z".parse().unwrap();
+        let now = created + TimeDelta::hours(25);
+        let unavailable = state("number.x", "unavailable", "2026-10-14T09:00:00+00:00");
+        assert_eq!(
+            decide_source(Some(&unavailable), created, now),
+            SourceDecision::TimedOutDefault
+        );
+        let edited = state("input_number.h", "4.0", "2026-10-14T20:00:00+00:00");
+        assert!(user_edited(&HELPERS[4], &edited, created));
+    }
+
+    #[test]
+    fn untouched_helper_still_migrates() {
+        let created: DateTime<Utc> = "2026-10-14T10:00:00Z".parse().unwrap();
+        // Created at the minimum (0 h) and never changed.
+        let untouched = state("input_number.h", "0.0", "2026-10-14T10:00:00+00:00");
+        assert!(!user_edited(&HELPERS[4], &untouched, created));
+        let untouched_select = state("input_select.v", "Žádný", "2026-10-14T10:00:00+00:00");
+        assert!(!user_edited(&HELPERS[0], &untouched_select, created));
+        // Copy path and 24 h default path both still write for an untouched helper.
+        let source = state("number.x", "60.0", "2026-10-14T09:00:00+00:00");
+        assert_eq!(
+            decide_source(Some(&source), created, created),
+            SourceDecision::Value("60.0")
+        );
+        let unavailable = state("number.x", "unavailable", "2026-10-14T09:00:00+00:00");
+        assert_eq!(
+            decide_source(Some(&unavailable), created, created + TimeDelta::hours(25)),
+            SourceDecision::TimedOutDefault
+        );
+    }
+
+    #[test]
+    fn user_edited_by_value_or_late_change() {
+        let created: DateTime<Utc> = "2026-10-14T10:00:00Z".parse().unwrap();
+        // A select moved off Žádný is an edit even if the change is recent.
+        let select = state(
+            "input_select.v",
+            "Prodej do sítě",
+            "2026-10-14T10:00:10+00:00",
+        );
+        assert!(user_edited(&HELPERS[0], &select, created));
+        // Same value, but changed well after creation.
+        let late = state("input_number.h", "0.0", "2026-10-14T10:05:00+00:00");
+        assert!(user_edited(&HELPERS[4], &late, created));
+        // Within the first minute is still creation.
+        let early = state("input_number.h", "0.0", "2026-10-14T10:00:59+00:00");
+        assert!(!user_edited(&HELPERS[4], &early, created));
+        // Time helper: the value is not compared, only the change time.
+        let time_late = state("input_datetime.t", "15:00:00", "2026-10-14T11:00:00+00:00");
+        assert!(user_edited(&HELPERS[1], &time_late, created));
+        let time_early = state("input_datetime.t", "15:00:00", "2026-10-14T10:00:00+00:00");
+        assert!(!user_edited(&HELPERS[1], &time_early, created));
+        // An unavailable helper cannot be judged: not treated as edited.
+        let gone = state("input_number.h", "unavailable", "2026-10-14T12:00:00+00:00");
+        assert!(!user_edited(&HELPERS[4], &gone, created));
     }
 }

@@ -12,9 +12,18 @@
 //! The horizon stops just before a missing block. The first planned mode is then applied to
 //! the *actual* block. The end state is valued at `cheap_ref` of the last day (see the totals).
 //!
+//! `--from <UTC timestamp>` starts the simulation at the first block at or after it, with the
+//! battery set to that block's recorded SOC; earlier blocks are skipped.
+//!
+//! `--profile import|house` replaces that forecast with the live hourly UTC profile, rebuilt for
+//! every decision day from the 7 local days before it: `import` is the old source (grid import,
+//! mean times `load_safety_factor`); `house` is the house-load profile (max of mean and p75 times
+//! the planner margin, falling back to `import` below 3 days), as the planner runs it now.
+//!
 //! Usage:
 //! `cargo run -p fluxion-core --example winter_reserve_replay -- data.json [--baseline-only]
-//!  [--csv out.csv] [--pv-noise] [--param key=value]...`
+//!  [--csv out.csv] [--pv-noise] [--profile forecast|import|house] [--from 2026-10-14T14:30:00Z]
+//!  [--param key=value]...`
 
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
@@ -26,6 +35,30 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::process::ExitCode;
+
+/// Planner load margin of the house-load profile (`control.planner_load_margin` default)
+const PLANNER_LOAD_MARGIN: f32 = 1.10;
+/// Days of house-load data before the house-load profile replaces the import one
+const MIN_HOUSE_LOAD_DAYS: usize = 3;
+
+/// Which load forecast the planner sees.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ProfileSource {
+    /// Mean of the same local minute over the 7 days before (default, unchanged)
+    Forecast,
+    /// Hourly UTC profile of grid import (the old `consumption_entity` source)
+    Import,
+    /// Hourly UTC profile of house load: max(mean, p75) times the planner margin
+    House,
+}
+
+/// Hourly UTC load profile (kWh per hour) built from the 7 local days before a decision day.
+struct HourlyLoad {
+    mean: [f32; 24],
+    p75: [f32; 24],
+    /// Days with at least one full UTC hour of data
+    days: usize,
+}
 
 #[derive(Deserialize)]
 struct Dataset {
@@ -50,6 +83,52 @@ struct Block {
     pv_kwh: Option<f32>,
     import_kwh: Option<f32>,
     export_kwh: Option<f32>,
+}
+
+/// Linear-interpolated percentile `q` of a non-empty slice. Sorts the slice.
+fn percentile(values: &mut [f32], q: f32) -> f32 {
+    values.sort_by(f32::total_cmp);
+    let pos = q * (values.len() - 1) as f32;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    values[lo] + (values[hi] - values[lo]) * (pos - lo as f32)
+}
+
+/// Builds the hourly UTC profile of `value` (kWh per block) from the 7 local days before
+/// `decision_day`. Only full UTC hours (4 blocks) count, as the live fetcher works on hours.
+fn hourly_load(rows: &[Row], decision_day: NaiveDate, value: fn(&Row) -> f32) -> HourlyLoad {
+    let mut hours: BTreeMap<(NaiveDate, u32), (f32, u32)> = BTreeMap::new();
+    for row in rows {
+        let day = row.local.date_naive();
+        if day >= decision_day || day < decision_day - Duration::days(7) {
+            continue;
+        }
+        let entry = hours
+            .entry((row.start.date_naive(), row.start.hour()))
+            .or_insert((0.0, 0));
+        entry.0 += value(row);
+        entry.1 += 1;
+    }
+    let mut per_day: BTreeMap<NaiveDate, [Option<f32>; 24]> = BTreeMap::new();
+    for ((day, hour), (kwh, blocks)) in hours {
+        if blocks == 4 {
+            per_day.entry(day).or_insert([None; 24])[hour as usize] = Some(kwh);
+        }
+    }
+    let mut out = HourlyLoad {
+        mean: [0.0; 24],
+        p75: [0.0; 24],
+        days: per_day.len(),
+    };
+    for h in 0..24 {
+        let mut values: Vec<f32> = per_day.values().filter_map(|d| d[h]).collect();
+        if values.is_empty() {
+            continue;
+        }
+        out.mean[h] = values.iter().sum::<f32>() / values.len() as f32;
+        out.p75[h] = percentile(&mut values, 0.75);
+    }
+    out
 }
 
 /// One block after parsing, with local time resolved.
@@ -155,6 +234,8 @@ fn run() -> Result<(), String> {
     let mut baseline_only = false;
     let mut csv_path: Option<String> = None;
     let mut pv_noise = false;
+    let mut profile = ProfileSource::Forecast;
+    let mut from: Option<DateTime<Utc>> = None;
     let mut params = WinterReserveParams::default();
 
     let mut iter = args.iter();
@@ -162,6 +243,20 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--baseline-only" => baseline_only = true,
             "--pv-noise" => pv_noise = true,
+            "--from" => {
+                let text = iter.next().ok_or("--from needs a UTC timestamp")?;
+                let parsed = DateTime::parse_from_rfc3339(text)
+                    .map_err(|err| format!("--from {text}: {err}"))?;
+                from = Some(parsed.with_timezone(&Utc));
+            }
+            "--profile" => {
+                profile = match iter.next().map(String::as_str) {
+                    Some("forecast") => ProfileSource::Forecast,
+                    Some("import") => ProfileSource::Import,
+                    Some("house") => ProfileSource::House,
+                    _ => return Err("--profile needs forecast, import or house".into()),
+                }
+            }
             "--csv" => csv_path = Some(iter.next().ok_or("--csv needs a path")?.clone()),
             "--param" => set_param(&mut params, iter.next().ok_or("--param needs key=value")?)?,
             other if other.starts_with("--") => return Err(format!("unknown flag {other}")),
@@ -238,7 +333,15 @@ fn run() -> Result<(), String> {
         load_hist.insert(key, row.load);
     }
 
-    let soc_start = rows[0].soc0_pct / 100.0 * capacity;
+    // First simulated block: the first one at or after `--from` (default: the first block).
+    let first = match from {
+        Some(t) => rows
+            .iter()
+            .position(|r| r.start >= t)
+            .ok_or("--from is after the last usable block")?,
+        None => 0,
+    };
+    let soc_start = rows[first].soc0_pct / 100.0 * capacity;
     let e0_su = soc_start.clamp(e_min, e_max);
     let mut e_su = e0_su;
     let mut e_wr = e0_su;
@@ -271,7 +374,7 @@ fn run() -> Result<(), String> {
     };
     let mut planned_blocks = 0usize;
 
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in rows.iter().enumerate().skip(first) {
         let day = row.local.date_naive();
         let acc = days.entry(day).or_default();
         acc.actual += row.import * row.buy - row.export * row.sell;
@@ -334,6 +437,8 @@ fn run() -> Result<(), String> {
                 } else {
                     day
                 };
+                let import_prof = hourly_load(&rows, day, |r| r.import);
+                let house_prof = hourly_load(&rows, day, |r| r.load);
                 let mut horizon: Vec<PlanBlock> = Vec::new();
                 for (j, later) in rows.iter().enumerate().skip(i) {
                     if later.local.date_naive() > horizon_end_day {
@@ -341,6 +446,23 @@ fn run() -> Result<(), String> {
                     }
                     let Some(load_fc) = forecast_load(i, j, &mut fallback_blocks) else {
                         break;
+                    };
+                    let hour = later.start.hour() as usize;
+                    let fallback_kwh = load_fc * params.load_safety_factor;
+                    let import_kwh = if import_prof.days > 0 {
+                        import_prof.mean[hour] * 0.25 * params.load_safety_factor
+                    } else {
+                        fallback_kwh
+                    };
+                    let load_kwh = match profile {
+                        ProfileSource::Forecast => fallback_kwh,
+                        ProfileSource::Import => import_kwh,
+                        ProfileSource::House if house_prof.days >= MIN_HOUSE_LOAD_DAYS => {
+                            house_prof.mean[hour].max(house_prof.p75[hour])
+                                * 0.25
+                                * PLANNER_LOAD_MARGIN
+                        }
+                        ProfileSource::House => import_kwh,
                     };
                     let noise = if pv_noise && j > i {
                         pv_noise_factor(j)
@@ -352,7 +474,7 @@ fn run() -> Result<(), String> {
                         duration_minutes: 15,
                         buy_czk: later.buy,
                         sell_czk: later.sell,
-                        load_kwh: load_fc * params.load_safety_factor,
+                        load_kwh,
                         pv_kwh: later.pv * params.pv_confidence * noise,
                         force_charge: false,
                         no_discharge: false,

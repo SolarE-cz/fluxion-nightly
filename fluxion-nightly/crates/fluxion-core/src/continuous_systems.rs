@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     components::*,
@@ -149,6 +149,23 @@ pub fn vpr_inverter_mode(mode: VprMode) -> Option<InverterOperationMode> {
 fn soc_blocks_mode(mode: InverterOperationMode, soc: f32, control: &ControlConfig) -> bool {
     (mode == InverterOperationMode::ForceCharge && soc >= control.max_battery_soc)
         || (mode == InverterOperationMode::ForceDischarge && soc <= control.min_battery_soc)
+}
+
+/// Defence in depth: ForceDischarge is never sent while `control.force_discharge_enabled` is false.
+/// The mode actually sent is returned (SelfUse instead of ForceDischarge).
+fn permitted_mode(
+    mode: InverterOperationMode,
+    force_discharge_enabled: bool,
+    inverter_id: &str,
+) -> InverterOperationMode {
+    if mode == InverterOperationMode::ForceDischarge && !force_discharge_enabled {
+        error!(
+            "🛑 ForceDischarge blocked for {}: control.force_discharge_enabled is false, sending SelfUse",
+            inverter_id
+        );
+        return InverterOperationMode::SelfUse;
+    }
+    mode
 }
 
 /// Max wait for the first lever sync before inverter writes proceed (startup only).
@@ -323,13 +340,43 @@ impl ExportLimitWatch {
     }
 }
 
-/// Send `SetExportLimit`, or log it in debug mode.
+/// Largest export limit FluxION may write: the lowest of the hard cap, `maximum_export_power_w`,
+/// the inverter's own `max` and the value itself. Logs a warning when it lowers the value.
+pub fn clamp_export_limit(value_w: u32, control: &ControlConfig, entity_max_w: Option<u32>) -> u32 {
+    let clamped = [
+        Some(value_w),
+        control.export_limit_hard_cap_w,
+        Some(control.maximum_export_power_w),
+        entity_max_w,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(value_w);
+    if clamped < value_w {
+        warn!(
+            "Export limit {} W clamped to {} W (hard cap {:?}, maximum_export_power_w {} W, entity max {:?} W)",
+            value_w,
+            clamped,
+            control.export_limit_hard_cap_w,
+            control.maximum_export_power_w,
+            entity_max_w
+        );
+    }
+    clamped
+}
+
+/// Send `SetExportLimit` with the value clamped by `clamp_export_limit`, or log it in debug mode.
+/// Returns the value written (or that would have been written).
 fn write_export_limit(
     async_writer: &crate::resources::AsyncInverterWriter,
+    control: &ControlConfig,
+    entity_max_w: Option<u32>,
     debug: bool,
     inverter_id: &str,
     limit_w: u32,
-) {
+) -> u32 {
+    let limit_w = clamp_export_limit(limit_w, control, entity_max_w);
     if debug {
         info!(
             "🔧 [DEBUG] Would set export limit of {} to {} W",
@@ -341,6 +388,7 @@ fn write_export_limit(
             InverterCommand::SetExportLimit(limit_w),
         );
     }
+    limit_w
 }
 
 /// System that executes scheduled mode changes
@@ -373,8 +421,10 @@ pub fn schedule_execution_system(
     mut kill_was_active: Local<bool>,
     mut lever_startup: Local<LeversStartup>,
     mut drift: Local<BTreeMap<String, ModeDriftWatch>>,
+    mut vpr_discharge_warned: Local<bool>,
 ) {
     let now = Utc::now();
+    let force_discharge_enabled = system_config.control_config.force_discharge_enabled;
 
     // Debug mode switched off at runtime: CurrentMode already equals the plan, so the
     // sync tracker is cleared to compare against the real hardware mode and send.
@@ -401,7 +451,24 @@ pub fn schedule_execution_system(
         .filter(|w| w.phase(now, &tz) == VprPhase::Active)
         .and_then(|w| {
             vpr_inverter_mode(w.mode).map(|mode| (mode, format!("VPR: {}", w.mode.option())))
+        })
+        .map(|(mode, reason)| {
+            // VPR "Vybíjení baterie" is a Force Discharge: blocked while it is disabled
+            if mode == InverterOperationMode::ForceDischarge && !force_discharge_enabled {
+                if !*vpr_discharge_warned {
+                    warn!(
+                        "VPR Vybíjení baterie blocked: force discharge disabled (control.force_discharge_enabled)"
+                    );
+                    *vpr_discharge_warned = true;
+                }
+                (InverterOperationMode::SelfUse, reason)
+            } else {
+                (mode, reason)
+            }
         });
+    if vpr_override.is_none() {
+        *vpr_discharge_warned = false;
+    }
     let vpr_exited = *vpr_was_active && vpr_override.is_none();
     *vpr_was_active = vpr_override.is_some();
 
@@ -431,6 +498,7 @@ pub fn schedule_execution_system(
                     "FluxION disabled by user".to_string(),
                 ),
             };
+            let target = permitted_mode(target, force_discharge_enabled, &inverter.id);
             // Not synced yet (startup or after a resync): compare with the hardware mode
             let is_initial_sync = !sync_tracker.synced_inverters.contains(&inverter.id);
             let compared = if is_initial_sync {
@@ -603,7 +671,11 @@ pub fn schedule_execution_system(
                         );
                         async_writer.write_command_async(
                             inverter.id.clone(),
-                            InverterCommand::SetMode(current_mode.mode),
+                            InverterCommand::SetMode(permitted_mode(
+                                current_mode.mode,
+                                force_discharge_enabled,
+                                &inverter.id,
+                            )),
                         );
                         current_mode.set_at = now;
                     } else {
@@ -699,7 +771,12 @@ pub fn schedule_execution_system(
                         current_mode.reason = scheduled_mode.reason.clone();
                     } else {
                         // Send command using direct async writer (fire-and-forget)
-                        let command = InverterCommand::SetMode(scheduled_mode.mode);
+                        let mode_sent = permitted_mode(
+                            scheduled_mode.mode,
+                            force_discharge_enabled,
+                            &inverter.id,
+                        );
+                        let command = InverterCommand::SetMode(mode_sent);
 
                         info!(
                             "📤 Sending command to change {} to {:?}: {}{}",
@@ -717,7 +794,7 @@ pub fn schedule_execution_system(
                         async_writer.write_command_async(inverter.id.clone(), command);
 
                         // Update current mode immediately (optimistic)
-                        current_mode.mode = scheduled_mode.mode;
+                        current_mode.mode = mode_sent;
                         current_mode.set_at = now;
                         current_mode.reason = scheduled_mode.reason.clone();
                     }
@@ -838,41 +915,56 @@ pub fn export_curtailment_system(
             continue;
         }
         let read_back = raw_state.and_then(|raw| raw.state.export_limit_w);
+        let entity_max_w = raw_state.and_then(|raw| raw.state.export_limit_max_w);
         let watch = export.limit_watch.entry(inverter.id.clone()).or_default();
         if !curtail_wanted {
             watch.skip_warned = false;
         }
 
         if !curtail_wanted && let Some(restore_w) = export.restore_limits_w.remove(&inverter.id) {
-            info!("✅ Export restored to {} W ({})", restore_w, inverter.id);
-            write_export_limit(&async_writer, debug.enabled, &inverter.id, restore_w);
-            watch.intended_w = restore_w;
+            // Restore to the exact limit read back before curtailing (clamped on write)
+            let written_w = write_export_limit(
+                &async_writer,
+                control,
+                entity_max_w,
+                debug.enabled,
+                &inverter.id,
+                restore_w,
+            );
+            info!("✅ Export restored to {} W ({})", written_w, inverter.id);
+            watch.intended_w = written_w;
             watch.written = true;
             watch.curtailed = false;
             watch.rewrites = 0;
             changed = true;
         } else if curtail_wanted && !export.restore_limits_w.contains_key(&inverter.id) {
-            let restore_w = match read_back {
-                Some(limit_w) if limit_w > 0 => Some(limit_w),
-                Some(_) => {
+            // Curtail only from a known limit that is above the curtail target
+            let curtail_from = match read_back {
+                Some(limit_w) if limit_w > 0 && control.export_limit_min_w < limit_w => {
+                    Some(limit_w)
+                }
+                Some(limit_w) => {
                     if !watch.skip_warned {
                         warn!(
-                            "Export limit of {} is already 0 W, not curtailing it",
-                            inverter.id
+                            "Export limit of {} is {} W, not above the curtail target {} W; not curtailing",
+                            inverter.id, limit_w, control.export_limit_min_w
                         );
                         watch.skip_warned = true;
                     }
                     None
                 }
                 None => {
-                    warn!(
-                        "Export limit of {} is unknown, restoring to maximum_export_power_w ({} W)",
-                        inverter.id, control.maximum_export_power_w
-                    );
-                    Some(control.maximum_export_power_w)
+                    if !watch.skip_warned {
+                        warn!(
+                            "Export limit of {} is unknown, not curtailing it (no restore value)",
+                            inverter.id
+                        );
+                        watch.skip_warned = true;
+                    }
+                    None
                 }
             };
-            if let Some(restore_w) = restore_w {
+            if let Some(restore_w) = curtail_from {
                 info!(
                     "🚫 Export curtailed (sell {:.3} ≤ {:.3}) for {}",
                     sell_price.unwrap_or_default(),
@@ -882,8 +974,15 @@ pub fn export_curtailment_system(
                 export
                     .restore_limits_w
                     .insert(inverter.id.clone(), restore_w);
-                write_export_limit(&async_writer, debug.enabled, &inverter.id, 0);
-                watch.intended_w = 0;
+                let written_w = write_export_limit(
+                    &async_writer,
+                    control,
+                    entity_max_w,
+                    debug.enabled,
+                    &inverter.id,
+                    control.export_limit_min_w,
+                );
+                watch.intended_w = written_w;
                 watch.written = true;
                 watch.curtailed = true;
                 watch.rewrites = 0;
@@ -902,7 +1001,14 @@ pub fn export_curtailment_system(
                         "⚠️ Export limit of {} reads {:?} W, expected {} W — rewriting",
                         inverter.id, read_back, watch.intended_w
                     );
-                    write_export_limit(&async_writer, false, &inverter.id, watch.intended_w);
+                    write_export_limit(
+                        &async_writer,
+                        control,
+                        entity_max_w,
+                        false,
+                        &inverter.id,
+                        watch.intended_w,
+                    );
                 }
                 Reassert::GiveUp => {
                     warn!(
@@ -1382,6 +1488,13 @@ mod levers_execution_tests {
                 raw.state.work_mode_ambiguous = true;
                 raw.last_updated = read_at;
             }
+        }
+
+        fn set_force_discharge(&mut self, enabled: bool) {
+            self.world
+                .resource_mut::<SystemConfig>()
+                .control_config
+                .force_discharge_enabled = enabled;
         }
 
         fn set_current(&mut self, mode: InverterOperationMode) {
@@ -2170,6 +2283,104 @@ mod levers_execution_tests {
         assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
     }
 
+    #[test]
+    fn permitted_mode_never_passes_force_discharge_when_disabled() {
+        assert_eq!(
+            permitted_mode(InverterOperationMode::ForceDischarge, false, "inv1"),
+            InverterOperationMode::SelfUse
+        );
+        assert_eq!(
+            permitted_mode(InverterOperationMode::ForceDischarge, true, "inv1"),
+            InverterOperationMode::ForceDischarge
+        );
+        assert_eq!(
+            permitted_mode(InverterOperationMode::ForceCharge, false, "inv1"),
+            InverterOperationMode::ForceCharge
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_force_discharge_is_sent_as_selfuse_when_disabled() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceDischarge,
+            )],
+            false,
+        );
+
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn planned_force_discharge_is_sent_when_enabled() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceDischarge,
+            )],
+            false,
+        );
+        h.set_force_discharge(true);
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceDischarge]
+        );
+    }
+
+    #[tokio::test]
+    async fn vpr_discharge_battery_is_blocked_when_disabled() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::DischargeBattery)),
+            ..Default::default()
+        });
+
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    #[tokio::test]
+    async fn vpr_discharge_battery_is_sent_when_enabled() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.set_force_discharge(true);
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::DischargeBattery)),
+            ..Default::default()
+        });
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceDischarge]
+        );
+    }
+
     /// Export curtailment world: one inverter reading `read_back_w` (master or independent) and a
     /// sell price of `sell` in the current block.
     struct ExportHarness {
@@ -2204,6 +2415,7 @@ mod levers_execution_tests {
             ..Default::default()
         });
         let mut config = system_config(8000);
+        config.control_config.export_curtailment_enabled = true;
         if master {
             config.inverters[0].topology = InverterTopology::Master {
                 slave_ids: Vec::new(),
@@ -2268,6 +2480,19 @@ mod levers_execution_tests {
                 raw.state.export_limit_w = read_back_w;
                 raw.last_updated = read_at;
             }
+        }
+
+        /// The inverter's own maximum for the export limit (its `max` attribute).
+        fn set_entity_max(&mut self, max_w: Option<u32>, read_at: DateTime<Utc>) {
+            let mut query = self.world.query::<&mut RawInverterState>();
+            for mut raw in query.iter_mut(&mut self.world) {
+                raw.state.export_limit_max_w = max_w;
+                raw.last_updated = read_at;
+            }
+        }
+
+        fn set_control(&mut self, edit: impl FnOnce(&mut fluxion_types::ControlConfig)) {
+            edit(&mut self.world.resource_mut::<SystemConfig>().control_config);
         }
     }
 
@@ -2391,13 +2616,97 @@ mod levers_execution_tests {
     }
 
     #[tokio::test]
-    async fn export_unknown_limit_falls_back_for_independent_inverter() {
+    async fn export_unknown_limit_does_not_curtail() {
         let mut h = export_harness(None, false, Some(-0.1));
 
         h.run();
+        h.run();
 
+        assert!(h.sent().await.is_empty());
+        assert_eq!(restore_entry(&h), None);
+    }
+
+    #[tokio::test]
+    async fn export_restore_is_clamped_to_entity_max() {
+        let now = Utc::now();
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.run();
         assert_eq!(h.sent().await, vec![("inv1".to_string(), 0)]);
-        assert_eq!(restore_entry(&h), Some(8000));
+
+        // The inverter's own maximum is now 6000 W: the exact pre-curtail 8000 W is clamped
+        h.set_entity_max(Some(6000), now + Duration::seconds(1));
+        h.set_read_back(Some(6000), now + Duration::seconds(1));
+        h.set_sell(Some(1.0));
+        h.run();
+
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 6000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_restore_is_clamped_to_hard_cap() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.set_control(|c| c.export_limit_hard_cap_w = Some(5000));
+        h.run();
+        h.set_sell(Some(1.0));
+        h.run();
+
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 5000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_restore_is_clamped_to_maximum_export_power() {
+        // Pre-curtail limit above maximum_export_power_w (8000 W in the harness)
+        let mut h = export_harness(Some(9000), false, Some(-0.1));
+        h.run();
+        h.set_sell(Some(1.0));
+        h.run();
+
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 0), ("inv1".to_string(), 8000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_curtail_uses_export_limit_min_w() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.set_control(|c| c.export_limit_min_w = 10);
+        h.run();
+        h.set_sell(Some(1.0));
+        h.run();
+
+        assert_eq!(
+            h.sent().await,
+            vec![("inv1".to_string(), 10), ("inv1".to_string(), 8000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn export_curtail_target_is_clamped_too() {
+        let mut h = export_harness(Some(8000), false, Some(-0.1));
+        h.set_control(|c| {
+            c.export_limit_min_w = 10;
+            c.export_limit_hard_cap_w = Some(5);
+        });
+        h.run();
+
+        assert_eq!(h.sent().await, vec![("inv1".to_string(), 5)]);
+    }
+
+    #[tokio::test]
+    async fn export_curtail_skipped_when_target_is_not_below_current_limit() {
+        let mut h = export_harness(Some(5), false, Some(-0.1));
+        h.set_control(|c| c.export_limit_min_w = 10);
+        h.run();
+
+        assert!(h.sent().await.is_empty());
+        assert_eq!(restore_entry(&h), None);
     }
 
     #[tokio::test]
@@ -2465,6 +2774,25 @@ mod levers_execution_tests {
             h.sent().await,
             vec![("inv1".to_string(), 0), ("inv1".to_string(), 0)]
         );
+    }
+
+    #[test]
+    fn export_curtailment_is_opt_in() {
+        assert!(!fluxion_types::ControlConfig::default().export_curtailment_enabled);
+    }
+
+    #[test]
+    fn export_limit_clamp_applies_every_cap() {
+        let mut control = fluxion_types::ControlConfig {
+            maximum_export_power_w: 8000,
+            ..Default::default()
+        };
+        assert_eq!(clamp_export_limit(9000, &control, None), 8000);
+        assert_eq!(clamp_export_limit(9000, &control, Some(6000)), 6000);
+        control.export_limit_hard_cap_w = Some(5000);
+        assert_eq!(clamp_export_limit(9000, &control, Some(6000)), 5000);
+        assert_eq!(clamp_export_limit(3000, &control, Some(6000)), 3000);
+        assert_eq!(clamp_export_limit(0, &control, Some(6000)), 0);
     }
 
     #[test]

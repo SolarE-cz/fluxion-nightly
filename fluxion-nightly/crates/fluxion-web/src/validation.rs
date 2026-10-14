@@ -173,6 +173,34 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
         });
     }
 
+    if !(1.0..=1.5).contains(&control.planner_load_margin) {
+        errors.push(ValidationIssue {
+            field: "control.planner_load_margin".to_owned(),
+            message: "Planner load margin must be between 1.0 and 1.5".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
+    if control.force_discharge_enabled {
+        errors.push(ValidationIssue {
+            field: "control.force_discharge_enabled".to_owned(),
+            message: "Battery force discharge is enabled and is not yet capped to the export limit"
+                .to_owned(),
+            severity: "warning".to_owned(),
+        });
+    }
+
+    // Export limits are unsigned watts (a negative value cannot be deserialised); the curtail
+    // target must not exceed the export maximum
+    if control.export_limit_min_w > control.maximum_export_power_w {
+        errors.push(ValidationIssue {
+            field: "control.export_limit_min_w".to_owned(),
+            message: "Export limit while curtailed must not exceed maximum_export_power_w"
+                .to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
     // ============= Pricing Settings =============
     let pricing = &config.pricing_config;
 

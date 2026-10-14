@@ -307,6 +307,9 @@ pub fn update_prices_system(
         consumption_history
             .hourly_profile()
             .map(|p| &p.hourly_avg_kwh),
+        consumption_history
+            .hourly_profile()
+            .and_then(|p| p.hourly_p75_kwh.as_ref()),
         timezone_config
             .as_ref()
             .and_then(|tz| tz.timezone.as_deref()),

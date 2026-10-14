@@ -10,6 +10,33 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.44] - 2026-10-14
+
+### Fixed
+
+- **Evening battery planning.** The planner's load profile came from grid import, which is near zero
+  at midday and low in the evening because the battery covers it, so it expected about half the real
+  evening load and spent the battery before the most expensive hours. The profile now comes from the
+  house-load power (`history.house_load_power_entity`, default the SolaX house load), time-weighted
+  over 7 days, and the planner uses the higher of the mean and the 75th percentile times
+  `control.planner_load_margin` (default 1.10). With a short battery it now holds charge in the
+  mid-priced hours before the peak.
+- **Lever migration** never overwrites a helper the user has changed.
+
+### Safety
+
+- **Export limit never exceeds the site cap.** Every export-limit write is clamped to the lowest of
+  the inverter entity's maximum, `control.maximum_export_power_w` and the new optional
+  `control.export_limit_hard_cap_w`. The adapter refuses a write above the entity maximum, or when
+  the maximum cannot be read. A restore goes only to the exact value read back before curtailing;
+  with an unknown previous limit FluxION does not curtail. Curtailment writes
+  `control.export_limit_min_w` (default 0).
+- **Export curtailment is off by default** (`control.export_curtailment_enabled: false`).
+- **Battery force discharge is off by default** (`control.force_discharge_enabled: false`). SolaX
+  Force Discharge runs at full battery power and is not yet capped to the export limit, so the
+  planner does not schedule it, VPR "Vybíjení baterie" applies Self Use, and execution never sends
+  it.
+
 ## [0.2.43] - 2026-10-14
 
 ### Added

@@ -95,6 +95,11 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
                 .hourly_consumption_profile
                 .as_ref()
                 .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
+            hourly_consumption_p75: request
+                .historical
+                .hourly_consumption_p75
+                .as_ref()
+                .and_then(|v| <&[f32; 24]>::try_from(v.as_slice()).ok()),
             block_forecasts: (!request.block_forecasts.is_empty()
                 && request.block_forecasts.len() == request.all_blocks.len())
             .then_some(request.block_forecasts.as_slice()),

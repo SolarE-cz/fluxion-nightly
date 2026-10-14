@@ -21,7 +21,8 @@ pub use battery_predictor::{
 };
 pub use consumption_history::{
     ConsumptionHistory, ConsumptionHistoryConfig, DailyEnergySummary, HourlyConsumptionProfile,
-    aggregate_daily_consumption, aggregate_hourly_consumption,
+    aggregate_daily_consumption, aggregate_hourly_consumption, aggregate_hourly_house_load,
+    pick_hourly_profile,
 };
 pub use pv_history::{PvHistory, PvHistoryPoint};
 

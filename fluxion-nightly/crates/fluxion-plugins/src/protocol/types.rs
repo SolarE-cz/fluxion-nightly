@@ -85,6 +85,9 @@ pub struct HistoricalData {
     /// Averaged over last 7 days of historical data
     #[serde(default)]
     pub hourly_consumption_profile: Option<Vec<f32>>,
+    /// Per-hour 75th percentile of house load (kWh per hour, 24 entries), when available
+    #[serde(default)]
+    pub hourly_consumption_p75: Option<Vec<f32>>,
 }
 
 /// Complete evaluation request sent to strategy plugins

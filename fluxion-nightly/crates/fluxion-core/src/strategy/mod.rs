@@ -268,6 +268,10 @@ pub struct EvaluationContext<'a> {
     /// Enables strategies to understand when energy demand is highest
     pub hourly_consumption_profile: Option<&'a [f32; 24]>,
 
+    /// Per-hour 75th percentile of house load (kWh per hour). Set only when the house-load profile
+    /// is in use; the Winter Reserve planner plans with max(mean, p75).
+    pub hourly_consumption_p75: Option<&'a [f32; 24]>,
+
     /// Per-block raw forecasts aligned with `all_price_blocks` (None = unknown)
     pub block_forecasts: Option<&'a [fluxion_plugins::protocol::BlockForecast]>,
 

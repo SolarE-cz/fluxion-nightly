@@ -321,6 +321,10 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                     .hourly_profile()
                     .map(|p| &p.hourly_avg_kwh),
                 params
+                    .consumption_history
+                    .hourly_profile()
+                    .and_then(|p| p.hourly_p75_kwh.as_ref()),
+                params
                     .timezone_config
                     .as_ref()
                     .and_then(|tz| tz.timezone.as_deref()),
@@ -506,6 +510,10 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                     .consumption_history
                     .hourly_profile()
                     .map(|p| &p.hourly_avg_kwh),
+                params
+                    .consumption_history
+                    .hourly_profile()
+                    .and_then(|p| p.hourly_p75_kwh.as_ref()),
                 params
                     .timezone_config
                     .as_ref()

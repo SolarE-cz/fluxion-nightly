@@ -43,6 +43,9 @@ pub struct BatteryParams {
     /// by `min_mode_change_interval_secs` and Force Discharge runs at full power meanwhile.
     #[serde(default)]
     pub export_guard_margin_kwh: f32,
+    /// Export is a battery discharge: offered only when `control.force_discharge_enabled`
+    #[serde(default)]
+    pub force_discharge_enabled: bool,
 }
 
 /// Tunables of the strategy (`strategies.winter_reserve` config section).
@@ -236,6 +239,7 @@ fn candidate_modes(
     let export_profit =
         block.sell_czk - cheap_ref / battery.efficiency - battery.wear_cost_czk_per_kwh;
     if block.export_allowed
+        && battery.force_discharge_enabled
         && block.sell_czk > 0.0
         && export_profit >= params.min_arbitrage_profit_czk
     {
@@ -698,6 +702,7 @@ fn battery_params(control: &ControlConfig) -> BatteryParams {
         wear_cost_czk_per_kwh: control.battery_wear_cost_czk_per_kwh,
         max_export_kw: control.maximum_export_power_w as f32 / 1000.0,
         export_guard_margin_kwh: mode_change_kwh.max(0.5),
+        force_discharge_enabled: control.force_discharge_enabled,
     }
 }
 
@@ -809,7 +814,8 @@ fn inverter_mode(mode: PlanMode) -> InverterOperationMode {
 
 impl WinterReserveStrategy {
     /// Plan blocks from the evaluated block to the end of the known horizon.
-    /// Load: non-empty UTC-hour profile, else aligned flat forecast, else average load.
+    /// Load: non-empty UTC-hour profile (max of mean and p75 times `planner_load_margin` when p75 is
+    /// available, else mean times `load_safety_factor`), else aligned flat forecast, else average load.
     /// PV: aligned forecast, else 0. Forecasts are used only when aligned with `all_price_blocks`.
     /// The first entry is the evaluated block. User levers are applied to the blocks (see `apply_user_levers`).
     fn horizon_blocks(&self, context: &super::EvaluationContext) -> Vec<PlanBlock> {
@@ -827,20 +833,29 @@ impl WinterReserveStrategy {
         let profile = context
             .hourly_consumption_profile
             .filter(|p| p.iter().sum::<f32>() > 0.0);
+        let p75 = context.hourly_consumption_p75.filter(|_| profile.is_some());
         let mut blocks: Vec<PlanBlock> = all
             .iter()
             .enumerate()
             .map(|(i, b)| {
                 let hours = b.duration_minutes as f32 / 60.0;
+                let hour = b.block_start.hour() as usize;
                 // Load: UTC-hour profile if it has data, else flat block forecast, else average load.
-                let base_load = match profile {
-                    Some(p) => p[b.block_start.hour() as usize] * hours,
-                    None => match forecasts {
-                        Some(f) => f[i].consumption_kwh,
-                        None => control.average_household_load_kw * hours,
-                    },
+                // With the p75 profile the planner uses max(mean, p75) times the planner margin.
+                let (base_load, factor) = match (profile, p75) {
+                    (Some(p), Some(q)) => {
+                        (p[hour].max(q[hour]) * hours, control.planner_load_margin)
+                    }
+                    (Some(p), None) => (p[hour] * hours, self.params.load_safety_factor),
+                    (None, _) => {
+                        let base = match forecasts {
+                            Some(f) => f[i].consumption_kwh,
+                            None => control.average_household_load_kw * hours,
+                        };
+                        (base, self.params.load_safety_factor)
+                    }
                 };
-                let load = base_load * self.params.load_safety_factor;
+                let load = base_load * factor;
                 let pv = match forecasts {
                     Some(f) => f[i].solar_kwh * self.params.pv_confidence,
                     None => 0.0,
@@ -1049,6 +1064,7 @@ mod tests {
             wear_cost_czk_per_kwh: 0.125,
             max_export_kw: 10.0,
             export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: true,
         }
     }
 
@@ -1584,6 +1600,8 @@ mod tests {
 
     fn control() -> ControlConfig {
         ControlConfig {
+            // Planner export tests model the enabled state (force discharge is opt-in)
+            force_discharge_enabled: true,
             battery_capacity_kwh: 96.0,
             min_battery_soc: 10.0,
             max_battery_soc: 100.0,
@@ -1639,6 +1657,7 @@ mod tests {
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 3.0,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
             block_forecasts: None,
             timezone: None,
             user_levers: None,
@@ -1760,6 +1779,25 @@ mod tests {
     }
 
     #[test]
+    fn load_uses_p75_with_planner_margin_when_available() {
+        let blocks = price_blocks();
+        let mut ctl = control();
+        ctl.planner_load_margin = 1.2;
+        let mut profile = [0.5_f32; 24];
+        profile[16] = 2.0;
+        let mut p75 = [0.5_f32; 24];
+        p75[16] = 3.0;
+        let mut c = ctx(&blocks, 0, &ctl, 50.0);
+        c.hourly_consumption_profile = Some(&profile);
+        c.hourly_consumption_p75 = Some(&p75);
+        c.block_forecasts = None;
+        let horizon = strategy().horizon_blocks(&c);
+        // max(mean, p75) = 3.0 kWh/h * 0.25 h * planner_load_margin 1.2
+        assert!(approx(horizon[0].load_kwh, 3.0 * 0.25 * 1.2));
+        assert!(approx(horizon[4].load_kwh, 0.5 * 0.25 * 1.2)); // 17:00 UTC
+    }
+
+    #[test]
     fn guard_export_falls_back_to_selfuse_at_floor() {
         let blocks = price_blocks();
         let ctl = control();
@@ -1843,6 +1881,24 @@ mod tests {
                 .map(|x| (x.load_kwh - x.pv_kwh).max(0.0))
                 .sum::<f32>();
         assert!(approx(floors[8], expected), "{} vs {expected}", floors[8]);
+    }
+
+    #[test]
+    fn planner_holds_mid_blocks_before_peak_when_battery_is_short() {
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        // 3 kWh above the floor (10 kWh battery at 40 %, floor 10 %). 2 h at 6 CZK, then a 2 h
+        // peak at 8 CZK. Load 3 kW = 0.75 kWh per 15-min block, no PV.
+        let b = BatteryParams {
+            capacity_kwh: 10.0,
+            ..battery()
+        };
+        let mut blocks: Vec<PlanBlock> = (0..8).map(|i| pblock(i, 6.0, 2.0, 0.75, 0.0)).collect();
+        blocks.extend((8..16).map(|i| pblock(i, 8.0, 2.0, 0.75, 0.0)));
+        let p = plan(&blocks, 40.0, tz, &b, &params);
+        let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
+        assert!(modes[..8].contains(&PlanMode::Hold), "{modes:?}");
+        assert!(modes[8..].iter().any(|m| *m != PlanMode::Hold), "{modes:?}");
     }
 
     #[test]
@@ -2284,5 +2340,76 @@ mod tests {
         c.user_levers = Some(&kill_switch);
         s.evaluate(&c);
         assert_eq!(s.plan_count.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
+mod force_discharge_gate_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn battery(force_discharge_enabled: bool) -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 20.0,
+            min_soc_pct: 10.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.9,
+            wear_cost_czk_per_kwh: 0.125,
+            max_export_kw: 10.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled,
+        }
+    }
+
+    /// A block where exporting is clearly profitable (sell 10, cheap reference 1).
+    fn profitable_block() -> PlanBlock {
+        PlanBlock {
+            start: Utc.with_ymd_and_hms(2026, 10, 13, 17, 0, 0).unwrap(),
+            duration_minutes: 15,
+            buy_czk: 1.0,
+            sell_czk: 10.0,
+            load_kwh: 0.5,
+            pv_kwh: 0.0,
+            force_charge: false,
+            no_discharge: false,
+            force_charge_at_or_below_czk: None,
+            export_min_soc_pct: None,
+            export_allowed: true,
+        }
+    }
+
+    #[test]
+    fn export_is_not_offered_when_force_discharge_is_disabled() {
+        let modes = candidate_modes(
+            &profitable_block(),
+            2.0,
+            1.0,
+            &battery(false),
+            &WinterReserveParams::default(),
+        );
+        assert!(!modes.contains(&PlanMode::Export));
+        assert!(modes.contains(&PlanMode::SelfUse));
+    }
+
+    #[test]
+    fn export_is_offered_when_force_discharge_is_enabled() {
+        let modes = candidate_modes(
+            &profitable_block(),
+            2.0,
+            1.0,
+            &battery(true),
+            &WinterReserveParams::default(),
+        );
+        assert!(modes.contains(&PlanMode::Export));
+    }
+
+    #[test]
+    fn planner_battery_params_follow_control_config() {
+        let mut control = ControlConfig::default();
+        assert!(!battery_params(&control).force_discharge_enabled);
+        control.force_discharge_enabled = true;
+        assert!(battery_params(&control).force_discharge_enabled);
     }
 }
