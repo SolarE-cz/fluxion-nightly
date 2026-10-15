@@ -17,6 +17,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::ha::actuation::{self, ActuationGuardConfig, ActuationState};
 use crate::ha::client::HomeAssistantClient;
 use fluxion_core::pricing::parse_spot_price_response;
 use fluxion_core::{
@@ -29,12 +30,27 @@ use fluxion_core::{
 pub struct HomeAssistantInverterAdapter {
     client: Arc<HomeAssistantClient>,
     mapper: Arc<dyn VendorEntityMapper>,
+    /// Pre-actuation guards (lock, wake, charge check), run before every write
+    guard: ActuationGuardConfig,
+    actuation: ActuationState,
 }
 
 impl HomeAssistantInverterAdapter {
     /// Create a new HA inverter adapter
     pub fn new(client: Arc<HomeAssistantClient>, mapper: Arc<dyn VendorEntityMapper>) -> Self {
-        Self { client, mapper }
+        Self {
+            client,
+            mapper,
+            guard: ActuationGuardConfig::default(),
+            actuation: ActuationState::default(),
+        }
+    }
+
+    /// Use the given pre-actuation guard settings (e.g. `control.auto_unlock_inverter`)
+    #[must_use]
+    pub fn with_guard(mut self, guard: ActuationGuardConfig) -> Self {
+        self.guard = guard;
+        self
     }
 
     /// Get reference to the underlying HA client (for history queries, etc.)
@@ -337,8 +353,16 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             inverter_id, command
         );
 
+        // Pre-actuation guard (brief H11): the single choke point for every SolaX write.
+        // Unlock before any write, including export limits; the write is skipped on error.
+        actuation::ensure_unlocked(&self.client, inverter_id, &self.guard).await?;
+
         match command {
             InverterCommand::SetMode(mode) => {
+                if *mode == InverterOperationMode::ForceCharge {
+                    actuation::ensure_awake(&self.client, inverter_id, &self.actuation).await;
+                }
+
                 // Get all entity changes needed from vendor mapper
                 let mode_change = self.mapper.get_mode_change_request(inverter_id, *mode);
 
@@ -393,6 +417,16 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
                     mode,
                     mode_change.entity_changes.len()
                 );
+
+                if actuation::note_mode_written(&self.actuation, *mode) {
+                    actuation::start_charge_check(
+                        self.client.clone(),
+                        &self.actuation,
+                        inverter_id,
+                        self.mapper.get_battery_power_entity(inverter_id),
+                        self.guard.charge_check_delay,
+                    );
+                }
             }
             InverterCommand::SetExportLimit(limit_w) => {
                 let entity_id = self.mapper.get_export_limit_entity(inverter_id);
@@ -917,6 +951,7 @@ impl fluxion_core::traits::ConsumptionHistoryDataSource for HaConsumptionHistory
 mod tests {
     use super::*;
     use fluxion_core::InverterOperationMode;
+    use serde_json::json;
 
     // Mock mapper for testing
     struct MockMapper;
@@ -975,10 +1010,13 @@ mod tests {
         fn get_mode_change_request(
             &self,
             _inverter_id: &str,
-            _mode: InverterOperationMode,
+            mode: InverterOperationMode,
         ) -> fluxion_core::ModeChangeRequest {
             fluxion_core::ModeChangeRequest {
-                entity_changes: vec![],
+                entity_changes: vec![fluxion_core::EntityChange {
+                    entity_id: "select.solax_charger_use_mode".to_string(),
+                    option: format!("{mode:?}"),
+                }],
             }
         }
     }
@@ -1001,6 +1039,318 @@ mod tests {
         let adapter = CzSpotPriceAdapter::new(client, "sensor.current_spot_electricity_prices");
         assert_eq!(adapter.name(), "CzSpotPrice");
         assert_eq!(adapter.entity_id, "sensor.current_spot_electricity_prices");
+    }
+    // ---- Pre-actuation guards (brief H11): the adapter's write_command, against mockito ----
+
+    use crate::ha::actuation::ActuationGuardConfig;
+    use mockito::{Matcher, Server};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Duration;
+
+    fn state_body(entity: &str, state: &str) -> Vec<u8> {
+        format!(
+            r#"{{"entity_id":"{entity}","state":"{state}","attributes":{{}},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}}"#
+        )
+        .into_bytes()
+    }
+
+    fn guard(auto_unlock: bool) -> ActuationGuardConfig {
+        ActuationGuardConfig {
+            auto_unlock,
+            unlock_timeout: Duration::from_millis(300),
+            unlock_poll: Duration::from_millis(10),
+            charge_check_delay: Duration::from_secs(3600),
+        }
+    }
+
+    fn adapter_for(url: String, cfg: ActuationGuardConfig) -> HomeAssistantInverterAdapter {
+        let client = Arc::new(HomeAssistantClient::new(url, "test_token").unwrap());
+        HomeAssistantInverterAdapter::new(client, Arc::new(MockMapper)).with_guard(cfg)
+    }
+
+    type Log = Arc<StdMutex<Vec<&'static str>>>;
+
+    #[tokio::test]
+    async fn locked_inverter_is_unlocked_and_read_back_before_write() {
+        let mut server = Server::new_async().await;
+        let log: Log = Arc::new(StdMutex::new(Vec::new()));
+        let reads = Arc::new(AtomicUsize::new(0));
+
+        let read_log = log.clone();
+        let read_count = reads.clone();
+        let lock_read = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(move |_| {
+                read_log.lock().unwrap().push("read");
+                let n = read_count.fetch_add(1, AtomicOrdering::SeqCst);
+                let state = if n == 0 { "Locked" } else { "Unlocked" };
+                state_body("select.solax_lock_state", state)
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        let notify_log = log.clone();
+        let notify = server
+            .mock("POST", "/api/services/persistent_notification/create")
+            .with_body_from_request(move |_| {
+                notify_log.lock().unwrap().push("notify");
+                b"[]".to_vec()
+            })
+            .create_async()
+            .await;
+        let select_log = log.clone();
+        let unlock = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(json!({"option": "Unlocked"})))
+            .with_body_from_request(move |_| {
+                select_log.lock().unwrap().push("select");
+                b"[]".to_vec()
+            })
+            .create_async()
+            .await;
+        let write_log = log.clone();
+        let write = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "select.solax_charger_use_mode"}),
+            ))
+            .with_body_from_request(move |_| {
+                write_log.lock().unwrap().push("write");
+                b"[]".to_vec()
+            })
+            .create_async()
+            .await;
+
+        let adapter = adapter_for(server.url(), guard(true));
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["read", "notify", "select", "read", "write"]
+        );
+        lock_read.assert_async().await;
+        notify.assert_async().await;
+        unlock.assert_async().await;
+        write.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn still_locked_after_timeout_skips_write_and_errors() {
+        let mut server = Server::new_async().await;
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(|_| state_body("select.solax_lock_state", "Locked"))
+            .create_async()
+            .await;
+        let _notify = server
+            .mock("POST", "/api/services/persistent_notification/create")
+            .with_body_from_request(|_| b"[]".to_vec())
+            .create_async()
+            .await;
+        let unlock = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(json!({"option": "Unlocked"})))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+        let write = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "select.solax_charger_use_mode"}),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let adapter = adapter_for(server.url(), guard(true));
+        let result = adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            )
+            .await;
+
+        assert!(result.is_err());
+        unlock.assert_async().await;
+        write.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unlocked_advanced_counts_as_unlocked() {
+        let mut server = Server::new_async().await;
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(|_| {
+                state_body("select.solax_lock_state", "Unlocked - Advanced")
+            })
+            .create_async()
+            .await;
+        let unlock = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(json!({"option": "Unlocked"})))
+            .expect(0)
+            .create_async()
+            .await;
+        let write = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "select.solax_charger_use_mode"}),
+            ))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let adapter = adapter_for(server.url(), guard(true));
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            )
+            .await
+            .unwrap();
+
+        unlock.assert_async().await;
+        write.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn locked_without_auto_unlock_notifies_and_skips_write() {
+        let mut server = Server::new_async().await;
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(|_| state_body("select.solax_lock_state", "Locked"))
+            .create_async()
+            .await;
+        let notify = server
+            .mock("POST", "/api/services/persistent_notification/create")
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+        let unlock = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(json!({"option": "Unlocked"})))
+            .expect(0)
+            .create_async()
+            .await;
+        let write = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "select.solax_charger_use_mode"}),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let adapter = adapter_for(server.url(), guard(false));
+        let result = adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            )
+            .await;
+
+        assert!(result.is_err());
+        notify.assert_async().await;
+        unlock.assert_async().await;
+        write.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn missing_lock_entity_lets_write_proceed() {
+        let mut server = Server::new_async().await;
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_status(404)
+            .create_async()
+            .await;
+        let write = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "select.solax_charger_use_mode"}),
+            ))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let adapter = adapter_for(server.url(), guard(true));
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            )
+            .await
+            .unwrap();
+
+        write.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn idle_run_mode_wakes_once_before_force_charge() {
+        let mut server = Server::new_async().await;
+        let log: Log = Arc::new(StdMutex::new(Vec::new()));
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(|_| state_body("select.solax_lock_state", "Unlocked"))
+            .create_async()
+            .await;
+        let _run_mode = server
+            .mock("GET", "/api/states/sensor.solax_run_mode")
+            .with_body_from_request(|_| state_body("sensor.solax_run_mode", "Idle Mode"))
+            .expect_at_least(2)
+            .create_async()
+            .await;
+        let press_log = log.clone();
+        let press = server
+            .mock("POST", "/api/services/button/press")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "button.solax_battery_awaken"}),
+            ))
+            .with_body_from_request(move |_| {
+                press_log.lock().unwrap().push("button");
+                b"[]".to_vec()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        let write_log = log.clone();
+        let write = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "select.solax_charger_use_mode"}),
+            ))
+            .with_body_from_request(move |_| {
+                write_log.lock().unwrap().push("write");
+                b"[]".to_vec()
+            })
+            .expect(2)
+            .create_async()
+            .await;
+
+        let adapter = adapter_for(server.url(), guard(true));
+        for _ in 0..2 {
+            adapter
+                .write_command(
+                    "solax",
+                    &InverterCommand::SetMode(InverterOperationMode::ForceCharge),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(*log.lock().unwrap(), vec!["button", "write", "write"]);
+        press.assert_async().await;
+        write.assert_async().await;
     }
 }
 

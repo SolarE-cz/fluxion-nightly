@@ -221,10 +221,20 @@ pub struct ControlConfig {
     #[serde(default)]
     pub force_discharge_enabled: bool,
 
-    /// SolaX only: when the inverter lock state reads "Locked", select "Unlocked" once per
-    /// lock event (never in debug mode). Default: false (notify only)
-    #[serde(default)]
+    /// SolaX only: before a write, a "Locked" inverter is unlocked (never in debug mode).
+    /// Default: true (matches Node-RED). When false the write is skipped and only a notification
+    /// is created.
+    #[serde(default = "default_true")]
     pub auto_unlock_inverter: bool,
+
+    /// Entity that holds the SolaX HotStandBy setting (switch or select). When unset, FluxION
+    /// tries `switch.<prefix>_hotstandby`, then the entity registry.
+    #[serde(default)]
+    pub hot_standby_entity: Option<String>,
+
+    /// Keep the HotStandBy setting on (checked at startup and every 5 minutes). Default: true
+    #[serde(default = "default_true")]
+    pub ensure_hot_standby: bool,
 }
 
 // Default value functions for serde
@@ -312,7 +322,9 @@ impl Default for ControlConfig {
             export_limit_hard_cap_w: None,
             export_limit_min_w: 0,
             force_discharge_enabled: false,
-            auto_unlock_inverter: false,
+            auto_unlock_inverter: true,
+            hot_standby_entity: None,
+            ensure_hot_standby: true,
         }
     }
 }

@@ -10,10 +10,12 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+pub mod actuation;
 pub mod adapters;
 pub mod client;
 pub mod dashboard_entities;
 pub mod errors;
+pub mod hot_standby;
 pub mod levers;
 pub mod plugin;
 pub mod solar_forecast_fetcher;

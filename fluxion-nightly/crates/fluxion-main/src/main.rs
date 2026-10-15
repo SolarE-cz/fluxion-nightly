@@ -157,8 +157,13 @@ fn initialize_and_run() -> Result<()> {
     );
 
     // Create data sources
-    let inverter_source: Arc<dyn fluxion_core::InverterDataSource> =
-        Arc::new(HomeAssistantInverterAdapter::new(ha_client.clone(), mapper));
+    let actuation_guard = fluxion_adapters::ha::actuation::ActuationGuardConfig {
+        auto_unlock: config.control.auto_unlock_inverter,
+        ..Default::default()
+    };
+    let inverter_source: Arc<dyn fluxion_core::InverterDataSource> = Arc::new(
+        HomeAssistantInverterAdapter::new(ha_client.clone(), mapper).with_guard(actuation_guard),
+    );
     info!("🔌 Inverter data source: {}", inverter_source.name());
 
     // Create spot price adapter (always create, but may not be used)

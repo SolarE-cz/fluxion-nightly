@@ -10,6 +10,21 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.46] - 2026-10-15
+
+### Added
+
+- **SolaX readiness guards before every inverter write.**
+  - **Unlock:** if `select.<id>_lock_state` is "Locked", FluxION selects "Unlocked" and waits for the
+    read-back (up to 10 s) before writing. "Unlocked - Advanced" is left alone. If the inverter stays
+    locked, the write is skipped and retried. `control.auto_unlock_inverter` now defaults to true.
+  - **HotStandBy:** found by name or in the HA entity registry (`control.hot_standby_entity`
+    overrides). Checked every 5 minutes and switched back on if off (at most once an hour, with a
+    notification). Set `control.ensure_hot_standby: false` to disable.
+  - **Wake:** before a grid charge, if the inverter is not in Normal mode, FluxION presses
+    `button.<id>_battery_awaken`. If the battery is not charging 5 minutes after a charge starts, you
+    get a notification.
+
 ## [0.2.45] - 2026-10-14
 
 ### Added
@@ -19,9 +34,15 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
   `sensor.fluxion_aktivni_pracovni_rezim` and `sensor.fluxion_prum_nocni_vyuziti_baterie`.
   Dashboard cards only need their entity ids changed. `prices` covers today.
 - **Inverter lock guard (SolaX).** When `select.<id>_lock_state` reads "Locked", FluxION creates
-  one persistent notification; with `control.auto_unlock_inverter: true` (default off) it selects
+  one persistent notification; with `control.auto_unlock_inverter: true` (default on) it selects
   "Unlocked" once, never in debug mode.
 - **Daily plan notification** at 00:15 with `notifications.daily_plan: true` (default off).
+- **SolaX readiness guards.** Every inverter write first checks the lock (unlock and read-back,
+  or skip the write when `control.auto_unlock_inverter` is off; default on), wakes the inverter
+  with `button.<id>_battery_awaken` before ForceCharge when the run mode is not Normal (at most
+  every 10 min), and warns once if the battery is not charging 5 minutes after ForceCharge.
+  HotStandBy (`control.hot_standby_entity`, auto-detected, `control.ensure_hot_standby`, default
+  on) is checked at startup and every 5 minutes and turned on at most once an hour.
 
 ### Fixed
 

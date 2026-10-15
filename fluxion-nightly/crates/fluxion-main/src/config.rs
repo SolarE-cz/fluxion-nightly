@@ -266,10 +266,18 @@ pub struct ControlConfig {
     #[serde(default)]
     pub force_discharge_enabled: bool,
 
-    /// SolaX only: select "Unlocked" once per lock event when the inverter reads "Locked"
-    /// (never in debug mode). Default: false (notify only)
-    #[serde(default)]
+    /// SolaX only: unlock a "Locked" inverter before a write (never in debug mode).
+    /// Default: true (matches Node-RED); when false the write is skipped and only notifies.
+    #[serde(default = "default_true")]
     pub auto_unlock_inverter: bool,
+
+    /// Entity that holds the SolaX HotStandBy setting. Empty or unset means auto-detect.
+    #[serde(default)]
+    pub hot_standby_entity: Option<String>,
+
+    /// Keep the HotStandBy setting on (startup and every 5 minutes). Default: true
+    #[serde(default = "default_true")]
+    pub ensure_hot_standby: bool,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -1531,7 +1539,9 @@ impl Default for AppConfig {
                 export_limit_hard_cap_w: None,
                 export_limit_min_w: default_export_limit_min_w(),
                 force_discharge_enabled: false,
-                auto_unlock_inverter: false,
+                auto_unlock_inverter: true,
+                hot_standby_entity: None,
+                ensure_hot_standby: true,
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -2090,6 +2100,12 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 export_limit_min_w: app_config.control.export_limit_min_w,
                 force_discharge_enabled: app_config.control.force_discharge_enabled,
                 auto_unlock_inverter: app_config.control.auto_unlock_inverter,
+                hot_standby_entity: app_config
+                    .control
+                    .hot_standby_entity
+                    .clone()
+                    .filter(|e| !e.trim().is_empty()),
+                ensure_hot_standby: app_config.control.ensure_hot_standby,
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,
