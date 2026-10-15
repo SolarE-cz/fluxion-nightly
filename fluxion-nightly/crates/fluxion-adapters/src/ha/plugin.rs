@@ -109,6 +109,7 @@ impl Plugin for HaPlugin {
             .init_resource::<super::dashboard_entities::DashboardState>()
             .init_resource::<super::hot_standby::HotStandbyChannel>()
             .init_resource::<super::hot_standby::HotStandbyState>()
+            .init_resource::<super::actuation::PreWakeState>()
             .insert_resource(levers::LeversSyncConfig::default())
             .add_systems(Startup, ha_init_config_system)
             // Use PostStartup for fetchers that depend on resources created via Commands
@@ -129,6 +130,7 @@ impl Plugin for HaPlugin {
             .add_systems(Update, levers::poll_levers_channel)
             .add_systems(PostStartup, super::hot_standby::spawn_hot_standby_resolver)
             .add_systems(Update, super::hot_standby::hot_standby_system)
+            .add_systems(Update, super::actuation::prewake_system)
             .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel)
             .add_systems(
                 Update,

@@ -36,7 +36,7 @@ pub struct HomeAssistantInverterAdapter {
     mapper: Arc<dyn VendorEntityMapper>,
     /// Pre-actuation guards (lock, wake, charge check), run before every write
     guard: ActuationGuardConfig,
-    actuation: ActuationState,
+    actuation: Arc<ActuationState>,
 }
 
 impl HomeAssistantInverterAdapter {
@@ -46,7 +46,7 @@ impl HomeAssistantInverterAdapter {
             client,
             mapper,
             guard: ActuationGuardConfig::default(),
-            actuation: ActuationState::default(),
+            actuation: Arc::new(ActuationState::default()),
         }
     }
 
@@ -60,6 +60,11 @@ impl HomeAssistantInverterAdapter {
     /// Get reference to the underlying HA client (for history queries, etc.)
     pub fn client(&self) -> &Arc<HomeAssistantClient> {
         &self.client
+    }
+
+    /// Shared actuation state, so the pre-wake system uses the same wake limit
+    pub fn actuation_state(&self) -> Arc<ActuationState> {
+        self.actuation.clone()
     }
 
     /// Read backup_discharge_min_soc sensor from HA
@@ -428,7 +433,7 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
                         &self.actuation,
                         inverter_id,
                         self.mapper.get_battery_power_entity(inverter_id),
-                        self.guard.charge_check_delay,
+                        &self.guard,
                     );
                 }
             }
@@ -1224,6 +1229,8 @@ mod tests {
             unlock_timeout: Duration::from_millis(300),
             unlock_poll: Duration::from_millis(10),
             charge_check_delay: Duration::from_secs(3600),
+            run_mode_wait: Duration::from_secs(3600),
+            run_mode_poll: Duration::from_millis(10),
         }
     }
 

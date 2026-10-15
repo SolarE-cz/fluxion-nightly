@@ -188,7 +188,7 @@ pub struct LeversStartup {
 
 /// True while the lever sync is expected but not yet available, within the startup wait.
 /// Writes (modes and curtailment) are skipped then.
-fn lever_startup_wait(
+pub fn lever_startup_wait(
     levers: Option<&crate::resources::UserLeversResource>,
     startup: &mut LeversStartup,
     now: Instant,

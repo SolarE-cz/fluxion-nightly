@@ -10,6 +10,17 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.49] - 2026-10-15
+
+### Fixed
+
+- **Wake the SolaX before a grid charge, not at it.** A SolaX in Idle Mode takes about 5 minutes to
+  reach Normal. FluxION now presses `battery_awaken` up to 10 minutes before a planned Force Charge,
+  so the cheap block isn't lost. It never presses while automation is disabled, a VPR window is
+  active, user control is off, the battery is full, or in debug mode.
+- **The "grid charging not running" check waits until the inverter reports Normal mode** (up to 15
+  minutes), and stays silent if the charge run has already ended.
+
 ## [0.2.48] - 2026-10-15
 
 ### Added

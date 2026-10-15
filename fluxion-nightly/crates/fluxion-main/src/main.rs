@@ -171,9 +171,12 @@ fn initialize_and_run() -> Result<()> {
         auto_unlock: config.control.auto_unlock_inverter,
         ..Default::default()
     };
-    let inverter_source: Arc<dyn fluxion_core::InverterDataSource> = Arc::new(
-        HomeAssistantInverterAdapter::new(ha_client.clone(), mapper).with_guard(actuation_guard),
-    );
+    let inverter_adapter =
+        HomeAssistantInverterAdapter::new(ha_client.clone(), mapper).with_guard(actuation_guard);
+    // Shared with the pre-wake system, so both use one awaken rate limit
+    let actuation_state =
+        fluxion_adapters::ha::actuation::ActuationStateResource(inverter_adapter.actuation_state());
+    let inverter_source: Arc<dyn fluxion_core::InverterDataSource> = Arc::new(inverter_adapter);
     info!("🔌 Inverter data source: {}", inverter_source.name());
 
     // Create spot price adapter (always create, but may not be used)
@@ -362,6 +365,7 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(config_update_channel)
         .insert_resource(timezone_config)
         .insert_resource(HaClientResource(ha_client))
+        .insert_resource(actuation_state)
         .insert_resource(price_adapter_tz_handle)
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
         .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
