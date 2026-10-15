@@ -248,13 +248,31 @@ fn candidate_modes(
     modes
 }
 
+/// Two block outcomes are physically the same when the battery and the grid see the same flows.
+/// Then the two modes differ only on paper, and switching the inverter mode changes nothing.
+fn same_physical_outcome(a: &BlockOutcome, b: &BlockOutcome) -> bool {
+    const TOL: f32 = 1e-6;
+    let close = |x: f32, y: f32| (x - y).abs() <= TOL;
+    close(a.energy_end_kwh, b.energy_end_kwh)
+        && close(a.battery_charge_kwh, b.battery_charge_kwh)
+        && close(a.battery_discharge_kwh, b.battery_discharge_kwh)
+        && close(a.grid_import_kwh, b.grid_import_kwh)
+        && close(a.grid_export_kwh, b.grid_export_kwh)
+        && close(a.curtailed_kwh, b.curtailed_kwh)
+}
+
 /// Anti-churn choice (PRD): SelfUse unless another mode is better by more than `min_benefit`.
 /// `modes[0]` must be SelfUse. Returns (mode, value, outcome).
+///
+/// `keep` is the mode applied to the previous block. When the chosen mode leaves the battery and
+/// grid exactly as `keep` would (for example SelfUse and Hold at the SOC floor), `keep` is returned:
+/// the inverter write would change nothing, and the planned cost is identical.
 fn choose(
     dp: &DpStep,
     modes: &[PlanMode],
     energy_kwh: f32,
     min_benefit: f32,
+    keep: Option<PlanMode>,
 ) -> (PlanMode, f32, BlockOutcome) {
     let evals: Vec<(PlanMode, f32, BlockOutcome)> = modes
         .iter()
@@ -264,14 +282,21 @@ fn choose(
         })
         .collect();
     let best = evals.iter().map(|e| e.1).fold(f32::INFINITY, f32::min);
-    if evals[0].1 <= best + min_benefit {
-        return evals[0];
+    let chosen = if evals[0].1 <= best + min_benefit {
+        evals[0]
+    } else {
+        evals[1..]
+            .iter()
+            .copied()
+            .reduce(|a, b| if b.1 < a.1 { b } else { a })
+            .unwrap_or(evals[0])
+    };
+    if let Some(kept) = keep.and_then(|mode| evals.iter().find(|e| e.0 == mode))
+        && same_physical_outcome(&kept.2, &chosen.2)
+    {
+        return *kept;
     }
-    evals[1..]
-        .iter()
-        .copied()
-        .reduce(|a, b| if b.1 < a.1 { b } else { a })
-        .unwrap_or(evals[0])
+    chosen
 }
 
 /// Morning blocks (PRD "Mornings and floor"): pv >= load after a deficit run of at least 4 h.
@@ -494,9 +519,24 @@ pub fn cheap_reference(buys: &[f32], percentile: f32) -> f32 {
 pub fn plan(
     blocks: &[PlanBlock],
     soc_pct: f32,
+    tz: Tz,
+    battery: &BatteryParams,
+    params: &WinterReserveParams,
+) -> Plan {
+    plan_from(blocks, soc_pct, tz, battery, params, None)
+}
+
+/// `plan`, with the mode currently applied to the inverter (`current`, None = unknown). In blocks
+/// without PV, a block keeps the previous block's mode (the first block keeps `current`) when both
+/// leave the battery and grid exactly the same, so the mode does not flip at each re-plan. With
+/// None the first block defaults to SelfUse.
+pub fn plan_from(
+    blocks: &[PlanBlock],
+    soc_pct: f32,
     _tz: Tz,
     battery: &BatteryParams,
     params: &WinterReserveParams,
+    current: Option<PlanMode>,
 ) -> Plan {
     let n = blocks.len();
     if n == 0 {
@@ -572,7 +612,7 @@ pub fn plan(
         };
         current[k] = grid
             .iter()
-            .map(|&e| choose(&dp, &modes, e, params.min_mode_benefit_czk).1)
+            .map(|&e| choose(&dp, &modes, e, params.min_mode_benefit_czk, None).1)
             .collect();
     }
 
@@ -580,6 +620,7 @@ pub fn plan(
     let mut energy = (soc_pct / 100.0 * capacity).clamp(emin, emax);
     let mut planned = Vec::with_capacity(n);
     let mut expected_cost = 0.0;
+    let mut previous = current;
     for (k, block) in blocks.iter().enumerate() {
         let modes = candidate_modes(block, median_buy, cheap_ref, battery, params);
         let dp = DpStep {
@@ -589,7 +630,11 @@ pub fn plan(
             grid: &grid,
             next_values: &values[k + 1],
         };
-        let (mode, _, outcome) = choose(&dp, &modes, energy, params.min_mode_benefit_czk);
+        // Keep the applied mode only in blocks without PV. The simulator models Hold as never
+        // charging from PV, so with a PV forecast a kept Hold could block real PV charging.
+        let keep = previous.filter(|_| block.pv_kwh <= 0.0);
+        let (mode, _, outcome) = choose(&dp, &modes, energy, params.min_mode_benefit_czk, keep);
+        previous = Some(mode);
         let cost = outcome_cost(&outcome, block, battery.wear_cost_czk_per_kwh);
         let soc_start_pct = soc_pct_of(energy, capacity);
         let soc_end_pct = soc_pct_of(outcome.energy_end_kwh, capacity);
@@ -888,9 +933,10 @@ impl WinterReserveStrategy {
         soc_pct: f32,
         tz: Tz,
         battery: &BatteryParams,
+        current: Option<PlanMode>,
     ) -> Plan {
         self.plan_count.fetch_add(1, Ordering::Relaxed);
-        plan(horizon, soc_pct, tz, battery, &self.params)
+        plan_from(horizon, soc_pct, tz, battery, &self.params, current)
     }
 
     /// Planned entry for `horizon[0]`. Head calls reuse or refresh the cache; projection
@@ -917,7 +963,7 @@ impl WinterReserveStrategy {
                 .and_then(|c| c.plan.blocks.iter().find(|b| b.start == first))
                 .cloned();
             return hit.unwrap_or_else(|| {
-                self.run_plan(horizon, soc_pct, tz, battery)
+                self.run_plan(horizon, soc_pct, tz, battery, None)
                     .blocks
                     .swap_remove(0)
             });
@@ -947,7 +993,13 @@ impl WinterReserveStrategy {
             return entry;
         }
 
-        let plan = self.run_plan(horizon, soc_pct, tz, battery);
+        // The mode applied at the last head call is the one the inverter runs now.
+        let current = cache
+            .as_ref()
+            .filter(|c| now - c.planned_at <= Duration::minutes(REPLAN_MAX_AGE_MIN * 2))
+            .and_then(|c| c.plan.blocks.first())
+            .map(|b| b.mode);
+        let plan = self.run_plan(horizon, soc_pct, tz, battery, current);
         let entry = plan.blocks[0].clone();
         *cache = Some(CachedPlan {
             plan,
@@ -1625,6 +1677,7 @@ mod tests {
                     (6.5, 5.5)
                 };
                 TimeBlockPrice {
+                    buy_price_czk_per_kwh: None,
                     block_start: base() + Duration::minutes(15 * i),
                     duration_minutes: 15,
                     price_czk_per_kwh: buy,
@@ -1899,6 +1952,77 @@ mod tests {
         let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
         assert!(modes[..8].contains(&PlanMode::Hold), "{modes:?}");
         assert!(modes[8..].iter().any(|m| *m != PlanMode::Hold), "{modes:?}");
+    }
+
+    fn mode_changes(modes: &[PlanMode]) -> usize {
+        modes.windows(2).filter(|w| w[0] != w[1]).count()
+    }
+
+    #[test]
+    fn floor_flat_prices_do_not_churn_modes() {
+        // Battery at the floor (energy = Emin), 8 h horizon of flat-ish prices (3.0 / 3.2 CZK), no
+        // PV. SelfUse and Hold leave the battery identical here, so the mode must not flip.
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        let b = BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 10.0,
+            ..battery()
+        };
+        let blocks: Vec<PlanBlock> = (0..32)
+            .map(|i| pblock(i, if i % 2 == 0 { 3.0 } else { 3.2 }, 2.0, 0.4, 0.0))
+            .collect();
+        let p = plan(&blocks, 10.0, tz, &b, &params);
+        let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
+        assert!(mode_changes(&modes) <= 1, "{modes:?}");
+    }
+
+    #[test]
+    fn floor_keeps_the_current_mode_when_outcomes_are_identical() {
+        // At the floor SelfUse and Hold give the same flows, so the applied mode is kept.
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        let b = BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 10.0,
+            ..battery()
+        };
+        let blocks: Vec<PlanBlock> = (0..4).map(|i| pblock(i, 3.0, 2.0, 0.4, 0.0)).collect();
+        let kept = plan_from(&blocks, 10.0, tz, &b, &params, Some(PlanMode::Hold));
+        assert_eq!(kept.blocks[0].mode, PlanMode::Hold);
+        let default = plan_from(&blocks, 10.0, tz, &b, &params, None);
+        assert_eq!(default.blocks[0].mode, PlanMode::SelfUse);
+    }
+
+    #[test]
+    fn floor_with_pv_forecast_does_not_keep_hold() {
+        // Hold blocks PV charging on SolaX; with any PV forecast a tie must go to SelfUse.
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        let b = BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 10.0,
+            ..battery()
+        };
+        let blocks: Vec<PlanBlock> = (0..4).map(|i| pblock(i, 3.0, 2.0, 0.4, 0.1)).collect();
+        let p = plan_from(&blocks, 10.0, tz, &b, &params, Some(PlanMode::Hold));
+        assert_eq!(p.blocks[0].mode, PlanMode::SelfUse);
+    }
+
+    #[test]
+    fn hold_still_chosen_over_previous_selfuse_when_better_by_more_than_benefit() {
+        // The H8 scenario, but the previous block was SelfUse: the mid blocks must still hold.
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        let b = BatteryParams {
+            capacity_kwh: 10.0,
+            ..battery()
+        };
+        let mut blocks: Vec<PlanBlock> = (0..8).map(|i| pblock(i, 6.0, 2.0, 0.75, 0.0)).collect();
+        blocks.extend((8..16).map(|i| pblock(i, 8.0, 2.0, 0.75, 0.0)));
+        let p = plan_from(&blocks, 40.0, tz, &b, &params, Some(PlanMode::SelfUse));
+        let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
+        assert!(modes[..8].contains(&PlanMode::Hold), "{modes:?}");
     }
 
     #[test]
@@ -2244,6 +2368,7 @@ mod tests {
     fn prices_rising_evening() -> Vec<TimeBlockPrice> {
         (0..60)
             .map(|i: i64| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
                 block_start: base() + Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.0,
@@ -2287,6 +2412,7 @@ mod tests {
         // Block 23 has the highest sell but is forced to charge (buy 0.5 <= 1.0); others buy at 2.0.
         let blocks: Vec<TimeBlockPrice> = (0..60)
             .map(|i: i64| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
                 block_start: base() + Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: if i == 23 { 0.5 } else { 2.0 },

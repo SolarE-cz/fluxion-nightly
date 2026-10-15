@@ -125,6 +125,10 @@ pub struct PricingConfig {
     #[serde(default)]
     pub tomorrow_price_entity: Option<String>,
 
+    /// Optional separate sensor for the buy price (incl. VAT); empty = buy at spot
+    #[serde(default)]
+    pub buy_price_entity: Option<String>,
+
     /// Use spot prices for buying decisions
     pub use_spot_prices_to_buy: bool,
 
@@ -1508,6 +1512,7 @@ impl Default for AppConfig {
             pricing: PricingConfig {
                 spot_price_entity: "sensor.current_spot_electricity_price_15min".to_string(),
                 tomorrow_price_entity: None,
+                buy_price_entity: None,
                 use_spot_prices_to_buy: true,
                 use_spot_prices_to_sell: true,
                 fixed_buy_prices: vec![0.05; 24], // 24 hourly values
@@ -2007,6 +2012,10 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
             pricing_config: fluxion_core::PricingConfig {
                 spot_price_entity: app_config.pricing.spot_price_entity,
                 tomorrow_price_entity: app_config.pricing.tomorrow_price_entity,
+                buy_price_entity: app_config
+                    .pricing
+                    .buy_price_entity
+                    .filter(|entity| !entity.trim().is_empty()),
                 use_spot_prices_to_buy: app_config.pricing.use_spot_prices_to_buy,
                 use_spot_prices_to_sell: app_config.pricing.use_spot_prices_to_sell,
                 fixed_buy_price_czk: if app_config.pricing.fixed_buy_prices.len() == 1 {

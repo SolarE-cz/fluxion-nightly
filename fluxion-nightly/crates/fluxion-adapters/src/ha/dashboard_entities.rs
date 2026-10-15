@@ -1161,6 +1161,7 @@ mod tests {
 
     fn price(start: DateTime<Utc>, buy: f32, sell: f32) -> TimeBlockPrice {
         TimeBlockPrice {
+            buy_price_czk_per_kwh: None,
             block_start: start,
             duration_minutes: 15,
             price_czk_per_kwh: buy,

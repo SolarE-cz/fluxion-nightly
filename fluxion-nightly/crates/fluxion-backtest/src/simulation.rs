@@ -201,6 +201,7 @@ fn simulate_winter_adaptive(
             effective_price_czk_per_kwh: p.price_czk_per_kwh,
             duration_minutes: 15,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         })
         .collect();
 
@@ -239,6 +240,7 @@ fn simulate_winter_adaptive(
             effective_price_czk_per_kwh: price,
             duration_minutes: 15,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
         let price_block = time_block_prices
             .get(price_idx % time_block_prices.len().max(1))

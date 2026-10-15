@@ -364,6 +364,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pricing_config = PricingConfig {
         spot_price_entity: "sensor.spot_price".to_string(),
         tomorrow_price_entity: None,
+        buy_price_entity: None,
         use_spot_prices_to_buy: true,
         use_spot_prices_to_sell: true,
         fixed_buy_price_czk: PriceSchedule::Flat(0.0),
@@ -389,6 +390,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 price_czk_per_kwh: spot_price + buy_fee_czk, // Import price = Spot + Buy Fee
                 effective_price_czk_per_kwh: spot_price + buy_fee_czk,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             }
         })
         .collect();

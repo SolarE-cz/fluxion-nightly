@@ -31,7 +31,7 @@ use fluxion_core::components::{
     HourlyConsumptionProfile, aggregate_hourly_house_load, pick_hourly_profile,
 };
 use fluxion_core::strategy::winter_reserve::{
-    BatteryParams, PlanBlock, PlanMode, WinterReserveParams, plan, simulate_block,
+    BatteryParams, PlanBlock, PlanMode, WinterReserveParams, plan_from, simulate_block,
 };
 use fluxion_core::traits::HistoryDataPoint;
 use fluxion_types::ControlConfig;
@@ -381,6 +381,8 @@ fn run() -> Result<(), String> {
         }
     };
     let mut planned_blocks = 0usize;
+    // Mode applied to the previous block: the planner keeps it while it is within the benefit
+    let mut applied: Option<PlanMode> = None;
 
     for (i, row) in rows.iter().enumerate().skip(first) {
         let day = row.local.date_naive();
@@ -488,12 +490,13 @@ fn run() -> Result<(), String> {
                     }
                 }
 
-                let result = plan(&horizon, soc_now, tz, &battery, &params);
+                let result = plan_from(&horizon, soc_now, tz, &battery, &params, applied);
                 let first = result
                     .blocks
                     .first()
                     .ok_or("planner returned an empty plan")?;
                 planned_blocks += 1;
+                applied = Some(first.mode);
                 (first.mode, first.floor_kwh, first.reason.clone())
             }
         };

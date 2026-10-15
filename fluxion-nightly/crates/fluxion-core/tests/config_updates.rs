@@ -37,6 +37,7 @@ fn test_config_update_flow() {
         pricing_config: fluxion_core::PricingConfig {
             spot_price_entity: "sensor.spot_price".to_string(),
             tomorrow_price_entity: None,
+            buy_price_entity: None,
             use_spot_prices_to_buy: true,
             use_spot_prices_to_sell: true,
             fixed_buy_price_czk: fluxion_core::PriceSchedule::Flat(4.0),
@@ -95,6 +96,7 @@ fn test_config_update_flow() {
                 price_czk_per_kwh: 3.0,
                 effective_price_czk_per_kwh: 3.0,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: chrono::Utc::now() + chrono::Duration::minutes(15),
@@ -102,6 +104,7 @@ fn test_config_update_flow() {
                 price_czk_per_kwh: 5.0,
                 effective_price_czk_per_kwh: 5.0,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
         ],
         block_duration_minutes: 15,
@@ -161,6 +164,7 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
         pricing_config: fluxion_core::PricingConfig {
             spot_price_entity: "sensor.spot_price".to_string(),
             tomorrow_price_entity: None,
+            buy_price_entity: None,
             use_spot_prices_to_buy: true,
             use_spot_prices_to_sell: true,
             fixed_buy_price_czk: fluxion_core::PriceSchedule::Flat(4.0),

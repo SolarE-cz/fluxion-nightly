@@ -366,6 +366,7 @@ mod tests {
         spot_sell: Option<f32>,
     ) -> TimeBlockPrice {
         TimeBlockPrice {
+            buy_price_czk_per_kwh: None,
             block_start: Utc.with_ymd_and_hms(2025, 1, 15, hour, minute, 0).unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: effective_price,

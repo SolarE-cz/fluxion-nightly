@@ -195,15 +195,17 @@ fn initialize_and_run() -> Result<()> {
     info!("🌍 Price adapter timezone handle created for HA timezone sync");
 
     // Wrap spot adapter in configurable source that respects use_spot_prices_to_buy/sell flags
-    let price_source: Arc<dyn fluxion_core::PriceDataSource> =
-        Arc::new(fluxion_adapters::ConfigurablePriceDataSource::new(
+    let price_source: Arc<dyn fluxion_core::PriceDataSource> = Arc::new(
+        fluxion_adapters::ConfigurablePriceDataSource::new(
             Arc::new(spot_adapter),
             config.pricing.use_spot_prices_to_buy,
             config.pricing.use_spot_prices_to_sell,
             config.pricing.fixed_buy_prices.clone(),
             config.pricing.fixed_sell_prices.clone(),
             config.pricing.spot_sell_fee,
-        ));
+        )
+        .with_buy_price_entity(config.pricing.buy_price_entity.clone()),
+    );
     info!("💰 Price data source: {}", price_source.name());
 
     let history_source: Arc<dyn fluxion_core::traits::ConsumptionHistoryDataSource> = Arc::new(
@@ -330,6 +332,19 @@ fn initialize_and_run() -> Result<()> {
         ..Default::default()
     };
 
+    // Dashboard entities, the lock guard and the manual-mode poll use one HA prefix:
+    // the first inverter FluxION controls (never a slave), not the "solax" default
+    let ha_config = fluxion_adapters::ha::plugin::HaConfig {
+        inverter_prefix: config
+            .inverters
+            .iter()
+            .find(|inv| inv.topology != "slave")
+            .or(config.inverters.first())
+            .map_or_else(|| "solax".to_string(), |inv| inv.entity_prefix.clone()),
+        ..Default::default()
+    };
+    info!("   HA entity prefix: {}", ha_config.inverter_prefix);
+
     let mut app = App::new();
     app
         // Add TaskPoolPlugin to initialize async task pools
@@ -337,6 +352,7 @@ fn initialize_and_run() -> Result<()> {
         // Add ScheduleRunnerPlugin for headless operation
         .add_plugins(ScheduleRunnerPlugin::run_loop(Duration::from_millis(100)))
         .add_plugins((FluxionCorePlugin, HaPlugin))
+        .insert_resource(ha_config)
         .insert_resource(levers_sync_config)
         .insert_resource(config)
         .insert_resource(system_config)

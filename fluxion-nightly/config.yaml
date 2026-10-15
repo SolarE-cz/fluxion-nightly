@@ -48,6 +48,7 @@ options:
   notifications:
     daily_plan: false
   pricing:
+    buy_price_entity: ''
     fixed_buy_prices: []
     fixed_sell_prices: []
     spot_buy_fee_czk: 0.5
@@ -239,6 +240,7 @@ schema:
   notifications:
     daily_plan: bool?
   pricing:
+    buy_price_entity: str?
     fixed_buy_prices:
     - float?
     - float?
@@ -446,4 +448,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.47
+version: 0.2.48

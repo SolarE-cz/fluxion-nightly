@@ -138,6 +138,7 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
 /// Convert an EvaluationRequest to the types needed by strategies
 fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBlockPrice>) {
     let price_block = TimeBlockPrice {
+        buy_price_czk_per_kwh: None,
         block_start: request.block.block_start,
         duration_minutes: request.block.duration_minutes,
         price_czk_per_kwh: request.block.price_czk_per_kwh,
@@ -149,6 +150,7 @@ fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBloc
         .all_blocks
         .iter()
         .map(|b| TimeBlockPrice {
+            buy_price_czk_per_kwh: None,
             block_start: b.block_start,
             duration_minutes: b.duration_minutes,
             price_czk_per_kwh: b.price_czk_per_kwh,

@@ -504,7 +504,8 @@ impl EconomicStrategy for NaiveSelfUseStrategy {
         eval.assumptions.consumption_forecast_kwh = consumption;
         eval.assumptions.current_battery_soc = battery_soc;
         eval.assumptions.battery_efficiency = efficiency;
-        eval.assumptions.grid_import_price_czk_per_kwh = context.price_block.price_czk_per_kwh;
+        eval.assumptions.grid_import_price_czk_per_kwh =
+            context.price_block.buy_energy_price_czk_per_kwh();
         eval.assumptions.grid_export_price_czk_per_kwh = context.grid_export_price_czk_per_kwh;
 
         eval
@@ -557,6 +558,7 @@ mod tests {
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig::default();
 
@@ -577,6 +579,7 @@ mod tests {
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig::default();
 
@@ -596,6 +599,7 @@ mod tests {
             price_czk_per_kwh: 4.0,
             effective_price_czk_per_kwh: 4.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig {
             battery_capacity_kwh: 10.0,
@@ -625,6 +629,7 @@ mod tests {
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
         let control_config = ControlConfig {
             battery_capacity_kwh: 10.0,

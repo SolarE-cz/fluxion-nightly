@@ -66,6 +66,20 @@ pub struct TimeBlockPrice {
     /// Strategies can use this for arbitrage: charge at fixed price, sell at spot price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_sell_price_czk_per_kwh: Option<f32>,
+
+    /// Buy energy price (CZK/kWh, no grid fees) from the separate buy sensor
+    /// (`pricing.buy_price_entity`). None when that sensor is not configured or has no value for
+    /// this block; the spot price is then the buy energy price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_price_czk_per_kwh: Option<f32>,
+}
+
+impl TimeBlockPrice {
+    /// Energy price paid when buying (CZK/kWh, before grid fees): the buy sensor when present,
+    /// otherwise the spot price
+    pub fn buy_energy_price_czk_per_kwh(&self) -> f32 {
+        self.buy_price_czk_per_kwh.unwrap_or(self.price_czk_per_kwh)
+    }
 }
 
 /// Fixed price data when spot prices are disabled

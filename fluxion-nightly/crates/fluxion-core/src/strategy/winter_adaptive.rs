@@ -1414,7 +1414,7 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: context.control_config.battery_wear_cost_czk_per_kwh,
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -1567,6 +1567,7 @@ mod tests {
                 price_czk_per_kwh: 4.5, // Expensive
                 effective_price_czk_per_kwh: 4.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1578,6 +1579,7 @@ mod tests {
                 price_czk_per_kwh: 1.2, // Very cheap
                 effective_price_czk_per_kwh: 1.2,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1589,6 +1591,7 @@ mod tests {
                 price_czk_per_kwh: 6.0, // Even more expensive (>20% higher than today)
                 effective_price_czk_per_kwh: 6.0,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1681,6 +1684,7 @@ mod tests {
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 

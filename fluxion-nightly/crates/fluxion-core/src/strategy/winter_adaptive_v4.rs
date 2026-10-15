@@ -507,7 +507,7 @@ impl EconomicStrategy for WinterAdaptiveV4Strategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: context.control_config.battery_wear_cost_czk_per_kwh,
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -607,6 +607,7 @@ mod tests {
                 price_czk_per_kwh: 3.73,
                 effective_price_czk_per_kwh: 3.73 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 19:15 - expensive
             TimeBlockPrice {
@@ -615,6 +616,7 @@ mod tests {
                 price_czk_per_kwh: 3.55,
                 effective_price_czk_per_kwh: 3.55 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 19:30 - expensive
             TimeBlockPrice {
@@ -623,6 +625,7 @@ mod tests {
                 price_czk_per_kwh: 3.30,
                 effective_price_czk_per_kwh: 3.30 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 19:45 - medium
             TimeBlockPrice {
@@ -631,6 +634,7 @@ mod tests {
                 price_czk_per_kwh: 2.96,
                 effective_price_czk_per_kwh: 2.96 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 20:00 - medium
             TimeBlockPrice {
@@ -639,6 +643,7 @@ mod tests {
                 price_czk_per_kwh: 3.17,
                 effective_price_czk_per_kwh: 3.17 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 22:00 - cheap
             TimeBlockPrice {
@@ -647,6 +652,7 @@ mod tests {
                 price_czk_per_kwh: 2.59,
                 effective_price_czk_per_kwh: 2.59 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 22:15 - cheapest!
             TimeBlockPrice {
@@ -655,6 +661,7 @@ mod tests {
                 price_czk_per_kwh: 2.31,
                 effective_price_czk_per_kwh: 2.31 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             // 22:30 - cheap
             TimeBlockPrice {
@@ -663,6 +670,7 @@ mod tests {
                 price_czk_per_kwh: 2.45,
                 effective_price_czk_per_kwh: 2.45 + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
         ]
     }

@@ -268,6 +268,7 @@ impl SimulationEngine {
                     price_czk_per_kwh: spot,
                     effective_price_czk_per_kwh: effective,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 }
             })
             .collect();
@@ -279,6 +280,7 @@ impl SimulationEngine {
             price_czk_per_kwh: price,
             effective_price_czk_per_kwh: effective_price,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
 
         // Build control config

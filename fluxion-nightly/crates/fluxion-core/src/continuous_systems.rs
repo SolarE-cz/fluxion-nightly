@@ -1360,6 +1360,7 @@ mod hdo_cache_sync_tests {
         PricingConfig {
             spot_price_entity: "sensor.spot_price".to_string(),
             tomorrow_price_entity: None,
+            buy_price_entity: None,
             use_spot_prices_to_buy: true,
             use_spot_prices_to_sell: true,
             fixed_buy_price_czk: PriceSchedule::Flat(0.0),
@@ -1379,6 +1380,7 @@ mod hdo_cache_sync_tests {
             price_czk_per_kwh: spot,
             effective_price_czk_per_kwh: spot,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         }
     }
 
@@ -1471,6 +1473,7 @@ mod levers_execution_tests {
             pricing_config: PricingConfig {
                 spot_price_entity: "sensor.spot_price".to_string(),
                 tomorrow_price_entity: None,
+                buy_price_entity: None,
                 use_spot_prices_to_buy: true,
                 use_spot_prices_to_sell: true,
                 fixed_buy_price_czk: PriceSchedule::Flat(4.0),
@@ -2546,6 +2549,7 @@ mod levers_execution_tests {
     fn sell_price_data(now: DateTime<Utc>, sell: Option<f32>) -> SpotPriceData {
         SpotPriceData {
             time_block_prices: vec![TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
                 block_start: now - Duration::minutes(1),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.0,

@@ -27,6 +27,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 1.5,
             effective_price_czk_per_kwh: 1.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -38,6 +39,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -49,6 +51,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 4.5,
             effective_price_czk_per_kwh: 4.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -60,6 +63,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -71,6 +75,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 3.5,
             effective_price_czk_per_kwh: 3.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -82,6 +87,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 5.0,
             effective_price_czk_per_kwh: 5.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -93,6 +99,7 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 2.5,
             effective_price_czk_per_kwh: 2.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -327,6 +334,7 @@ fn test_v2_spike_detection() {
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -338,6 +346,7 @@ fn test_v2_spike_detection() {
             price_czk_per_kwh: 9.5, // Above 8.0 threshold
             effective_price_czk_per_kwh: 9.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -349,6 +358,7 @@ fn test_v2_spike_detection() {
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -592,6 +602,7 @@ fn load_scenario_from_export(path: &str, name: &str) -> Option<TestScenario> {
             price_czk_per_kwh: b.p,
             effective_price_czk_per_kwh: b.p,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         })
         .collect();
 

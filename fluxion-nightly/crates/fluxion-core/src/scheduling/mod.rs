@@ -131,9 +131,13 @@ pub fn calculate_effective_prices(
         };
 
         // Buy price = energy price + HDO grid fee (+ operator buy fee on spot).
+        // Spot buy: the buy sensor's price when the block has one, else spot.
         // Fixed buy: the configured price at the block's local time replaces spot.
         let (energy_price, buy_fee) = if pricing_config.use_spot_prices_to_buy {
-            (block.price_czk_per_kwh, pricing_config.spot_buy_fee_czk)
+            (
+                block.buy_energy_price_czk_per_kwh(),
+                pricing_config.spot_buy_fee_czk,
+            )
         } else {
             let tz = hdo_cache.map_or(chrono_tz::UTC, |cache| cache.timezone());
             let local = block.block_start.with_timezone(&tz);
@@ -707,20 +711,22 @@ pub fn generate_schedule(
                     .format(
                         "reason-cheapest-block",
                         Some(&fluent_args![
-                            "price" => price_block.price_czk_per_kwh,
+                            "price" => price_block.buy_energy_price_czk_per_kwh(),
                             "currency" => currency_symbol
                         ]),
                     )
                     .unwrap_or_else(|_| {
                         format!(
                             "Cheapest block ({}{:.3}/kWh)",
-                            currency_symbol, price_block.price_czk_per_kwh
+                            currency_symbol,
+                            price_block.buy_energy_price_czk_per_kwh()
                         )
                     })
             } else {
                 format!(
                     "Cheapest block ({}{:.3}/kWh)",
-                    currency_symbol, price_block.price_czk_per_kwh
+                    currency_symbol,
+                    price_block.buy_energy_price_czk_per_kwh()
                 )
             };
             (InverterOperationMode::ForceCharge, reason)
@@ -1213,6 +1219,7 @@ mod tests {
         let now = Utc::now();
         let blocks: Vec<TimeBlockPrice> = (0..4)
             .map(|i| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
                 block_start: now + ChronoDuration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
@@ -1275,7 +1282,78 @@ mod tests {
             price_czk_per_kwh: spot,
             effective_price_czk_per_kwh: spot,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         }
+    }
+
+    fn buy_sensor_pricing(use_spot_prices_to_buy: bool) -> PricingConfig {
+        PricingConfig {
+            spot_price_entity: "sensor.current_spot_electricity_price_15min".to_string(),
+            tomorrow_price_entity: None,
+            buy_price_entity: Some("sensor.current_buy_electricity_price_15min".to_string()),
+            use_spot_prices_to_buy,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        }
+    }
+
+    #[test]
+    fn test_effective_buy_uses_buy_sensor_price_and_keeps_sell() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut block = spot_block(start, 2.0);
+        block.buy_price_czk_per_kwh = Some(2.42);
+        block.spot_sell_price_czk_per_kwh = Some(1.5);
+        let mut blocks = vec![block];
+
+        // No HDO cache: high tariff fee; the operator buy fee still applies on top
+        calculate_effective_prices(&mut blocks, None, &buy_sensor_pricing(true));
+
+        assert!((blocks[0].effective_price_czk_per_kwh - (2.42 + 1.80 + 0.5)).abs() < 0.001);
+        assert_eq!(blocks[0].price_czk_per_kwh, 2.0);
+        assert_eq!(blocks[0].spot_sell_price_czk_per_kwh, Some(1.5));
+    }
+
+    #[test]
+    fn test_effective_buy_without_buy_value_falls_back_to_spot() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut blocks = vec![spot_block(start, 2.0)];
+
+        calculate_effective_prices(&mut blocks, None, &buy_sensor_pricing(true));
+
+        assert!((blocks[0].effective_price_czk_per_kwh - (2.0 + 1.80 + 0.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_effective_buy_unset_is_spot_plus_fees_exactly() {
+        // Without a buy sensor the formula is unchanged from before H13: spot + HDO fee + buy fee
+        let mut pricing = buy_sensor_pricing(true);
+        pricing.buy_price_entity = None;
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut blocks = vec![spot_block(start, 2.0), spot_block(start, 3.25)];
+
+        calculate_effective_prices(&mut blocks, None, &pricing);
+
+        assert_eq!(blocks[0].effective_price_czk_per_kwh, 2.0_f32 + 1.80 + 0.5);
+        assert_eq!(blocks[1].effective_price_czk_per_kwh, 3.25_f32 + 1.80 + 0.5);
+    }
+
+    #[test]
+    fn test_effective_buy_fixed_buy_ignores_buy_sensor() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut block = spot_block(start, 2.0);
+        block.buy_price_czk_per_kwh = Some(2.42);
+        let mut blocks = vec![block];
+
+        // Fixed buy price (0.0 here) replaces the buy side; no buy fee on fixed prices
+        calculate_effective_prices(&mut blocks, None, &buy_sensor_pricing(false));
+
+        assert!((blocks[0].effective_price_czk_per_kwh - 1.80).abs() < 0.001);
     }
 
     #[test]
@@ -1292,6 +1370,7 @@ mod tests {
         let pricing = PricingConfig {
             spot_price_entity: "sensor.spot_price".to_string(),
             tomorrow_price_entity: None,
+            buy_price_entity: None,
             use_spot_prices_to_buy: true,
             use_spot_prices_to_sell: true,
             fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
@@ -1332,6 +1411,7 @@ mod tests {
         let pricing = PricingConfig {
             spot_price_entity: "sensor.spot_price".to_string(),
             tomorrow_price_entity: None,
+            buy_price_entity: None,
             use_spot_prices_to_buy: false,
             use_spot_prices_to_sell: true,
             fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Hourly(hourly),
@@ -1406,6 +1486,7 @@ mod tests {
         let now = Utc::now();
         let blocks: Vec<TimeBlockPrice> = (0..2)
             .map(|i| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
                 block_start: now + ChronoDuration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,

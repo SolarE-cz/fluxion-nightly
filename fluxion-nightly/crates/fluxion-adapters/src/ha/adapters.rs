@@ -12,9 +12,12 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use crate::ha::actuation::{self, ActuationGuardConfig, ActuationState};
@@ -24,6 +27,7 @@ use fluxion_core::{
     GenericInverterState, InverterCommand, InverterDataSource, InverterOperationMode,
     PriceDataSource, SpotPriceData, VendorEntityMapper,
 };
+use fluxion_types::pricing::TimeBlockPrice;
 
 /// Home Assistant adapter implementing InverterDataSource
 /// Uses VendorEntityMapper to map between generic and vendor-specific entities
@@ -555,6 +559,31 @@ impl CzSpotPriceAdapter {
     fn get_timezone(&self) -> Option<Tz> {
         *self.timezone.read()
     }
+
+    /// Read another price sensor in the spot sensor format and return its `(block start, CZK/kWh)`
+    /// pairs (used for the buy price sensor, `pricing.buy_price_entity`)
+    pub async fn read_block_prices(&self, entity_id: &str) -> Result<Vec<(DateTime<Utc>, f32)>> {
+        let state = self
+            .client
+            .get_state(entity_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .with_context(|| format!("Failed to read price entity: {entity_id}"))?;
+
+        let entity_json = serde_json::json!({
+            "state": state.state,
+            "attributes": state.attributes,
+            "last_updated": state.last_updated,
+        });
+        let price_data = parse_spot_price_response(&entity_json, self.get_timezone())
+            .with_context(|| format!("Failed to parse price entity: {entity_id}"))?;
+
+        Ok(price_data
+            .time_block_prices
+            .iter()
+            .map(|block| (block.block_start, block.price_czk_per_kwh))
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -724,6 +753,29 @@ pub struct ConfigurablePriceDataSource {
     #[expect(dead_code, reason = "Reserved for fixed sell price schedule support")]
     fixed_sell_prices: Vec<f32>,
     spot_sell_fee_czk: f32,
+    /// Separate buy price sensor (`pricing.buy_price_entity`), read only when buying at spot
+    buy_price_entity: Option<String>,
+    /// Minimum time between two reads of the buy price sensor
+    buy_fetch_interval: Duration,
+    /// Buy sensor state kept between price reads
+    buy_state: Mutex<BuyPriceState>,
+}
+
+/// Default minimum time between two reads of the buy price sensor (prices change per 15 minutes,
+/// while the price cache asks for spot prices every few seconds)
+pub const BUY_PRICE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Buy price sensor state carried between price reads (brief H13b)
+#[derive(Debug, Default)]
+struct BuyPriceState {
+    /// Last time the sensor was read, successfully or not
+    last_fetch: Option<Instant>,
+    /// Last good buy price per block start (UTC); kept when a later read fails or drops a block
+    last_good: HashMap<DateTime<Utc>, f32>,
+    /// The last read failed (WARN once when this changes)
+    failing: bool,
+    /// Blocks were missing from the last good read (WARN once when this changes)
+    missing: bool,
 }
 
 impl ConfigurablePriceDataSource {
@@ -742,6 +794,9 @@ impl ConfigurablePriceDataSource {
             fixed_buy_prices,
             fixed_sell_prices,
             spot_sell_fee_czk,
+            buy_price_entity: None,
+            buy_fetch_interval: BUY_PRICE_FETCH_INTERVAL,
+            buy_state: Mutex::new(BuyPriceState::default()),
         }
     }
 
@@ -787,6 +842,7 @@ impl ConfigurablePriceDataSource {
                     // Effective price will be calculated by scheduler with HDO fees
                     effective_price_czk_per_kwh: hour_price,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -808,6 +864,110 @@ impl ConfigurablePriceDataSource {
     }
 }
 
+impl ConfigurablePriceDataSource {
+    /// Buy at the price of a separate sensor (`pricing.buy_price_entity`) when buying at spot.
+    /// Empty or unset keeps the spot price for buying.
+    pub fn with_buy_price_entity(mut self, entity_id: Option<String>) -> Self {
+        self.buy_price_entity = entity_id.filter(|entity| !entity.trim().is_empty());
+        self
+    }
+
+    /// Minimum time between two reads of the buy price sensor (default `BUY_PRICE_FETCH_INTERVAL`)
+    pub fn with_buy_fetch_interval(mut self, interval: Duration) -> Self {
+        self.buy_fetch_interval = interval;
+        self
+    }
+}
+
+/// Median of buy/spot over the blocks that have both prices (None when there are none)
+fn buy_to_spot_ratio(blocks: &[TimeBlockPrice], buy: &HashMap<DateTime<Utc>, f32>) -> Option<f32> {
+    let mut ratios: Vec<f32> = blocks
+        .iter()
+        .filter(|b| b.price_czk_per_kwh.abs() > f32::EPSILON)
+        .filter_map(|b| buy.get(&b.block_start).map(|p| p / b.price_czk_per_kwh))
+        .collect();
+    if ratios.is_empty() {
+        return None;
+    }
+    ratios.sort_by(|a, b| a.total_cmp(b));
+    let mid = ratios.len() / 2;
+    Some(if ratios.len().is_multiple_of(2) {
+        (ratios[mid - 1] + ratios[mid]) / 2.0
+    } else {
+        ratios[mid]
+    })
+}
+
+impl ConfigurablePriceDataSource {
+    /// Set the buy price of every block (brief H13, H13b).
+    ///
+    /// The buy sensor is read at most once per `buy_fetch_interval`; in between, and when a read
+    /// fails, the last good buy prices are used. Blocks the sensor never covered get spot scaled by
+    /// the median buy/spot ratio, or plain spot when no ratio is known. WARN and INFO only when the
+    /// state changes.
+    async fn apply_buy_prices(&self, entity_id: &str, data: &mut SpotPriceData) {
+        let due = {
+            let state = self.buy_state.lock();
+            state
+                .last_fetch
+                .is_none_or(|t| t.elapsed() >= self.buy_fetch_interval)
+        };
+        if due {
+            let result = self.spot_adapter.read_block_prices(entity_id).await;
+            let mut state = self.buy_state.lock();
+            state.last_fetch = Some(Instant::now());
+            match result {
+                Ok(prices) => {
+                    if state.failing {
+                        info!("✅ Buy price sensor {entity_id} readable again");
+                        state.failing = false;
+                    }
+                    state.last_good.extend(prices);
+                    if let Some(first) = data.time_block_prices.iter().map(|b| b.block_start).min()
+                    {
+                        state.last_good.retain(|start, _| *start >= first);
+                    }
+                }
+                Err(e) => {
+                    if !state.failing {
+                        warn!(
+                            "⚠️ Buy price sensor {entity_id} unavailable ({e:#}); keeping last good buy prices"
+                        );
+                        state.failing = true;
+                    }
+                }
+            }
+        }
+
+        let mut state = self.buy_state.lock();
+        let ratio = buy_to_spot_ratio(&data.time_block_prices, &state.last_good);
+        let mut missing = 0;
+        for block in &mut data.time_block_prices {
+            if let Some(buy) = state.last_good.get(&block.block_start) {
+                block.buy_price_czk_per_kwh = Some(*buy);
+            } else {
+                missing += 1;
+                block.buy_price_czk_per_kwh = ratio.map(|r| block.price_czk_per_kwh * r);
+            }
+        }
+
+        // A failed read is already reported; missing blocks are judged on successful reads only
+        if !state.failing {
+            if missing > 0 && !state.missing {
+                let how = if ratio.is_some() {
+                    "scaled spot used"
+                } else {
+                    "spot used"
+                };
+                warn!("⚠️ Buy price sensor {entity_id}: missing {missing} blocks, {how}");
+            } else if missing == 0 && state.missing {
+                info!("✅ Buy price sensor {entity_id} covers all blocks again");
+            }
+            state.missing = missing > 0;
+        }
+    }
+}
+
 #[async_trait]
 impl PriceDataSource for ConfigurablePriceDataSource {
     async fn read_prices(&self) -> Result<SpotPriceData> {
@@ -815,6 +975,9 @@ impl PriceDataSource for ConfigurablePriceDataSource {
         if self.use_spot_for_buy {
             debug!("💰 [ConfigurablePrice] Using spot prices for buy decisions");
             let mut data = self.spot_adapter.read_prices().await?;
+            if let Some(entity_id) = &self.buy_price_entity {
+                self.apply_buy_prices(entity_id, &mut data).await;
+            }
 
             // When using spot for both buy and sell, compute spot sell price from raw spot price
             if self.use_spot_for_sell {
@@ -1380,5 +1543,356 @@ mod export_limit_guard_tests {
         // The entity max cannot be read: the write is refused
         assert!(!export_limit_allowed(0, None));
         assert!(!export_limit_allowed(9000, None));
+    }
+}
+
+#[cfg(test)]
+mod buy_price_tests {
+    use super::*;
+    use fluxion_types::pricing::TimeBlockPrice;
+    use mockito::Server;
+    use serde_json::json;
+
+    const SPOT: &str = "sensor.current_spot_electricity_price_15min";
+    const BUY: &str = "sensor.current_buy_electricity_price_15min";
+
+    fn entity_body(entity: &str, state: &str, attributes: serde_json::Value) -> String {
+        json!({
+            "entity_id": entity,
+            "state": state,
+            "attributes": attributes,
+            "last_changed": "2026-10-14T22:00:00Z",
+            "last_updated": "2026-10-14T22:00:00Z",
+        })
+        .to_string()
+    }
+
+    fn source(url: String, buy_entity: Option<&str>) -> ConfigurablePriceDataSource {
+        source_with(url, buy_entity, BUY_PRICE_FETCH_INTERVAL)
+    }
+
+    fn source_with(
+        url: String,
+        buy_entity: Option<&str>,
+        interval: Duration,
+    ) -> ConfigurablePriceDataSource {
+        let client = Arc::new(HomeAssistantClient::new(url, "t").unwrap());
+        let spot = Arc::new(CzSpotPriceAdapter::new(client, SPOT));
+        ConfigurablePriceDataSource::new(spot, true, true, vec![], vec![], 0.5)
+            .with_buy_price_entity(buy_entity.map(str::to_string))
+            .with_buy_fetch_interval(interval)
+    }
+
+    fn buy_mock_path() -> String {
+        format!("/api/states/{BUY}")
+    }
+
+    fn block_at(data: &SpotPriceData, utc: &str) -> TimeBlockPrice {
+        let start: DateTime<Utc> = utc.parse().unwrap();
+        data.time_block_prices
+            .iter()
+            .find(|b| b.block_start == start)
+            .cloned()
+            .expect("block present")
+    }
+
+    async fn spot_mock(server: &mut Server) -> mockito::Mock {
+        server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                SPOT,
+                "3.0",
+                json!({
+                    "2026-10-15T00:00:00+02:00": 2.0,
+                    "2026-10-15T00:15:00+02:00": 3.0,
+                    "2026-10-15T00:30:00+02:00": 4.0,
+                }),
+            ))
+            .create_async()
+            .await
+    }
+
+    #[tokio::test]
+    async fn buy_sensor_sets_buy_price_per_block_and_sell_stays_spot() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        // Buy sensor has no 00:30 block; that block falls back to spot
+        let _buy = server
+            .mock("GET", format!("/api/states/{BUY}").as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                BUY,
+                "2.42",
+                json!({
+                    "2026-10-15T00:00:00+02:00": 2.42,
+                    "2026-10-15T00:15:00+02:00": 2.6,
+                    "2026-10-15T00:45:00+02:00": 2.9,
+                }),
+            ))
+            .create_async()
+            .await;
+
+        let data = source(server.url(), Some(BUY)).read_prices().await.unwrap();
+
+        let first = block_at(&data, "2026-10-14T22:00:00Z");
+        assert_eq!(first.price_czk_per_kwh, 2.0);
+        assert_eq!(first.buy_price_czk_per_kwh, Some(2.42));
+        assert_eq!(first.buy_energy_price_czk_per_kwh(), 2.42);
+        assert_eq!(first.spot_sell_price_czk_per_kwh, Some(1.5));
+
+        let second = block_at(&data, "2026-10-14T22:15:00Z");
+        assert_eq!(second.buy_price_czk_per_kwh, Some(2.6));
+        assert_eq!(second.spot_sell_price_czk_per_kwh, Some(2.5));
+
+        // Uncovered block: spot scaled by the median buy/spot ratio of the covered blocks
+        let missing = block_at(&data, "2026-10-14T22:30:00Z");
+        let expected = 4.0 * ((2.42 / 2.0 + 2.6 / 3.0) / 2.0);
+        assert!((missing.buy_price_czk_per_kwh.unwrap() - expected).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn missing_buy_sensor_falls_back_to_spot_for_every_block() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        let _buy = server
+            .mock("GET", format!("/api/states/{BUY}").as_str())
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let data = source(server.url(), Some(BUY)).read_prices().await.unwrap();
+
+        assert_eq!(data.time_block_prices.len(), 3);
+        assert!(
+            data.time_block_prices
+                .iter()
+                .all(|b| b.buy_price_czk_per_kwh.is_none())
+        );
+        assert_eq!(
+            block_at(&data, "2026-10-14T22:00:00Z").buy_energy_price_czk_per_kwh(),
+            2.0
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_buy_sensor_falls_back_to_spot() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        let _buy = server
+            .mock("GET", format!("/api/states/{BUY}").as_str())
+            .with_status(200)
+            .with_body(entity_body(BUY, "unavailable", json!({})))
+            .create_async()
+            .await;
+
+        let data = source(server.url(), Some(BUY)).read_prices().await.unwrap();
+
+        assert!(
+            data.time_block_prices
+                .iter()
+                .all(|b| b.buy_price_czk_per_kwh.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_or_empty_buy_entity_is_never_requested() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        let buy = server
+            .mock("GET", format!("/api/states/{BUY}").as_str())
+            .expect(0)
+            .create_async()
+            .await;
+
+        let unset = source(server.url(), None).read_prices().await.unwrap();
+        let empty = source(server.url(), Some("  "))
+            .read_prices()
+            .await
+            .unwrap();
+
+        assert!(
+            unset
+                .time_block_prices
+                .iter()
+                .all(|b| b.buy_price_czk_per_kwh.is_none())
+        );
+        assert!(
+            empty
+                .time_block_prices
+                .iter()
+                .all(|b| b.buy_price_czk_per_kwh.is_none())
+        );
+        assert_eq!(
+            block_at(&unset, "2026-10-14T22:15:00Z").buy_energy_price_czk_per_kwh(),
+            3.0
+        );
+        buy.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn failed_buy_read_reuses_last_good_prices() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        let ok = server
+            .mock("GET", buy_mock_path().as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                BUY,
+                "2.42",
+                json!({
+                    "2026-10-15T00:00:00+02:00": 2.42,
+                    "2026-10-15T00:15:00+02:00": 2.6,
+                }),
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let src = source_with(server.url(), Some(BUY), Duration::ZERO);
+        let first = src.read_prices().await.unwrap();
+        ok.assert_async().await;
+
+        // The sensor now fails twice: both reads keep the last good buy prices
+        let failing = server
+            .mock("GET", buy_mock_path().as_str())
+            .with_status(500)
+            .expect(2)
+            .create_async()
+            .await;
+        let second = src.read_prices().await.unwrap();
+        let third = src.read_prices().await.unwrap();
+        failing.assert_async().await;
+
+        for data in [&first, &second, &third] {
+            assert_eq!(
+                block_at(data, "2026-10-14T22:00:00Z").buy_price_czk_per_kwh,
+                Some(2.42)
+            );
+            assert_eq!(
+                block_at(data, "2026-10-14T22:15:00Z").buy_price_czk_per_kwh,
+                Some(2.6)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_buy_coverage_scales_spot_for_uncovered_blocks() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        let _buy = server
+            .mock("GET", buy_mock_path().as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                BUY,
+                "2.42",
+                json!({
+                    "2026-10-15T00:00:00+02:00": 2.42,
+                    "2026-10-15T00:15:00+02:00": 3.63,
+                }),
+            ))
+            .create_async()
+            .await;
+
+        let data = source(server.url(), Some(BUY)).read_prices().await.unwrap();
+
+        // Covered blocks take the buy sensor; the uncovered 00:30 block is spot x 1.21
+        assert_eq!(
+            block_at(&data, "2026-10-14T22:00:00Z").buy_price_czk_per_kwh,
+            Some(2.42)
+        );
+        let scaled = block_at(&data, "2026-10-14T22:30:00Z");
+        assert!((scaled.buy_price_czk_per_kwh.unwrap() - 4.0 * 1.21).abs() < 1e-3);
+        assert_eq!(scaled.spot_sell_price_czk_per_kwh, Some(3.5));
+    }
+
+    #[tokio::test]
+    async fn buy_sensor_without_covered_blocks_falls_back_to_spot() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        // Buy values only for another day: no ratio can be known for the spot blocks
+        let _buy = server
+            .mock("GET", buy_mock_path().as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                BUY,
+                "2.42",
+                json!({ "2026-10-16T00:00:00+02:00": 2.42 }),
+            ))
+            .create_async()
+            .await;
+
+        let data = source(server.url(), Some(BUY)).read_prices().await.unwrap();
+
+        assert!(
+            data.time_block_prices
+                .iter()
+                .all(|b| b.buy_price_czk_per_kwh.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn buy_sensor_is_read_at_most_once_per_interval() {
+        let mut server = Server::new_async().await;
+        let _spot = spot_mock(&mut server).await;
+        let buy = server
+            .mock("GET", buy_mock_path().as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                BUY,
+                "2.42",
+                json!({ "2026-10-15T00:00:00+02:00": 2.42 }),
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+        let src = source(server.url(), Some(BUY));
+
+        // Spot is read on every call; the buy sensor only once within the interval
+        let _first = src.read_prices().await.unwrap();
+        let _second = src.read_prices().await.unwrap();
+        let third = src.read_prices().await.unwrap();
+
+        buy.assert_async().await;
+        assert_eq!(
+            block_at(&third, "2026-10-14T22:00:00Z").buy_price_czk_per_kwh,
+            Some(2.42)
+        );
+    }
+
+    #[test]
+    fn buy_to_spot_ratio_is_median_over_covered_blocks() {
+        fn block(secs: i64, spot: f32) -> TimeBlockPrice {
+            TimeBlockPrice {
+                block_start: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+                duration_minutes: 15,
+                price_czk_per_kwh: spot,
+                effective_price_czk_per_kwh: spot,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
+            }
+        }
+        let buy: HashMap<DateTime<Utc>, f32> = [(0, 2.42), (900, 4.84), (1800, 1.0)]
+            .into_iter()
+            .map(|(secs, price)| (DateTime::<Utc>::from_timestamp(secs, 0).unwrap(), price))
+            .collect();
+        // Block at 1800 has no buy value; block at 2700 has zero spot and is ignored
+        let blocks = vec![
+            block(0, 2.0),
+            block(900, 4.0),
+            block(1800, 5.0),
+            block(2700, 0.0),
+        ];
+        let ratio = buy_to_spot_ratio(&blocks, &buy).unwrap();
+        assert!((ratio - 1.21).abs() < 1e-4);
+
+        // Even count: median of 1.2 and 1.4
+        let buy: HashMap<DateTime<Utc>, f32> = [(0, 2.4), (900, 5.6)]
+            .into_iter()
+            .map(|(secs, price)| (DateTime::<Utc>::from_timestamp(secs, 0).unwrap(), price))
+            .collect();
+        let ratio = buy_to_spot_ratio(&blocks[..2], &buy).unwrap();
+        assert!((ratio - 1.3).abs() < 1e-4);
+
+        assert_eq!(buy_to_spot_ratio(&blocks, &HashMap::new()), None);
     }
 }

@@ -39,6 +39,10 @@ configuration:
     name: Entita spotové ceny
     description: >-
       Home Assistant entita poskytující aktuální spotové ceny elektřiny.
+  buy_price_entity:
+    name: Entita nákupní ceny
+    description: >-
+      Volitelná Home Assistant entita s nákupní cenou (včetně DPH) ve stejném formátu jako spotová cena. Prázdné = nákup za spotovou cenu.
   use_spot_prices_to_buy:
     name: Použít spotové ceny pro nákup
     description: >-

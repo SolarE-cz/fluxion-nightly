@@ -109,6 +109,10 @@ pub struct PricingConfig {
     /// Optional separate sensor for tomorrow's prices
     #[serde(default)]
     pub tomorrow_price_entity: Option<String>,
+    /// Optional separate sensor for the buy price (incl. VAT), same format as the spot sensor.
+    /// Used for buy decisions when `use_spot_prices_to_buy` is set; the sell price stays spot.
+    #[serde(default)]
+    pub buy_price_entity: Option<String>,
     pub use_spot_prices_to_buy: bool,
     pub use_spot_prices_to_sell: bool,
     pub fixed_buy_price_czk: PriceSchedule,

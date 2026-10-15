@@ -192,6 +192,7 @@ mod tests {
             price_czk_per_kwh: effective_price * 0.8, // spot = 80% of effective for test purposes
             effective_price_czk_per_kwh: effective_price,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         }
     }
 

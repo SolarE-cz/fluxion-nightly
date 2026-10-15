@@ -615,7 +615,7 @@ impl EconomicStrategy for WinterAdaptiveV8Strategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: 0.0, // V8 doesn't use wear cost (provable data only)
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -931,6 +931,7 @@ mod tests {
                     price_czk_per_kwh: 1.0,
                     effective_price_czk_per_kwh: 1.0 + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -946,6 +947,7 @@ mod tests {
                     price_czk_per_kwh: 3.0,
                     effective_price_czk_per_kwh: 3.0 + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -961,6 +963,7 @@ mod tests {
                     price_czk_per_kwh: 6.0,
                     effective_price_czk_per_kwh: 6.0 + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -976,6 +979,7 @@ mod tests {
                     price_czk_per_kwh: 4.0,
                     effective_price_czk_per_kwh: 4.0 + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }

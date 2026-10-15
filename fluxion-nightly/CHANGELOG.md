@@ -10,6 +10,23 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.48] - 2026-10-15
+
+### Added
+
+- **Separate buy-price sensor** (`pricing.buy_price_entity`). Use it for sites whose buy price is a
+  different HA sensor from the spot/sell price, for example spot × 1.21 with VAT. A failed read
+  reuses the last good buy prices; blocks the sensor doesn't cover use spot × the observed buy/spot
+  ratio. The sensor is read at most once a minute. If unset, nothing changes.
+
+### Fixed
+
+- **The dashboard entities, lock guard and night usage now use the configured inverter's prefix**
+  instead of the `solax` default.
+- **No more Hold ↔ Self-Use flapping at the SOC floor overnight.** When both modes leave the battery
+  and grid the same, the applied mode is kept (only in blocks without PV, so PV charging is never
+  blocked).
+
 ## [0.2.47] - 2026-10-15
 
 ### Added

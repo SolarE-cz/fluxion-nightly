@@ -689,12 +689,12 @@ impl WinterAdaptiveV9Strategy {
         };
 
         // Grid fee at the last charge block (used to detect HDO transition)
-        let charge_grid_fee =
-            blocks[last_charge].effective_price_czk_per_kwh - blocks[last_charge].price_czk_per_kwh;
+        let charge_grid_fee = blocks[last_charge].effective_price_czk_per_kwh
+            - blocks[last_charge].buy_energy_price_czk_per_kwh();
 
         for i in (last_charge + 1)..blocks.len() {
             let block = &blocks[i];
-            let grid_fee = block.effective_price_czk_per_kwh - block.price_czk_per_kwh;
+            let grid_fee = block.effective_price_czk_per_kwh - block.buy_energy_price_czk_per_kwh();
 
             // Stop at HDO high tariff transition (grid fee jumps by >0.5 CZK)
             if grid_fee > charge_grid_fee + 0.5 {
@@ -1035,7 +1035,7 @@ impl EconomicStrategy for WinterAdaptiveV9Strategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: 0.0,
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -1380,6 +1380,7 @@ mod tests {
                     price_czk_per_kwh: price,
                     effective_price_czk_per_kwh: price + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -1651,6 +1652,7 @@ mod tests {
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price + grid_fee,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1897,6 +1899,7 @@ mod tests {
                     price_czk_per_kwh: effective_price - 1.8,
                     effective_price_czk_per_kwh: effective_price,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -1972,6 +1975,7 @@ mod tests {
                     price_czk_per_kwh: spot_price,
                     effective_price_czk_per_kwh: spot_price + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -2052,6 +2056,7 @@ mod tests {
                     price_czk_per_kwh: spot_price,
                     effective_price_czk_per_kwh: spot_price + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }
@@ -2089,6 +2094,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2113,6 +2119,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2144,6 +2151,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2183,6 +2191,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2222,6 +2231,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(15),
@@ -2229,6 +2239,7 @@ mod tests {
                 price_czk_per_kwh: 10.0,
                 effective_price_czk_per_kwh: 10.5, // Very expensive gap
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
                 block_start: base_time + chrono::Duration::minutes(30),
@@ -2236,6 +2247,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             },
         ];
 
@@ -2269,6 +2281,7 @@ mod tests {
                 price_czk_per_kwh: 2.0,
                 effective_price_czk_per_kwh: 2.5,
                 spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -2326,6 +2339,7 @@ mod tests {
                     price_czk_per_kwh: spot_price,
                     effective_price_czk_per_kwh: spot_price + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }

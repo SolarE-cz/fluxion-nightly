@@ -810,7 +810,7 @@ fn build_dashboard_response(
                                         None,
                                         Some(format!(
                                             "Time-Aware Charge - Cheapest block ({:.3} CZK/kWh)",
-                                            block.price_czk_per_kwh
+                                            block.buy_energy_price_czk_per_kwh()
                                         )),
                                         None,
                                         None,

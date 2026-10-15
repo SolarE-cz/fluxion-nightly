@@ -32,6 +32,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 1.5,
             effective_price_czk_per_kwh: 1.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -43,6 +44,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -54,6 +56,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 4.5,
             effective_price_czk_per_kwh: 4.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -65,6 +68,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -76,6 +80,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 3.5,
             effective_price_czk_per_kwh: 3.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -87,6 +92,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 5.0,
             effective_price_czk_per_kwh: 5.0,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -98,6 +104,7 @@ fn create_czech_pattern() -> Vec<TimeBlockPrice> {
             price_czk_per_kwh: 2.5,
             effective_price_czk_per_kwh: 2.5,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 

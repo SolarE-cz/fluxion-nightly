@@ -105,11 +105,11 @@ fn calculate_ema(values: &[f32], period: usize) -> Option<f32> {
 pub fn setup_price_cache(mut commands: Commands, price_source: Res<PriceDataSourceResource>) {
     let price_cache = crate::resources::PriceCache::new(
         price_source.0.clone(),
-        3, // 5 minutes fetch interval (was 5 seconds in the old system)
+        3, // 3 seconds fetch interval (price cache refresh; the buy sensor has its own limit)
     );
 
     commands.insert_resource(price_cache);
-    info!("✅ Price cache initialized with 5-minute fetch interval");
+    info!("✅ Price cache initialized with 3-second fetch interval");
 }
 
 /// Simplified system that updates prices using direct cache access

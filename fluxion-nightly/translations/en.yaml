@@ -39,6 +39,10 @@ configuration:
     name: Spot Price Entity
     description: >-
       The Home Assistant entity that provides current electricity spot prices.
+  buy_price_entity:
+    name: Buy Price Entity
+    description: >-
+      Optional Home Assistant entity with the buy price (incl. VAT), in the same format as the spot price entity. Empty = buy at spot price.
   use_spot_prices_to_buy:
     name: Use Spot Prices for Buying
     description: >-

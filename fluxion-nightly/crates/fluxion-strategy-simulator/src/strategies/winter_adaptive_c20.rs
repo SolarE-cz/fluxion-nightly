@@ -928,7 +928,7 @@ impl EconomicStrategy for WinterAdaptiveC20Strategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: 0.0,
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -1238,6 +1238,7 @@ mod tests {
                     price_czk_per_kwh: price,
                     effective_price_czk_per_kwh: price + grid_fee,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         }

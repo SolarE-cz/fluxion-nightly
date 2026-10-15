@@ -308,6 +308,7 @@ mod tests {
             pricing_config: PricingConfig {
                 spot_price_entity: "sensor.spot_price".to_owned(),
                 tomorrow_price_entity: None,
+                buy_price_entity: None,
                 use_spot_prices_to_buy: true,
                 use_spot_prices_to_sell: true,
                 fixed_buy_price_czk: fluxion_core::resources::PriceSchedule::Flat(5.0),

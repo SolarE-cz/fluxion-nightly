@@ -173,6 +173,7 @@ fn parse_forecast_sensor(
             // Effective price will be calculated by scheduler with HDO fees
             effective_price_czk_per_kwh: price,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -212,6 +213,7 @@ fn convert_to_15min_blocks(blocks: Vec<TimeBlockPrice>) -> Vec<TimeBlockPrice> {
                     price_czk_per_kwh: block.price_czk_per_kwh,
                     effective_price_czk_per_kwh: block.effective_price_czk_per_kwh,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             }
         } else {
@@ -313,6 +315,7 @@ fn parse_single_day_array(
             // Effective price will be calculated by scheduler with HDO fees
             effective_price_czk_per_kwh: price,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -465,6 +468,7 @@ fn parse_price_arrays(
             // Effective price will be calculated by scheduler with HDO fees
             effective_price_czk_per_kwh: price,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -520,6 +524,7 @@ fn parse_price_arrays(
             // Effective price will be calculated by scheduler with HDO fees
             effective_price_czk_per_kwh: price,
             spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -612,6 +617,7 @@ fn parse_timestamp_keyed_attributes(
                     // Effective price will be calculated by scheduler with HDO fees
                     effective_price_czk_per_kwh: price as f32,
                     spot_sell_price_czk_per_kwh: None,
+                    buy_price_czk_per_kwh: None,
                 });
             } else {
                 warn!(
