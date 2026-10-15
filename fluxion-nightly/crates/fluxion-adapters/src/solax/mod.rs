@@ -12,9 +12,11 @@
 
 mod entity_mapper;
 mod modes;
+pub mod variant;
 
 pub use entity_mapper::{SolaxEntityMapper, SolaxUltraEntityMapper};
 pub use modes::{SolaxChargerUseMode, SolaxManualMode};
+pub use variant::{detect_inverter_type, detect_variant};
 
 use fluxion_core::{InverterType, VendorEntityMapper};
 use std::sync::Arc;

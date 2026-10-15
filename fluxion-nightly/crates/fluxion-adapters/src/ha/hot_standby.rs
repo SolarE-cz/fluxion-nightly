@@ -20,12 +20,15 @@ use anyhow::Result;
 use bevy_ecs::prelude::*;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::ha::actuation::lock_entity;
 use crate::ha::client::HomeAssistantClient;
-use crate::ha::errors::{HaError, HaResult};
+use crate::ha::errors::HaResult;
 use crate::ha::plugin::{HaClientResource, HaConfig};
 use crate::ha::ws::{HaWsSession, websocket_url};
 use fluxion_core::DebugModeConfig;
@@ -58,6 +61,7 @@ pub struct RegistryEntry {
     pub entity_id: String,
     pub platform: String,
     pub unique_id: String,
+    pub config_entry_id: Option<String>,
 }
 
 fn is_unusable(state: &str) -> bool {
@@ -119,6 +123,7 @@ pub fn parse_registry(value: &Value) -> Vec<RegistryEntry> {
                         entity_id: e["entity_id"].as_str()?.to_string(),
                         platform: e["platform"].as_str().unwrap_or_default().to_string(),
                         unique_id: e["unique_id"].as_str().unwrap_or_default().to_string(),
+                        config_entry_id: e["config_entry_id"].as_str().map(str::to_string),
                     })
                 })
                 .collect()
@@ -127,11 +132,24 @@ pub fn parse_registry(value: &Value) -> Vec<RegistryEntry> {
 }
 
 /// Entity ids of SolaX HotStandBy registry entries (platform `solax_modbus`, unique_id `*_hotstandby`)
+/// in the same config entry as the lock entity. Without a registry entry for the lock entity there
+/// are none, so an entry of another config entry (another inverter) is never picked.
 #[must_use]
-pub fn registry_candidates(entries: &[RegistryEntry]) -> Vec<String> {
+pub fn registry_candidates(entries: &[RegistryEntry], lock_entity: &str) -> Vec<String> {
+    let Some(config_entry) = entries
+        .iter()
+        .find(|e| e.entity_id == lock_entity)
+        .and_then(|e| e.config_entry_id.as_deref())
+    else {
+        return Vec::new();
+    };
     entries
         .iter()
-        .filter(|e| e.platform == "solax_modbus" && e.unique_id.ends_with("_hotstandby"))
+        .filter(|e| {
+            e.platform == "solax_modbus"
+                && e.unique_id.ends_with("_hotstandby")
+                && e.config_entry_id.as_deref() == Some(config_entry)
+        })
         .map(|e| e.entity_id.clone())
         .collect()
 }
@@ -163,10 +181,10 @@ pub async fn fetch_registry(url: &str, token: &str) -> HaResult<Vec<RegistryEntr
     Ok(parse_registry(&result))
 }
 
-async fn exists(client: &HomeAssistantClient, entity_id: &str) -> Option<String> {
-    match client.get_state(entity_id).await {
-        Ok(s) => Some(s.state),
-        Err(HaError::EntityNotFound(_)) => None,
+/// Current state of an entity, or `None` when it is missing or unreadable
+async fn state_of(client: &HomeAssistantClient, entity_id: &str) -> Option<String> {
+    match client.get_state_optional(entity_id).await {
+        Ok(state) => state.map(|s| s.state),
         Err(e) => {
             debug!("HotStandBy candidate {} unreadable: {}", entity_id, e);
             None
@@ -174,17 +192,23 @@ async fn exists(client: &HomeAssistantClient, entity_id: &str) -> Option<String>
     }
 }
 
-/// Resolve the HotStandBy entity. Order: configured entity, `switch.<prefix>_hotstandby`, then
-/// the registry (`registry` is `None` when the websocket is unavailable).
-pub async fn resolve_hot_standby_with(
-    client: &HomeAssistantClient,
+/// Resolve the HotStandBy entity of one inverter. Order: the configured entity, the usable
+/// `switch.<prefix>_hotstandby`, the usable `select.<prefix>_hotstandby`, then the registry
+/// restricted to the lock entity's config entry. `lookup` returns the state of an entity that
+/// exists; `registry` is `None` when the websocket is unavailable.
+pub async fn resolve_hot_standby_with<F, Fut>(
+    lookup: F,
     prefix: &str,
     configured: Option<&str>,
     registry: Option<Vec<RegistryEntry>>,
-) -> Option<HotStandbyTarget> {
+) -> Option<HotStandbyTarget>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
     if let Some(entity) = configured.map(str::trim).filter(|e| !e.is_empty()) {
         if let Some(kind) = kind_of(entity)
-            && exists(client, entity).await.is_some()
+            && lookup(entity.to_string()).await.is_some()
         {
             return Some(HotStandbyTarget {
                 entity_id: entity.to_string(),
@@ -197,25 +221,37 @@ pub async fn resolve_hot_standby_with(
         );
     }
 
-    let switch = format!("switch.{prefix}_hotstandby");
-    if exists(client, &switch).await.is_some() {
-        return Some(HotStandbyTarget {
-            entity_id: switch,
-            kind: HotStandbyKind::Switch,
-        });
+    for (entity, kind) in [
+        (
+            format!("switch.{prefix}_hotstandby"),
+            HotStandbyKind::Switch,
+        ),
+        (
+            format!("select.{prefix}_hotstandby"),
+            HotStandbyKind::Select,
+        ),
+    ] {
+        if let Some(state) = lookup(entity.clone()).await
+            && !is_unusable(&state)
+        {
+            return Some(HotStandbyTarget {
+                entity_id: entity,
+                kind,
+            });
+        }
     }
 
     let entries = registry?;
     let mut with_state = Vec::new();
-    for entity in registry_candidates(&entries) {
-        if let Some(state) = exists(client, &entity).await {
+    for entity in registry_candidates(&entries, &lock_entity(prefix)) {
+        if let Some(state) = lookup(entity.clone()).await {
             with_state.push((entity, state));
         }
     }
     choose_registry_candidate(&with_state)
 }
 
-/// Resolve the HotStandBy entity, reading the registry over the websocket
+/// Resolve the HotStandBy entity of one inverter, reading the registry over the websocket
 pub async fn resolve_hot_standby(
     client: &HomeAssistantClient,
     prefix: &str,
@@ -231,28 +267,8 @@ pub async fn resolve_hot_standby(
         },
         None => None,
     };
-    resolve_hot_standby_with(client, prefix, configured, registry).await
-}
-
-/// Channel that carries the startup resolution result to the update system
-#[derive(Resource)]
-pub struct HotStandbyChannel {
-    pub tx: crossbeam_channel::Sender<Option<HotStandbyTarget>>,
-    pub rx: crossbeam_channel::Receiver<Option<HotStandbyTarget>>,
-}
-
-impl Default for HotStandbyChannel {
-    fn default() -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        Self { tx, rx }
-    }
-}
-
-#[derive(Resource, Default)]
-pub struct HotStandbyState {
-    target: Option<HotStandbyTarget>,
-    last_check: Option<Instant>,
-    last_enable: Arc<Mutex<Option<Instant>>>,
+    let lookup = move |entity: String| async move { state_of(client, &entity).await };
+    resolve_hot_standby_with(lookup, prefix, configured, registry).await
 }
 
 /// Enable HotStandBy when it is off. Debug mode logs only.
@@ -304,7 +320,35 @@ async fn check_once(
     Ok(())
 }
 
-/// PostStartup: resolve the HotStandBy entity in the background and log once if it is missing
+/// Channel that carries each inverter's startup resolution to the update system
+#[derive(Resource)]
+pub struct HotStandbyChannel {
+    pub tx: crossbeam_channel::Sender<(String, Option<HotStandbyTarget>)>,
+    pub rx: crossbeam_channel::Receiver<(String, Option<HotStandbyTarget>)>,
+}
+
+impl Default for HotStandbyChannel {
+    fn default() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        Self { tx, rx }
+    }
+}
+
+/// A resolved HotStandBy entity with its own enable throttle
+struct Tracked {
+    target: HotStandbyTarget,
+    last_enable: Arc<Mutex<Option<Instant>>>,
+}
+
+/// Resolved HotStandBy entities keyed by inverter id
+#[derive(Resource, Default)]
+pub struct HotStandbyState {
+    targets: HashMap<String, Tracked>,
+    last_check: Option<Instant>,
+}
+
+/// PostStartup: resolve the HotStandBy entity of every configured inverter in the background and
+/// log once per inverter if it is missing
 pub fn spawn_hot_standby_resolver(
     channel: Res<HotStandbyChannel>,
     ha_client: Option<Res<HaClientResource>>,
@@ -322,22 +366,37 @@ pub fn spawn_hot_standby_resolver(
         return;
     }
     let tx = channel.tx.clone();
+    // The configured entity is one entity, so it applies to the first inverter only
     let configured = config.control_config.hot_standby_entity.clone();
-    let prefix = ha_config.inverter_prefix.clone();
+    let mut inverters: Vec<String> = config.inverters.iter().map(|inv| inv.id.clone()).collect();
+    if inverters.is_empty() {
+        inverters.push(ha_config.inverter_prefix.clone());
+    }
     let client = client.0.clone();
     tokio::spawn(async move {
-        let target = resolve_hot_standby(&client, &prefix, configured.as_deref()).await;
-        match &target {
-            Some(t) => info!("HotStandBy entity resolved: {}", t.entity_id),
-            None => warn!(
-                "⚠️ HotStandBy entity not found (set control.hot_standby_entity); guard inactive"
-            ),
+        for (index, inverter) in inverters.into_iter().enumerate() {
+            let configured = if index == 0 {
+                configured.as_deref()
+            } else {
+                None
+            };
+            let target = resolve_hot_standby(&client, &inverter, configured).await;
+            match &target {
+                Some(t) => info!(
+                    "HotStandBy entity resolved for {}: {}",
+                    inverter, t.entity_id
+                ),
+                None => warn!(
+                    "⚠️ HotStandBy entity not found for {} (set control.hot_standby_entity); guard inactive",
+                    inverter
+                ),
+            }
+            let _ = tx.send((inverter, target));
         }
-        let _ = tx.send(target);
     });
 }
 
-/// Update: store the resolved target and check it at startup and every 5 minutes
+/// Update: store the resolved targets and check them at startup and every 5 minutes
 pub fn hot_standby_system(
     mut state: ResMut<HotStandbyState>,
     channel: Res<HotStandbyChannel>,
@@ -345,12 +404,25 @@ pub fn hot_standby_system(
     system_config: Option<Res<SystemConfig>>,
     debug_mode: Option<Res<DebugModeConfig>>,
 ) {
-    while let Ok(target) = channel.rx.try_recv() {
-        state.target = target;
+    while let Ok((inverter, target)) = channel.rx.try_recv() {
+        match target {
+            Some(target) => {
+                state.targets.insert(
+                    inverter,
+                    Tracked {
+                        target,
+                        last_enable: Arc::new(Mutex::new(None)),
+                    },
+                );
+            }
+            None => {
+                state.targets.remove(&inverter);
+            }
+        }
     }
-    let Some(target) = state.target.clone() else {
+    if state.targets.is_empty() {
         return;
-    };
+    }
     let Some(client) = ha_client else {
         return;
     };
@@ -370,11 +442,17 @@ pub fn hot_standby_system(
     state.last_check = Some(now);
     // Runtime debug state; without it, behave as debug and change nothing
     let debug = debug_mode.as_ref().is_none_or(|d| d.enabled);
-    let last_enable = state.last_enable.clone();
+    let checks: Vec<(HotStandbyTarget, Arc<Mutex<Option<Instant>>>)> = state
+        .targets
+        .values()
+        .map(|t| (t.target.clone(), t.last_enable.clone()))
+        .collect();
     let client = client.0.clone();
     tokio::spawn(async move {
-        if let Err(e) = check_once(&client, &target, &last_enable, debug).await {
-            warn!("⚠️ HotStandBy check failed: {}", e);
+        for (target, last_enable) in checks {
+            if let Err(e) = check_once(&client, &target, &last_enable, debug).await {
+                warn!("⚠️ HotStandBy check failed for {}: {}", target.entity_id, e);
+            }
         }
     });
 }
@@ -408,9 +486,9 @@ mod tests {
 
     #[test]
     fn enable_calls_match_entity_kind() {
-        let (service, data) = enable_call(&target("switch.garaz_solax_inverter_hotstandby"));
+        let (service, data) = enable_call(&target("switch.solax_inverter_hotstandby"));
         assert_eq!(service, "switch.turn_on");
-        assert_eq!(data["entity_id"], "switch.garaz_solax_inverter_hotstandby");
+        assert_eq!(data["entity_id"], "switch.solax_inverter_hotstandby");
         let (service, data) = enable_call(&target("select.solax_hotstandby"));
         assert_eq!(service, "select.select_option");
         assert_eq!(data["option"], "Enabled");
@@ -424,23 +502,62 @@ mod tests {
         assert!(enable_due(Some(t0), t0 + HOT_STANDBY_ENABLE_INTERVAL));
     }
 
+    const HYBRID: &str = include_str!("../../tests/fixtures/solax_hybrid_entity_ids.txt");
+    const ULTRA: &str = include_str!("../../tests/fixtures/solax_ultra_parallel_entity_ids.txt");
+
+    /// Lookup over a fixed set of entities (state per id); other ids do not exist
+    fn lookup_in(
+        states: &[(&str, &str)],
+    ) -> impl Fn(String) -> std::future::Ready<Option<String>> + use<> {
+        let map: HashMap<String, String> = states
+            .iter()
+            .map(|(entity, state)| (entity.to_string(), state.to_string()))
+            .collect();
+        move |entity| std::future::ready(map.get(&entity).cloned())
+    }
+
+    /// Lookup over every entity of a fixture file (state `on`), with per-entity overrides
+    fn fixture_lookup(
+        text: &str,
+        overrides: &[(&str, &str)],
+    ) -> impl Fn(String) -> std::future::Ready<Option<String>> + use<> {
+        let mut states: Vec<(&str, &str)> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|entity| (entity, "on"))
+            .collect();
+        states.extend_from_slice(overrides);
+        lookup_in(&states)
+    }
+
     #[test]
-    fn registry_parse_and_candidates() {
+    fn registry_candidates_stay_in_lock_config_entry() {
         let value = json!([
-            {"entity_id": "switch.garaz_solax_inverter_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby"},
-            {"entity_id": "select.solax_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby"},
-            {"entity_id": "sensor.other", "platform": "solax_modbus", "unique_id": "other"},
-            {"entity_id": "switch.foreign_hotstandby", "platform": "other", "unique_id": "x_hotstandby"},
+            {"entity_id": "select.solax_lock_state", "platform": "solax_modbus", "unique_id": "SolaX_lock", "config_entry_id": "A"},
+            {"entity_id": "switch.solax_inverter_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby", "config_entry_id": "A"},
+            {"entity_id": "select.solax_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby", "config_entry_id": "A"},
+            {"entity_id": "select.other_hotstandby", "platform": "solax_modbus", "unique_id": "Other_hotstandby", "config_entry_id": "B"},
+            {"entity_id": "switch.foreign_hotstandby", "platform": "other", "unique_id": "x_hotstandby", "config_entry_id": "A"},
         ]);
         let entries = parse_registry(&value);
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         assert_eq!(
-            registry_candidates(&entries),
+            registry_candidates(&entries, "select.solax_lock_state"),
             vec![
-                "switch.garaz_solax_inverter_hotstandby",
+                "switch.solax_inverter_hotstandby",
                 "select.solax_hotstandby"
             ]
         );
+    }
+
+    #[test]
+    fn registry_step_skipped_without_lock_registry_entry() {
+        let value = json!([
+            {"entity_id": "switch.solax_inverter_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby", "config_entry_id": "A"},
+        ]);
+        let entries = parse_registry(&value);
+        assert!(registry_candidates(&entries, "select.solax_lock_state").is_empty());
     }
 
     #[test]
@@ -451,13 +568,13 @@ mod tests {
                 "unavailable".to_string(),
             ),
             (
-                "switch.garaz_solax_inverter_hotstandby".to_string(),
+                "switch.solax_inverter_hotstandby".to_string(),
                 "on".to_string(),
             ),
         ];
         assert_eq!(
             choose_registry_candidate(&candidates),
-            Some(target("switch.garaz_solax_inverter_hotstandby"))
+            Some(target("switch.solax_inverter_hotstandby"))
         );
         let only_select = vec![
             (
@@ -481,104 +598,112 @@ mod tests {
 
     #[tokio::test]
     async fn resolution_uses_configured_entity_first() {
-        let mut server = Server::new_async().await;
-        let configured = server
-            .mock("GET", "/api/states/switch.custom_hot")
-            .with_status(200)
-            .with_body(r#"{"entity_id":"switch.custom_hot","state":"on","attributes":{},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#)
-            .create_async()
-            .await;
-        let switch = server
-            .mock("GET", "/api/states/switch.solax_hotstandby")
-            .expect(0)
-            .create_async()
-            .await;
-        let client = HomeAssistantClient::new(server.url(), "t").unwrap();
+        let lookup = lookup_in(&[
+            ("switch.custom_hot", "on"),
+            ("switch.solax_hotstandby", "off"),
+        ]);
         let found =
-            resolve_hot_standby_with(&client, "solax", Some("switch.custom_hot"), None).await;
+            resolve_hot_standby_with(lookup, "solax", Some("switch.custom_hot"), None).await;
         assert_eq!(found, Some(target("switch.custom_hot")));
-        configured.assert_async().await;
-        switch.assert_async().await;
     }
 
     #[tokio::test]
     async fn resolution_falls_back_to_prefix_switch() {
-        let mut server = Server::new_async().await;
-        let missing = server
-            .mock("GET", "/api/states/switch.custom_hot")
-            .with_status(404)
-            .create_async()
-            .await;
-        let switch = server
-            .mock("GET", "/api/states/switch.solax_hotstandby")
-            .with_status(200)
-            .with_body(r#"{"entity_id":"switch.solax_hotstandby","state":"off","attributes":{},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#)
-            .create_async()
-            .await;
-        let client = HomeAssistantClient::new(server.url(), "t").unwrap();
+        let lookup = lookup_in(&[("switch.solax_hotstandby", "off")]);
         let found =
-            resolve_hot_standby_with(&client, "solax", Some("switch.custom_hot"), None).await;
+            resolve_hot_standby_with(lookup, "solax", Some("switch.custom_hot"), None).await;
         assert_eq!(found, Some(target("switch.solax_hotstandby")));
-        missing.assert_async().await;
-        switch.assert_async().await;
     }
 
     #[tokio::test]
-    async fn resolution_registry_picks_switch_over_unavailable_select() {
-        let mut server = Server::new_async().await;
-        let no_switch = server
-            .mock("GET", "/api/states/switch.solax_hotstandby")
-            .with_status(404)
-            .create_async()
-            .await;
-        let select = server
-            .mock("GET", "/api/states/select.solax_hotstandby")
-            .with_status(200)
-            .with_body(
-                r#"{"entity_id":"select.solax_hotstandby","state":"unavailable","attributes":{}}"#,
-            )
-            .create_async()
-            .await;
-        let garaz = server
-            .mock("GET", "/api/states/switch.garaz_solax_inverter_hotstandby")
-            .with_status(200)
-            .with_body(r#"{"entity_id":"switch.garaz_solax_inverter_hotstandby","state":"on","attributes":{},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#)
-            .create_async()
-            .await;
-        let registry = vec![
-            RegistryEntry {
-                entity_id: "select.solax_hotstandby".into(),
-                platform: "solax_modbus".into(),
-                unique_id: "SolaX_hotstandby".into(),
-            },
-            RegistryEntry {
-                entity_id: "switch.garaz_solax_inverter_hotstandby".into(),
-                platform: "solax_modbus".into(),
-                unique_id: "SolaX_hotstandby".into(),
-            },
+    async fn resolution_skips_unavailable_switch_for_usable_select() {
+        let lookup = lookup_in(&[
+            ("switch.solax_80_master_hotstandby", "unavailable"),
+            ("select.solax_80_master_hotstandby", "Disabled"),
+        ]);
+        let found = resolve_hot_standby_with(lookup, "solax_80_master", None, None).await;
+        assert_eq!(found, Some(target("select.solax_80_master_hotstandby")));
+    }
+
+    #[tokio::test]
+    async fn ultra_parallel_each_inverter_resolves_to_its_own_select() {
+        for prefix in ["solax_80_master", "solax_81_slave", "solax_53_other"] {
+            let lookup = fixture_lookup(ULTRA, &[]);
+            let found = resolve_hot_standby_with(lookup, prefix, None, None).await;
+            assert_eq!(
+                found,
+                Some(target(&format!("select.{prefix}_hotstandby"))),
+                "prefix {prefix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn x3_hybrid_resolves_through_registry_to_renamed_switch() {
+        // Fixture: select.solax_hotstandby is unavailable, switch.solax_hotstandby absent
+        let lookup = fixture_lookup(HYBRID, &[("select.solax_hotstandby", "unavailable")]);
+        let registry = parse_registry(&json!([
+            {"entity_id": "select.solax_lock_state", "platform": "solax_modbus", "unique_id": "SolaX_lock", "config_entry_id": "X3"},
+            {"entity_id": "select.solax_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby", "config_entry_id": "X3"},
+            {"entity_id": "switch.solax_inverter_hotstandby", "platform": "solax_modbus", "unique_id": "SolaX_hotstandby", "config_entry_id": "X3"},
+        ]));
+        let found = resolve_hot_standby_with(lookup, "solax", None, Some(registry)).await;
+        assert_eq!(found, Some(target("switch.solax_inverter_hotstandby")));
+    }
+
+    #[tokio::test]
+    async fn registry_picks_each_inverter_from_its_own_config_entry() {
+        // No prefix-named entities exist, so only the registry can resolve them
+        let registry = parse_registry(&json!([
+            {"entity_id": "select.solax_80_master_lock_state", "platform": "solax_modbus", "unique_id": "m_lock", "config_entry_id": "A"},
+            {"entity_id": "select.solax_81_slave_lock_state", "platform": "solax_modbus", "unique_id": "s_lock", "config_entry_id": "B"},
+            {"entity_id": "select.solax_53_other_lock_state", "platform": "solax_modbus", "unique_id": "o_lock", "config_entry_id": "C"},
+            {"entity_id": "select.garage_hot_a", "platform": "solax_modbus", "unique_id": "A_hotstandby", "config_entry_id": "A"},
+            {"entity_id": "select.garage_hot_b", "platform": "solax_modbus", "unique_id": "B_hotstandby", "config_entry_id": "B"},
+            {"entity_id": "select.garage_hot_c", "platform": "solax_modbus", "unique_id": "C_hotstandby", "config_entry_id": "C"},
+        ]));
+        let states = [
+            ("select.garage_hot_a", "Enabled"),
+            ("select.garage_hot_b", "Disabled"),
+            ("select.garage_hot_c", "Enabled"),
         ];
-        let client = HomeAssistantClient::new(server.url(), "t").unwrap();
-        let found = resolve_hot_standby_with(&client, "solax", None, Some(registry)).await;
-        assert_eq!(
-            found,
-            Some(target("switch.garaz_solax_inverter_hotstandby"))
-        );
-        no_switch.assert_async().await;
-        select.assert_async().await;
-        garaz.assert_async().await;
+        let master = resolve_hot_standby_with(
+            lookup_in(&states),
+            "solax_80_master",
+            None,
+            Some(registry.clone()),
+        )
+        .await;
+        assert_eq!(master, Some(target("select.garage_hot_a")));
+        let slave = resolve_hot_standby_with(
+            lookup_in(&states),
+            "solax_81_slave",
+            None,
+            Some(registry.clone()),
+        )
+        .await;
+        assert_eq!(slave, Some(target("select.garage_hot_b")));
+        let other =
+            resolve_hot_standby_with(lookup_in(&states), "solax_53_other", None, Some(registry))
+                .await;
+        assert_eq!(other, Some(target("select.garage_hot_c")));
+    }
+
+    #[tokio::test]
+    async fn registry_step_skipped_when_lock_has_no_registry_entry() {
+        let registry = parse_registry(&json!([
+            {"entity_id": "select.garage_hot_a", "platform": "solax_modbus", "unique_id": "A_hotstandby", "config_entry_id": "A"},
+        ]));
+        let lookup = lookup_in(&[("select.garage_hot_a", "Enabled")]);
+        let found = resolve_hot_standby_with(lookup, "solax_80_master", None, Some(registry)).await;
+        assert_eq!(found, None);
     }
 
     #[tokio::test]
     async fn resolution_none_when_nothing_found() {
-        let mut server = Server::new_async().await;
-        let _missing = server
-            .mock("GET", "/api/states/switch.solax_hotstandby")
-            .with_status(404)
-            .create_async()
-            .await;
-        let client = HomeAssistantClient::new(server.url(), "t").unwrap();
+        let lookup = lookup_in(&[]);
         assert_eq!(
-            resolve_hot_standby_with(&client, "solax", None, None).await,
+            resolve_hot_standby_with(lookup, "solax", None, None).await,
             None
         );
     }

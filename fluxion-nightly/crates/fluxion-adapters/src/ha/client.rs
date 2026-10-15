@@ -108,6 +108,18 @@ impl HomeAssistantClient {
 
     /// Get the state of a specific entity
     pub async fn get_state(&self, entity_id: &str) -> HaResult<HaEntityState> {
+        match self.get_state_optional(entity_id).await? {
+            Some(state) => Ok(state),
+            None => {
+                error!("❌ [HA ERROR] Entity not found: {}", entity_id);
+                Err(HaError::EntityNotFound(entity_id.to_string()))
+            }
+        }
+    }
+
+    /// Get the state of a specific entity, or `None` when it does not exist (HTTP 404).
+    /// A missing entity is logged at DEBUG only, so optional probes stay quiet.
+    pub async fn get_state_optional(&self, entity_id: &str) -> HaResult<Option<HaEntityState>> {
         let url = format!("{}/api/states/{}", self.base_url, entity_id);
         debug!("🔍 [HA QUERY] Getting state for entity: {}", entity_id);
         debug!("   URL: {}", url);
@@ -122,11 +134,11 @@ impl HomeAssistantClient {
                 debug!("✅ [HA RESULT] Entity: {} = '{}'", entity_id, state.state);
                 trace!("   Attributes: {:?}", state.attributes);
                 trace!("   Last updated: {}", state.last_updated);
-                Ok(state)
+                Ok(Some(state))
             }
             StatusCode::NOT_FOUND => {
-                error!("❌ [HA ERROR] Entity not found: {}", entity_id);
-                Err(HaError::EntityNotFound(entity_id.to_string()))
+                debug!("   [HA] Entity does not exist: {}", entity_id);
+                Ok(None)
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 error!(
@@ -665,6 +677,37 @@ mod tests {
 
         assert!(matches!(result, Err(HaError::EntityNotFound(_))));
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_get_state_optional_missing_is_none() {
+        let mut server = Server::new_async().await;
+        let missing = server
+            .mock("GET", "/api/states/sensor.solax_inverter_bdc_status")
+            .with_status(404)
+            .create_async()
+            .await;
+        let present = server
+            .mock("GET", "/api/states/sensor.solax_run_mode")
+            .with_status(200)
+            .with_body(r#"{"entity_id":"sensor.solax_run_mode","state":"Normal Mode","attributes":{},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let client = HomeAssistantClient::new(server.url(), "test_token").unwrap();
+        let absent = client
+            .get_state_optional("sensor.solax_inverter_bdc_status")
+            .await
+            .unwrap();
+        let found = client
+            .get_state_optional("sensor.solax_run_mode")
+            .await
+            .unwrap();
+
+        assert!(absent.is_none());
+        assert_eq!(found.map(|s| s.state), Some("Normal Mode".to_string()));
+        missing.assert_async().await;
+        present.assert_async().await;
     }
 
     #[tokio::test]

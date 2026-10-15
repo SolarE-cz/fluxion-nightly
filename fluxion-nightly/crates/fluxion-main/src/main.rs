@@ -143,6 +143,16 @@ fn initialize_and_run() -> Result<()> {
             TimezoneConfig::default()
         };
 
+    // Detect SolaX vs SolaX Ultra per inverter from HA, before any mapper or history default is
+    // built from the configured type (brief H12)
+    for inv in config.inverters.iter_mut() {
+        inv.inverter_type = runtime_handle.block_on(fluxion_adapters::solax::detect_inverter_type(
+            &ha_client,
+            &inv.id,
+            inv.inverter_type,
+        ));
+    }
+
     // Create vendor-specific entity mapper based on config
     // Use inverter type from first inverter (for multi-inverter setups, all should use same type)
     let inverter_type = config

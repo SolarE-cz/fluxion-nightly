@@ -10,6 +10,22 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.47] - 2026-10-15
+
+### Added
+
+- **SolaX / SolaX Ultra auto-detection.** At startup FluxION checks which battery-SOC sensor each
+  configured SolaX inverter has (`_battery_capacity` = SolaX, `_battery_total_capacity_charge` =
+  Ultra) and uses the matching entities, whatever `vendor` says. A mismatch is logged as a warning.
+
+### Fixed
+
+- **HotStandBy is resolved per inverter.** In an HA with several SolaX inverters, FluxION only uses
+  the configured inverter's own HotStandBy entity (`switch.<id>_hotstandby`,
+  `select.<id>_hotstandby`, or the registry entry from the same integration entry). It never uses
+  another inverter's. The missing-candidate probe no longer logs an error.
+- The charge-running check works on SolaX Ultra, which has no `inverter_bdc_status` sensor.
+
 ## [0.2.46] - 2026-10-15
 
 ### Added

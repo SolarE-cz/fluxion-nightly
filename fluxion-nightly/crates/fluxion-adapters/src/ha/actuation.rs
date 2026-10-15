@@ -268,7 +268,13 @@ pub fn start_charge_check(
     let bdc_entity = format!("sensor.{inverter_id}_inverter_bdc_status");
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        let bdc = client.get_state(&bdc_entity).await.ok().map(|s| s.state);
+        // The SolaX Ultra has no BDC status sensor: a missing one is not an error, power decides
+        let bdc = client
+            .get_state_optional(&bdc_entity)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.state);
         let power = client
             .get_state(&battery_power_entity)
             .await
@@ -325,6 +331,14 @@ mod tests {
         assert!(!is_charging(Some("Stop"), Some(0.0)));
         assert!(!is_charging(Some("Discharge"), Some(-100.0)));
         assert!(!is_charging(None, None));
+    }
+
+    #[test]
+    fn ultra_without_bdc_status_uses_battery_power() {
+        // SolaX Ultra has no inverter_bdc_status: charging is judged by battery power alone
+        assert!(is_charging(None, Some(350.0)));
+        assert!(!is_charging(None, Some(0.0)));
+        assert!(!is_charging(None, Some(-120.0)));
     }
 
     #[test]
