@@ -10,6 +10,13 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.60] - 2026-10-16
+
+### Fixed
+- Add-on start-up banner reports `system.debug_mode` (it always printed "Debug mode: true").
+- Dashboard in the Backup default mode: the predicted SOC line stops at the Back Up minimum (the planner's floor) instead of draining to the hardware minimum; PV still charges above it, Force Charge/Discharge blocks are unchanged. Chart bars, tooltip and Upcoming Schedule show the blocks the executor runs as Back Up Mode as "Back Up Mode (25%)" in the Back Up colour. The chart refresh now updates the predicted SOC line, and the chart and schedule refresh right after the default-mode switch.
+- `history.consumption_entity` and `history.solar_production_entity` are add-on options. When unset, the consumption entity is derived from the first inverter's prefix (`sensor.<prefix>_today_s_import_energy`), so sites whose prefix is not `solax` get daily summaries and the EMA.
+
 ## [0.2.59] - 2026-10-16
 
 ### Fixed

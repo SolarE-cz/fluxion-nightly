@@ -21,8 +21,9 @@ use crate::{
     components::*,
     config_events::{ConfigUpdateEvent, UserControlUpdateEvent},
     debug::DebugModeConfig,
-    resources::{SystemConfig, TimezoneConfig},
+    resources::{SystemConfig, TimezoneConfig, UserControlResource},
 };
+use fluxion_types::user_control::{DefaultMode, UserControlState};
 
 /// Channel for web query requests
 #[derive(Resource)]
@@ -422,6 +423,10 @@ pub struct PriceBlockData {
     /// `None` for past blocks and where no forecast covers the block
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solar_forecast_kw: Option<f32>,
+    /// Minimum SOC (%) Back Up Mode keeps, for blocks that run as Back Up Mode in the Back Up
+    /// default mode (brief H19); `None` otherwise
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_min_soc_pct: Option<u8>,
 }
 
 /// System health data
@@ -515,6 +520,7 @@ pub fn web_query_system(
     consumption_history_config: Option<Res<ConsumptionHistoryConfig>>,
     hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
     solar_forecast: Option<Res<crate::async_systems::SolarForecastData>>,
+    user_control: Option<Res<UserControlResource>>,
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -538,6 +544,7 @@ pub fn web_query_system(
                 consumption_history_config.as_deref(),
                 hdo_data.as_deref(),
                 solar_forecast.as_deref(),
+                user_control.as_deref().map(|uc| &uc.state),
             ),
         };
 
@@ -654,8 +661,20 @@ fn build_dashboard_response(
     consumption_history_config: Option<&ConsumptionHistoryConfig>,
     hdo_data: Option<&crate::async_systems::HdoScheduleData>,
     solar_forecast_data: Option<&crate::async_systems::SolarForecastData>,
+    user_control: Option<&UserControlState>,
 ) -> WebQueryResponse {
     let now = Utc::now();
+
+    // The schedule as the executor runs it: planner Self-Use is Back Up Mode in the Back Up
+    // default mode. Display only; the planner's schedule stays unchanged.
+    let display_schedule = schedule
+        .single()
+        .ok()
+        .map(|sched| effective_display_schedule(sched, user_control));
+    // Back Up minimum shown next to blocks that run as Back Up Mode in the Back Up default mode
+    let backup_display_min_soc = user_control
+        .filter(|uc| uc.default_mode == DefaultMode::Backup)
+        .map(|uc| uc.backup_min_soc_pct);
 
     // Compute consumption statistics (EMA, imports, hourly profile) early for use in inverter data
     let consumption_stats =
@@ -733,7 +752,7 @@ fn build_dashboard_response(
         .collect();
 
     // Query schedule data
-    let schedule_data = schedule.single().ok().and_then(|sched| {
+    let schedule_data = display_schedule.as_ref().and_then(|sched| {
         sched.get_current_mode(now).map(|current| {
             // Find next change
             let next_change = sched
@@ -783,8 +802,8 @@ fn build_dashboard_response(
             .ok()
             .zip(price_analysis.single().ok())
             .map(|(prices, analysis)| {
-                // Get schedule for matching blocks with strategy info
-                let sched = schedule.single().ok();
+                // Get schedule for matching blocks with strategy info (effective modes)
+                let sched = display_schedule.as_ref();
 
                 // Per-block PV forecast aligned with the price blocks
                 let price_block_starts: Vec<DateTime<Utc>> = prices
@@ -901,6 +920,7 @@ fn build_dashboard_response(
                                 }
                             });
 
+                        let block_type_is_backup = block_type == "backup";
                         let block_end = block.block_start
                             + chrono::Duration::minutes(i64::from(block.duration_minutes));
                         let solar_forecast_kw = solar_forecast_kwh
@@ -923,6 +943,8 @@ fn build_dashboard_response(
                             debug_info,
                             is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
                             solar_forecast_kw,
+                            backup_min_soc_pct: backup_display_min_soc
+                                .filter(|_| block_type_is_backup),
                         }
                     })
                     .collect();
@@ -1109,7 +1131,7 @@ fn build_dashboard_response(
         .unwrap_or(chrono_tz::UTC);
 
     // Calculate battery SOC predictions based on schedule
-    let battery_soc_prediction = schedule.single().ok().and_then(|sched| {
+    let battery_soc_prediction = display_schedule.as_ref().and_then(|sched| {
         // Get current battery SOC from first inverter
         let current_soc = inverter_data
             .first()
@@ -1153,13 +1175,12 @@ fn build_dashboard_response(
         );
 
         // Generate prediction using configured charge/discharge rates
-        let prediction = crate::components::battery_predictor::predict_battery_soc_with_inputs(
+        let prediction = predict_display_soc(
             sched,
             &system_config.control_config,
             current_soc,
-            Some(system_config.control_config.max_battery_charge_rate_kw), // Use configured charge rate
-            Some(system_config.control_config.max_battery_charge_rate_kw), // Use same for discharge
             &inputs,
+            user_control,
         );
 
         if prediction.is_empty() {
@@ -1294,9 +1315,156 @@ fn get_topology_string(inverter_id: &str, config: &SystemConfig) -> String {
     }
 }
 
+/// Predicted SOC for the dashboard over `display_schedule` (effective modes, see
+/// [`effective_display_schedule`]), at the configured charge rate both ways. Back Up Mode
+/// blocks hold the Back Up floor, the same floor the planner uses
+/// (`scheduling::backup_planner_floor`), so it follows the default-mode switch on the next query.
+pub fn predict_display_soc(
+    display_schedule: &OperationSchedule,
+    control_config: &crate::resources::ControlConfig,
+    current_soc: f32,
+    inputs: &crate::components::battery_predictor::PredictionInputs,
+    user_control: Option<&UserControlState>,
+) -> crate::components::battery_predictor::BatteryPrediction {
+    crate::components::battery_predictor::predict_battery_soc_with_inputs(
+        display_schedule,
+        control_config,
+        current_soc,
+        Some(control_config.max_battery_charge_rate_kw),
+        Some(control_config.max_battery_charge_rate_kw),
+        inputs,
+        crate::scheduling::backup_planner_floor(
+            user_control,
+            control_config.min_battery_soc,
+            control_config.max_battery_soc,
+        ),
+    )
+}
+
+/// Copy of the planner schedule with each block's mode replaced by the mode the executor runs
+/// ([`UserControlState::effective_mode_at`]): planner Self-Use is Back Up Mode in the Back Up
+/// default mode unless a fixed slot covers the block. Used for display and the SOC prediction.
+pub fn effective_display_schedule(
+    schedule: &OperationSchedule,
+    user_control: Option<&UserControlState>,
+) -> OperationSchedule {
+    let mut display = schedule.clone();
+    if let Some(uc) = user_control {
+        for block in &mut display.scheduled_blocks {
+            block.mode = uc.effective_mode_at(block.mode, block.block_start);
+        }
+    }
+    display
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn self_use_schedule(start: DateTime<Utc>, count: usize) -> OperationSchedule {
+        OperationSchedule {
+            scheduled_blocks: (0..count)
+                .map(|i| ScheduledMode {
+                    block_start: start + chrono::Duration::minutes(15 * i as i64),
+                    duration_minutes: 15,
+                    target_inverters: None,
+                    mode: if i == 0 {
+                        InverterOperationMode::ForceCharge
+                    } else {
+                        InverterOperationMode::SelfUse
+                    },
+                    reason: "Self-Use - test".to_string(),
+                    decision_uid: None,
+                    debug_info: None,
+                })
+                .collect(),
+            generated_at: start,
+            based_on_price_version: start,
+        }
+    }
+
+    fn backup_state(min_soc: u8) -> UserControlState {
+        UserControlState {
+            default_mode: DefaultMode::Backup,
+            backup_min_soc_pct: min_soc,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn display_schedule_shows_back_up_for_self_use_blocks_in_backup_default() {
+        let start = Utc::now();
+        let planned = self_use_schedule(start, 4);
+
+        let display = effective_display_schedule(&planned, Some(&backup_state(25)));
+        let modes: Vec<_> = display.scheduled_blocks.iter().map(|b| b.mode).collect();
+        assert_eq!(
+            modes,
+            vec![
+                InverterOperationMode::ForceCharge,
+                InverterOperationMode::BackUpMode,
+                InverterOperationMode::BackUpMode,
+                InverterOperationMode::BackUpMode,
+            ]
+        );
+        // Reasons and the planner's own schedule stay unchanged
+        assert_eq!(display.scheduled_blocks[1].reason, "Self-Use - test");
+        assert_eq!(
+            planned.scheduled_blocks[1].mode,
+            InverterOperationMode::SelfUse
+        );
+
+        // Self-Use default or no user control: as planned
+        let self_use = UserControlState::default();
+        for uc in [Some(&self_use), None] {
+            let display = effective_display_schedule(&planned, uc);
+            assert_eq!(
+                display.scheduled_blocks[1].mode,
+                InverterOperationMode::SelfUse
+            );
+        }
+    }
+
+    #[test]
+    fn predicted_soc_floors_at_backup_min_and_follows_the_switch() {
+        let start = Utc::now();
+        let mut planned = self_use_schedule(start, 12);
+        planned.scheduled_blocks[0].mode = InverterOperationMode::SelfUse;
+        let config = crate::resources::ControlConfig {
+            min_battery_soc: 10.0,
+            hardware_min_battery_soc: 10.0,
+            max_battery_soc: 100.0,
+            battery_capacity_kwh: 23.0,
+            max_battery_charge_rate_kw: 10.0,
+            ..Default::default()
+        };
+        // 2.3 kWh deficit per block = 10 % of the battery
+        let inputs = crate::components::battery_predictor::PredictionInputs {
+            load_kwh_per_block: vec![2.3; 12],
+            pv_kwh_per_block: vec![0.0; 12],
+        };
+        let last = |uc: Option<&UserControlState>| {
+            let display = effective_display_schedule(&planned, uc);
+            let p = predict_display_soc(&display, &config, 60.0, &inputs, uc);
+            let socs: Vec<f32> = p.points().iter().map(|pt| pt.soc_percent).collect();
+            (socs.iter().copied().fold(f32::MAX, f32::min), socs[11])
+        };
+
+        let mut state = backup_state(25);
+        let (min, end) = last(Some(&state));
+        assert!((min - 25.0).abs() < 1e-3 && (end - 25.0).abs() < 1e-3);
+
+        // Flip to Self-Use: the next query drains to the hardware minimum
+        state.default_mode = DefaultMode::SelfUse;
+        let (_, end) = last(Some(&state));
+        assert!((end - 10.0).abs() < 1e-3, "{end}");
+
+        // Back to Backup with a new minimum
+        state.default_mode = DefaultMode::Backup;
+        state.backup_min_soc_pct = 40;
+        let (min, _) = last(Some(&state));
+        assert!((min - 40.0).abs() < 1e-3, "{min}");
+    }
 
     fn profile(hourly_avg_kwh: [f32; 24]) -> HourlyConsumptionProfile {
         HourlyConsumptionProfile {

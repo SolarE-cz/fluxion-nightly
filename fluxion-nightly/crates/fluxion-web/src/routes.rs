@@ -150,6 +150,21 @@ pub fn display_timezone(response: &WebQueryResponse) -> (Option<Tz>, TimezoneSou
 
 /// Format a timestamp in the display timezone, or in UTC when unknown.
 /// Each timestamp is converted individually, so DST offsets are per instant.
+/// Chart and Upcoming Schedule label of a block's effective mode. Blocks that run as Back Up
+/// Mode in the Back Up default mode carry the minimum SOC, e.g. "Back Up Mode (25%)"; the page
+/// colours every label starting with "Back Up Mode" with the Back Up legend colour.
+pub fn display_mode_label(block: &fluxion_core::web_bridge::PriceBlockData) -> String {
+    match block.block_type.as_str() {
+        "charge" => "Force Charge".to_owned(),
+        "discharge" => "Force Discharge".to_owned(),
+        "backup" => match block.backup_min_soc_pct {
+            Some(min_soc) => format!("Back Up Mode ({min_soc}%)"),
+            None => "Back Up Mode".to_owned(),
+        },
+        _ => "Self-Use".to_owned(),
+    }
+}
+
 fn format_in_display_tz(ts: DateTime<Utc>, tz: Option<Tz>, fmt: &str) -> String {
     match tz {
         Some(tz) => ts.with_timezone(&tz).format(fmt).to_string(),
@@ -301,14 +316,7 @@ impl DashboardTemplate {
                 decision_uids.push(block.decision_uid.clone());
                 solar_forecast_kw.push(block.solar_forecast_kw);
 
-                // Map mode for display
-                let mode = match block.block_type.as_str() {
-                    "charge" => "Force Charge",
-                    "discharge" => "Force Discharge",
-                    "backup" => "Back Up Mode",
-                    _ => "Self-Use",
-                };
-                modes.push(mode.to_owned());
+                modes.push(display_mode_label(block));
 
                 // Calculate price breakdown for stacked bars
                 let spot_price = block.price;

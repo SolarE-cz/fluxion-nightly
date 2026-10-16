@@ -1784,7 +1784,7 @@
                     const opacity = isHistorical ? 0.4 : 0.8; // Dimmed for past blocks
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`; // Purple
                     if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
@@ -1794,7 +1794,7 @@
                     const opacity = isHistorical ? 0.5 : 1.0;
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`; // Purple
                     if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
@@ -2224,8 +2224,18 @@
     <script>
         // Refresh chart data every 10 seconds (independent of SSE)
         const ingressPath = "{{ ingress_path }}";
-        setInterval(function() {
-            fetch(ingressPath + '/chart-data')
+
+        // Predicted SOC line from chart data (it follows the default-mode switch, brief H19)
+        function applySocPrediction(chart, data) {
+            const dataset = chart.data.datasets.find(d => d.label === 'Predicted SOC (%)');
+            if (!dataset || !data || !data.labels || !data.battery_soc_prediction) return;
+            const predictionMap = new Map();
+            data.battery_soc_prediction.forEach(point => predictionMap.set(point.label, point.soc));
+            dataset.data = data.labels.map(label => predictionMap.has(label) ? predictionMap.get(label) : null);
+        }
+
+        function refreshPriceChart() {
+            return fetch(ingressPath + '/chart-data')
                 .then(response => response.json())
                 .then(data => {
                     if (window.priceChartInstance && data) {
@@ -2248,7 +2258,7 @@
                                     const opacity = isHistorical ? 0.4 : 0.8;
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
                                     if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
@@ -2283,6 +2293,7 @@
                         if (window.FluxionChartSeries) {
                             window.FluxionChartSeries.sync(window.priceChartInstance, data);
                         }
+                        applySocPrediction(window.priceChartInstance, data);
 
                         // Update NOW line
                         if (data.current_time_label) {
@@ -2294,7 +2305,8 @@
                     }
                 })
                 .catch(err => console.error('Failed to update chart:', err));
-        }, 10000); // 10 seconds
+        }
+        setInterval(refreshPriceChart, 10000); // 10 seconds
     </script>
 
     <!-- Upcoming Schedule (Outside SSE update area - updates every 15 minutes) -->
@@ -2342,6 +2354,7 @@
                     const dataHash = JSON.stringify({
                         labels: chartData.labels ? chartData.labels.slice(0, 24) : [],
                         strategies: chartData.strategies ? chartData.strategies.slice(0, 24) : [],
+                        modes: chartData.modes ? chartData.modes.slice(0, 96) : [],
                         profits: chartData.profits ? chartData.profits.slice(0, 24) : []
                     });
 
@@ -2358,6 +2371,8 @@
 
         // Initial load
         fetchAndUpdateSchedule();
+        // Called after the default-mode switch so Self-Use/Back Up labels follow at once
+        window.refreshUpcomingSchedule = fetchAndUpdateSchedule;
 
         // Update every 15 minutes
         setInterval(fetchAndUpdateSchedule, FETCH_INTERVAL_MS);
@@ -2506,7 +2521,8 @@
             const tdMode = document.createElement('td');
             tdMode.style.padding = '8px';
             const modeBadge = document.createElement('span');
-            modeBadge.className = 'mode-badge mode-' + group.mode.toLowerCase().replace(/ /g, '-');
+            // "Back Up Mode (25%)" uses the Back Up Mode badge style
+            modeBadge.className = 'mode-badge mode-' + group.mode.replace(/\s*\(.*\)$/, '').toLowerCase().replace(/ /g, '-');
             modeBadge.style.fontSize = '0.8em';
             modeBadge.style.padding = '2px 6px';
             modeBadge.textContent = group.mode;
@@ -3354,7 +3370,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     const opacity = isHistorical ? 0.4 : 0.8;
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
                                     if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
@@ -3363,7 +3379,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     const opacity = isHistorical ? 0.5 : 1.0;
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
                                     if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
@@ -3396,6 +3412,9 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                         window.priceChartData = Object.assign({}, window.priceChartData, chartData);
                         if (window.FluxionChartSeries) {
                             window.FluxionChartSeries.sync(window.priceChartInstance, chartData);
+                        }
+                        if (typeof applySocPrediction === 'function') {
+                            applySocPrediction(window.priceChartInstance, chartData);
                         }
 
                         // Update NOW line
@@ -3540,6 +3559,15 @@ async function sendDefaultMode(defaultMode, minSoc) {
     }
 }
 
+// The backend applies the new default mode on its next tick; then refresh the chart's mode
+// colours, the predicted SOC line and the Upcoming Schedule
+function refreshAfterDefaultModeChange() {
+    setTimeout(() => {
+        if (typeof refreshPriceChart === 'function') refreshPriceChart();
+        if (window.refreshUpcomingSchedule) window.refreshUpcomingSchedule();
+    }, 1500);
+}
+
 async function updateDefaultMode() {
     const backup = document.getElementById('default-mode-toggle').checked;
     const name = document.getElementById('default-mode-name');
@@ -3547,12 +3575,14 @@ async function updateDefaultMode() {
     if (!backup) {
         if (await sendDefaultMode('self_use')) {
             name.textContent = name.dataset.selfUse;
+            refreshAfterDefaultModeChange();
         }
         return;
     }
     const minSoc = parseInt(document.getElementById('backup-min-soc-input').value, 10);
     if (await sendDefaultMode('backup', minSoc)) {
         name.textContent = name.dataset.backup;
+        refreshAfterDefaultModeChange();
     }
 }
 
@@ -3562,7 +3592,9 @@ async function updateBackupMinSoc() {
         alert('Minimum SOC must be between 15 and 100');
         return;
     }
-    await sendDefaultMode('backup', minSoc);
+    if (await sendDefaultMode('backup', minSoc)) {
+        refreshAfterDefaultModeChange();
+    }
 }
 
 // Load current user control state

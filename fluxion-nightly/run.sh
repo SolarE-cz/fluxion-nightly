@@ -32,7 +32,7 @@ bashio::log.info "Log level: $LOG_LEVEL"
 
 # Display configuration summary
 if [ -f "$CONFIG_PATH" ]; then
-  DEBUG_MODE=$(jq -r '.debug_mode // true' "$CONFIG_PATH")
+  DEBUG_MODE=$(jq -r '[.system.debug_mode, .debug_mode, true] | map(select(. != null)) | first' "$CONFIG_PATH")
   INVERTER_COUNT=$(jq -r '.inverters | length' "$CONFIG_PATH")
 
   bashio::log.info "Configuration summary:"

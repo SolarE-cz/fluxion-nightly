@@ -156,6 +156,27 @@ impl UserControlState {
         }
     }
 
+    /// Mode the executor runs for a planned block starting at `at` (display only). In Back Up
+    /// default mode a planned Self-Use block runs as Back Up Mode with `backup_min_soc_pct`,
+    /// unless a user fixed slot covers it; every other mode runs as planned. Mirrors the
+    /// executor rule in `fluxion-core` `continuous_systems` (brief H19); the planner's own block
+    /// modes stay unchanged.
+    #[must_use]
+    pub fn effective_mode_at(
+        &self,
+        planned: InverterOperationMode,
+        at: DateTime<Utc>,
+    ) -> InverterOperationMode {
+        if self.default_mode == DefaultMode::Backup
+            && planned == InverterOperationMode::SelfUse
+            && self.get_fixed_slot_at(at).is_none()
+        {
+            InverterOperationMode::BackUpMode
+        } else {
+            planned
+        }
+    }
+
     /// Seed the default mode from the config's `default_battery_mode` when the user has never
     /// set it (`last_modified` is `None`), so the dashboard shows the mode in effect. Once the
     /// user sets it from the dashboard, the dashboard value wins. Returns `true` when seeded.
@@ -364,6 +385,44 @@ mod tests {
         };
         assert!(!state.seed_default_mode_from_config(InverterOperationMode::BackUpMode, 20.0));
         assert_eq!(state.default_mode, DefaultMode::SelfUse);
+    }
+
+    #[test]
+    fn effective_mode_maps_planned_self_use_to_back_up_only_in_backup_default() {
+        use InverterOperationMode::*;
+        let now = Utc::now();
+        let mut state = UserControlState::default();
+        for mode in [
+            SelfUse,
+            ForceCharge,
+            ForceDischarge,
+            BackUpMode,
+            NoChargeNoDischarge,
+        ] {
+            assert_eq!(state.effective_mode_at(mode, now), mode, "Self-Use default");
+        }
+
+        state.default_mode = DefaultMode::Backup;
+        assert_eq!(state.effective_mode_at(SelfUse, now), BackUpMode);
+        for mode in [ForceCharge, ForceDischarge, BackUpMode, NoChargeNoDischarge] {
+            assert_eq!(state.effective_mode_at(mode, now), mode, "Backup default");
+        }
+
+        // A fixed slot keeps its own mode, as in the executor
+        state.fixed_time_slots.push(FixedTimeSlot::new(
+            now + Duration::hours(1),
+            now + Duration::hours(2),
+            SelfUse,
+            None,
+        ));
+        assert_eq!(
+            state.effective_mode_at(SelfUse, now + Duration::minutes(90)),
+            SelfUse
+        );
+        assert_eq!(
+            state.effective_mode_at(SelfUse, now + Duration::hours(2)),
+            BackUpMode
+        );
     }
 
     #[test]

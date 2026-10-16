@@ -1363,12 +1363,15 @@ impl Default for StrategyEnabledConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumptionHistoryConfig {
-    /// Home Assistant entity ID for daily consumption (e.g., "sensor.solax_today_s_import_energy")
-    #[serde(default = "default_consumption_entity")]
+    /// Home Assistant entity ID for daily consumption (grid import today, kWh). Empty or unset:
+    /// derived from the first inverter's entity prefix, `sensor.<prefix>_today_s_import_energy`
+    /// (e.g. "sensor.solax_today_s_import_energy").
+    #[serde(default)]
     pub consumption_entity: String,
 
-    /// Home Assistant entity ID for daily solar production (e.g., "sensor.energy_production_today")
-    #[serde(default = "default_solar_production_entity")]
+    /// Home Assistant entity ID for daily solar production. Empty or unset:
+    /// "sensor.energy_production_today".
+    #[serde(default)]
     pub solar_production_entity: String,
 
     /// Home Assistant entity ID for house load power in W. Empty or unset: derived from the
@@ -1388,8 +1391,8 @@ pub struct ConsumptionHistoryConfig {
 impl Default for ConsumptionHistoryConfig {
     fn default() -> Self {
         Self {
-            consumption_entity: default_consumption_entity(),
-            solar_production_entity: default_solar_production_entity(),
+            consumption_entity: String::new(),
+            solar_production_entity: String::new(),
             house_load_power_entity: None,
             ema_days: default_ema_days(),
             seasonal_detection_days: default_seasonal_detection_days(),
@@ -1397,12 +1400,37 @@ impl Default for ConsumptionHistoryConfig {
     }
 }
 
-fn default_consumption_entity() -> String {
-    "sensor.solax_today_s_import_energy".to_string()
+/// Daily consumption entity used when none is configured and there is no inverter to derive it
+const FALLBACK_CONSUMPTION_ENTITY: &str = "sensor.solax_today_s_import_energy";
+/// Daily solar production entity used when none is configured
+const DEFAULT_SOLAR_PRODUCTION_ENTITY: &str = "sensor.energy_production_today";
+
+impl ConsumptionHistoryConfig {
+    /// Daily consumption entity in effect: the configured one, else the first inverter's
+    /// grid-import-today sensor from its entity prefix (`sensor.<prefix>_today_s_import_energy`
+    /// on SolaX), so a site whose prefix is not `solax` reads its own sensor.
+    pub fn effective_consumption_entity(&self, inverters: &[InverterConfig]) -> String {
+        non_empty(&self.consumption_entity)
+            .or_else(|| {
+                inverters.first().and_then(|inv| {
+                    fluxion_adapters::solax::create_entity_mapper(inv.inverter_type)
+                        .get_grid_import_today_entity(&inv.entity_prefix)
+                })
+            })
+            .unwrap_or_else(|| FALLBACK_CONSUMPTION_ENTITY.to_string())
+    }
+
+    /// Daily solar production entity in effect: the configured one, else
+    /// "sensor.energy_production_today"
+    pub fn effective_solar_production_entity(&self) -> String {
+        non_empty(&self.solar_production_entity)
+            .unwrap_or_else(|| DEFAULT_SOLAR_PRODUCTION_ENTITY.to_string())
+    }
 }
 
-fn default_solar_production_entity() -> String {
-    "sensor.energy_production_today".to_string()
+fn non_empty(entity: &str) -> Option<String> {
+    let entity = entity.trim();
+    (!entity.is_empty()).then(|| entity.to_string())
 }
 
 fn default_ema_days() -> usize {
@@ -2704,8 +2732,10 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 },
             },
             history: fluxion_core::ConsumptionHistoryConfig {
-                consumption_entity: app_config.history.consumption_entity,
-                solar_production_entity: app_config.history.solar_production_entity,
+                consumption_entity: app_config
+                    .history
+                    .effective_consumption_entity(&app_config.inverters),
+                solar_production_entity: app_config.history.effective_solar_production_entity(),
                 house_load_power_entity: app_config
                     .history
                     .house_load_power_entity
@@ -3204,6 +3234,61 @@ mod tests {
         assert_eq!(
             system.inverters[0].topology,
             fluxion_core::InverterTopology::Independent
+        );
+    }
+
+    #[test]
+    fn consumption_entity_derives_from_first_inverter_prefix_when_unset() {
+        let options = |prefix: &str, history: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "{prefix}", "vendor": "solax-ultra",
+                                "entity_prefix": "{prefix}", "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                             "force_discharge_hours": 1, "min_battery_soc": 10,
+                             "max_battery_soc": 100}},
+                "history": {history},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+        let history_of = |json: String| -> fluxion_core::ConsumptionHistoryConfig {
+            let config: AppConfig = serde_json::from_str(&json).expect("parse");
+            let system: fluxion_core::SystemConfig = config.into();
+            system.history
+        };
+
+        // Owner site: prefix "solax" keeps the long-standing sensor
+        let h = history_of(options("solax", r#"{"house_load_power_entity": ""}"#));
+        assert_eq!(h.consumption_entity, "sensor.solax_today_s_import_energy");
+        assert_eq!(h.solar_production_entity, "sensor.energy_production_today");
+
+        // Other prefix, key missing or empty: that site's own sensor
+        for history in ["{}", r#"{"consumption_entity": "  "}"#] {
+            let h = history_of(options("solax_80_jakub", history));
+            assert_eq!(
+                h.consumption_entity,
+                "sensor.solax_80_jakub_today_s_import_energy"
+            );
+        }
+
+        // Configured values win
+        let h = history_of(options(
+            "solax_80_jakub",
+            r#"{"consumption_entity": "sensor.grid_import_today",
+                "solar_production_entity": "sensor.pv_today"}"#,
+        ));
+        assert_eq!(h.consumption_entity, "sensor.grid_import_today");
+        assert_eq!(h.solar_production_entity, "sensor.pv_today");
+
+        // Built-in default config (prefix "solax")
+        let system: fluxion_core::SystemConfig = AppConfig::default().into();
+        assert_eq!(
+            system.history.consumption_entity,
+            "sensor.solax_today_s_import_energy"
         );
     }
 

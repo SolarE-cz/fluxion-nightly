@@ -328,6 +328,7 @@ pub fn predict_battery_soc(
         max_charge_rate_kw,
         max_discharge_rate_kw,
         &inputs,
+        None,
     )
 }
 
@@ -340,6 +341,10 @@ pub fn predict_battery_soc(
 /// * `max_charge_rate_kw` - Maximum charging power (kW) - if None, uses 3.5 kW default
 /// * `max_discharge_rate_kw` - Maximum discharge power (kW) - if None, uses 3.5 kW default
 /// * `inputs` - Per-block load and PV energy, aligned with `scheduled_blocks`
+/// * `backup_floor_soc` - SOC (%) Back Up Mode keeps in the battery: the planner floor of the
+///   Back Up default mode (`scheduling::backup_planner_floor`). In `BackUpMode` blocks the house
+///   runs from grid/PV below `max(hardware minimum, floor)`; PV surplus still charges above it.
+///   `None` keeps the hardware minimum (Self-Use default).
 ///
 /// # Returns
 /// A `BatteryPrediction` with SOC values for each scheduled block
@@ -350,6 +355,7 @@ pub fn predict_battery_soc_with_inputs(
     max_charge_rate_kw: Option<f32>,
     max_discharge_rate_kw: Option<f32>,
     inputs: &PredictionInputs,
+    backup_floor_soc: Option<f32>,
 ) -> BatteryPrediction {
     let mut prediction = BatteryPrediction::new();
 
@@ -373,6 +379,7 @@ pub fn predict_battery_soc_with_inputs(
     let battery_capacity = control_config.battery_capacity_kwh;
     let max_soc = control_config.max_battery_soc;
     let hardware_min_soc = control_config.hardware_min_battery_soc;
+    let backup_floor = backup_floor_soc.map(|floor| floor.max(hardware_min_soc));
 
     // Start prediction from actual current SOC, not clamped to min_soc
     // This allows showing realistic predictions even when battery is below configured minimum
@@ -402,8 +409,13 @@ pub fn predict_battery_soc_with_inputs(
             InverterOperationMode::SelfUse
             | InverterOperationMode::BackUpMode
             | InverterOperationMode::FeedinPriority => {
-                // In self-use or backup mode, SOC changes depend on solar generation vs household consumption
-                // Backup mode behaves the same as self-use for SOC prediction purposes
+                // In self-use or backup mode, SOC changes depend on solar generation vs household consumption.
+                // Back Up Mode stops discharging at the backup floor (when known); below it the
+                // house runs from grid/PV, so the prediction never discharges past it.
+                let floor = match (block.mode, backup_floor) {
+                    (InverterOperationMode::BackUpMode, Some(floor)) => Some(floor),
+                    _ => None,
+                };
                 // Calculate net energy flow to/from battery for this block
                 let load_kwh = inputs.load_kwh_per_block.get(i).copied().unwrap_or(0.0);
                 let pv_kwh = inputs.pv_kwh_per_block.get(i).copied().unwrap_or(0.0);
@@ -418,8 +430,12 @@ pub fn predict_battery_soc_with_inputs(
                 } else if net_kwh < 0.0 {
                     // Power deficit - battery discharges to cover household load
                     let soc_decrease = calculate_soc_change(-net_kwh, battery_capacity);
-                    // Use hardware minimum SOC enforced by inverter firmware
-                    soc = (soc - soc_decrease).max(hardware_min_soc);
+                    soc = match floor {
+                        // Already below the backup floor: hold, never raise it to the floor
+                        Some(floor) => (soc - soc_decrease).max(floor.min(soc)),
+                        // Use hardware minimum SOC enforced by inverter firmware
+                        None => (soc - soc_decrease).max(hardware_min_soc),
+                    };
                 }
                 // If net_kwh == 0.0, SOC remains stable (solar exactly matches load)
             }
@@ -821,7 +837,7 @@ mod tests {
         assert_eq!(inputs.pv_kwh_per_block[5], 0.0); // 16:15 block onwards
 
         let prediction =
-            predict_battery_soc_with_inputs(&schedule, &config, 80.0, None, None, &inputs);
+            predict_battery_soc_with_inputs(&schedule, &config, 80.0, None, None, &inputs, None);
         let socs: Vec<f32> = prediction.points().iter().map(|p| p.soc_percent).collect();
 
         // Night blocks: 1.5 kWh/h x 0.25 h = 0.375 kWh = 1.63 % per block until min SOC
@@ -884,5 +900,180 @@ mod tests {
         let inputs = build_prediction_inputs(&schedule, &no_forecast);
         assert!((inputs.pv_kwh_per_block[0] - 0.5).abs() < 1e-4);
         assert_eq!(inputs.pv_kwh_per_block[2], 0.0);
+    }
+
+    fn blocks(modes: &[InverterOperationMode]) -> OperationSchedule {
+        let start = Utc::now();
+        OperationSchedule {
+            scheduled_blocks: modes
+                .iter()
+                .enumerate()
+                .map(|(i, mode)| ScheduledMode {
+                    block_start: start + chrono::Duration::minutes(15 * i as i64),
+                    duration_minutes: 15,
+                    target_inverters: None,
+                    mode: *mode,
+                    reason: "test".to_string(),
+                    decision_uid: None,
+                    debug_info: None,
+                })
+                .collect(),
+            generated_at: start,
+            based_on_price_version: start,
+        }
+    }
+
+    /// 2.3 kWh net per block = 10 % of the 23 kWh test battery
+    fn inputs(load_kwh: &[f32], pv_kwh: &[f32]) -> PredictionInputs {
+        PredictionInputs {
+            load_kwh_per_block: load_kwh.to_vec(),
+            pv_kwh_per_block: pv_kwh.to_vec(),
+        }
+    }
+
+    fn socs(prediction: &BatteryPrediction) -> Vec<f32> {
+        prediction.points().iter().map(|p| p.soc_percent).collect()
+    }
+
+    #[test]
+    fn back_up_blocks_hold_the_backup_floor_self_use_drains_to_hardware_min() {
+        use InverterOperationMode::*;
+        let config = create_test_config();
+        let load = [2.3; 6];
+        let pv = [0.0; 6];
+
+        // Self-Use default: drains to the hardware minimum (10 %)
+        let self_use = blocks(&[SelfUse; 6]);
+        let p = predict_battery_soc_with_inputs(
+            &self_use,
+            &config,
+            50.0,
+            None,
+            None,
+            &inputs(&load, &pv),
+            None,
+        );
+        assert!((socs(&p)[5] - 10.0).abs() < 1e-3, "{:?}", socs(&p));
+
+        // Back Up default (25 %): the same load stops at 25 %
+        let backup = blocks(&[BackUpMode; 6]);
+        let p = predict_battery_soc_with_inputs(
+            &backup,
+            &config,
+            50.0,
+            None,
+            None,
+            &inputs(&load, &pv),
+            Some(25.0),
+        );
+        let s = socs(&p);
+        assert!(s.iter().all(|soc| *soc >= 25.0 - 1e-3), "{s:?}");
+        assert!((s[5] - 25.0).abs() < 1e-3, "{s:?}");
+
+        // A floor below the hardware minimum keeps the hardware minimum
+        let p = predict_battery_soc_with_inputs(
+            &backup,
+            &config,
+            50.0,
+            None,
+            None,
+            &inputs(&load, &pv),
+            Some(5.0),
+        );
+        assert!((socs(&p)[5] - 10.0).abs() < 1e-3);
+
+        // Floor known but blocks still planned Self-Use (fixed slot): hardware minimum
+        let p = predict_battery_soc_with_inputs(
+            &self_use,
+            &config,
+            50.0,
+            None,
+            None,
+            &inputs(&load, &pv),
+            Some(25.0),
+        );
+        assert!((socs(&p)[5] - 10.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn back_up_floor_lets_pv_charge_above_it_and_never_raises_a_low_soc() {
+        use InverterOperationMode::*;
+        let config = create_test_config();
+        let backup = blocks(&[BackUpMode; 4]);
+
+        // Hold at the floor, then PV surplus charges above it, then load drains back to it
+        let p = predict_battery_soc_with_inputs(
+            &backup,
+            &config,
+            30.0,
+            None,
+            None,
+            &inputs(&[2.3, 0.0, 0.0, 9.2], &[0.0, 2.3, 2.3, 0.0]),
+            Some(25.0),
+        );
+        let s = socs(&p);
+        assert!((s[0] - 25.0).abs() < 1e-3, "{s:?}");
+        assert!(s[2] > 40.0, "PV charges above the floor: {s:?}");
+        assert!((s[3] - 25.0).abs() < 1e-3, "{s:?}");
+
+        // Below the floor already: hold the real SOC, never lift it to the floor
+        let p = predict_battery_soc_with_inputs(
+            &backup,
+            &config,
+            18.0,
+            None,
+            None,
+            &inputs(&[2.3; 4], &[0.0; 4]),
+            Some(25.0),
+        );
+        assert!(socs(&p).iter().all(|soc| (*soc - 18.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn force_blocks_ignore_the_backup_floor() {
+        use InverterOperationMode::*;
+        let config = create_test_config();
+        let schedule = blocks(&[ForceDischarge; 8]);
+        let with_floor = predict_battery_soc_with_inputs(
+            &schedule,
+            &config,
+            40.0,
+            Some(10.0),
+            Some(10.0),
+            &inputs(&[0.0; 8], &[0.0; 8]),
+            Some(25.0),
+        );
+        let without = predict_battery_soc_with_inputs(
+            &schedule,
+            &config,
+            40.0,
+            Some(10.0),
+            Some(10.0),
+            &inputs(&[0.0; 8], &[0.0; 8]),
+            None,
+        );
+        assert_eq!(socs(&with_floor), socs(&without));
+        assert!((socs(&with_floor)[7] - 10.0).abs() < 1e-3);
+
+        let charge = blocks(&[ForceCharge; 2]);
+        let a = predict_battery_soc_with_inputs(
+            &charge,
+            &config,
+            20.0,
+            Some(10.0),
+            None,
+            &inputs(&[0.0; 2], &[0.0; 2]),
+            Some(25.0),
+        );
+        let b = predict_battery_soc_with_inputs(
+            &charge,
+            &config,
+            20.0,
+            Some(10.0),
+            None,
+            &inputs(&[0.0; 2], &[0.0; 2]),
+            None,
+        );
+        assert_eq!(socs(&a), socs(&b));
     }
 }

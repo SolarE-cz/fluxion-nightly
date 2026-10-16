@@ -37,7 +37,9 @@ options:
     min_battery_soc: 10
     planner_load_margin: 1.1
   history:
+    consumption_entity: ''
     house_load_power_entity: ''
+    solar_production_entity: ''
   inverters:
   - entity_prefix: solax
     id: solax
@@ -230,7 +232,9 @@ schema:
     min_battery_soc: float(0,100)?
     planner_load_margin: float(1.0,1.5)?
   history:
+    consumption_entity: str?
     house_load_power_entity: str?
+    solar_production_entity: str?
   inverters:
   - entity_prefix: str
     id: str
@@ -459,4 +463,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.59
+version: 0.2.60

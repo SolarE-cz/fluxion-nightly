@@ -605,6 +605,8 @@ struct ChartDataJson {
     profits: Vec<Option<f32>>,
     current_time_label: Option<String>,
     current_battery_soc: Option<f32>,
+    /// Predicted SOC per block, so a refresh follows the default-mode switch (brief H19)
+    battery_soc_prediction: Vec<routes::SocPredictionPoint>,
     // Stacked bar data for HDO display
     spot_prices: Vec<f32>,
     grid_fees: Vec<f32>,
@@ -676,6 +678,7 @@ fn build_chart_data_json(response: &WebQueryResponse, i18n: Arc<I18n>) -> Option
         profits: chart.profits,
         current_time_label: chart.current_time_label,
         current_battery_soc,
+        battery_soc_prediction: chart.battery_soc_prediction,
         // Stacked bar data
         spot_prices: chart.spot_prices,
         grid_fees: chart.grid_fees,
@@ -929,6 +932,7 @@ fn abbreviate_operation(op: &str) -> &str {
         "charge" => "c",
         "discharge" => "d",
         "self-use" => "s",
+        "backup" => "b",
         _ => "u", // unknown
     }
 }
@@ -978,7 +982,58 @@ mod tests {
             debug_info: None,
             is_historical: false,
             solar_forecast_kw,
+            backup_min_soc_pct: None,
         }
+    }
+
+    fn backup_block(ts: &str) -> PriceBlockData {
+        PriceBlockData {
+            block_type: "backup".to_owned(),
+            strategy: Some("Self-Use".to_owned()),
+            backup_min_soc_pct: Some(25),
+            ..block(ts, None)
+        }
+    }
+
+    #[test]
+    fn effective_back_up_blocks_show_mode_with_min_soc_on_render_and_refresh() {
+        let mut charge = block("2026-10-16T10:00:00Z", None);
+        charge.block_type = "charge".to_owned();
+        let mut planned_backup = block("2026-10-16T10:30:00Z", None);
+        planned_backup.block_type = "backup".to_owned();
+        let blocks = vec![
+            charge,
+            backup_block("2026-10-16T10:15:00Z"),
+            planned_backup,
+            block("2026-10-16T10:45:00Z", None),
+        ];
+        let mut resp = response(blocks, None);
+        resp.battery_soc_prediction =
+            Some(vec![fluxion_core::web_bridge::BatterySocPredictionPoint {
+                timestamp: "2026-10-16T10:15:00Z".parse().unwrap(),
+                soc: 25.0,
+            }]);
+
+        // Refresh (/chart-data)
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert_eq!(
+            json["modes"],
+            serde_json::json!([
+                "Force Charge",
+                "Back Up Mode (25%)",
+                "Back Up Mode",
+                "Self-Use"
+            ])
+        );
+        assert_eq!(json["battery_soc_prediction"][0]["soc"], 25.0);
+
+        // First render embeds the same labels; the page colours them with the Back Up colour
+        let html = DashboardTemplate::from_query_response(resp, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains(r#""Back Up Mode (25%)""#));
+        assert!(html.contains("mode.startsWith('Back Up Mode')"));
+        assert!(!html.contains("mode === 'Back Up Mode'"));
     }
 
     fn response(blocks: Vec<PriceBlockData>, hdo: Option<HdoScheduleInfo>) -> WebQueryResponse {
