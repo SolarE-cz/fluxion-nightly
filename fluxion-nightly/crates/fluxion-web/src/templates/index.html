@@ -409,6 +409,16 @@
         color: var(--text-secondary);
     }
 
+    .backup-min-soc {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .backup-min-soc input {
+        width: 70px;
+    }
+
     .user-control-slots {
         display: flex;
         justify-content: space-between;
@@ -1404,6 +1414,21 @@
                     <span class="label-text">Disallow Discharge</span>
                     <span class="label-help">Prevents ForceDischarge mode</span>
                 </label>
+            </div>
+            <div class="restriction-toggle">
+                <label class="config-toggle-switch">
+                    <input type="checkbox" class="config-toggle-input" id="default-mode-toggle" {% if uc.default_mode.as_str() == "backup" %}checked{% endif %} onchange="updateDefaultMode()">
+                    <span class="config-toggle-slider"></span>
+                </label>
+                <label for="default-mode-toggle">
+                    <span class="label-text">{{ self.t("default-mode-label") }}: <span id="default-mode-name" data-self-use="{{ self.t("default-mode-self-use") }}" data-backup="{{ self.t("default-mode-backup") }}">{% if uc.default_mode.as_str() == "backup" %}{{ self.t("default-mode-backup") }}{% else %}{{ self.t("default-mode-self-use") }}{% endif %}</span></span>
+                    <span class="label-help">{{ self.t("default-mode-help") }}</span>
+                </label>
+            </div>
+            <div class="backup-min-soc" id="backup-min-soc-row" {% if uc.default_mode.as_str() != "backup" %}style="display: none;"{% endif %}>
+                <label for="backup-min-soc-input">{{ self.t("backup-min-soc-label") }}</label>
+                <input type="number" id="backup-min-soc-input" min="15" max="100" step="1" value="{{ uc.backup_min_soc_pct }}">
+                <button type="button" onclick="updateBackupMinSoc()">{{ self.t("backup-min-soc-save") }}</button>
             </div>
         </div>
 
@@ -3257,6 +3282,55 @@ async function updateRestrictions() {
         console.error('Error updating restrictions:', error);
         alert('Failed to update restrictions: ' + error.message);
     }
+}
+
+// Update the default mode (Self-Use or Backup). The minimum SOC is sent with it in Backup.
+async function sendDefaultMode(defaultMode, minSoc) {
+    const body = { default_mode: defaultMode };
+    if (minSoc !== undefined) {
+        body.backup_min_soc_pct = minSoc;
+    }
+    try {
+        const response = await fetch(`${USER_CONTROL_API}/default-mode`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+            alert('Failed to update default mode');
+            return false;
+        }
+        return true;
+    } catch (error) {
+        console.error('Error updating default mode:', error);
+        alert('Failed to update default mode: ' + error.message);
+        return false;
+    }
+}
+
+async function updateDefaultMode() {
+    const backup = document.getElementById('default-mode-toggle').checked;
+    const name = document.getElementById('default-mode-name');
+    document.getElementById('backup-min-soc-row').style.display = backup ? '' : 'none';
+    if (!backup) {
+        if (await sendDefaultMode('self_use')) {
+            name.textContent = name.dataset.selfUse;
+        }
+        return;
+    }
+    const minSoc = parseInt(document.getElementById('backup-min-soc-input').value, 10);
+    if (await sendDefaultMode('backup', minSoc)) {
+        name.textContent = name.dataset.backup;
+    }
+}
+
+async function updateBackupMinSoc() {
+    const minSoc = parseInt(document.getElementById('backup-min-soc-input').value, 10);
+    if (!Number.isInteger(minSoc) || minSoc < 15 || minSoc > 100) {
+        alert('Minimum SOC must be between 15 and 100');
+        return;
+    }
+    await sendDefaultMode('backup', minSoc);
 }
 
 // Load current user control state

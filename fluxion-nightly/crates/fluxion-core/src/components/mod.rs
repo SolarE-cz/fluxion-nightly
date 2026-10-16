@@ -182,4 +182,7 @@ pub enum InverterCommand {
 
     /// Set export power limit (watts)
     SetExportLimit(u32),
+
+    /// Set Back Up Mode after the inverter's backup minimum SOC (%) is in place (brief H19)
+    SetBackupMode { min_soc_pct: u8 },
 }

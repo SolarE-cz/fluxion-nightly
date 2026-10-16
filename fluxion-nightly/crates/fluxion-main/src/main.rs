@@ -246,7 +246,7 @@ fn initialize_and_run() -> Result<()> {
 
     // Load user control state from persistence
     let user_control_persistence = UserControlPersistence::default_production();
-    let user_control_state = match user_control_persistence.load() {
+    let mut user_control_state = match user_control_persistence.load() {
         Ok(state) => {
             info!(
                 "🎛️ Loaded user control state: enabled={}, disallow_charge={}, disallow_discharge={}, {} fixed slots",
@@ -265,6 +265,16 @@ fn initialize_and_run() -> Result<()> {
             Default::default()
         }
     };
+    // The config's default_battery_mode seeds the dashboard only while the user has never set it
+    if user_control_state.seed_default_mode_from_config(
+        system_config.control_config.default_battery_mode,
+        system_config.control_config.min_battery_soc,
+    ) {
+        info!(
+            "🎛️ Default mode seeded from config: backup, minimum SOC {}%",
+            user_control_state.backup_min_soc_pct
+        );
+    }
 
     // Create channel for user control updates from web to ECS
     let (user_control_update_sender, user_control_update_channel) = UserControlUpdateSender::new();
@@ -277,7 +287,8 @@ fn initialize_and_run() -> Result<()> {
             .to_string_lossy()
             .to_string(),
         Some(user_control_update_sender),
-    );
+    )
+    .with_max_battery_soc(system_config.control_config.max_battery_soc);
 
     // Initialize i18n with configured language from config
     let language = config.system.language;

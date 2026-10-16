@@ -449,6 +449,10 @@ pub async fn start_web_server(
                 axum::routing::put(user_control_api::set_restrictions).with_state(uc_state.clone()),
             )
             .route(
+                "/api/user-control/default-mode",
+                axum::routing::put(user_control_api::set_default_mode).with_state(uc_state.clone()),
+            )
+            .route(
                 "/api/user-control/slots",
                 axum::routing::post(user_control_api::create_slot).with_state(uc_state.clone()),
             )

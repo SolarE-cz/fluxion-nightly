@@ -235,6 +235,31 @@ pub fn gate_force_discharge(blocks: &mut [ScheduledMode], enabled: bool) -> usiz
 /// * `timezone` - Optional IANA timezone of the site (e.g. "Europe/Prague"), passed to strategies
 ///
 /// # Returns
+/// Planner minimum SOC (%) in Back Up default mode: the higher of the control and Back Up
+/// minimums. `None` in Self-Use, so the planner keeps the control minimum (brief H19).
+#[must_use]
+pub fn backup_planner_floor(
+    user_control: Option<&UserControlState>,
+    min_battery_soc: f32,
+    max_battery_soc: f32,
+) -> Option<f32> {
+    let uc = user_control
+        .filter(|uc| uc.default_mode == fluxion_types::user_control::DefaultMode::Backup)?;
+    if f32::from(uc.backup_min_soc_pct)
+        > fluxion_types::user_control::backup_min_soc_limit(max_battery_soc)
+    {
+        static CAP_WARNED: std::sync::Once = std::sync::Once::new();
+        CAP_WARNED.call_once(|| {
+            warn!(
+                "Back Up minimum SOC {}% is above max_battery_soc - 5 ({}%), planning with the cap",
+                uc.backup_min_soc_pct,
+                fluxion_types::user_control::backup_min_soc_limit(max_battery_soc)
+            );
+        });
+    }
+    Some(uc.planner_min_soc_pct(min_battery_soc, max_battery_soc))
+}
+
 /// Complete `OperationSchedule` with economically optimized mode assignments
 #[expect(clippy::too_many_arguments)]
 pub fn generate_schedule_with_optimizer(
@@ -265,6 +290,11 @@ pub fn generate_schedule_with_optimizer(
     // Block starts decided by Winter-Reserve; its short force runs are kept
     let mut winter_reserve_blocks: HashSet<DateTime<Utc>> = HashSet::new();
     let mut total_profit = 0.0;
+    let planner_min_soc_pct = backup_planner_floor(
+        user_control,
+        control_config.min_battery_soc,
+        control_config.max_battery_soc,
+    );
 
     // Track predicted SOC throughout schedule for realistic future evaluations
     let now = Utc::now();
@@ -366,6 +396,7 @@ pub fn generate_schedule_with_optimizer(
             ),
             timezone,
             user_levers,
+            planner_min_soc_pct,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -512,6 +543,7 @@ pub fn generate_schedule_with_optimizer(
             ),
             timezone,
             user_levers,
+            planner_min_soc_pct,
         );
 
         // Get decision from plugin manager
@@ -1049,6 +1081,7 @@ fn create_evaluation_request(
     block_forecasts: Vec<BlockForecast>,
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
+    planner_min_soc_pct: Option<f32>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -1097,6 +1130,7 @@ fn create_evaluation_request(
         block_forecasts,
         timezone: timezone.map(str::to_owned),
         user_levers: user_levers.copied(),
+        planner_min_soc_pct,
     }
 }
 
@@ -1586,5 +1620,39 @@ mod force_discharge_gate_tests {
 
         assert_eq!(gate_force_discharge(&mut blocks, true), 0);
         assert_eq!(blocks[0].mode, InverterOperationMode::ForceDischarge);
+    }
+}
+
+#[cfg(test)]
+mod backup_floor_tests {
+    use super::*;
+    use fluxion_types::user_control::DefaultMode;
+
+    #[test]
+    fn floor_is_none_in_self_use_and_without_user_control() {
+        let state = UserControlState::default();
+        assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), None);
+        assert_eq!(backup_planner_floor(None, 10.0, 100.0), None);
+    }
+
+    #[test]
+    fn floor_is_max_of_control_and_backup_minimum_in_backup() {
+        let state = UserControlState {
+            default_mode: DefaultMode::Backup,
+            backup_min_soc_pct: 40,
+            ..Default::default()
+        };
+        assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), Some(40.0));
+        assert_eq!(backup_planner_floor(Some(&state), 55.0, 100.0), Some(55.0));
+    }
+
+    #[test]
+    fn floor_is_capped_below_battery_maximum() {
+        let state = UserControlState {
+            default_mode: DefaultMode::Backup,
+            backup_min_soc_pct: 100,
+            ..Default::default()
+        };
+        assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), Some(95.0));
     }
 }

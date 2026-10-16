@@ -75,9 +75,22 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
     fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
         let (price_block, all_blocks) = convert_request(request);
 
+        // Back Up default mode raises the minimum SOC the strategy plans with (brief H19)
+        let planner_control;
+        let control_config = match request.planner_min_soc_pct {
+            Some(min_soc) => {
+                planner_control = ControlConfig {
+                    min_battery_soc: min_soc,
+                    ..self.control_config.clone()
+                };
+                &planner_control
+            }
+            None => &self.control_config,
+        };
+
         let context = EvaluationContext {
             price_block: &price_block,
-            control_config: &self.control_config,
+            control_config,
             current_battery_soc: request.battery.current_soc_percent,
             solar_forecast_kwh: request.forecast.solar_kwh,
             consumption_forecast_kwh: request.forecast.consumption_kwh,

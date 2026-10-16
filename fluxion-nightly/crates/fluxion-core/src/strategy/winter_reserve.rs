@@ -487,7 +487,9 @@ pub fn simulate_block(
     let cmax = battery.max_charge_kw * h;
     let dmax = battery.max_discharge_kw * h;
     let xmax = battery.max_export_kw * h;
-    let e = energy_kwh.clamp(emin, emax);
+    // Below Emin the battery may still charge but never discharges: discharge headroom is
+    // measured from Emin, so the gap below it is not available energy (brief H19 item 4).
+    let e = energy_kwh.clamp(0.0, emax);
     let (load, pv) = (block.load_kwh, block.pv_kwh);
     let mut o = BlockOutcome::default();
 
@@ -684,8 +686,9 @@ pub fn plan_from(
             .collect();
     }
 
-    // Forward pass with the exact simulator, starting from the live SOC.
-    let mut energy = (soc_pct / 100.0 * capacity).clamp(emin, emax);
+    // Forward pass with the exact simulator, starting from the real live SOC. A SOC below Emin is
+    // not raised to the floor: it can charge but not discharge (brief H19 item 4).
+    let mut energy = (soc_pct / 100.0 * capacity).clamp(0.0, emax);
     let mut planned = Vec::with_capacity(n);
     let mut expected_cost = 0.0;
     let mut previous = current;
@@ -848,6 +851,8 @@ struct CachedPlan {
     planned_at: DateTime<Utc>,
     horizon_last_start: DateTime<Utc>,
     price_fingerprint: u64,
+    /// Effective minimum SOC (%) the plan used; a change, such as the Back Up floor, replans
+    min_soc_pct: f32,
 }
 
 /// The levers the planner reads. VPR and the kill switch are applied by execution, so they are
@@ -1158,6 +1163,7 @@ impl WinterReserveStrategy {
             c.plan.blocks.first().map(|b| b.start) != Some(first)
                 || c.horizon_last_start != last
                 || c.price_fingerprint != fingerprint
+                || (c.min_soc_pct - battery.min_soc_pct).abs() > 1e-6
                 || now - c.planned_at > Duration::minutes(REPLAN_MAX_AGE_MIN)
                 || c.plan
                     .blocks
@@ -1193,6 +1199,7 @@ impl WinterReserveStrategy {
             planned_at: now,
             horizon_last_start: last,
             price_fingerprint: fingerprint,
+            min_soc_pct: battery.min_soc_pct,
         });
         (entry, Some(replanned))
     }
@@ -2080,6 +2087,44 @@ mod tests {
     }
 
     #[test]
+    fn raised_min_soc_floor_replans_at_once() {
+        let blocks = price_blocks();
+        let s = strategy();
+        s.evaluate(&ctx(&blocks, 0, &control(), 50.0));
+        // The Back Up floor changes the effective minimum SOC: the cached plan must not be reused
+        let mut raised = control();
+        raised.min_battery_soc = 40.0;
+        s.evaluate(&ctx(&blocks, 0, &raised, 50.0));
+        assert_eq!(s.plan_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn soc_below_floor_is_planned_from_real_soc_and_never_discharged() {
+        let blocks = price_blocks();
+        let mut ctl = control();
+        ctl.min_battery_soc = 40.0;
+        let s = strategy();
+        let horizon = s.horizon_blocks(&ctx(&blocks, 0, &ctl, 20.0));
+        let battery = battery_params(&ctl);
+        let plan = s.run_plan(&horizon, 20.0, chrono_tz::UTC, &battery, None);
+        // No phantom start at the floor
+        assert!(
+            (plan.blocks[0].soc_start_pct - 20.0).abs() < 0.01,
+            "phantom start: {}",
+            plan.blocks[0].soc_start_pct
+        );
+        // Below the floor the battery may charge but never discharge
+        for b in &plan.blocks {
+            assert!(
+                b.soc_end_pct >= b.soc_start_pct - 0.01,
+                "discharge below floor at {}: {:?}",
+                b.start,
+                b.mode
+            );
+        }
+    }
+
+    #[test]
     fn projection_returns_cached_block_without_replanning() {
         let blocks = price_blocks();
         let ctl = control();
@@ -2139,6 +2184,7 @@ mod tests {
             planned_at: clock_block0(),
             horizon_last_start: blocks.last().unwrap().block_start,
             price_fingerprint: fingerprint,
+            min_soc_pct: control().min_battery_soc,
         });
     }
 

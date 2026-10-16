@@ -294,12 +294,30 @@ impl PriceCache {
 #[derive(Resource)]
 pub struct AsyncInverterWriter {
     source: Arc<dyn crate::traits::InverterDataSource>,
+    /// Backup minimum SOC (%) last confirmed by the adapter, per inverter. Set only when a
+    /// `SetBackupMode` returns Ok; cleared by any other write to that inverter, success or not.
+    backup_confirmed: Arc<parking_lot::Mutex<std::collections::HashMap<String, u8>>>,
 }
 
 impl AsyncInverterWriter {
     /// Create a new async inverter writer
     pub fn new(source: Arc<dyn crate::traits::InverterDataSource>) -> Self {
-        Self { source }
+        Self {
+            source,
+            backup_confirmed: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Backup minimum SOC the adapter last confirmed for this inverter (brief H19)
+    pub fn confirmed_backup_min_soc(&self, inverter_id: &str) -> Option<u8> {
+        self.backup_confirmed.lock().get(inverter_id).copied()
+    }
+
+    /// Record a confirmed backup minimum SOC (used by tests and by the success path)
+    pub fn set_confirmed_backup_min_soc(&self, inverter_id: &str, min_soc_pct: u8) {
+        self.backup_confirmed
+            .lock()
+            .insert(inverter_id.to_string(), min_soc_pct);
     }
 
     /// Write a command synchronously (blocks until completion)
@@ -325,6 +343,7 @@ impl AsyncInverterWriter {
         command: crate::components::InverterCommand,
     ) {
         let source = self.source.clone();
+        let backup_confirmed = self.backup_confirmed.clone();
 
         tokio::spawn(async move {
             match source.write_command(&inverter_id, &command).await {
@@ -334,8 +353,17 @@ impl AsyncInverterWriter {
                         inverter_id,
                         command
                     );
+                    match command {
+                        crate::components::InverterCommand::SetBackupMode { min_soc_pct } => {
+                            backup_confirmed.lock().insert(inverter_id, min_soc_pct);
+                        }
+                        _ => {
+                            backup_confirmed.lock().remove(&inverter_id);
+                        }
+                    }
                 }
                 Err(e) => {
+                    backup_confirmed.lock().remove(&inverter_id);
                     tracing::error!(
                         "❌ Async command failed for {}: {:?} - {}",
                         inverter_id,

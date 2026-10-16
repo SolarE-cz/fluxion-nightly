@@ -10,6 +10,19 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.58] - 2026-10-16
+
+### Added
+
+- Default mode switch on the dashboard: Self-Use or Backup. In Backup the planner's Self-Use blocks
+  run as SolaX Back Up Mode, the inverter's backup minimum SOC is set to the chosen target, and the
+  planner never discharges below it. `PUT /api/user-control/default-mode`.
+
+### Fixed
+
+- The backup minimum SOC is re-written whenever the target changes, also while the inverter is
+  already in Back Up Mode, and Back Up Mode is never entered with an unknown minimum.
+
 ## [0.2.57] - 2026-10-16
 
 ### Fixed

@@ -16,7 +16,7 @@ use tracing::{error, info, trace};
 use crate::{
     PluginManagerResource,
     components::*,
-    config_events::{ConfigSection, UserControlChangeType},
+    config_events::ConfigSection,
     debug::DebugModeConfig,
     pricing::analyze_prices,
     resources::{SystemConfig, UserControlResource, UserLeversResource},
@@ -396,13 +396,8 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
         );
 
         // Determine if schedule recalculation is needed
-        let needs_schedule_recalc = matches!(
-            event.change_type,
-            UserControlChangeType::SlotAdded
-                | UserControlChangeType::SlotModified
-                | UserControlChangeType::SlotRemoved
-                | UserControlChangeType::RestrictionsChanged
-        );
+        let needs_schedule_recalc =
+            crate::config_events::user_control_change_recalcs_schedule(event.change_type);
 
         if needs_schedule_recalc {
             info!("🔄 Triggering schedule recalculation due to user control changes");

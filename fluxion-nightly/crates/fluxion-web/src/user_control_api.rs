@@ -24,7 +24,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use fluxion_core::{UserControlChangeType, UserControlPersistence, UserControlUpdateEvent};
-use fluxion_types::user_control::FixedTimeSlot;
+use fluxion_types::user_control::{DefaultMode, FixedTimeSlot, backup_min_soc_in_range};
 use fluxion_types::{InverterOperationMode, UserControlState};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,8 @@ pub struct UserControlApiState {
     pub persistence_path: String,
     /// Optional sender for user control updates to ECS
     pub update_sender: Option<UserControlUpdateSender>,
+    /// Battery maximum (%) from the config; the Back Up minimum must stay below it by 5
+    pub max_battery_soc: f32,
 }
 
 impl std::fmt::Debug for UserControlApiState {
@@ -51,6 +53,7 @@ impl std::fmt::Debug for UserControlApiState {
             .field("state", &"<RwLock>")
             .field("persistence_path", &self.persistence_path)
             .field("update_sender", &self.update_sender.is_some())
+            .field("max_battery_soc", &self.max_battery_soc)
             .finish()
     }
 }
@@ -66,7 +69,15 @@ impl UserControlApiState {
             state: Arc::new(RwLock::new(state)),
             persistence_path: persistence_path.into(),
             update_sender,
+            max_battery_soc: 100.0,
         }
+    }
+
+    /// Set the battery maximum (%) the Back Up minimum is validated against
+    #[must_use]
+    pub fn with_max_battery_soc(mut self, max_battery_soc: f32) -> Self {
+        self.max_battery_soc = max_battery_soc;
+        self
     }
 }
 
@@ -78,6 +89,8 @@ pub struct GetUserControlResponse {
     pub enabled: bool,
     pub disallow_charge: bool,
     pub disallow_discharge: bool,
+    pub default_mode: String,
+    pub backup_min_soc_pct: u8,
     pub fixed_time_slots: Vec<FixedTimeSlotResponse>,
     pub last_modified: Option<String>,
 }
@@ -117,6 +130,8 @@ pub async fn get_user_control(
         enabled: current_state.enabled,
         disallow_charge: current_state.disallow_charge,
         disallow_discharge: current_state.disallow_discharge,
+        default_mode: current_state.default_mode.as_str().to_owned(),
+        backup_min_soc_pct: current_state.backup_min_soc_pct,
         fixed_time_slots: current_state
             .fixed_time_slots
             .iter()
@@ -223,6 +238,88 @@ pub async fn set_restrictions(
         success: true,
         disallow_charge,
         disallow_discharge,
+    }))
+}
+
+// ==================== PUT /api/user-control/default-mode ====================
+
+/// Request for PUT /api/user-control/default-mode
+#[derive(Deserialize)]
+pub struct SetDefaultModeRequest {
+    /// "self_use" or "backup"
+    pub default_mode: String,
+    /// Back Up minimum SOC (%), 15..=100; kept unchanged when omitted
+    #[serde(default)]
+    pub backup_min_soc_pct: Option<i64>,
+}
+
+/// Response for PUT /api/user-control/default-mode
+#[derive(Serialize)]
+pub struct SetDefaultModeResponse {
+    pub success: bool,
+    pub default_mode: String,
+    pub backup_min_soc_pct: u8,
+}
+
+/// PUT /api/user-control/default-mode - Set the default mode and the Back Up minimum SOC.
+/// Invalid values are rejected with 400 before anything is changed.
+pub async fn set_default_mode(
+    State(state): State<UserControlApiState>,
+    Json(request): Json<SetDefaultModeRequest>,
+) -> Result<Json<SetDefaultModeResponse>, (StatusCode, String)> {
+    let mode = DefaultMode::parse(&request.default_mode).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("unknown default_mode '{}'", request.default_mode),
+        )
+    })?;
+    // Targets at or above max_battery_soc - 5 are rejected (brief H19 item 5)
+    let limit = fluxion_types::user_control::backup_min_soc_limit(state.max_battery_soc);
+    let min_soc = match request.backup_min_soc_pct {
+        Some(value) => Some(
+            u8::try_from(value)
+                .ok()
+                .filter(|_| backup_min_soc_in_range(value))
+                .filter(|v| f32::from(*v) < limit)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "backup_min_soc_pct must be 15..=100 and below {limit}% (battery max minus 5)"
+                        ),
+                    )
+                })?,
+        ),
+        None => None,
+    };
+
+    let new_state = {
+        let mut user_state = state.state.write();
+        user_state.default_mode = mode;
+        if let Some(min_soc) = min_soc {
+            user_state.backup_min_soc_pct = min_soc;
+        }
+        user_state.last_modified = Some(Utc::now());
+        user_state.clone()
+    };
+
+    info!(
+        "🎛️ Default mode: {}, Back Up minimum SOC {}%",
+        new_state.default_mode.as_str(),
+        new_state.backup_min_soc_pct
+    );
+
+    persist_and_notify(
+        &state,
+        &new_state,
+        UserControlChangeType::DefaultModeChanged,
+    )
+    .map_err(|status| (status, "failed to persist default mode".to_owned()))?;
+
+    Ok(Json(SetDefaultModeResponse {
+        success: true,
+        default_mode: new_state.default_mode.as_str().to_owned(),
+        backup_min_soc_pct: new_state.backup_min_soc_pct,
     }))
 }
 
@@ -425,4 +522,137 @@ fn persist_and_notify(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod default_mode_tests {
+    use super::*;
+    use fluxion_types::user_control::DefaultMode;
+
+    fn api_state(dir: &tempfile::TempDir) -> UserControlApiState {
+        let path = dir.path().join("user_control.json");
+        UserControlApiState::new(
+            UserControlState::default(),
+            path.to_string_lossy().to_string(),
+            None,
+        )
+    }
+
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    fn request(mode: &str, min_soc: Option<i64>) -> Json<SetDefaultModeRequest> {
+        Json(SetDefaultModeRequest {
+            default_mode: mode.to_owned(),
+            backup_min_soc_pct: min_soc,
+        })
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected_and_nothing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_state(&dir);
+        let result = run(set_default_mode(State(api.clone()), request("auto", None)));
+        assert_eq!(
+            result.err().map(|(status, _)| status),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        let state = api.state.read();
+        assert_eq!(state.default_mode, DefaultMode::SelfUse);
+        assert_eq!(state.backup_min_soc_pct, 25);
+    }
+
+    #[test]
+    fn out_of_range_min_soc_is_rejected_and_nothing_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_state(&dir);
+        for bad in [14, 101, -5] {
+            let result = run(set_default_mode(
+                State(api.clone()),
+                request("backup", Some(bad)),
+            ));
+            assert_eq!(
+                result.err().map(|(status, _)| status),
+                Some(StatusCode::BAD_REQUEST),
+                "{bad}"
+            );
+        }
+        let state = api.state.read();
+        assert_eq!(state.default_mode, DefaultMode::SelfUse);
+        assert_eq!(state.backup_min_soc_pct, 25);
+    }
+
+    #[test]
+    fn valid_change_persists_and_round_trips_through_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_state(&dir);
+        let response = run(set_default_mode(
+            State(api.clone()),
+            request("backup", Some(40)),
+        ))
+        .expect("accepted");
+        assert_eq!(response.default_mode, "backup");
+        assert_eq!(response.backup_min_soc_pct, 40);
+
+        // Persisted to the state file
+        let path = dir.path().join("user_control.json");
+        let loaded = UserControlPersistence::new(&path).load().unwrap();
+        assert_eq!(loaded.default_mode, DefaultMode::Backup);
+        assert_eq!(loaded.backup_min_soc_pct, 40);
+
+        // Reported by GET /api/user-control
+        let got = run(get_user_control(State(api.clone())));
+        assert_eq!(got.default_mode, "backup");
+        assert_eq!(got.backup_min_soc_pct, 40);
+    }
+
+    #[test]
+    fn omitted_min_soc_keeps_the_stored_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_state(&dir);
+        let _ = run(set_default_mode(
+            State(api.clone()),
+            request("backup", Some(60)),
+        ))
+        .expect("accepted");
+        let response = run(set_default_mode(
+            State(api.clone()),
+            request("self_use", None),
+        ))
+        .expect("accepted");
+        assert_eq!(response.default_mode, "self_use");
+        assert_eq!(response.backup_min_soc_pct, 60);
+    }
+
+    #[test]
+    fn backup_target_at_battery_max_minus_5_is_rejected_with_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_state(&dir).with_max_battery_soc(100.0);
+        let (status, message) = run(set_default_mode(
+            State(api.clone()),
+            request("backup", Some(95)),
+        ))
+        .err()
+        .expect("rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("95%"), "{message}");
+        assert_eq!(api.state.read().backup_min_soc_pct, 25);
+    }
+
+    #[test]
+    fn backup_target_just_below_battery_max_minus_5_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = api_state(&dir).with_max_battery_soc(100.0);
+        let response = run(set_default_mode(
+            State(api.clone()),
+            request("backup", Some(94)),
+        ))
+        .expect("accepted");
+        assert_eq!(response.backup_min_soc_pct, 94);
+    }
 }

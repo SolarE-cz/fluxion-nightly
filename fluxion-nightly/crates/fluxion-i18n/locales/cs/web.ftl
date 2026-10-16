@@ -104,3 +104,9 @@ debug-strategy-mode = Režim
 debug-strategy-profit = Zisk
 debug-strategy-reason = Důvod
 debug-no-info = Ladicí informace nejsou k dispozici (nastavte log_level = "debug" v konfiguraci)
+default-mode-label = Výchozí režim
+default-mode-self-use = Self-Use
+default-mode-backup = Backup
+default-mode-help = Režim pro plánované bloky Self-Use
+backup-min-soc-label = Minimální SOC baterie (%)
+backup-min-soc-save = Uložit

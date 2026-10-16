@@ -104,3 +104,9 @@ debug-strategy-mode = Mode
 debug-strategy-profit = Profit
 debug-strategy-reason = Reason
 debug-no-info = Debug info not available (set log_level = "debug" in config)
+default-mode-label = Default mode
+default-mode-self-use = Self-Use
+default-mode-backup = Backup
+default-mode-help = Mode for planned Self-Use blocks
+backup-min-soc-label = Minimum battery SOC (%)
+backup-min-soc-save = Save

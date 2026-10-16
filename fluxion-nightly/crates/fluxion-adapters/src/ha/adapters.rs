@@ -67,6 +67,40 @@ impl HomeAssistantInverterAdapter {
         self.actuation.clone()
     }
 
+    /// Set `number.<inverter>_backup_discharge_min_soc` to `target` only when it differs (brief
+    /// H19). A failed read fails the write, so Back Up Mode never starts with an unknown minimum.
+    async fn sync_backup_min_soc(&self, inverter_id: &str, target: u8) -> Result<()> {
+        let entity_id = format!(
+            "number.{}_backup_discharge_min_soc",
+            inverter_id.replace('.', "_")
+        );
+        let state = self
+            .client
+            .get_state(&entity_id)
+            .await
+            .with_context(|| format!("Cannot read {entity_id}, Back Up Mode not set"))?;
+        if state
+            .state
+            .parse::<f32>()
+            .is_ok_and(|value| (value - f32::from(target)).abs() < 0.5)
+        {
+            debug!("   {} already {}%", entity_id, target);
+            return Ok(());
+        }
+        self.client
+            .call_service(
+                "number.set_value",
+                serde_json::json!({
+                    "entity_id": entity_id,
+                    "value": target,
+                }),
+            )
+            .await
+            .with_context(|| format!("Failed to set {entity_id} to {target}%"))?;
+        info!("✅ [ADAPTER] {} set to {}%", entity_id, target);
+        Ok(())
+    }
+
     /// Read backup_discharge_min_soc sensor from HA
     /// Returns the minimum SOC for battery discharge configured in HA
     /// Sensor: number.<prefix>_backup_discharge_min_soc
@@ -366,6 +400,17 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
         // Unlock before any write, including export limits; the write is skipped on error.
         actuation::ensure_unlocked(&self.client, inverter_id, &self.guard).await?;
 
+        // Back Up Mode: the minimum SOC is synced first, then the mode is written as SetMode
+        let mode_command;
+        let command = match command {
+            InverterCommand::SetBackupMode { min_soc_pct } => {
+                self.sync_backup_min_soc(inverter_id, *min_soc_pct).await?;
+                mode_command = InverterCommand::SetMode(InverterOperationMode::BackUpMode);
+                &mode_command
+            }
+            other => other,
+        };
+
         match command {
             InverterCommand::SetMode(mode) => {
                 if *mode == InverterOperationMode::ForceCharge {
@@ -489,6 +534,10 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
                     })?;
 
                 info!("✅ [ADAPTER] Export limit set successfully");
+            }
+            InverterCommand::SetBackupMode { .. } => {
+                // Mapped to SetMode above; reaching this arm would be a dispatch bug
+                anyhow::bail!("SetBackupMode was not mapped for {}", inverter_id);
             }
         }
         Ok(())
@@ -1240,6 +1289,107 @@ mod tests {
     }
 
     type Log = Arc<StdMutex<Vec<&'static str>>>;
+
+    /// Back Up write with the real SolaX mapper: the minimum SOC is set only when it differs,
+    /// then the mode is selected as the native "Back Up Mode" option (brief H19).
+    async fn backup_write(current_min_soc: &str, target: u8, expected_sets: usize) {
+        let mut server = Server::new_async().await;
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(|_| state_body("select.solax_lock_state", "Unlocked"))
+            .create_async()
+            .await;
+        let min_soc_body = current_min_soc.to_string();
+        let _min_soc = server
+            .mock("GET", "/api/states/number.solax_backup_discharge_min_soc")
+            .with_body_from_request(move |_| {
+                state_body("number.solax_backup_discharge_min_soc", &min_soc_body)
+            })
+            .create_async()
+            .await;
+        let set_value = server
+            .mock("POST", "/api/services/number/set_value")
+            .match_body(Matcher::PartialJson(json!({
+                "entity_id": "number.solax_backup_discharge_min_soc",
+                "value": target,
+            })))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(expected_sets)
+            .create_async()
+            .await;
+        let select = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(json!({
+                "entity_id": "select.solax_charger_use_mode",
+                "option": "Back Up Mode",
+            })))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "test_token").unwrap());
+        let adapter = HomeAssistantInverterAdapter::new(
+            client,
+            Arc::new(crate::solax::SolaxEntityMapper::new()),
+        )
+        .with_guard(guard(true));
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetBackupMode {
+                    min_soc_pct: target,
+                },
+            )
+            .await
+            .unwrap();
+        set_value.assert_async().await;
+        select.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn backup_write_sets_min_soc_only_when_it_differs() {
+        // Differs: the minimum SOC is written before the mode
+        backup_write("25.0", 40, 1).await;
+    }
+
+    #[tokio::test]
+    async fn backup_write_skips_min_soc_when_already_equal() {
+        backup_write("40.0", 40, 0).await;
+    }
+
+    #[tokio::test]
+    async fn backup_write_fails_without_mode_write_when_min_soc_cannot_be_read() {
+        let mut server = Server::new_async().await;
+        let _lock = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(|_| state_body("select.solax_lock_state", "Unlocked"))
+            .create_async()
+            .await;
+        let _min_soc = server
+            .mock("GET", "/api/states/number.solax_backup_discharge_min_soc")
+            .with_status(500)
+            .create_async()
+            .await;
+        let select = server
+            .mock("POST", "/api/services/select/select_option")
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(0)
+            .create_async()
+            .await;
+
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "test_token").unwrap());
+        let adapter = HomeAssistantInverterAdapter::new(
+            client,
+            Arc::new(crate::solax::SolaxEntityMapper::new()),
+        )
+        .with_guard(guard(true));
+        let result = adapter
+            .write_command("solax", &InverterCommand::SetBackupMode { min_soc_pct: 40 })
+            .await;
+        assert!(result.is_err());
+        select.assert_async().await;
+    }
 
     #[tokio::test]
     async fn locked_inverter_is_unlocked_and_read_back_before_write() {

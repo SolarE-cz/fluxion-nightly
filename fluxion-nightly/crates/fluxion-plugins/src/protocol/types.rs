@@ -138,6 +138,10 @@ pub struct EvaluationRequest {
     /// User levers from Home Assistant; `None` until the first successful sync
     #[serde(default)]
     pub user_levers: Option<fluxion_types::UserLevers>,
+
+    /// Planner minimum SOC (%) when the default mode is Back Up; `None` keeps the control minimum
+    #[serde(default)]
+    pub planner_min_soc_pct: Option<f32>,
 }
 
 /// Operation mode decision

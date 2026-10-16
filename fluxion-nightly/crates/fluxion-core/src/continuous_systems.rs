@@ -590,6 +590,16 @@ pub fn schedule_execution_system(
         None => schedule.and_then(|s| s.get_current_mode(now)).cloned(),
     };
 
+    // Default mode Back Up (brief H19): planner Self-Use runs as Back Up Mode with the user's
+    // minimum SOC. Explicit overrides (VPR, a fixed slot active now) keep their own mode.
+    let backup_default = user_control
+        .as_ref()
+        .filter(|uc| uc.state.default_mode == fluxion_types::user_control::DefaultMode::Backup);
+    let explicit_override = vpr_override.is_some()
+        || user_control
+            .as_ref()
+            .is_some_and(|uc| uc.state.get_fixed_slot_at(now).is_some());
+
     // Process each inverter
     for (mut current_mode, inverter, battery_status, raw_state) in current_mode_query.iter_mut() {
         // Find inverter config
@@ -660,6 +670,18 @@ pub fn schedule_execution_system(
                     continue;
                 }
 
+                // Planner Self-Use in Back Up default: Back Up Mode with the user's minimum SOC
+                let backup_min_soc = match backup_default {
+                    Some(uc)
+                        if !explicit_override
+                            && effective_mode.mode == InverterOperationMode::SelfUse =>
+                    {
+                        effective_mode.mode = InverterOperationMode::BackUpMode;
+                        Some(uc.state.backup_min_soc_pct)
+                    }
+                    _ => None,
+                };
+
                 // Use effective_mode (with potential fixed slot override) for the rest
                 let scheduled_mode = &effective_mode;
 
@@ -705,14 +727,16 @@ pub fn schedule_execution_system(
                             "⚠️ Inverter mode drifted to {:?} (expected {:?}) — re-applying",
                             raw.state.work_mode, current_mode.mode
                         );
-                        async_writer.write_command_async(
-                            inverter.id.clone(),
-                            InverterCommand::SetMode(permitted_mode(
+                        // Back Up re-apply goes through SetBackupMode so the minimum SOC is synced
+                        let drift_command = match backup_min_soc {
+                            Some(min_soc_pct) => InverterCommand::SetBackupMode { min_soc_pct },
+                            None => InverterCommand::SetMode(permitted_mode(
                                 current_mode.mode,
                                 force_discharge_enabled,
                                 &inverter.id,
                             )),
-                        );
+                        };
+                        async_writer.write_command_async(inverter.id.clone(), drift_command);
                         current_mode.set_at = now;
                     } else {
                         debug!("Skipping drift re-apply for {}: SOC safety", inverter.id);
@@ -726,7 +750,15 @@ pub fn schedule_execution_system(
                         r.state.work_mode_ambiguous
                             && r.state.work_mode == InverterOperationMode::ForceCharge
                     });
-                if scheduled_mode.mode != effective_current_mode || ambiguous_manual_resync {
+                // Back Up default: the adapter must confirm the minimum SOC, not just the mode
+                let backup_pending = !debug.enabled
+                    && backup_min_soc.is_some_and(|target| {
+                        async_writer.confirmed_backup_min_soc(&inverter.id) != Some(target)
+                    });
+                if scheduled_mode.mode != effective_current_mode
+                    || ambiguous_manual_resync
+                    || backup_pending
+                {
                     // On initial sync: bypass debounce to apply plan immediately
                     // After initial sync: check minimum interval
                     if !bypass_debounce && !can_change_mode(&current_mode, &config, now) {
@@ -768,13 +800,21 @@ pub fn schedule_execution_system(
                         continue;
                     }
 
-                    // Skip force-discharge if battery is at or below min SOC
+                    // Skip force-discharge at or below the effective floor: in Back Up default the
+                    // inverter keeps the Back Up minimum, so that is the floor (brief H19 item 6)
+                    let discharge_floor =
+                        backup_default.map_or(system_config.control_config.min_battery_soc, |uc| {
+                            uc.state.planner_min_soc_pct(
+                                system_config.control_config.min_battery_soc,
+                                system_config.control_config.max_battery_soc,
+                            )
+                        });
                     if scheduled_mode.mode == InverterOperationMode::ForceDischarge
-                        && soc <= system_config.control_config.min_battery_soc
+                        && soc <= discharge_floor
                     {
                         debug!(
                             "Skipping force-discharge for {}: SOC ({:.1}%) <= min ({:.1}%)",
-                            inverter.id, soc, system_config.control_config.min_battery_soc
+                            inverter.id, soc, discharge_floor
                         );
                         // Mark as synced even if skipped due to SOC
                         if is_initial_sync {
@@ -812,7 +852,10 @@ pub fn schedule_execution_system(
                             force_discharge_enabled,
                             &inverter.id,
                         );
-                        let command = InverterCommand::SetMode(mode_sent);
+                        let command = match backup_min_soc {
+                            Some(min_soc_pct) => InverterCommand::SetBackupMode { min_soc_pct },
+                            None => InverterCommand::SetMode(mode_sent),
+                        };
 
                         info!(
                             "📤 Sending command to change {} to {:?}: {}{}",
@@ -1580,6 +1623,9 @@ mod levers_execution_tests {
                 .iter()
                 .filter_map(|(_, c)| match c {
                     InverterCommand::SetMode(mode) => Some(*mode),
+                    InverterCommand::SetBackupMode { .. } => {
+                        Some(InverterOperationMode::BackUpMode)
+                    }
                     _ => None,
                 })
                 .collect()
@@ -2452,6 +2498,232 @@ mod levers_execution_tests {
             h.sent_modes().await,
             vec![InverterOperationMode::ForceDischarge]
         );
+    }
+
+    /// Harness with the default mode set to Back Up (brief H19).
+    fn backup_harness(blocks: Vec<ScheduledMode>) -> Harness {
+        let mut h = harness(blocks, false);
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .default_mode = fluxion_types::user_control::DefaultMode::Backup;
+        h
+    }
+
+    #[tokio::test]
+    async fn backup_default_sends_planner_selfuse_as_backup_mode() {
+        let now = Utc::now();
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::SelfUse,
+        )]);
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::BackUpMode]
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_default_keeps_forcecharge_and_hold_unchanged() {
+        let now = Utc::now();
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::ForceCharge,
+        )]);
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::NoChargeNoDischarge,
+        )]);
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::NoChargeNoDischarge]
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_default_keeps_active_fixed_slot_selfuse() {
+        let now = Utc::now();
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::SelfUse,
+        )]);
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .fixed_time_slots
+            .push(fluxion_types::user_control::FixedTimeSlot::new(
+                now - Duration::minutes(5),
+                now + Duration::hours(1),
+                InverterOperationMode::SelfUse,
+                None,
+            ));
+        // Hardware is in Back Up, so the explicit SelfUse slot must be written as SelfUse
+        {
+            let mut query = h.world.query::<&mut RawInverterState>();
+            for mut raw in query.iter_mut(&mut h.world) {
+                raw.state.work_mode = InverterOperationMode::BackUpMode;
+            }
+        }
+
+        h.run();
+
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// Commands recorded so far (writes run on the tokio runtime; let them finish first).
+    async fn sent_commands(h: &Harness) -> Vec<InverterCommand> {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        h.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn backup_default_hardware_backup_with_different_min_soc_sends_one_setbackup() {
+        let now = Utc::now();
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::SelfUse,
+        )]);
+        h.set_hardware(InverterOperationMode::BackUpMode, now);
+        // The adapter last confirmed 10 %, the target is the default 25 %
+        h.world
+            .resource::<AsyncInverterWriter>()
+            .set_confirmed_backup_min_soc("inv1", 10);
+
+        h.run();
+
+        let commands = sent_commands(&h).await;
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            commands[0],
+            InverterCommand::SetBackupMode { min_soc_pct: 25 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn backup_default_hardware_backup_with_same_min_soc_sends_nothing() {
+        let now = Utc::now();
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::SelfUse,
+        )]);
+        h.set_hardware(InverterOperationMode::BackUpMode, now);
+        h.world
+            .resource::<AsyncInverterWriter>()
+            .set_confirmed_backup_min_soc("inv1", 25);
+
+        h.run();
+
+        assert!(sent_commands(&h).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_default_drift_reapply_uses_setbackupmode_not_plain_backup_mode() {
+        let now = Utc::now();
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::SelfUse,
+        )]);
+        h.mark_synced();
+        h.set_current(InverterOperationMode::BackUpMode);
+        h.world
+            .resource::<AsyncInverterWriter>()
+            .set_confirmed_backup_min_soc("inv1", 25);
+
+        // Another controller moved the inverter to Self Use; confirmed by two reads 40 s apart
+        h.set_hardware(InverterOperationMode::SelfUse, now - Duration::seconds(40));
+        h.run();
+        h.set_hardware(InverterOperationMode::SelfUse, now);
+        h.run();
+        h.run();
+
+        let commands = sent_commands(&h).await;
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert!(matches!(
+            commands[0],
+            InverterCommand::SetBackupMode { min_soc_pct: 25 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn backup_default_floor_blocks_planned_force_discharge_below_backup_target() {
+        let now = Utc::now();
+        // Battery is at 50 %, the Back Up target is 60 %: discharge stops at the higher floor
+        let mut h = backup_harness(vec![block(
+            now - Duration::minutes(1),
+            InverterOperationMode::ForceDischarge,
+        )]);
+        h.set_force_discharge(true);
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .backup_min_soc_pct = 60;
+
+        h.run();
+
+        assert!(sent_commands(&h).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn selfuse_floor_still_allows_planned_force_discharge_at_same_soc() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceDischarge,
+            )],
+            false,
+        );
+        h.set_force_discharge(true);
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .backup_min_soc_pct = 60;
+
+        h.run();
+
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceDischarge]
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_default_debug_mode_sends_nothing() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            true,
+        );
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .default_mode = fluxion_types::user_control::DefaultMode::Backup;
+
+        h.run();
+
+        assert!(h.sent_modes().await.is_empty());
     }
 
     #[tokio::test]
