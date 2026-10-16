@@ -435,6 +435,7 @@ pub fn init_plugin_manager(
         load_safety_factor: wr_core.load_safety_factor,
         pv_confidence: wr_core.pv_confidence,
         min_mode_benefit_czk: wr_core.min_mode_benefit_czk,
+        mode_switch_min_benefit_czk: wr_core.mode_switch_min_benefit_czk,
         soc_resolution_pct: wr_core.soc_resolution_pct,
     };
     manager.register(Arc::new(StrategyPlugin::new(

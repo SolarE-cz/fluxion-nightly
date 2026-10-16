@@ -57,6 +57,8 @@ pub struct WinterReserveParams {
     pub load_safety_factor: f32,
     pub pv_confidence: f32,
     pub min_mode_benefit_czk: f32,
+    /// Extra benefit (CZK) a SelfUse/Hold switch needs before a kept mode is dropped
+    pub mode_switch_min_benefit_czk: f32,
     pub soc_resolution_pct: f32,
 }
 
@@ -69,6 +71,7 @@ impl Default for WinterReserveParams {
             load_safety_factor: 1.10,
             pv_confidence: 0.70,
             min_mode_benefit_czk: 0.10,
+            mode_switch_min_benefit_czk: 1.0,
             soc_resolution_pct: 0.5,
         }
     }
@@ -267,11 +270,17 @@ fn same_physical_outcome(a: &BlockOutcome, b: &BlockOutcome) -> bool {
 /// `keep` is the mode applied to the previous block. When the chosen mode leaves the battery and
 /// grid exactly as `keep` would (for example SelfUse and Hold at the SOC floor), `keep` is returned:
 /// the inverter write would change nothing, and the planned cost is identical.
+///
+/// Between SelfUse and Hold only, `keep` is also returned when it is within
+/// `mode_switch_min_benefit` of the chosen mode. Small forecast changes then do not flip the
+/// mode back and forth. Charge, Export and NoDischarge are never held this way. The forward pass
+/// passes this only for block 0, the live transition; later blocks pass 0.
 fn choose(
     dp: &DpStep,
     modes: &[PlanMode],
     energy_kwh: f32,
     min_benefit: f32,
+    mode_switch_min_benefit: f32,
     keep: Option<PlanMode>,
 ) -> (PlanMode, f32, BlockOutcome) {
     let evals: Vec<(PlanMode, f32, BlockOutcome)> = modes
@@ -281,6 +290,16 @@ fn choose(
             (mode, value, outcome)
         })
         .collect();
+    select_mode(&evals, min_benefit, mode_switch_min_benefit, keep)
+}
+
+/// The selection rule of `choose`, on evaluated candidates (`evals[0]` is SelfUse).
+fn select_mode(
+    evals: &[(PlanMode, f32, BlockOutcome)],
+    min_benefit: f32,
+    mode_switch_min_benefit: f32,
+    keep: Option<PlanMode>,
+) -> (PlanMode, f32, BlockOutcome) {
     let best = evals.iter().map(|e| e.1).fold(f32::INFINITY, f32::min);
     let chosen = if evals[0].1 <= best + min_benefit {
         evals[0]
@@ -291,10 +310,17 @@ fn choose(
             .reduce(|a, b| if b.1 < a.1 { b } else { a })
             .unwrap_or(evals[0])
     };
-    if let Some(kept) = keep.and_then(|mode| evals.iter().find(|e| e.0 == mode))
-        && same_physical_outcome(&kept.2, &chosen.2)
-    {
-        return *kept;
+    if let Some(kept) = keep.and_then(|mode| evals.iter().find(|e| e.0 == mode)) {
+        let switch_only = |m: PlanMode| matches!(m, PlanMode::SelfUse | PlanMode::Hold);
+        if same_physical_outcome(&kept.2, &chosen.2) {
+            return *kept;
+        }
+        if switch_only(kept.0)
+            && switch_only(chosen.0)
+            && kept.1 <= chosen.1 + mode_switch_min_benefit
+        {
+            return *kept;
+        }
     }
     chosen
 }
@@ -612,7 +638,17 @@ pub fn plan_from(
         };
         current[k] = grid
             .iter()
-            .map(|&e| choose(&dp, &modes, e, params.min_mode_benefit_czk, None).1)
+            .map(|&e| {
+                choose(
+                    &dp,
+                    &modes,
+                    e,
+                    params.min_mode_benefit_czk,
+                    params.mode_switch_min_benefit_czk,
+                    None,
+                )
+                .1
+            })
             .collect();
     }
 
@@ -633,7 +669,21 @@ pub fn plan_from(
         // Keep the applied mode only in blocks without PV. The simulator models Hold as never
         // charging from PV, so with a PV forecast a kept Hold could block real PV charging.
         let keep = previous.filter(|_| block.pv_kwh <= 0.0);
-        let (mode, _, outcome) = choose(&dp, &modes, energy, params.min_mode_benefit_czk, keep);
+        // Only block 0 is the live transition (keep is the mode on the inverter). Later blocks
+        // are re-decided when they become block 0, so they get no SelfUse/Hold hysteresis.
+        let switch_benefit = if k == 0 {
+            params.mode_switch_min_benefit_czk
+        } else {
+            0.0
+        };
+        let (mode, _, outcome) = choose(
+            &dp,
+            &modes,
+            energy,
+            params.min_mode_benefit_czk,
+            switch_benefit,
+            keep,
+        );
         previous = Some(mode);
         let cost = outcome_cost(&outcome, block, battery.wear_cost_czk_per_kwh);
         let soc_start_pct = soc_pct_of(energy, capacity);
@@ -993,7 +1043,8 @@ impl WinterReserveStrategy {
             return entry;
         }
 
-        // The mode applied at the last head call is the one the inverter runs now.
+        // The head mode of the last plan (not read from the inverter). Overrides such as the kill
+        // switch, VPR or fixed slots leave it unchanged, so the plan stays stable under them.
         let current = cache
             .as_ref()
             .filter(|c| now - c.planned_at <= Duration::minutes(REPLAN_MAX_AGE_MIN * 2))
@@ -2010,8 +2061,9 @@ mod tests {
     }
 
     #[test]
-    fn hold_still_chosen_over_previous_selfuse_when_better_by_more_than_benefit() {
-        // The H8 scenario, but the previous block was SelfUse: the mid blocks must still hold.
+    fn small_hold_benefit_keeps_applied_selfuse() {
+        // The H8 scenario with the previous block SelfUse. Hold gains only 0.59 CZK at block 0,
+        // under the 1.0 CZK switch threshold, so the applied SelfUse is kept.
         let tz = chrono_tz::Europe::Prague;
         let params = WinterReserveParams::default();
         let b = BatteryParams {
@@ -2022,7 +2074,89 @@ mod tests {
         blocks.extend((8..16).map(|i| pblock(i, 8.0, 2.0, 0.75, 0.0)));
         let p = plan_from(&blocks, 40.0, tz, &b, &params, Some(PlanMode::SelfUse));
         let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
+        assert_eq!(modes[0], PlanMode::SelfUse, "{modes:?}");
+    }
+
+    #[test]
+    fn hold_still_chosen_over_previous_selfuse_when_better_by_more_than_switch_threshold() {
+        // Load 2.0 kWh per block, buy 6.0 then 8.0: Hold gains 1.58 CZK at block 0 over the applied
+        // SelfUse, above the 1.0 CZK switch threshold, so Hold is chosen
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        let b = BatteryParams {
+            capacity_kwh: 10.0,
+            ..battery()
+        };
+        let mut blocks: Vec<PlanBlock> = (0..8).map(|i| pblock(i, 6.0, 2.0, 2.0, 0.0)).collect();
+        blocks.extend((8..16).map(|i| pblock(i, 8.0, 2.0, 2.0, 0.0)));
+        let p = plan_from(&blocks, 40.0, tz, &b, &params, Some(PlanMode::SelfUse));
+        let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
         assert!(modes[..8].contains(&PlanMode::Hold), "{modes:?}");
+    }
+
+    /// Candidate with a physical outcome of its own, so the same-outcome rule never applies.
+    fn cand(mode: PlanMode, value: f32) -> (PlanMode, f32, BlockOutcome) {
+        let outcome = BlockOutcome {
+            grid_import_kwh: mode as u8 as f32,
+            ..BlockOutcome::default()
+        };
+        (mode, value, outcome)
+    }
+
+    #[test]
+    fn mode_switch_keeps_selfuse_when_hold_is_better_by_less_than_one_czk() {
+        let evals = [cand(PlanMode::SelfUse, 10.0), cand(PlanMode::Hold, 9.5)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, Some(PlanMode::SelfUse));
+        assert_eq!(mode, PlanMode::SelfUse);
+    }
+
+    #[test]
+    fn mode_switch_takes_hold_when_better_by_more_than_one_czk() {
+        let evals = [cand(PlanMode::SelfUse, 10.0), cand(PlanMode::Hold, 8.5)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, Some(PlanMode::SelfUse));
+        assert_eq!(mode, PlanMode::Hold);
+    }
+
+    #[test]
+    fn mode_switch_keeps_hold_when_selfuse_is_better_by_less_than_one_czk() {
+        let evals = [cand(PlanMode::SelfUse, 9.5), cand(PlanMode::Hold, 10.0)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, Some(PlanMode::Hold));
+        assert_eq!(mode, PlanMode::Hold);
+    }
+
+    #[test]
+    fn mode_switch_takes_selfuse_when_better_by_more_than_one_czk() {
+        let evals = [cand(PlanMode::SelfUse, 8.5), cand(PlanMode::Hold, 10.0)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, Some(PlanMode::Hold));
+        assert_eq!(mode, PlanMode::SelfUse);
+    }
+
+    #[test]
+    fn mode_switch_never_holds_charge_over_selfuse() {
+        // Charge is 0.6 CZK better (above the 0.10 floor by 0.5): it wins despite the hysteresis
+        let evals = [cand(PlanMode::SelfUse, 10.0), cand(PlanMode::Charge, 9.4)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, Some(PlanMode::SelfUse));
+        assert_eq!(mode, PlanMode::Charge);
+    }
+
+    #[test]
+    fn mode_switch_hysteresis_is_zero_after_block_zero() {
+        // The forward pass passes the switch benefit only for block 0; later blocks pass 0.
+        // Previous Hold, SelfUse 0.5 CZK better: the switch happens with 0, and Hold stays with 1.0.
+        let evals = [cand(PlanMode::SelfUse, 9.5), cand(PlanMode::Hold, 10.0)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 0.0, Some(PlanMode::Hold));
+        assert_eq!(mode, PlanMode::SelfUse);
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, Some(PlanMode::Hold));
+        assert_eq!(mode, PlanMode::Hold);
+    }
+
+    #[test]
+    fn mode_switch_without_keep_is_unchanged() {
+        let evals = [cand(PlanMode::SelfUse, 10.0), cand(PlanMode::Hold, 9.5)];
+        let (mode, _, _) = select_mode(&evals, 0.10, 1.0, None);
+        assert_eq!(mode, PlanMode::Hold);
+        let (mode, _, _) = select_mode(&evals, 0.10, 0.0, Some(PlanMode::SelfUse));
+        assert_eq!(mode, PlanMode::Hold);
     }
 
     #[test]

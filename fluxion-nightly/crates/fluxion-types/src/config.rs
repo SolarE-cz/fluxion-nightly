@@ -1060,6 +1060,9 @@ pub struct WinterReserveConfigCore {
     /// Benefit (CZK) required to leave SelfUse for another mode (default: 0.10)
     #[serde(default = "default_wr_min_mode_benefit")]
     pub min_mode_benefit_czk: f32,
+    /// Extra benefit (CZK) to drop a kept SelfUse or Hold for the other one (default: 1.0)
+    #[serde(default = "default_wr_mode_switch_min_benefit")]
+    pub mode_switch_min_benefit_czk: f32,
     /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
     #[serde(default = "default_wr_soc_resolution_pct")]
     pub soc_resolution_pct: f32,
@@ -1086,6 +1089,9 @@ fn default_wr_pv_confidence() -> f32 {
 fn default_wr_min_mode_benefit() -> f32 {
     0.10
 }
+fn default_wr_mode_switch_min_benefit() -> f32 {
+    1.0
+}
 fn default_wr_soc_resolution_pct() -> f32 {
     0.5
 }
@@ -1101,6 +1107,7 @@ impl Default for WinterReserveConfigCore {
             load_safety_factor: default_wr_load_safety_factor(),
             pv_confidence: default_wr_pv_confidence(),
             min_mode_benefit_czk: default_wr_min_mode_benefit(),
+            mode_switch_min_benefit_czk: default_wr_mode_switch_min_benefit(),
             soc_resolution_pct: default_wr_soc_resolution_pct(),
         }
     }

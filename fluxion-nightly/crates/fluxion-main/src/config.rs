@@ -1054,6 +1054,7 @@ pub struct WinterReserveConfig {
     pub load_safety_factor: f32,
     pub pv_confidence: f32,
     pub min_mode_benefit_czk: f32,
+    pub mode_switch_min_benefit_czk: f32,
     pub soc_resolution_pct: f32,
 }
 
@@ -1069,6 +1070,7 @@ impl Default for WinterReserveConfig {
             load_safety_factor: core.load_safety_factor,
             pv_confidence: core.pv_confidence,
             min_mode_benefit_czk: core.min_mode_benefit_czk,
+            mode_switch_min_benefit_czk: core.mode_switch_min_benefit_czk,
             soc_resolution_pct: core.soc_resolution_pct,
         }
     }
@@ -2448,6 +2450,10 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     load_safety_factor: app_config.strategies.winter_reserve.load_safety_factor,
                     pv_confidence: app_config.strategies.winter_reserve.pv_confidence,
                     min_mode_benefit_czk: app_config.strategies.winter_reserve.min_mode_benefit_czk,
+                    mode_switch_min_benefit_czk: app_config
+                        .strategies
+                        .winter_reserve
+                        .mode_switch_min_benefit_czk,
                     soc_resolution_pct: app_config.strategies.winter_reserve.soc_resolution_pct,
                 },
                 winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
@@ -3102,6 +3108,7 @@ mod winter_reserve_config_tests {
         assert!((wr.load_safety_factor - 1.10).abs() < 1e-6);
         assert!((wr.pv_confidence - 0.70).abs() < 1e-6);
         assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
+        assert!((wr.mode_switch_min_benefit_czk - 1.0).abs() < 1e-6);
         assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
     }
 
@@ -3117,6 +3124,7 @@ mod winter_reserve_config_tests {
                 "load_safety_factor": 1.2,
                 "pv_confidence": 0.5,
                 "min_mode_benefit_czk": 0.25,
+                "mode_switch_min_benefit_czk": 2.5,
                 "soc_resolution_pct": 1.0
             }
         }"#;
@@ -3131,6 +3139,7 @@ mod winter_reserve_config_tests {
         assert!((wr.load_safety_factor - 1.2).abs() < 1e-6);
         assert!((wr.pv_confidence - 0.5).abs() < 1e-6);
         assert!((wr.min_mode_benefit_czk - 0.25).abs() < 1e-6);
+        assert!((wr.mode_switch_min_benefit_czk - 2.5).abs() < 1e-6);
         assert!((wr.soc_resolution_pct - 1.0).abs() < 1e-6);
     }
 

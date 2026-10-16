@@ -10,6 +10,15 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.50] - 2026-10-16
+
+### Fixed
+
+- **Winter Reserve no longer flips between Self-Use and battery Hold at night.** A switch between
+  the two now needs at least `mode_switch_min_benefit_czk` (default 1.0 CZK) of expected gain over
+  the mode currently planned. Only the live block is affected, and only in blocks without solar.
+  Grid charging and export decisions are unchanged. Set it to 0 to switch it off.
+
 ## [0.2.49] - 2026-10-15
 
 ### Fixed
