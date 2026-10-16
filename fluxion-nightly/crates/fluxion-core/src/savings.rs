@@ -58,6 +58,8 @@ fn planner_block(block: &RecordedBlock) -> PlanBlock {
         sell_czk: block.sell_czk,
         load_kwh: block.load_kwh,
         pv_kwh: block.pv_kwh,
+        reserve_load_kwh: block.load_kwh,
+        reserve_pv_kwh: block.pv_kwh,
         force_charge: false,
         no_discharge: false,
         export_min_soc_pct: None,

@@ -7,10 +7,16 @@
 //! Input: the JSON written by `fluxion/tools/winter_reserve/export_ha_history.py`.
 //! For every block the planner sees the horizon (today, plus tomorrow after 13:00 local)
 //! with a forecast (load: mean of the same local quarter-hour over the previous 7 local days,
-//! else the mean of all earlier blocks, times `load_safety_factor`; never the block's own
-//! actual value. PV: the actual value times `pv_confidence`, a perfect forecast scaled down).
+//! else the mean of all earlier blocks; never the block's own actual value. The planner plans
+//! buys on the expected flows (load as is, PV times `--pv-forecast-bias`) and sizes the night
+//! reserve on the conservative ones (load times `load_safety_factor`, PV times `pv_confidence`).
 //! The horizon stops just before a missing block. The first planned mode is then applied to
 //! the *actual* block. The end state is valued at `cheap_ref` of the last day (see the totals).
+//!
+//! `--pv-forecast-bias <f>` (default 1.0) multiplies the forecast PV the planner sees, in both
+//! views. The simulated reality always uses the actual PV, so a value below 1.0 replays a
+//! pessimistic forecast, the case where the planner used to overbuy from the grid.
+//! The totals include the grid-charge kWh and its cost (charge the grid had to import).
 //!
 //! `--from <UTC timestamp>` starts the simulation at the first block at or after it, with the
 //! battery set to that block's recorded SOC; earlier blocks are skipped.
@@ -22,8 +28,8 @@
 //!
 //! Usage:
 //! `cargo run -p fluxion-core --example winter_reserve_replay -- data.json [--baseline-only]
-//!  [--csv out.csv] [--pv-noise] [--profile forecast|import|house] [--from 2026-10-14T14:30:00Z]
-//!  [--param key=value]...`
+//!  [--csv out.csv] [--pv-noise] [--pv-forecast-bias 0.5] [--profile forecast|import|house]
+//!  [--from 2026-10-14T14:30:00Z] [--param key=value]...`
 
 use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
@@ -159,6 +165,9 @@ struct Acc {
     cost: f32,
     wear_cost: f32,
     export_kwh: f32,
+    /// Battery charge the grid supplied, per block min(charge, import): kWh and its cost (CZK).
+    grid_charge_kwh: f32,
+    grid_charge_czk: f32,
     min_night_soc: Option<f32>,
 }
 
@@ -242,6 +251,7 @@ fn run() -> Result<(), String> {
     let mut baseline_only = false;
     let mut csv_path: Option<String> = None;
     let mut pv_noise = false;
+    let mut pv_forecast_bias = 1.0_f32;
     let mut profile = ProfileSource::Forecast;
     let mut from: Option<DateTime<Utc>> = None;
     let mut params = WinterReserveParams::default();
@@ -251,6 +261,12 @@ fn run() -> Result<(), String> {
         match arg.as_str() {
             "--baseline-only" => baseline_only = true,
             "--pv-noise" => pv_noise = true,
+            "--pv-forecast-bias" => {
+                let text = iter.next().ok_or("--pv-forecast-bias needs a factor")?;
+                pv_forecast_bias = text
+                    .parse()
+                    .map_err(|err| format!("--pv-forecast-bias {text}: {err}"))?;
+            }
             "--from" => {
                 let text = iter.next().ok_or("--from needs a UTC timestamp")?;
                 let parsed = DateTime::parse_from_rfc3339(text)
@@ -398,6 +414,8 @@ fn run() -> Result<(), String> {
             sell_czk: row.sell,
             load_kwh: row.load,
             pv_kwh: row.pv,
+            reserve_load_kwh: row.load,
+            reserve_pv_kwh: row.pv,
             force_charge: false,
             no_discharge: false,
             force_charge_at_or_below_czk: None,
@@ -457,28 +475,35 @@ fn run() -> Result<(), String> {
                     let Some(load_fc) = forecast_load(i, j, &mut fallback_blocks) else {
                         break;
                     };
-                    let fallback_kwh = load_fc * params.load_safety_factor;
-                    let load_kwh = match &live_profile {
-                        Some(p) => planner_block_load(
-                            p,
-                            later.start.hour() as usize,
-                            params.load_safety_factor,
-                            ControlConfig::default().planner_load_margin,
+                    // Expected load is the hourly mean (as production); the reserve load is
+                    // max(mean, p75) times the planner margin, or mean times the safety factor.
+                    let (load_kwh, reserve_load_kwh) = match &live_profile {
+                        Some(p) => (
+                            p.hourly_avg_kwh[later.start.hour() as usize] * 0.25,
+                            planner_block_load(
+                                p,
+                                later.start.hour() as usize,
+                                params.load_safety_factor,
+                                ControlConfig::default().planner_load_margin,
+                            ),
                         ),
-                        None => fallback_kwh,
+                        None => (load_fc, load_fc * params.load_safety_factor),
                     };
                     let noise = if pv_noise && j > i {
                         pv_noise_factor(j)
                     } else {
                         1.0
                     };
+                    let pv_kwh = later.pv * pv_forecast_bias * noise;
                     horizon.push(PlanBlock {
                         start: later.start,
                         duration_minutes: 15,
                         buy_czk: later.buy,
                         sell_czk: later.sell,
                         load_kwh,
-                        pv_kwh: later.pv * params.pv_confidence * noise,
+                        pv_kwh,
+                        reserve_load_kwh,
+                        reserve_pv_kwh: pv_kwh * params.pv_confidence,
                         force_charge: false,
                         no_discharge: false,
                         force_charge_at_or_below_czk: None,
@@ -505,6 +530,9 @@ fn run() -> Result<(), String> {
         acc.wr.cost += wr_out.grid_import_kwh * row.buy - wr_out.grid_export_kwh * row.sell;
         acc.wr.wear_cost += wr_out.battery_discharge_kwh * battery.wear_cost_czk_per_kwh;
         acc.wr.export_kwh += wr_out.grid_export_kwh;
+        let grid_charge = wr_out.battery_charge_kwh.min(wr_out.grid_import_kwh);
+        acc.wr.grid_charge_kwh += grid_charge;
+        acc.wr.grid_charge_czk += grid_charge * row.buy;
         if is_night(row.local.hour()) {
             acc.wr.min_night_soc = Some(acc.wr.min_night_soc.map_or(soc_now, |m| m.min(soc_now)));
         }
@@ -527,7 +555,7 @@ fn run() -> Result<(), String> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "PV forecast = actual PV × pv_confidence (perfect-shape forecast): savings are an upper bound."
+        "PV forecast = actual PV × pv_forecast_bias {pv_forecast_bias:.2} (expected) and × pv_confidence (reserve), perfect-shape forecast: savings are an upper bound."
     );
     if pv_noise {
         let _ = writeln!(
@@ -545,6 +573,8 @@ fn run() -> Result<(), String> {
     let total_su_wear: f32 = counted().map(|d| d.su.wear_cost).sum();
     let total_wr: f32 = counted().map(|d| d.wr.cost).sum();
     let total_wr_wear: f32 = counted().map(|d| d.wr.wear_cost).sum();
+    let total_wr_grid_charge_kwh: f32 = counted().map(|d| d.wr.grid_charge_kwh).sum();
+    let total_wr_grid_charge_czk: f32 = counted().map(|d| d.wr.grid_charge_czk).sum();
     let wr_cols = !baseline_only;
 
     // End state: energy left above SelfUse's, valued at the last day's cheap_ref times efficiency.
@@ -625,6 +655,10 @@ fn run() -> Result<(), String> {
         }
     );
     if wr_cols {
+        let _ = writeln!(
+            out,
+            "grid charge: WinterReserve {total_wr_grid_charge_kwh:.2} kWh = {total_wr_grid_charge_czk:.2} CZK (pv_forecast_bias {pv_forecast_bias:.2})"
+        );
         let _ = writeln!(
             out,
             "end state: WinterReserve {e_wr:.2} kWh vs SelfUse {e_su:.2} kWh, cheap_ref_last_day {cheap_ref_last_day:.3} CZK/kWh, end_soc_adjustment_czk {end_soc_adjustment_czk:.2} (efficiency {:.2}) | WinterReserve raw {total_wr:.2} CZK, adjusted {total_wr_adjusted:.2} CZK (adjusted = raw - end_soc_adjustment_czk)",

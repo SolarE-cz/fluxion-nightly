@@ -10,6 +10,22 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.56] - 2026-10-16
+
+### Fixed
+
+- Winter Reserve plans and buys on the expected solar and load forecast. The conservative view
+  (PV x pv_confidence, load x safety margin) now only sizes the night reserve and the export guard,
+  so the planner no longer grid-charges energy the sun will deliver.
+- Winter Reserve recognises the coming morning when the plan starts in the last hours of the night
+  (before 08:00 local). It used to need a 4 h night inside the plan, so from about 05:15 the whole
+  battery became the night reserve.
+
+### Added
+
+- One `WinterReserve horizon:` log line per replan and the planner input in
+  `/data/winter_reserve_last_plan.json`, so a plan can be replayed offline.
+
 ## [0.2.55] - 2026-10-16
 
 ### Fixed
