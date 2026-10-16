@@ -10,6 +10,14 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.55] - 2026-10-16
+
+### Fixed
+
+- **Add-on options can be saved again.** 0.2.52–0.2.54 declared
+  `solar_forecast.actual_pv_power_entities` with an enum schema, so Supervisor rejected every
+  options save. It is now a list of entity ids.
+
 ## [0.2.54] - 2026-10-16
 
 ### Fixed

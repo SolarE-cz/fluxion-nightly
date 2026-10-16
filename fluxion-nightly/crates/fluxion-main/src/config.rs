@@ -3285,6 +3285,27 @@ mod addon_schema_tests {
             "winter_reserve numeric options were not all checked"
         );
     }
+
+    #[test]
+    fn test_addon_schema_has_no_single_value_list_enum() {
+        // In the add-on schema `list(a|b)` is an enum, not a list. `list(str)?` only accepts the
+        // literal "str", so Supervisor rejects every options save. A list is a `- str?` sequence.
+        let schema = include_str!("../../../fluxion/config.yaml")
+            .split_once("\nschema:")
+            .expect("config.yaml has a schema section")
+            .1;
+        for line in schema.lines() {
+            if let Some(start) = line.find("list(") {
+                let inner = &line[start + "list(".len()..];
+                let inner = &inner[..inner.find(')').unwrap_or(inner.len())];
+                assert!(
+                    inner.contains('|'),
+                    "schema line `{}` is a single-value enum; use a `- str?` sequence for a list",
+                    line.trim()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

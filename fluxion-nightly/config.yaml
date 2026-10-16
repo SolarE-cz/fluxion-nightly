@@ -304,7 +304,8 @@ schema:
   remote_access:
     enabled: bool?
   solar_forecast:
-    actual_pv_power_entities: list(str)?
+    actual_pv_power_entities:
+    - str?
     provider: str?
   staging_token: str?
   strategies:
@@ -456,4 +457,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.54
+version: 0.2.55
