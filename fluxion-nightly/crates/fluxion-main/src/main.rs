@@ -171,8 +171,22 @@ fn initialize_and_run() -> Result<()> {
         auto_unlock: config.control.auto_unlock_inverter,
         ..Default::default()
     };
-    let inverter_adapter =
-        HomeAssistantInverterAdapter::new(ha_client.clone(), mapper).with_guard(actuation_guard);
+    // Read-only PV of parallel units, added to their inverter's PV (never written to)
+    let pv_extra_prefixes: std::collections::HashMap<String, Vec<String>> = config
+        .inverters
+        .iter()
+        .map(|inv| (inv.id.clone(), config::AppConfig::pv_extra_prefixes(inv)))
+        .filter(|(_, extras)| !extras.is_empty())
+        .collect();
+    for (id, extras) in &pv_extra_prefixes {
+        info!(
+            "☀️ Inverter {} PV adds read-only parallel units: {:?}",
+            id, extras
+        );
+    }
+    let inverter_adapter = HomeAssistantInverterAdapter::new(ha_client.clone(), mapper)
+        .with_guard(actuation_guard)
+        .with_pv_extra_prefixes(pv_extra_prefixes);
     // Shared with the pre-wake system, so both use one awaken rate limit
     let actuation_state =
         fluxion_adapters::ha::actuation::ActuationStateResource(inverter_adapter.actuation_state());

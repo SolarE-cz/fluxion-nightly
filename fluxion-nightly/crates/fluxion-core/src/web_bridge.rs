@@ -196,7 +196,7 @@ pub struct ConsumptionStats {
     pub today_import_kwh: Option<f32>,
     /// Total grid import yesterday (kWh), if available
     pub yesterday_import_kwh: Option<f32>,
-    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = UTC hour of day)
     /// Averaged over last 7 days of historical data
     pub hourly_consumption_profile: Option<Vec<f32>>,
 }
@@ -418,6 +418,10 @@ pub struct PriceBlockData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<crate::strategy::BlockDebugInfo>, // Debug info (only when log_level=debug)
     pub is_historical: bool, // True if block is in the past (shows regenerated schedule, not actual history)
+    /// Forecast PV power (kW, mean over the block) for blocks that have not ended yet,
+    /// `None` for past blocks and where no forecast covers the block
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solar_forecast_kw: Option<f32>,
 }
 
 /// System health data
@@ -542,6 +546,98 @@ pub fn web_query_system(
     }
 }
 
+/// Consumption statistics for the dashboard: EMA, today's and yesterday's import, hourly profile.
+/// `None` only when none of them is known. The hourly profile alone is enough: a site whose
+/// history has no daily summaries yet still gets its profile on the chart.
+fn compute_consumption_stats(
+    consumption_history: Option<&ConsumptionHistory>,
+    consumption_history_config: Option<&ConsumptionHistoryConfig>,
+    now: DateTime<Utc>,
+) -> Option<ConsumptionStats> {
+    // Determine EMA window (days) from config if available, otherwise default to 7
+    let ema_days = consumption_history_config
+        .map(|cfg| cfg.ema_days)
+        .unwrap_or(7);
+
+    let mut ema_kwh: Option<f32> = None;
+    let mut today_import_kwh: Option<f32> = None;
+    let mut yesterday_import_kwh: Option<f32> = None;
+
+    if let Some(history) = consumption_history {
+        // EMA based on historical daily consumption values
+        let values = history.consumption_values();
+        if history.has_sufficient_data(ema_days) {
+            ema_kwh = calculate_ema(&values, ema_days);
+        }
+
+        // Today and yesterday imports from history summaries (newest first)
+        let today_date = now.date_naive();
+        let yesterday_date = today_date.pred_opt().unwrap_or(today_date);
+
+        for summary in history.summaries().iter() {
+            let date = summary.date.date_naive();
+            if date == today_date && today_import_kwh.is_none() {
+                today_import_kwh = Some(summary.grid_import_kwh);
+            } else if date == yesterday_date && yesterday_import_kwh.is_none() {
+                yesterday_import_kwh = Some(summary.grid_import_kwh);
+            }
+
+            if today_import_kwh.is_some() && yesterday_import_kwh.is_some() {
+                break;
+            }
+        }
+    }
+
+    // Hourly profile, indexed by UTC hour
+    let hourly_consumption_profile = consumption_history
+        .and_then(|h| h.hourly_profile())
+        .map(|p| p.hourly_avg_kwh.to_vec());
+
+    if ema_kwh.is_none()
+        && today_import_kwh.is_none()
+        && yesterday_import_kwh.is_none()
+        && hourly_consumption_profile.is_none()
+    {
+        return None;
+    }
+    Some(ConsumptionStats {
+        ema_kwh,
+        ema_days,
+        today_import_kwh,
+        yesterday_import_kwh,
+        hourly_consumption_profile,
+    })
+}
+
+/// HDO schedule for the chart. The grid fees come from the pricing config, the same values
+/// `calculate_effective_prices` adds to the planner's buy price, so the chart and the plan agree.
+fn hdo_schedule_info(
+    hdo: &crate::async_systems::HdoScheduleData,
+    pricing_config: &fluxion_types::config::PricingConfig,
+) -> HdoScheduleInfo {
+    let low_tariff_czk = pricing_config.hdo_low_tariff_czk;
+    let high_tariff_czk = pricing_config.hdo_high_tariff_czk;
+    if hdo.low_tariff_periods.is_empty() {
+        warn!(
+            "⚠️ HDO schedule has 0 low tariff periods! last_updated: {:?}",
+            hdo.last_updated
+        );
+    } else {
+        debug!(
+            "📊 HDO schedule for web: {} periods, low={:.2} CZK, high={:.2} CZK",
+            hdo.low_tariff_periods.len(),
+            low_tariff_czk,
+            high_tariff_czk
+        );
+    }
+    HdoScheduleInfo {
+        low_tariff_periods: hdo.low_tariff_periods.clone(),
+        low_tariff_czk,
+        high_tariff_czk,
+        last_updated: hdo.last_updated.map(|t| t.to_rfc3339()),
+    }
+}
+
 ///Build dashboard response from ECS queries
 #[allow(clippy::too_many_arguments)]
 fn build_dashboard_response(
@@ -561,60 +657,9 @@ fn build_dashboard_response(
 ) -> WebQueryResponse {
     let now = Utc::now();
 
-    // Compute consumption statistics (EMA and imports) early for use in inverter data
-    let consumption_stats = {
-        // Determine EMA window (days) from config if available, otherwise default to 7
-        let ema_days = consumption_history_config
-            .map(|cfg| cfg.ema_days)
-            .unwrap_or(7);
-
-        let mut ema_kwh: Option<f32> = None;
-        let mut today_import_kwh: Option<f32> = None;
-        let mut yesterday_import_kwh: Option<f32> = None;
-
-        if let Some(history) = consumption_history {
-            // EMA based on historical daily consumption values
-            let values = history.consumption_values();
-            if history.has_sufficient_data(ema_days) {
-                ema_kwh = calculate_ema(&values, ema_days);
-            }
-
-            // Today and yesterday imports from history summaries (newest first)
-            let today_date = now.date_naive();
-            let yesterday_date = today_date.pred_opt().unwrap_or(today_date);
-
-            for summary in history.summaries().iter() {
-                let date = summary.date.date_naive();
-                if date == today_date && today_import_kwh.is_none() {
-                    today_import_kwh = Some(summary.grid_import_kwh);
-                } else if date == yesterday_date && yesterday_import_kwh.is_none() {
-                    yesterday_import_kwh = Some(summary.grid_import_kwh);
-                }
-
-                if today_import_kwh.is_some() && yesterday_import_kwh.is_some() {
-                    break;
-                }
-            }
-        }
-
-        // Extract hourly profile if available
-        let hourly_consumption_profile = consumption_history
-            .and_then(|h| h.hourly_profile())
-            .map(|p| p.hourly_avg_kwh.to_vec());
-
-        // Only include stats if we have at least some meaningful data
-        if ema_kwh.is_some() || today_import_kwh.is_some() || yesterday_import_kwh.is_some() {
-            Some(ConsumptionStats {
-                ema_kwh,
-                ema_days,
-                today_import_kwh,
-                yesterday_import_kwh,
-                hourly_consumption_profile,
-            })
-        } else {
-            None
-        }
-    };
+    // Compute consumption statistics (EMA, imports, hourly profile) early for use in inverter data
+    let consumption_stats =
+        compute_consumption_stats(consumption_history, consumption_history_config, now);
 
     // Extract EMA for use in inverter data
     let grid_import_ema = consumption_stats.as_ref().and_then(|stats| stats.ema_kwh);
@@ -741,6 +786,17 @@ fn build_dashboard_response(
                 // Get schedule for matching blocks with strategy info
                 let sched = schedule.single().ok();
 
+                // Per-block PV forecast aligned with the price blocks
+                let price_block_starts: Vec<DateTime<Utc>> = prices
+                    .time_block_prices
+                    .iter()
+                    .map(|b| b.block_start)
+                    .collect();
+                let solar_forecast_kwh = crate::async_systems::solar_block_forecast_covered(
+                    solar_forecast_data,
+                    &price_block_starts,
+                );
+
                 // Build price blocks with classification
                 let blocks: Vec<PriceBlockData> = prices
                     .time_block_prices
@@ -845,6 +901,15 @@ fn build_dashboard_response(
                                 }
                             });
 
+                        let block_end = block.block_start
+                            + chrono::Duration::minutes(i64::from(block.duration_minutes));
+                        let solar_forecast_kw = solar_forecast_kwh
+                            .as_ref()
+                            .and_then(|f| f.get(idx).copied().flatten())
+                            .filter(|_| block_end > now)
+                            // Forecast values are kWh per 15-min block
+                            .map(|kwh| kwh * 4.0);
+
                         PriceBlockData {
                             timestamp: block.block_start,
                             price: block.price_czk_per_kwh,
@@ -857,6 +922,7 @@ fn build_dashboard_response(
                             decision_uid,
                             debug_info,
                             is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
+                            solar_forecast_kw,
                         }
                     })
                     .collect();
@@ -1121,28 +1187,7 @@ fn build_dashboard_response(
     });
 
     // Build HDO schedule info for chart display
-    let hdo_schedule = hdo_data.map(|hdo| {
-        // Log HDO data being sent to web
-        if hdo.low_tariff_periods.is_empty() {
-            warn!(
-                "⚠️ HDO schedule has 0 low tariff periods! last_updated: {:?}",
-                hdo.last_updated
-            );
-        } else {
-            debug!(
-                "📊 HDO schedule for web: {} periods, low={:.2} CZK, high={:.2} CZK",
-                hdo.low_tariff_periods.len(),
-                hdo.low_tariff_czk,
-                hdo.high_tariff_czk
-            );
-        }
-        HdoScheduleInfo {
-            low_tariff_periods: hdo.low_tariff_periods.clone(),
-            low_tariff_czk: hdo.low_tariff_czk,
-            high_tariff_czk: hdo.high_tariff_czk,
-            last_updated: hdo.last_updated.map(|t| t.to_rfc3339()),
-        }
-    });
+    let hdo_schedule = hdo_data.map(|hdo| hdo_schedule_info(hdo, &system_config.pricing_config));
 
     // Build pricing fees from config
     let pricing_fees = Some(PricingFees {
@@ -1252,6 +1297,85 @@ fn get_topology_string(inverter_id: &str, config: &SystemConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile(hourly_avg_kwh: [f32; 24]) -> HourlyConsumptionProfile {
+        HourlyConsumptionProfile {
+            hourly_avg_kwh,
+            days_averaged: 3,
+            hourly_p75_kwh: None,
+        }
+    }
+
+    #[test]
+    fn consumption_stats_keep_profile_without_daily_summaries() {
+        let mut hourly = [0.5; 24];
+        hourly[17] = 2.0;
+        let mut history = ConsumptionHistory::new(7);
+        history.set_hourly_profile(profile(hourly));
+        assert!(history.summaries().is_empty());
+
+        let stats = compute_consumption_stats(Some(&history), None, Utc::now())
+            .expect("profile alone is enough for stats");
+        assert_eq!(stats.ema_kwh, None);
+        assert_eq!(stats.today_import_kwh, None);
+        assert_eq!(stats.yesterday_import_kwh, None);
+        assert_eq!(stats.ema_days, 7);
+        assert_eq!(stats.hourly_consumption_profile, Some(hourly.to_vec()));
+    }
+
+    #[test]
+    fn consumption_stats_none_without_any_data() {
+        let history = ConsumptionHistory::new(7);
+        assert!(compute_consumption_stats(Some(&history), None, Utc::now()).is_none());
+        assert!(compute_consumption_stats(None, None, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn consumption_stats_with_summaries_and_profile() {
+        let now = Utc::now();
+        let mut history = ConsumptionHistory::new(7);
+        history.add_summary(DailyEnergySummary {
+            date: now,
+            consumption_kwh: 10.0,
+            solar_production_kwh: 2.0,
+            grid_import_kwh: 8.0,
+        });
+        history.set_hourly_profile(profile([1.0; 24]));
+        let stats = compute_consumption_stats(Some(&history), None, now).unwrap();
+        assert_eq!(stats.today_import_kwh, Some(8.0));
+        assert_eq!(stats.hourly_consumption_profile, Some(vec![1.0; 24]));
+    }
+
+    #[test]
+    fn hdo_schedule_fees_come_from_pricing_config() {
+        // The resource may still carry the strategy's (zero) HDO fees
+        let hdo = crate::async_systems::HdoScheduleData {
+            low_tariff_periods: vec![("00:00".to_owned(), "06:00".to_owned())],
+            high_tariff_czk: 0.0,
+            low_tariff_czk: 0.0,
+            ..Default::default()
+        };
+        let pricing = fluxion_types::config::PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_owned(),
+            tomorrow_price_entity: None,
+            buy_price_entity: Some("sensor.buy_price".to_owned()),
+            use_spot_prices_to_buy: true,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.0,
+            spot_sell_fee_czk: 0.0,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_owned(),
+            hdo_low_tariff_czk: 0.5,
+            hdo_high_tariff_czk: 1.8,
+        };
+
+        let info = hdo_schedule_info(&hdo, &pricing);
+
+        assert!((info.low_tariff_czk - 0.5).abs() < f32::EPSILON);
+        assert!((info.high_tariff_czk - 1.8).abs() < f32::EPSILON);
+        assert_eq!(info.low_tariff_periods, hdo.low_tariff_periods);
+    }
 
     #[test]
     fn display_timezone_prefers_home_assistant() {

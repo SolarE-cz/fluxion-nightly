@@ -48,6 +48,11 @@ pub struct InverterConfig {
     pub inverter_type: InverterType,
     pub entity_prefix: String,
     pub topology: InverterTopology,
+    /// Read-only entity prefixes of parallel units (e.g. a SolaX parallel slave) whose PV power
+    /// and solar energy are added to this inverter's PV readings. Never written to, and not part
+    /// of battery, house-load or control reads.
+    #[serde(default)]
+    pub pv_extra_prefixes: Vec<String>,
 }
 
 /// Inverter topology for multi-inverter setups

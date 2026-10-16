@@ -75,10 +75,14 @@ pub fn spawn_solar_forecast_fetcher(
         tracing::warn!("⚠️ Home Assistant timezone unknown, forecast accuracy uses UTC days");
         chrono_tz::UTC
     });
+    // Each inverter's own PV plus its read-only parallel units (pv_extra_prefixes)
     let prefixes: Vec<&str> = system_config
         .inverters
         .iter()
-        .map(|inv| inv.entity_prefix.as_str())
+        .flat_map(|inv| {
+            std::iter::once(inv.entity_prefix.as_str())
+                .chain(inv.pv_extra_prefixes.iter().map(String::as_str))
+        })
         .collect();
     let actual_entities = actual_pv_entities(&config.actual_pv_power_entities, &prefixes);
     let mut accuracy = AccuracyMonitor::new(PathBuf::from(BIAS_STATE_PATH), tz, actual_entities);

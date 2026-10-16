@@ -10,6 +10,16 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.59] - 2026-10-16
+
+### Fixed
+- Dashboard price chart: HDO tariff periods show as a strip when a block's grid fee is 0, and the chart's fee bars use the same pricing HDO fees the planner adds (they came from the WinterAdaptiveV3 settings).
+- Avg Consumption works when there are no daily import summaries, and is drawn at the right hours (the profile is per UTC hour).
+- PV history is averaged into 15-minute blocks, so the PV line fills in; new Solar Forecast line for the remaining blocks, on by default.
+
+### Added
+- `inverters[].pv_extra_prefixes`: read-only PV of parallel units (e.g. a SolaX Ultra slave) added to the inverter's PV power and solar energy for the dashboard and forecast accuracy. Nothing is ever written to these units, and their battery, grid, house-load and mode sensors are not read.
+
 ## [0.2.58] - 2026-10-16
 
 ### Added

@@ -81,7 +81,7 @@ pub struct HistoricalData {
     pub grid_import_today_kwh: Option<f32>,
     /// Total household consumption today (kWh)
     pub consumption_today_kwh: Option<f32>,
-    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = UTC hour of day)
     /// Averaged over last 7 days of historical data
     #[serde(default)]
     pub hourly_consumption_profile: Option<Vec<f32>>,

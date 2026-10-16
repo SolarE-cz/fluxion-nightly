@@ -1471,6 +1471,11 @@
                 <span><div class="legend-box pv-generation"></div> PV Generation ({{ inv.pv_power_w }} W)</span>
                 {% endif %}
                 <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px;">
+                    <input type="checkbox" id="toggleSolarForecast" style="cursor: pointer;" checked>
+                    <div class="legend-box" style="background: transparent; border: 2px dashed rgba(255, 213, 79, 0.95);"></div>
+                    Solar Forecast
+                </label>
+                <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px;">
                     <input type="checkbox" id="toggleConsumptionProfile" style="cursor: pointer;">
                     <div class="legend-box" style="background: rgba(0, 188, 212, 0.15); border: 2px solid rgba(0, 188, 212, 0.7);"></div>
                     Avg Consumption
@@ -1482,8 +1487,288 @@
         </div>
     </div>
     <script>
+        // Shared chart series logic: used on first render and by every chart refresh.
+        window.FluxionChartSeries = (function() {
+            const LABELS = {
+                hdoStrip: 'HDO Tariff',
+                pv: 'PV Generation (kW)',
+                forecast: 'Solar Forecast (kW)',
+                consumption: 'Avg Consumption (kW)'
+            };
+            const PREFS = {
+                forecast: { key: 'fluxion-chart-show-solar-forecast', fallback: true },
+                consumption: { key: 'fluxion-chart-show-consumption', fallback: false }
+            };
+            // Strip height as a fraction of the chart height (hidden 0..1 axis)
+            const HDO_STRIP_HEIGHT = 0.035;
+
+            function readPref(name) {
+                const pref = PREFS[name];
+                try {
+                    const v = window.localStorage.getItem(pref.key);
+                    if (v === 'true') return true;
+                    if (v === 'false') return false;
+                } catch (e) { /* storage unavailable */ }
+                return pref.fallback;
+            }
+
+            function writePref(name, value) {
+                try {
+                    window.localStorage.setItem(PREFS[name].key, value ? 'true' : 'false');
+                } catch (e) { /* storage unavailable */ }
+            }
+
+            function hasValues(arr) {
+                return Array.isArray(arr) && arr.some(v => v !== null && v !== undefined);
+            }
+
+            function tariffColor(type, isHistorical, alpha) {
+                const opacity = alpha !== undefined ? alpha : (isHistorical ? 0.4 : 0.8);
+                return type === 'low'
+                    ? `rgba(255, 235, 59, ${opacity})`   // Yellow for low tariff
+                    : `rgba(244, 67, 54, ${opacity})`;   // Red for high tariff
+            }
+
+            // Profile is indexed by UTC hour; map each block by its UTC start, not its local label
+            function consumptionData(d) {
+                const profile = d.hourly_consumption_profile;
+                if (!Array.isArray(profile) || profile.length !== 24 || !Array.isArray(d.block_starts_utc)) return null;
+                const data = d.block_starts_utc.map(s => {
+                    const t = Date.parse(s);
+                    return isNaN(t) ? null : profile[new Date(t).getUTCHours()];
+                });
+                return hasValues(data) ? data : null;
+            }
+
+            function pvData(d) {
+                return hasValues(d.pv_actual_kw) ? d.pv_actual_kw : null;
+            }
+
+            function forecastData(d) {
+                return hasValues(d.solar_forecast_kw) ? d.solar_forecast_kw : null;
+            }
+
+            // Floating bars along the bottom for blocks whose tariff is known but whose
+            // grid fee is 0 (a fee > 0 is already drawn as the stacked Grid Fee bar)
+            function hdoStripData(d) {
+                if (!d.tariff_known || !Array.isArray(d.tariff_types)) return null;
+                const fees = d.grid_fees || [];
+                const data = d.tariff_types.map((t, i) => (fees[i] > 0 ? null : [0, HDO_STRIP_HEIGHT]));
+                return hasValues(data) ? data : null;
+            }
+
+            function hdoStripColors(d) {
+                return (d.tariff_types || []).map((t, i) => tariffColor(t, d.is_historical && d.is_historical[i]));
+            }
+
+            function buildDataset(name, d, data) {
+                if (name === 'hdoStrip') {
+                    return {
+                        label: LABELS.hdoStrip,
+                        data: data,
+                        type: 'bar',
+                        backgroundColor: hdoStripColors(d),
+                        borderWidth: 0,
+                        barPercentage: 1.0,
+                        categoryPercentage: 1.0,
+                        yAxisID: 'yHdo',
+                        // Same bar group as the price bars (no side-by-side split); stacking is
+                        // per value axis, so it does not stack onto the prices
+                        stack: 'price',
+                        order: 0
+                    };
+                }
+                if (name === 'pv') {
+                    return {
+                        label: LABELS.pv,
+                        data: data,
+                        type: 'line',
+                        borderColor: 'rgba(255, 193, 7, 0.8)',
+                        backgroundColor: 'rgba(255, 193, 7, 0.15)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        pointHoverRadius: 5,
+                        pointBackgroundColor: 'rgba(255, 193, 7, 1)',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 1,
+                        fill: 'origin',
+                        tension: 0.4,
+                        yAxisID: 'y2',
+                        order: 3,
+                        spanGaps: true // bridge a block the 15-min sampler skipped
+                    };
+                }
+                if (name === 'forecast') {
+                    return {
+                        label: LABELS.forecast,
+                        data: data,
+                        type: 'line',
+                        borderColor: 'rgba(255, 213, 79, 0.95)',
+                        backgroundColor: 'rgba(255, 213, 79, 0.0)',
+                        borderWidth: 2,
+                        borderDash: [6, 4],
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        fill: false,
+                        tension: 0.3,
+                        yAxisID: 'y2',
+                        order: 1,
+                        spanGaps: false,
+                        hidden: !readPref('forecast')
+                    };
+                }
+                // consumption
+                return {
+                    label: LABELS.consumption,
+                    data: data,
+                    type: 'line',
+                    borderColor: 'rgba(0, 188, 212, 0.7)',
+                    backgroundColor: 'rgba(0, 188, 212, 0.1)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    fill: 'origin',
+                    stepped: 'before',
+                    yAxisID: 'y2',
+                    order: 4,
+                    hidden: !readPref('consumption')
+                };
+            }
+
+            function seriesData(name, d) {
+                if (name === 'hdoStrip') return hdoStripData(d);
+                if (name === 'pv') return pvData(d);
+                if (name === 'forecast') return forecastData(d);
+                return consumptionData(d);
+            }
+
+            const NAMES = ['hdoStrip', 'pv', 'forecast', 'consumption'];
+
+            // Datasets for the first render
+            function datasets(d) {
+                const out = [];
+                NAMES.forEach(name => {
+                    const data = seriesData(name, d);
+                    if (data) out.push(buildDataset(name, d, data));
+                });
+                return out;
+            }
+
+            function y2Visible(chart) {
+                return chart.data.datasets.some((ds, i) =>
+                    ds.yAxisID === 'y2' && chart.isDatasetVisible(i) && hasValues(ds.data));
+            }
+
+            function y2VisibleFor(d) {
+                return !!(pvData(d)
+                    || (forecastData(d) && readPref('forecast'))
+                    || (consumptionData(d) && readPref('consumption')));
+            }
+
+            // Bring the series of an existing chart in line with fresh chart data:
+            // update, add (when missing at first render) or remove each one.
+            function sync(chart, d) {
+                NAMES.forEach(name => {
+                    const data = seriesData(name, d);
+                    const idx = chart.data.datasets.findIndex(ds => ds.label === LABELS[name]);
+                    if (!data) {
+                        if (idx >= 0) chart.data.datasets.splice(idx, 1);
+                        return;
+                    }
+                    if (idx >= 0) {
+                        const ds = chart.data.datasets[idx];
+                        ds.data = data;
+                        if (name === 'hdoStrip') ds.backgroundColor = hdoStripColors(d);
+                    } else {
+                        chart.data.datasets.push(buildDataset(name, d, data));
+                    }
+                });
+                if (chart.options.scales && chart.options.scales.y2) {
+                    chart.options.scales.y2.display = y2Visible(chart);
+                }
+                // Series added after first render need the top legend too
+                const legend = chart.options.plugins && chart.options.plugins.legend;
+                if (legend && chart.data.datasets.some(ds => ds.yAxisID === 'y2')) {
+                    legend.display = true;
+                }
+                syncCheckboxes(chart);
+            }
+
+            function setVisible(chart, name, visible) {
+                writePref(name, visible);
+                if (!chart) return;
+                const idx = chart.data.datasets.findIndex(x => x.label === LABELS[name]);
+                if (idx >= 0) {
+                    chart.data.datasets[idx].hidden = !visible;
+                    chart.setDatasetVisibility(idx, visible);
+                }
+                if (chart.options.scales && chart.options.scales.y2) {
+                    chart.options.scales.y2.display = y2Visible(chart);
+                }
+                chart.update('none');
+            }
+
+            const CHECKBOXES = { forecast: 'toggleSolarForecast', consumption: 'toggleConsumptionProfile' };
+
+            function syncCheckboxes(chart) {
+                Object.keys(CHECKBOXES).forEach(name => {
+                    const box = document.getElementById(CHECKBOXES[name]);
+                    if (!box) return;
+                    box.checked = readPref(name);
+                    const present = chart && chart.data.datasets.some(ds => ds.label === LABELS[name]);
+                    const label = box.closest('label');
+                    if (label) label.style.opacity = present ? '1' : '0.5';
+                    box.title = present ? '' : 'No data yet';
+                });
+            }
+
+            function wireCheckboxes() {
+                Object.keys(CHECKBOXES).forEach(name => {
+                    const box = document.getElementById(CHECKBOXES[name]);
+                    if (!box || box.dataset.wired) return;
+                    box.dataset.wired = '1';
+                    box.addEventListener('change', function() {
+                        setVisible(window.priceChartInstance, name, this.checked);
+                    });
+                });
+                syncCheckboxes(window.priceChartInstance);
+            }
+
+            // Chart legend click on a series: remember it like the checkbox does and refit y2
+            function legendToggled(chart, datasetIndex) {
+                const ds = chart.data.datasets[datasetIndex];
+                if (!ds) return;
+                const visible = chart.isDatasetVisible(datasetIndex);
+                Object.keys(CHECKBOXES).forEach(name => {
+                    if (ds.label === LABELS[name]) {
+                        ds.hidden = !visible;
+                        writePref(name, visible);
+                    }
+                });
+                if (chart.options.scales && chart.options.scales.y2) {
+                    chart.options.scales.y2.display = y2Visible(chart);
+                }
+                syncCheckboxes(chart);
+                chart.update('none');
+            }
+
+            // Tooltip line naming the tariff of a block (used when the fee is 0)
+            function tariffLabel(type) {
+                return type === 'low' ? '🟡 Low' : '🔴 High';
+            }
+
+            return {
+                LABELS, HDO_STRIP_HEIGHT, datasets, sync, y2VisibleFor, wireCheckboxes, legendToggled,
+                consumptionData, pvData, forecastData, hdoStripData, tariffColor, tariffLabel,
+                readPref, writePref
+            };
+        })();
+    </script>
+    <script>
         (function() {
             const chartData = {{ chart_data_json|safe }};
+            window.priceChartData = chartData;
+            const initialChartData = chartData;
             {% if let Some(inv) = inverters.first() %}
             const currentBatterySoc = {{ inv.battery_soc }};
             {% else %}
@@ -1660,74 +1945,11 @@
                     });
                 }
 
-                // Add PV generation history as area chart if available
-                console.log('☀️ [CHART] PV generation history:', chartData.pv_generation_history);
-                console.log('☀️ [CHART] PV generation history length:', chartData.pv_generation_history ? chartData.pv_generation_history.length : 0);
-
-                if (chartData.pv_generation_history && chartData.pv_generation_history.length > 0) {
-                    console.log('☀️ [CHART] Processing', chartData.pv_generation_history.length, 'PV history points');
-                    console.log('☀️ [CHART] First PV point:', chartData.pv_generation_history[0]);
-                    console.log('☀️ [CHART] Last PV point:', chartData.pv_generation_history[chartData.pv_generation_history.length - 1]);
-
-                    // Create a mapping from label to PV power
-                    const pvMap = new Map();
-                    chartData.pv_generation_history.forEach(point => {
-                        pvMap.set(point.label, point.power_w);
-                    });
-
-                    console.log('☀️ [CHART] PV map has', pvMap.size, 'entries');
-
-                    // Map PV history to chart labels (fill nulls where no data)
-                    const pvData = chartData.labels.map(label => pvMap.get(label) || null);
-                    const nonNullPvCount = pvData.filter(v => v !== null).length;
-                    console.log('☀️ [CHART] Mapped PV data: ', nonNullPvCount, 'non-null values out of', pvData.length);
-
-                    // Convert watts to kilowatts for better display scale
-                    const pvDataKw = pvData.map(v => v !== null ? v / 1000 : null);
-
-                    datasets.push({
-                        label: 'PV Generation (kW)',
-                        data: pvDataKw,
-                        type: 'line',
-                        borderColor: 'rgba(255, 193, 7, 0.8)',
-                        backgroundColor: 'rgba(255, 193, 7, 0.15)',
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        pointHoverRadius: 5,
-                        pointBackgroundColor: 'rgba(255, 193, 7, 1)',
-                        pointBorderColor: '#fff',
-                        pointBorderWidth: 1,
-                        fill: 'origin', // Fill area under the line
-                        tension: 0.4, // Smooth curves
-                        yAxisID: 'y2',
-                        order: 3, // Behind the price bars
-                        spanGaps: true
-                    });
-                }
-
-                // Add hourly consumption profile if available (hidden by default, toggled by checkbox)
-                if (chartData.hourly_consumption_profile && chartData.hourly_consumption_profile.length === 24) {
-                    const profileData = chartData.labels.map(label => {
-                        const match = label.match(/(\d{2}):(\d{2})$/);
-                        if (match) return chartData.hourly_consumption_profile[parseInt(match[1], 10)];
-                        return null;
-                    });
-                    datasets.push({
-                        label: 'Avg Consumption (kW)',
-                        data: profileData,
-                        type: 'line',
-                        borderColor: 'rgba(0, 188, 212, 0.7)',
-                        backgroundColor: 'rgba(0, 188, 212, 0.1)',
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        pointHoverRadius: 4,
-                        fill: 'origin',
-                        stepped: 'before',
-                        yAxisID: 'y2',
-                        order: 4,
-                        hidden: true
-                    });
-                }
+                // PV history (bucketed per block by UTC instant), solar forecast, average
+                // consumption (UTC-hour profile) and the HDO tariff strip for zero-fee blocks
+                const seriesDatasets = window.FluxionChartSeries.datasets(chartData);
+                datasets.push(...seriesDatasets);
+                const hasPowerSeries = seriesDatasets.some(ds => ds.yAxisID === 'y2');
 
                 window.priceChartInstance = new Chart(ctx, {
                     type: 'bar',
@@ -1744,14 +1966,18 @@
                         },
                         plugins: {
                             legend: {
-                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || (chartData.pv_generation_history && chartData.pv_generation_history.length > 0),
+                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || hasPowerSeries,
                                 position: 'top',
                                 labels: {
                                     color: '#999',
                                     filter: function(item) {
                                         // Show battery, PV, and consumption related legends
-                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV') || item.text.includes('Consumption');
+                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV') || item.text.includes('Consumption') || item.text.includes('Forecast');
                                     }
+                                },
+                                onClick: function(e, item, legend) {
+                                    Chart.defaults.plugins.legend.onClick.call(this, e, item, legend);
+                                    window.FluxionChartSeries.legendToggled(legend.chart, item.datasetIndex);
                                 }
                             },
                             tooltip: {
@@ -1765,9 +1991,17 @@
                                 callbacks: {
                                     title: (items) => items[0].label,
                                     label: (context) => {
-                                        // Skip HDO grid fee dataset in tooltip (shown in main price tooltip)
-                                        if (context.dataset.label === 'Grid Fee (HDO)') {
+                                        // Latest data (refreshes merge into it), first render as fallback
+                                        const chartData = window.priceChartData || initialChartData;
+                                        // Skip HDO grid fee dataset and tariff strip in tooltip (shown in main price tooltip)
+                                        if (context.dataset.label === 'Grid Fee (HDO)' || context.dataset.label === window.FluxionChartSeries.LABELS.hdoStrip) {
                                             return null; // Will be shown in the main price tooltip
+                                        }
+                                        if (context.dataset.type === 'line' && (context.parsed.y === null || context.parsed.y === undefined || isNaN(context.parsed.y))) {
+                                            return null;
+                                        }
+                                        if (context.dataset.label === window.FluxionChartSeries.LABELS.forecast) {
+                                            return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} kW`;
                                         }
                                         if (context.dataset.label.includes('Battery') || context.dataset.label.includes('SOC') || context.dataset.label.includes('Predicted')) {
                                             return `${context.dataset.label}: ${context.parsed.y.toFixed(1)}%`;
@@ -1805,8 +2039,10 @@
                                             lines.push('═══ Price Breakdown ═══');
                                             lines.push(`  Spot Price: ${spotPrice.toFixed(3)} Kč`);
                                             if (gridFee > 0) {
-                                                const tariffLabel = tariffType === 'low' ? '🟡 Low' : '🔴 High';
+                                                const tariffLabel = window.FluxionChartSeries.tariffLabel(tariffType);
                                                 lines.push(`  Grid Fee: ${gridFee.toFixed(2)} Kč (${tariffLabel})`);
+                                            } else if (chartData.tariff_known && chartData.tariff_types) {
+                                                lines.push(`  HDO Tariff: ${window.FluxionChartSeries.tariffLabel(tariffType)}`);
                                             }
                                             if (buyFee > 0) {
                                                 lines.push(`  Buy/Dist: ${buyFee.toFixed(2)} Kč`);
@@ -1931,20 +2167,26 @@
                                 },
                                 position: 'right'
                             },
+                            yHdo: {
+                                // Hidden 0..1 axis for the HDO tariff strip along the bottom
+                                display: false,
+                                stacked: false,
+                                min: 0,
+                                max: 1
+                            },
                             y2: {
-                                display: (chartData.pv_generation_history && chartData.pv_generation_history.length > 0),
+                                display: window.FluxionChartSeries.y2VisibleFor(chartData),
                                 beginAtZero: true,
                                 title: {
                                     display: true,
-                                    text: 'PV Power (kW)',
+                                    text: 'Power (kW)',
                                     color: 'rgba(255, 193, 7, 0.9)'
                                 },
                                 ticks: { color: 'rgba(255, 193, 7, 0.8)' },
                                 grid: {
                                     display: false // Don't show grid lines to avoid clutter
                                 },
-                                position: 'right',
-                                offset: true
+                                position: 'right'
                             },
                             x: {
                                 stacked: true,  // Enable stacking for price breakdown
@@ -1967,21 +2209,8 @@
                 });
             }
 
-            // Wire checkbox to toggle consumption profile visibility
-            const toggleCheckbox = document.getElementById('toggleConsumptionProfile');
-            if (toggleCheckbox && window.priceChartInstance) {
-                toggleCheckbox.addEventListener('change', function() {
-                    const chart = window.priceChartInstance;
-                    const dsIndex = chart.data.datasets.findIndex(d => d.label === 'Avg Consumption (kW)');
-                    if (dsIndex >= 0) {
-                        chart.data.datasets[dsIndex].hidden = !this.checked;
-                        const pvDs = chart.data.datasets.find(d => d.label === 'PV Generation (kW)');
-                        const pvVisible = pvDs && !pvDs.hidden;
-                        chart.options.scales.y2.display = this.checked || pvVisible;
-                        chart.update('none');
-                    }
-                });
-            }
+            // Wire the Solar Forecast / Avg Consumption checkboxes (state kept in localStorage)
+            window.FluxionChartSeries.wireCheckboxes();
         })();
     </script>
     {% else %}
@@ -2048,14 +2277,11 @@
                             currentSocDataset.data = data.labels.map(() => data.current_battery_soc);
                         }
 
-                        // Update consumption profile dataset if present
-                        const consumptionDataset = findDataset('Avg Consumption (kW)');
-                        if (consumptionDataset && data.hourly_consumption_profile && data.hourly_consumption_profile.length === 24) {
-                            consumptionDataset.data = data.labels.map(label => {
-                                const match = label.match(/(\d{2}):(\d{2})$/);
-                                if (match) return data.hourly_consumption_profile[parseInt(match[1], 10)];
-                                return null;
-                            });
+                        // PV history, solar forecast, avg consumption and HDO tariff strip
+                        // (added here too when they were missing at first render)
+                        window.priceChartData = Object.assign({}, window.priceChartData, data);
+                        if (window.FluxionChartSeries) {
+                            window.FluxionChartSeries.sync(window.priceChartInstance, data);
                         }
 
                         // Update NOW line
@@ -3164,6 +3390,12 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                         const currentSocDataset = findDataset('Current SOC (%)');
                         if (currentSocDataset && chartData.current_battery_soc) {
                             currentSocDataset.data = chartData.labels.map(() => chartData.current_battery_soc);
+                        }
+
+                        // PV history, solar forecast, avg consumption and HDO tariff strip
+                        window.priceChartData = Object.assign({}, window.priceChartData, chartData);
+                        if (window.FluxionChartSeries) {
+                            window.FluxionChartSeries.sync(window.priceChartInstance, chartData);
                         }
 
                         // Update NOW line

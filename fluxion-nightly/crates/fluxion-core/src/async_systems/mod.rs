@@ -225,6 +225,16 @@ pub fn solar_block_forecast(
     data: Option<&SolarForecastData>,
     block_starts: &[DateTime<Utc>],
 ) -> Option<Vec<f32>> {
+    solar_block_forecast_covered(data, block_starts)
+        .map(|blocks| blocks.into_iter().map(|kwh| kwh.unwrap_or(0.0)).collect())
+}
+
+/// PV forecast (kWh per 15-min forecast block) for each block start, `None` where no forecast
+/// key covers the start. Returns `None` when no per-block forecast is available.
+pub fn solar_block_forecast_covered(
+    data: Option<&SolarForecastData>,
+    block_starts: &[DateTime<Utc>],
+) -> Option<Vec<Option<f32>>> {
     let data = data?;
     if data.block_kwh.is_empty() {
         return None;
@@ -242,7 +252,6 @@ pub fn solar_block_forecast(
                     .next_back()
                     .filter(|(key, _)| *start - **key < chrono::Duration::minutes(60))
                     .map(|(_, kwh)| *kwh)
-                    .unwrap_or(0.0)
             })
             .collect(),
     )
@@ -321,6 +330,16 @@ mod solar_block_forecast_tests {
         let values = solar_block_forecast(Some(&forecast), &[utc(10, 0), utc(10, 15)]).unwrap();
 
         assert_eq!(values, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn test_covered_forecast_marks_uncovered_blocks_none() {
+        let forecast = data(vec![(utc(10, 0), 0.1), (utc(10, 15), 0.2)]);
+        let starts = [utc(9, 45), utc(10, 0), utc(10, 15), utc(11, 15)];
+
+        let values = solar_block_forecast_covered(Some(&forecast), &starts).unwrap();
+
+        assert_eq!(values, vec![None, Some(0.1), Some(0.2), None]);
     }
 
     #[test]

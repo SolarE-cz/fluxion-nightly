@@ -25,6 +25,11 @@ configuration:
     name: Topology
     description: >-
       Inverter role in multi-inverter setups (independent, master, slave).
+  pv_extra_prefixes:
+    name: Extra PV Prefixes (read-only)
+    description: >-
+      Entity prefixes of parallel units whose PV power and solar energy are
+      added to this inverter's PV. They are only read, never controlled.
   min_battery_soc:
     name: Minimum Battery SOC
     description: >-

@@ -263,7 +263,7 @@ pub struct EvaluationContext<'a> {
     /// Tracks cost basis of energy currently stored in battery
     pub battery_avg_charge_price_czk_per_kwh: f32,
 
-    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = UTC hour of day)
     /// Averaged over last 7 days of historical data
     /// Enables strategies to understand when energy demand is highest
     pub hourly_consumption_profile: Option<&'a [f32; 24]>,

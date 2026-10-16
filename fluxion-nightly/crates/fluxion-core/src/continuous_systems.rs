@@ -1512,6 +1512,7 @@ mod levers_execution_tests {
                 inverter_type: fluxion_types::InverterType::Solax,
                 entity_prefix: "solax".to_string(),
                 topology: InverterTopology::Independent,
+                pv_extra_prefixes: Vec::new(),
             }],
             pricing_config: PricingConfig {
                 spot_price_entity: "sensor.spot_price".to_string(),

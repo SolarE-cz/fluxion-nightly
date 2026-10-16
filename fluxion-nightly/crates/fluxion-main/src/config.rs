@@ -113,6 +113,12 @@ pub struct InverterConfig {
     /// Accepts both "master" (config.toml) and "master_id" (HA addon options.json)
     #[serde(alias = "master_id")]
     pub master: Option<String>,
+
+    /// Read-only entity prefixes of parallel units whose PV power and solar energy are added to
+    /// this inverter's PV (e.g. a SolaX parallel slave `solax_81`). Nothing is ever written to
+    /// them, and battery, house-load and mode reads stay this inverter's own.
+    #[serde(default)]
+    pub pv_extra_prefixes: Vec<String>,
 }
 
 /// Pricing configuration
@@ -1536,6 +1542,7 @@ impl Default for AppConfig {
                 topology: "independent".to_string(),
                 slaves: None,
                 master: None,
+                pv_extra_prefixes: Vec::new(),
             }],
             pricing: PricingConfig {
                 spot_price_entity: "sensor.current_spot_electricity_price_15min".to_string(),
@@ -1670,6 +1677,30 @@ impl AppConfig {
     }
 
     /// Validate configuration with detailed error reporting
+    /// Why a `pv_extra_prefixes` entry is not allowed, if it is not: it must not name a
+    /// configured inverter (those are controlled; extras are read-only).
+    fn pv_extra_prefix_error(&self, extra: &str) -> Option<String> {
+        self.inverters
+            .iter()
+            .find(|inv| inv.id == extra || inv.entity_prefix == extra)
+            .map(|inv| {
+                format!(
+                    "PV extra prefix '{extra}' is the configured inverter '{}'; extras must be read-only parallel units",
+                    inv.id
+                )
+            })
+    }
+
+    /// Non-empty, trimmed `pv_extra_prefixes` of an inverter
+    pub fn pv_extra_prefixes(inverter: &InverterConfig) -> Vec<String> {
+        inverter
+            .pv_extra_prefixes
+            .iter()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
     pub fn validate_detailed(&self) -> ValidationResult {
         let mut result = ValidationResult::success();
 
@@ -1693,6 +1724,11 @@ impl AppConfig {
                     format!("{prefix}.entity_prefix"),
                     "Entity prefix cannot be empty",
                 );
+            }
+            for extra in Self::pv_extra_prefixes(inverter) {
+                if let Some(error) = self.pv_extra_prefix_error(&extra) {
+                    result.add_error(format!("{prefix}.pv_extra_prefixes"), error);
+                }
             }
 
             // Validate topology relationships
@@ -1858,6 +1894,11 @@ impl AppConfig {
             }
             if inverter.entity_prefix.is_empty() {
                 anyhow::bail!("Inverter '{}' has empty entity_prefix", inverter.id);
+            }
+            for extra in Self::pv_extra_prefixes(inverter) {
+                if let Some(error) = self.pv_extra_prefix_error(&extra) {
+                    anyhow::bail!("Inverter '{}': {}", inverter.id, error);
+                }
             }
 
             // Validate topology relationships
@@ -2035,6 +2076,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         },
                         _ => fluxion_core::InverterTopology::Independent,
                     },
+                    pv_extra_prefixes: AppConfig::pv_extra_prefixes(inv),
                 })
                 .collect(),
             pricing_config: fluxion_core::PricingConfig {
@@ -2921,6 +2963,7 @@ mod tests {
                     topology: "master".to_string(),
                     slaves: Some(vec!["slave_1".to_string()]),
                     master: None,
+                    pv_extra_prefixes: Vec::new(),
                 },
                 InverterConfig {
                     id: "slave_1".to_string(),
@@ -2929,6 +2972,7 @@ mod tests {
                     topology: "slave".to_string(),
                     slaves: None,
                     master: Some("master".to_string()),
+                    pv_extra_prefixes: Vec::new(),
                 },
             ],
             ..AppConfig::default()
@@ -3115,6 +3159,69 @@ mod tests {
             config.validate().is_ok(),
             "HA addon master/slave config should be valid"
         );
+    }
+
+    #[test]
+    fn test_ha_addon_pv_extra_prefixes() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "solax_80",
+                    "vendor": "solax-ultra",
+                    "entity_prefix": "solax_80",
+                    "topology": "independent",
+                    "pv_extra_prefixes": ["solax_81", " ", ""]
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.price",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            },
+            "control": {
+                "maximum_export_power_w": 5000,
+                "force_charge_hours": 2,
+                "force_discharge_hours": 1,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(ha_addon_json).expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(config.validate_detailed().valid);
+
+        let system: fluxion_core::SystemConfig = config.into();
+        // Read-only extras only; the parallel unit is not a configured (controlled) inverter
+        assert_eq!(system.inverters.len(), 1);
+        assert_eq!(system.inverters[0].pv_extra_prefixes, vec!["solax_81"]);
+        assert_eq!(
+            system.inverters[0].topology,
+            fluxion_core::InverterTopology::Independent
+        );
+    }
+
+    #[test]
+    fn test_pv_extra_prefixes_default_empty() {
+        let config = AppConfig::default();
+        assert!(config.inverters[0].pv_extra_prefixes.is_empty());
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(system.inverters[0].pv_extra_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_pv_extra_prefix_may_not_name_a_configured_inverter() {
+        let mut config = AppConfig::default();
+        let own_prefix = config.inverters[0].entity_prefix.clone();
+        config.inverters[0].pv_extra_prefixes = vec![own_prefix];
+        assert!(config.validate().is_err());
+        assert!(!config.validate_detailed().valid);
     }
 }
 

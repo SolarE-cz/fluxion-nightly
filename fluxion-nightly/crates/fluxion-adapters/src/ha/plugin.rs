@@ -877,16 +877,10 @@ pub fn poll_hdo_channel(
             resource.low_tariff_periods = message.low_tariff_periods;
             resource.last_updated = Some(chrono::Utc::now());
 
-            // Update tariff rates from config
+            // Tariff rates from the pricing config, the ones the planner's effective price uses
             if let Some(ref config) = system_config {
-                resource.high_tariff_czk = config
-                    .strategies_config
-                    .winter_adaptive_v3
-                    .hdo_high_tariff_czk;
-                resource.low_tariff_czk = config
-                    .strategies_config
-                    .winter_adaptive_v3
-                    .hdo_low_tariff_czk;
+                resource.high_tariff_czk = config.pricing_config.hdo_high_tariff_czk;
+                resource.low_tariff_czk = config.pricing_config.hdo_low_tariff_czk;
             }
         }
     }

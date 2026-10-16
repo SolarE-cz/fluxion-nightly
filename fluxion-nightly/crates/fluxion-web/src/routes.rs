@@ -93,9 +93,18 @@ pub struct ChartData {
     pub buy_fees: Vec<f32>,
     /// Total effective price: spot + grid_fee + buy_fees
     pub effective_prices: Vec<f32>,
-    /// Hourly consumption profile (24 values, kWh per hour, index = hour of day)
+    /// Hourly consumption profile (24 values, kWh per hour, index = UTC hour of day)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hourly_consumption_profile: Option<Vec<f32>>,
+    /// True when an HDO schedule with low-tariff periods is known, so `tariff_types` is real
+    /// (otherwise every block defaults to "high")
+    pub tariff_known: bool,
+    /// Actual PV power (kW), mean of the PV history samples inside each block; `None` where the
+    /// block has no samples. Aligned with `labels`.
+    pub pv_actual_kw: Vec<Option<f32>>,
+    /// Forecast PV power (kW) for blocks that have not ended yet; `None` elsewhere.
+    /// Aligned with `labels`.
+    pub solar_forecast_kw: Vec<Option<f32>>,
 }
 
 /// Live data template (for SSE updates only)
@@ -248,9 +257,11 @@ impl DashboardTemplate {
             let mut tariff_types = Vec::new();
             let mut buy_fees = Vec::new();
             let mut effective_prices = Vec::new();
+            let mut solar_forecast_kw = Vec::new();
 
             // Get HDO and pricing fee info from response
             let hdo_schedule = response.hdo_schedule.as_ref();
+            let tariff_known = hdo_schedule.is_some_and(|hdo| !hdo.low_tariff_periods.is_empty());
             let pricing_fees = response.pricing_fees.as_ref();
 
             // Get current time in the appropriate timezone for the "now" marker
@@ -288,6 +299,7 @@ impl DashboardTemplate {
                 is_historical_vec.push(block.is_historical); // Track if block is past (regenerated schedule)
                 reasons.push(block.reason.clone());
                 decision_uids.push(block.decision_uid.clone());
+                solar_forecast_kw.push(block.solar_forecast_kw);
 
                 // Map mode for display
                 let mode = match block.block_type.as_str() {
@@ -437,6 +449,14 @@ impl DashboardTemplate {
 
             let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
 
+            // Bucket PV history into the chart blocks by UTC instant
+            let block_starts: Vec<DateTime<Utc>> =
+                price_data.blocks.iter().map(|b| b.timestamp).collect();
+            let pv_actual_kw = bucket_pv_history_kw(
+                &block_starts,
+                response.pv_generation_history.as_deref().unwrap_or(&[]),
+            );
+
             // Convert PV generation history to chart format
             let pv_generation_history = response.pv_generation_history.as_ref().map_or_else(
                 || {
@@ -515,6 +535,9 @@ impl DashboardTemplate {
                     buy_fees,
                     effective_prices,
                     hourly_consumption_profile: hourly_consumption_profile.clone(),
+                    tariff_known,
+                    pv_actual_kw,
+                    solar_forecast_kw,
                 },
             }
         });
@@ -545,6 +568,39 @@ impl DashboardTemplate {
             user_control,
         }
     }
+}
+
+/// Default block length when the next block start does not give one
+const DEFAULT_BLOCK_MINUTES: i64 = 15;
+
+/// Mean PV power (kW) of the history samples inside each block, matched by UTC instant.
+/// Block `i` covers `[starts[i], starts[i + 1])`; the last block (or one followed by a gap
+/// longer than an hour) covers 15 minutes. `None` where a block has no samples.
+pub fn bucket_pv_history_kw(
+    block_starts: &[DateTime<Utc>],
+    history: &[fluxion_core::web_bridge::PvGenerationHistoryPoint],
+) -> Vec<Option<f32>> {
+    let default_len = chrono::Duration::minutes(DEFAULT_BLOCK_MINUTES);
+    let mut sums = vec![(0.0_f32, 0.0_f32); block_starts.len()];
+    for point in history {
+        // Last block starting at or before the sample
+        let idx = block_starts.partition_point(|start| *start <= point.timestamp);
+        let Some(i) = idx.checked_sub(1) else {
+            continue;
+        };
+        let end = block_starts
+            .get(i + 1)
+            .copied()
+            .filter(|next| *next - block_starts[i] <= chrono::Duration::hours(1))
+            .unwrap_or(block_starts[i] + default_len);
+        if point.timestamp < end {
+            sums[i].0 += point.power_w;
+            sums[i].1 += 1.0;
+        }
+    }
+    sums.into_iter()
+        .map(|(sum, count)| (count > 0.0).then(|| sum / count / 1000.0))
+        .collect()
 }
 
 /// Check if a time (HH:MM format) falls within any of the low tariff periods
@@ -738,6 +794,44 @@ mod tests {
         assert!(block_in_low_tariff(at(13), Some(prague), &periods));
         assert!(!block_in_low_tariff(at(14), Some(prague), &periods));
         assert!(block_in_low_tariff(at(16), Some(prague), &periods));
+    }
+
+    fn pv(ts: &str, power_w: f32) -> fluxion_core::web_bridge::PvGenerationHistoryPoint {
+        fluxion_core::web_bridge::PvGenerationHistoryPoint {
+            timestamp: ts.parse().unwrap(),
+            power_w,
+        }
+    }
+
+    #[test]
+    fn pv_history_is_bucketed_into_blocks_by_utc_instant() {
+        let starts: Vec<DateTime<Utc>> = [
+            "2026-10-16T10:00:00Z",
+            "2026-10-16T10:15:00Z",
+            "2026-10-16T10:30:00Z",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        // Samples at arbitrary minutes, as the PV history records them
+        let history = [
+            pv("2026-10-16T09:59:00Z", 9000.0), // before the first block: dropped
+            pv("2026-10-16T10:02:17Z", 1000.0),
+            pv("2026-10-16T10:11:40Z", 3000.0),
+            pv("2026-10-16T10:37:05Z", 1500.0),
+            pv("2026-10-16T10:45:00Z", 9000.0), // after the last block's 15 min: dropped
+        ];
+
+        let kw = bucket_pv_history_kw(&starts, &history);
+
+        assert_eq!(kw, vec![Some(2.0), None, Some(1.5)]);
+    }
+
+    #[test]
+    fn pv_history_bucketing_handles_empty_inputs() {
+        assert!(bucket_pv_history_kw(&[], &[pv("2026-10-16T10:00:00Z", 1.0)]).is_empty());
+        let starts: Vec<DateTime<Utc>> = vec!["2026-10-16T10:00:00Z".parse().unwrap()];
+        assert_eq!(bucket_pv_history_kw(&starts, &[]), vec![None]);
     }
 
     #[test]

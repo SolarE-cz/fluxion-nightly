@@ -37,6 +37,19 @@ pub struct HomeAssistantInverterAdapter {
     /// Pre-actuation guards (lock, wake, charge check), run before every write
     guard: ActuationGuardConfig,
     actuation: Arc<ActuationState>,
+    /// Read-only PV extras per inverter id: entity prefixes of parallel units whose PV power and
+    /// solar energy are added to that inverter's. Only `read_state` uses them; no write path does.
+    pv_extra_prefixes: HashMap<String, Vec<String>>,
+    /// Extra PV entities already warned about as unavailable (WARN once each)
+    pv_extra_warned: Mutex<std::collections::HashSet<String>>,
+}
+
+/// PV values read from a parallel unit's entities
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct PvExtras {
+    power_w: f32,
+    today_kwh: f32,
+    total_kwh: f32,
 }
 
 impl HomeAssistantInverterAdapter {
@@ -47,7 +60,59 @@ impl HomeAssistantInverterAdapter {
             mapper,
             guard: ActuationGuardConfig::default(),
             actuation: Arc::new(ActuationState::default()),
+            pv_extra_prefixes: HashMap::new(),
+            pv_extra_warned: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Read-only PV extras: for each inverter id, the entity prefixes of parallel units whose
+    /// `pv_power_total`, `today_s_solar_energy` and `total_solar_energy` are added to that
+    /// inverter's PV readings. These prefixes are never written to.
+    #[must_use]
+    pub fn with_pv_extra_prefixes(mut self, extras: HashMap<String, Vec<String>>) -> Self {
+        self.pv_extra_prefixes = extras
+            .into_iter()
+            .filter(|(_, prefixes)| !prefixes.is_empty())
+            .collect();
+        self
+    }
+
+    /// Sum the PV power and solar energy of the inverter's read-only extra prefixes.
+    /// An unavailable entity is skipped (WARN once per entity), so the master's value stays.
+    async fn read_pv_extras(&self, inverter_id: &str) -> PvExtras {
+        let mut extras = PvExtras::default();
+        let Some(prefixes) = self.pv_extra_prefixes.get(inverter_id) else {
+            return extras;
+        };
+        for prefix in prefixes {
+            let entities = [
+                Some(self.mapper.get_pv_power_entity(prefix)),
+                self.mapper.get_today_solar_energy_entity(prefix),
+                self.mapper.get_total_solar_energy_entity(prefix),
+            ];
+            for (slot, entity) in entities.into_iter().enumerate() {
+                let Some(entity) = entity else { continue };
+                match self.read_sensor_float(&entity).await {
+                    Ok(value) => {
+                        self.pv_extra_warned.lock().remove(&entity);
+                        match slot {
+                            0 => extras.power_w += value,
+                            1 => extras.today_kwh += value,
+                            _ => extras.total_kwh += value,
+                        }
+                    }
+                    Err(e) => {
+                        if self.pv_extra_warned.lock().insert(entity.clone()) {
+                            warn!(
+                                "⚠️ [ADAPTER] Extra PV entity {} for {} unavailable, using the rest: {:#}",
+                                entity, inverter_id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        extras
     }
 
     /// Use the given pre-actuation guard settings (e.g. `control.auto_unlock_inverter`)
@@ -326,6 +391,14 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
                 self.mapper.get_total_solar_energy_entity(id)
             })
             .await;
+
+        // Read-only PV of parallel units (pv_extra_prefixes), added to this inverter's PV.
+        // pv1/pv2 stay this inverter's own strings. Energy totals are added only to a value
+        // the inverter itself reported.
+        let extras = self.read_pv_extras(inverter_id).await;
+        let pv_power = pv_power + extras.power_w;
+        let today_solar_energy_kwh = today_solar_energy_kwh.map(|kwh| kwh + extras.today_kwh);
+        let total_solar_energy_kwh = total_solar_energy_kwh.map(|kwh| kwh + extras.total_kwh);
 
         // Live export limit and the entity's own maximum, from one state read
         let export_limit_entity = self.mapper.get_export_limit_entity(inverter_id);
@@ -1345,6 +1418,148 @@ mod tests {
             .unwrap();
         set_value.assert_async().await;
         select.assert_async().await;
+    }
+
+    // ---- Read-only PV extras of a parallel unit (pv_extra_prefixes) ----
+
+    async fn mock_state(
+        server: &mut mockito::ServerGuard,
+        entity: &'static str,
+        state: &'static str,
+    ) {
+        server
+            .mock("GET", format!("/api/states/{entity}").as_str())
+            .with_body_from_request(move |_| state_body(entity, state))
+            .create_async()
+            .await;
+    }
+
+    /// Master `solax_80` with its core reads, PV 2000 W, today 51.3 kWh, total 1000 kWh
+    async fn master_states(server: &mut mockito::ServerGuard) {
+        for (entity, state) in [
+            ("sensor.solax_80_battery_capacity", "55"),
+            ("sensor.solax_80_grid_import", "-300"),
+            ("sensor.solax_80_battery_power_charge", "1200"),
+            ("sensor.solax_80_pv_power_total", "2000"),
+            ("select.solax_80_charger_use_mode", "Self Use Mode"),
+            ("sensor.solax_80_house_load", "800"),
+            ("sensor.solax_80_today_s_solar_energy", "51.3"),
+            ("sensor.solax_80_total_solar_energy", "1000"),
+        ] {
+            mock_state(server, entity, state).await;
+        }
+    }
+
+    fn extras_adapter(url: String) -> HomeAssistantInverterAdapter {
+        let client = Arc::new(HomeAssistantClient::new(url, "test_token").unwrap());
+        HomeAssistantInverterAdapter::new(client, Arc::new(crate::solax::SolaxEntityMapper::new()))
+            .with_guard(guard(true))
+            .with_pv_extra_prefixes(HashMap::from([(
+                "solax_80".to_owned(),
+                vec!["solax_81".to_owned()],
+            )]))
+    }
+
+    #[tokio::test]
+    async fn pv_extras_are_added_to_master_pv_only() {
+        let mut server = Server::new_async().await;
+        master_states(&mut server).await;
+        mock_state(&mut server, "sensor.solax_81_pv_power_total", "5500").await;
+        mock_state(&mut server, "sensor.solax_81_today_s_solar_energy", "143.2").await;
+        mock_state(&mut server, "sensor.solax_81_total_solar_energy", "3000").await;
+        // Battery, house load and grid of the parallel unit are never read
+        let untouched = server
+            .mock("GET", Matcher::Regex(r"^/api/states/(sensor|select|number)\.solax_81_(battery|house|grid|charger|export|lock|manual)".to_owned()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let state = extras_adapter(server.url())
+            .read_state("solax_80")
+            .await
+            .unwrap();
+
+        assert!((state.pv_power_w - 7500.0).abs() < 0.01);
+        assert!((state.today_solar_energy_kwh.unwrap() - 194.5).abs() < 0.01);
+        assert!((state.total_solar_energy_kwh.unwrap() - 4000.0).abs() < 0.01);
+        assert!((state.battery_soc - 55.0).abs() < 0.01);
+        assert!((state.battery_power_w - 1200.0).abs() < 0.01);
+        assert_eq!(state.house_load_w, Some(800.0));
+        untouched.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unavailable_pv_extra_keeps_master_value() {
+        let mut server = Server::new_async().await;
+        master_states(&mut server).await;
+        // Only the extra's power exists; its energy sensors are unavailable
+        mock_state(&mut server, "sensor.solax_81_pv_power_total", "500").await;
+        mock_state(
+            &mut server,
+            "sensor.solax_81_today_s_solar_energy",
+            "unavailable",
+        )
+        .await;
+        let adapter = extras_adapter(server.url());
+
+        let state = adapter.read_state("solax_80").await.unwrap();
+
+        assert!((state.pv_power_w - 2500.0).abs() < 0.01);
+        assert!((state.today_solar_energy_kwh.unwrap() - 51.3).abs() < 0.01);
+        assert!((state.total_solar_energy_kwh.unwrap() - 1000.0).abs() < 0.01);
+        // Warned once per entity, not on every read
+        adapter.read_state("solax_80").await.unwrap();
+        assert_eq!(adapter.pv_extra_warned.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_write_path_touches_pv_extra_prefixes() {
+        let mut server = Server::new_async().await;
+        let extra_reads = server
+            .mock(
+                "GET",
+                Matcher::Regex(r"^/api/states/[a-z_]+\.solax_81".to_owned()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let extra_writes = server
+            .mock("POST", Matcher::Regex(r"^/api/services/".to_owned()))
+            .match_body(Matcher::Regex("solax_81".to_owned()))
+            .expect(0)
+            .create_async()
+            .await;
+        mock_state(&mut server, "select.solax_80_lock_state", "Unlocked").await;
+        mock_state(
+            &mut server,
+            "number.solax_80_backup_discharge_min_soc",
+            "20",
+        )
+        .await;
+        // The writes do happen, on the master only
+        let master_writes = server
+            .mock("POST", Matcher::Regex(r"^/api/services/".to_owned()))
+            .match_body(Matcher::Regex("solax_80".to_owned()))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect_at_least(4)
+            .create_async()
+            .await;
+        let adapter = extras_adapter(server.url());
+
+        for command in [
+            InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            InverterCommand::SetMode(InverterOperationMode::ForceDischarge),
+            InverterCommand::SetMode(InverterOperationMode::NoChargeNoDischarge),
+            InverterCommand::SetExportLimit(5000),
+            InverterCommand::SetBackupMode { min_soc_pct: 30 },
+        ] {
+            // Results do not matter here, only which entities the writes touch
+            let _ = adapter.write_command("solax_80", &command).await;
+        }
+
+        extra_reads.assert_async().await;
+        extra_writes.assert_async().await;
+        master_writes.assert_async().await;
     }
 
     #[tokio::test]

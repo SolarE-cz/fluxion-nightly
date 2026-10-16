@@ -25,6 +25,11 @@ configuration:
     name: Topologie
     description: >-
       Role střídače při zapojení více střídačů (independent, master, slave).
+  pv_extra_prefixes:
+    name: Další FV prefixy (jen čtení)
+    description: >-
+      Prefixy entit paralelních jednotek, jejichž FV výkon a vyrobená energie
+      se přičtou k tomuto střídači. Pouze se čtou, nikdy se neřídí.
   min_battery_soc:
     name: Minimální SOC baterie
     description: >-

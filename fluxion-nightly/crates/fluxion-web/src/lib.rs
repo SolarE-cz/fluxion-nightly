@@ -614,8 +614,15 @@ struct ChartDataJson {
     decision_uids: Vec<Option<String>>,
     /// Total effective price: spot + grid_fee + buy_fees
     effective_prices: Vec<f32>,
+    /// Hourly consumption profile (kWh per hour, index = UTC hour of day)
     #[serde(skip_serializing_if = "Option::is_none")]
     hourly_consumption_profile: Option<Vec<f32>>,
+    /// True when an HDO schedule is known, so `tariff_types` is real
+    tariff_known: bool,
+    /// Actual PV power (kW) per block from PV history, aligned with `labels`
+    pv_actual_kw: Vec<Option<f32>>,
+    /// Forecast PV power (kW) per not-yet-ended block, aligned with `labels`
+    solar_forecast_kw: Vec<Option<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     solar_forecast_remaining_today_kwh: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -624,71 +631,76 @@ struct ChartDataJson {
     utc_offset_minutes: Option<i32>,
 }
 
+/// Build the chart refresh JSON from a dashboard response; `None` when there is no price data
+fn build_chart_data_json(response: &WebQueryResponse, i18n: Arc<I18n>) -> Option<ChartDataJson> {
+    // User control state not needed for chart data
+    let template = DashboardTemplate::from_query_response(
+        response.clone(),
+        i18n,
+        String::new(), // JSON endpoint doesn't need ingress path
+        None,
+    );
+
+    // Extract battery SOC from first inverter
+    let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
+
+    // Extract solar forecast data
+    let solar_remaining = response
+        .solar_forecast
+        .as_ref()
+        .filter(|sf| sf.available)
+        .map(|sf| sf.remaining_today_kwh);
+    let solar_tomorrow = response
+        .solar_forecast
+        .as_ref()
+        .filter(|sf| sf.available)
+        .map(|sf| sf.tomorrow_kwh);
+
+    // Calculate UTC offset from timezone string
+    let utc_offset_minutes = display_timezone(response).0.map(|tz| {
+        let now = chrono::Utc::now().with_timezone(&tz);
+        #[expect(clippy::integer_division)]
+        {
+            now.offset().fix().local_minus_utc() / 60
+        }
+    });
+
+    // Extract chart data from template
+    let chart = template.prices?.chart_data;
+    Some(ChartDataJson {
+        labels: chart.labels,
+        block_starts_utc: chart.block_starts_utc,
+        prices: chart.prices,
+        modes: chart.modes,
+        strategies: chart.strategies,
+        profits: chart.profits,
+        current_time_label: chart.current_time_label,
+        current_battery_soc,
+        // Stacked bar data
+        spot_prices: chart.spot_prices,
+        grid_fees: chart.grid_fees,
+        tariff_types: chart.tariff_types,
+        is_historical: chart.is_historical,
+        reasons: chart.reasons,
+        decision_uids: chart.decision_uids,
+        effective_prices: chart.effective_prices,
+        hourly_consumption_profile: chart.hourly_consumption_profile,
+        tariff_known: chart.tariff_known,
+        pv_actual_kw: chart.pv_actual_kw,
+        solar_forecast_kw: chart.solar_forecast_kw,
+        solar_forecast_remaining_today_kwh: solar_remaining,
+        solar_forecast_tomorrow_kwh: solar_tomorrow,
+        utc_offset_minutes,
+    })
+}
+
 /// Chart data endpoint - returns JSON for chart updates (once per minute)
 async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoResponse {
     match app_state.query_sender.query_dashboard().await {
-        Ok(response) => {
-            // User control state not needed for chart data
-            let template = DashboardTemplate::from_query_response(
-                response.clone(),
-                app_state.i18n.clone(),
-                String::new(), // JSON endpoint doesn't need ingress path
-                None,
-            );
-
-            // Extract battery SOC from first inverter
-            let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
-
-            // Extract solar forecast data
-            let solar_remaining = response
-                .solar_forecast
-                .as_ref()
-                .filter(|sf| sf.available)
-                .map(|sf| sf.remaining_today_kwh);
-            let solar_tomorrow = response
-                .solar_forecast
-                .as_ref()
-                .filter(|sf| sf.available)
-                .map(|sf| sf.tomorrow_kwh);
-
-            // Calculate UTC offset from timezone string
-            let utc_offset_minutes = display_timezone(&response).0.map(|tz| {
-                let now = chrono::Utc::now().with_timezone(&tz);
-                #[expect(clippy::integer_division)]
-                {
-                    now.offset().fix().local_minus_utc() / 60
-                }
-            });
-
-            // Extract chart data from template
-            if let Some(prices) = template.prices {
-                let chart_json = ChartDataJson {
-                    labels: prices.chart_data.labels,
-                    block_starts_utc: prices.chart_data.block_starts_utc,
-                    prices: prices.chart_data.prices,
-                    modes: prices.chart_data.modes,
-                    strategies: prices.chart_data.strategies,
-                    profits: prices.chart_data.profits,
-                    current_time_label: prices.chart_data.current_time_label,
-                    current_battery_soc,
-                    // Stacked bar data
-                    spot_prices: prices.chart_data.spot_prices,
-                    grid_fees: prices.chart_data.grid_fees,
-                    tariff_types: prices.chart_data.tariff_types,
-                    is_historical: prices.chart_data.is_historical,
-                    reasons: prices.chart_data.reasons,
-                    decision_uids: prices.chart_data.decision_uids,
-                    effective_prices: prices.chart_data.effective_prices,
-                    hourly_consumption_profile: prices.chart_data.hourly_consumption_profile,
-                    solar_forecast_remaining_today_kwh: solar_remaining,
-                    solar_forecast_tomorrow_kwh: solar_tomorrow,
-                    utc_offset_minutes,
-                };
-                Json(chart_json).into_response()
-            } else {
-                (axum::http::StatusCode::NO_CONTENT, "").into_response()
-            }
-        }
+        Ok(response) => match build_chart_data_json(&response, app_state.i18n.clone()) {
+            Some(chart_json) => Json(chart_json).into_response(),
+            None => (axum::http::StatusCode::NO_CONTENT, "").into_response(),
+        },
         Err(_) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "").into_response(),
     }
 }
@@ -939,5 +951,148 @@ fn abbreviate_reason(reason: &str) -> String {
         format!("{}...", reason.get(..50).unwrap_or_default())
     } else {
         reason.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use fluxion_core::web_bridge::{
+        ConsumptionStats, HdoScheduleInfo, PriceBlockData, PriceData, SystemHealthData,
+        TimezoneSource,
+    };
+
+    fn block(ts: &str, solar_forecast_kw: Option<f32>) -> PriceBlockData {
+        let timestamp: DateTime<Utc> = ts.parse().unwrap();
+        PriceBlockData {
+            timestamp,
+            price: 2.0,
+            effective_buy_price: None,
+            block_type: "self-use".to_owned(),
+            target_soc: None,
+            strategy: None,
+            expected_profit: None,
+            reason: None,
+            decision_uid: None,
+            debug_info: None,
+            is_historical: false,
+            solar_forecast_kw,
+        }
+    }
+
+    fn response(blocks: Vec<PriceBlockData>, hdo: Option<HdoScheduleInfo>) -> WebQueryResponse {
+        WebQueryResponse {
+            timestamp: Utc::now(),
+            debug_mode: false,
+            inverters: vec![],
+            schedule: None,
+            prices: Some(PriceData {
+                current_price: 2.0,
+                min_price: 2.0,
+                max_price: 2.0,
+                avg_price: 2.0,
+                blocks,
+                today_min_price: 2.0,
+                today_max_price: 2.0,
+                today_avg_price: 2.0,
+                today_median_price: 2.0,
+                tomorrow_min_price: None,
+                tomorrow_max_price: None,
+                tomorrow_avg_price: None,
+                tomorrow_median_price: None,
+            }),
+            health: SystemHealthData {
+                inverter_source: true,
+                price_source: true,
+                last_update: Utc::now(),
+                errors: vec![],
+            },
+            timezone: Some("Europe/Prague".to_owned()),
+            timezone_source: TimezoneSource::HomeAssistant,
+            battery_soc_history: None,
+            battery_soc_prediction: None,
+            pv_generation_history: None,
+            consumption_stats: Some(ConsumptionStats {
+                ema_kwh: None,
+                ema_days: 7,
+                today_import_kwh: None,
+                yesterday_import_kwh: None,
+                hourly_consumption_profile: Some(vec![0.5; 24]),
+            }),
+            hdo_schedule: hdo,
+            pricing_fees: None,
+            solar_forecast: None,
+        }
+    }
+
+    fn i18n() -> Arc<I18n> {
+        Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap())
+    }
+
+    #[test]
+    fn chart_json_carries_solar_forecast_series() {
+        let blocks = vec![
+            block("2026-10-16T10:00:00Z", None),
+            block("2026-10-16T10:15:00Z", Some(3.2)),
+            block("2026-10-16T10:30:00Z", Some(0.0)),
+        ];
+        let chart = build_chart_data_json(&response(blocks, None), i18n()).unwrap();
+        let json = serde_json::to_value(&chart).unwrap();
+
+        let forecast: Vec<Option<f64>> =
+            serde_json::from_value(json["solar_forecast_kw"].clone()).unwrap();
+        assert_eq!(forecast.len(), 3);
+        assert_eq!(forecast[0], None);
+        assert!((forecast[1].unwrap() - 3.2).abs() < 1e-6);
+        assert_eq!(forecast[2], Some(0.0));
+        // Aligned with the labels and UTC block starts
+        assert_eq!(json["labels"].as_array().unwrap().len(), 3);
+        assert_eq!(json["block_starts_utc"][1], "2026-10-16T10:15:00Z");
+        assert_eq!(json["pv_actual_kw"], serde_json::json!([null, null, null]));
+        assert_eq!(
+            json["hourly_consumption_profile"].as_array().unwrap().len(),
+            24
+        );
+        // No HDO schedule: tariff types are a default, not a known tariff
+        assert_eq!(json["tariff_known"], false);
+    }
+
+    #[test]
+    fn dashboard_renders_chart_series_helper_and_toggles() {
+        let blocks = vec![block("2026-10-16T10:00:00Z", Some(1.0))];
+        let html = DashboardTemplate::from_query_response(
+            response(blocks, None),
+            i18n(),
+            String::new(),
+            None,
+        )
+        .render()
+        .unwrap();
+        assert!(html.contains("window.FluxionChartSeries"));
+        assert!(html.contains(r#"id="toggleSolarForecast""#));
+        assert!(html.contains(r#"id="toggleConsumptionProfile""#));
+        assert!(html.contains(r#""solar_forecast_kw":[1.0]"#));
+    }
+
+    #[test]
+    fn chart_json_marks_tariff_known_with_zero_fees() {
+        let hdo = HdoScheduleInfo {
+            low_tariff_periods: vec![("00:00".to_owned(), "12:00".to_owned())],
+            low_tariff_czk: 0.0,
+            high_tariff_czk: 0.0,
+            last_updated: None,
+        };
+        // 10:00Z = 12:00 Prague (high), 09:45Z = 11:45 Prague (low)
+        let blocks = vec![
+            block("2026-10-16T09:45:00Z", None),
+            block("2026-10-16T10:00:00Z", None),
+        ];
+        let chart = build_chart_data_json(&response(blocks, Some(hdo)), i18n()).unwrap();
+        let json = serde_json::to_value(&chart).unwrap();
+
+        assert_eq!(json["tariff_known"], true);
+        assert_eq!(json["tariff_types"], serde_json::json!(["low", "high"]));
+        assert_eq!(json["grid_fees"], serde_json::json!([0.0, 0.0]));
     }
 }

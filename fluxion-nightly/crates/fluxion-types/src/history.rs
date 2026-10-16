@@ -98,7 +98,8 @@ impl DailyEnergySummary {
 /// Average hourly consumption profile computed from historical data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HourlyConsumptionProfile {
-    /// Average consumption per hour (kWh). Index 0 = 00:00-01:00, index 23 = 23:00-00:00
+    /// Average consumption per hour (kWh), indexed by UTC hour of day.
+    /// Index 0 = 00:00-01:00 UTC, index 23 = 23:00-00:00 UTC (not local time).
     pub hourly_avg_kwh: [f32; 24],
     /// Number of days used to compute the average
     pub days_averaged: usize,
