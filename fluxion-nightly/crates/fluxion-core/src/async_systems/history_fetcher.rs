@@ -103,14 +103,21 @@ pub fn poll_consumption_history_channel(
 
     // NON-BLOCKING: try to receive from channel
     while let Ok(update) = channel.receiver.try_recv() {
-        if update.daily_summaries.is_empty() {
+        // The hourly profile comes from house-load power and stands on its own: a site whose
+        // consumption entity is missing has no daily summaries but still has a profile.
+        if update.daily_summaries.is_empty() && update.hourly_profile.is_none() {
             debug!("⚠️ Received empty consumption history");
             continue;
         }
 
         info!(
-            "📊 Updating consumption history: {} daily summaries",
-            update.daily_summaries.len()
+            "📊 Updating consumption history: {} daily summaries, hourly profile: {}",
+            update.daily_summaries.len(),
+            if update.hourly_profile.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
         );
 
         // Add all summaries to the history
@@ -249,4 +256,51 @@ async fn fetch_consumption_history(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+
+    fn profile() -> HourlyConsumptionProfile {
+        HourlyConsumptionProfile {
+            hourly_avg_kwh: [2.0; 24],
+            days_averaged: 8,
+            hourly_p75_kwh: None,
+        }
+    }
+
+    fn poll(update: ConsumptionHistoryUpdate) -> ConsumptionHistory {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(update).unwrap();
+        let mut world = World::new();
+        world.insert_resource(ConsumptionHistory::new(7));
+        world.spawn(ConsumptionHistoryChannel { receiver: rx });
+        world
+            .run_system_once(poll_consumption_history_channel)
+            .unwrap();
+        world.remove_resource::<ConsumptionHistory>().unwrap()
+    }
+
+    #[test]
+    fn profile_is_kept_without_daily_summaries() {
+        // A site whose consumption entity is missing has no daily summaries; its house-load profile
+        // must still reach the planner.
+        let history = poll(ConsumptionHistoryUpdate {
+            daily_summaries: Vec::new(),
+            hourly_profile: Some(profile()),
+        });
+        assert!(history.summaries().is_empty());
+        assert_eq!(history.hourly_profile().unwrap().hourly_avg_kwh[3], 2.0);
+    }
+
+    #[test]
+    fn empty_update_changes_nothing() {
+        let history = poll(ConsumptionHistoryUpdate {
+            daily_summaries: Vec::new(),
+            hourly_profile: None,
+        });
+        assert!(history.hourly_profile().is_none());
+    }
 }

@@ -10,6 +10,16 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.57] - 2026-10-16
+
+### Fixed
+
+- The planner load comes from the 7-day house-load profile even when the consumption history
+  entity is missing. Before, such a site planned on the inverter's live house-load reading, which
+  on a parallel master includes the slave's charging (about 17 kW) and fed back into grid charging.
+- Without load history the planner uses the configured average load, never the live reading.
+- Winter Reserve re-plans as soon as the load profile or the PV forecast changes.
+
 ## [0.2.56] - 2026-10-16
 
 ### Fixed

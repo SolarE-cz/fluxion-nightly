@@ -29,10 +29,11 @@ use fluxion_types::config::ControlConfig;
 use super::BackupDischargeMinSoc;
 
 /// Generates consumption forecast for scheduling using priority-based data sources
-/// Priority: 1) Historical data (EMA), 2) Current consumption, 3) Configured fallback
+/// Priority: 1) Historical data (EMA), 2) Configured fallback. The instantaneous house load is
+/// not used: on a parallel master it includes the slave's battery and PV flows (17 kW while the
+/// slave charges, negative while it exports), and a flat plan load from it fed back into grid charging.
 fn generate_consumption_forecast(
     consumption_history: &ConsumptionHistory,
-    current_inverter_raw_state: Option<&RawInverterState>,
     control_config: &ControlConfig,
     num_blocks: usize,
 ) -> Option<Vec<f32>> {
@@ -47,22 +48,8 @@ fn generate_consumption_forecast(
         } else {
             control_config.average_household_load_kw * 24.0
         }
-    } else if let Some(raw_state) = current_inverter_raw_state {
-        // Priority 2: Use current consumption data (extrapolated)
-        if let Some(current_load_w) = raw_state.state.house_load_w {
-            let current_load_kw = current_load_w / 1000.0;
-            // Apply dampening factor since instantaneous readings can be high
-            let estimated_daily = current_load_kw * 24.0 * 0.9;
-            trace!(
-                "📊 Using current consumption: {:.0}W → {:.2} kWh/day",
-                current_load_w, estimated_daily
-            );
-            estimated_daily
-        } else {
-            control_config.average_household_load_kw * 24.0
-        }
     } else {
-        // Priority 3: Use configured fallback
+        // Priority 2: Use configured fallback
         trace!(
             "📊 Using fallback consumption: {:.2} kWh/day",
             control_config.average_household_load_kw * 24.0
@@ -250,7 +237,6 @@ pub fn update_prices_system(
     // Generate consumption forecast from available data
     let consumption_forecast = generate_consumption_forecast(
         &consumption_history,
-        inverter_raw_state_query.iter().next(),
         &config.control_config,
         new_prices.time_block_prices.len(),
     );
@@ -330,5 +316,22 @@ pub fn update_prices_system(
     } else {
         commands.spawn(new_schedule);
         info!("✅ Initial schedule created");
+    }
+}
+
+#[cfg(test)]
+mod consumption_forecast_tests {
+    use super::*;
+
+    #[test]
+    fn without_history_the_forecast_is_the_configured_average() {
+        // Never the instantaneous house load: a parallel master reads ~17 kW while the slave charges.
+        let control = ControlConfig {
+            average_household_load_kw: 2.0,
+            ..ControlConfig::default()
+        };
+        let forecast =
+            generate_consumption_forecast(&ConsumptionHistory::new(7), &control, 4).unwrap();
+        assert_eq!(forecast, vec![0.5; 4]);
     }
 }

@@ -868,6 +868,9 @@ fn price_fingerprint(horizon: &[PlanBlock], levers: Option<&UserLevers>) -> u64 
         b.start.hash(&mut hasher);
         ((b.buy_czk * 1000.0).round() as i64).hash(&mut hasher);
         ((b.sell_czk * 1000.0).round() as i64).hash(&mut hasher);
+        // Flows at 0.1 kWh: a load profile or PV forecast arriving or changing re-plans at once.
+        ((b.load_kwh * 10.0).round() as i64).hash(&mut hasher);
+        ((b.pv_kwh * 10.0).round() as i64).hash(&mut hasher);
     }
     format!("{:?}", planner_levers(levers)).hash(&mut hasher);
     hasher.finish()
@@ -1122,7 +1125,7 @@ impl WinterReserveStrategy {
 
     /// Planned entry for `horizon[0]`. Head calls reuse or refresh the cache; projection
     /// calls read the cache and, on a miss, plan without caching. `horizon` is never empty.
-    /// `fingerprint` is `price_fingerprint` of the horizon and levers.
+    /// `fingerprint` is `price_fingerprint` of the horizon (prices and flows) and levers.
     #[expect(clippy::too_many_arguments)]
     fn entry_for(
         &self,
