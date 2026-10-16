@@ -10,6 +10,19 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.54] - 2026-10-16
+
+### Fixed
+
+- **Solar forecast accuracy check is more robust.**
+  - If HA's entity registry is unreachable at startup, provider discovery retries every 5 minutes
+    instead of staying on name-only matching.
+  - A day is counted only when every roof plane's forecast and every PV sensor's statistics are
+    complete.
+  - Actual production is read after 22:00.
+  - `sensor.fluxion_solar_forecast_bias` is republished every 15 minutes, so it survives an HA
+    restart.
+
 ## [0.2.53] - 2026-10-16
 
 ### Fixed

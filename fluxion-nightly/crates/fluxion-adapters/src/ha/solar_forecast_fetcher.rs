@@ -25,7 +25,7 @@ use fluxion_core::{SystemConfig, TimezoneConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Cached discovered sensor entity IDs for each pattern
@@ -35,7 +35,14 @@ struct DiscoveredSensors {
     remaining_today: Vec<String>,
     tomorrow: Vec<String>,
     initialized: bool,
+    /// How the provider filter was applied in the last discovery
+    source: Option<ProviderSource>,
+    /// When discovery last ran successfully
+    last_attempt: Option<Instant>,
 }
+
+/// How often provider discovery is retried while it is in a fallback
+const DISCOVERY_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Startup system: spawn async worker to fetch solar forecast from HA
 pub fn spawn_solar_forecast_fetcher(
@@ -102,6 +109,7 @@ pub fn spawn_solar_forecast_fetcher(
         // Poll at configured interval (default 60 seconds)
         loop {
             tokio::time::sleep(Duration::from_secs(config.fetch_interval_seconds)).await;
+            retry_discovery_if_due(&client, &config, &discovered).await;
             tracing::debug!("📊 Polling solar forecast from HA");
             let forecast_total = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
             accuracy.tick(&client, Utc::now(), forecast_total).await;
@@ -145,20 +153,33 @@ async fn discover_sensors(
         }
     };
     let selection = select_provider_sensors(pattern_sets, registry.as_deref(), &config.provider);
+    let previous = discovered.read().await.source;
     match selection.source {
         ProviderSource::PatternOnly => {}
-        ProviderSource::Provider => tracing::info!(
-            "☀️ Solar forecast provider '{}': using only its sensors",
-            config.provider
-        ),
-        ProviderSource::RegistryUnavailable => tracing::warn!(
-            "⚠️ Solar forecast provider '{}' not checked (registry unavailable), using pattern match only",
-            config.provider
-        ),
-        ProviderSource::NoProviderMatch => tracing::warn!(
-            "⚠️ No sensors of solar forecast provider '{}' match, using pattern match only",
-            config.provider
-        ),
+        ProviderSource::Provider => {
+            if previous != Some(ProviderSource::Provider) {
+                tracing::info!(
+                    "☀️ Solar forecast provider '{}': using only its sensors",
+                    config.provider
+                );
+            }
+        }
+        ProviderSource::RegistryUnavailable => {
+            if fallback_warn_due(previous, selection.source) {
+                tracing::warn!(
+                    "⚠️ Solar forecast provider '{}' not checked (registry unavailable), using pattern match only; retrying every 5 min",
+                    config.provider
+                );
+            }
+        }
+        ProviderSource::NoProviderMatch => {
+            if fallback_warn_due(previous, selection.source) {
+                tracing::warn!(
+                    "⚠️ No sensors of solar forecast provider '{}' match, using pattern match only; retrying every 5 min",
+                    config.provider
+                );
+            }
+        }
     }
     let [total_today, remaining_today, tomorrow] = selection.sets;
 
@@ -208,8 +229,51 @@ async fn discover_sensors(
     cache.remaining_today = remaining_today;
     cache.tomorrow = tomorrow;
     cache.initialized = true;
+    cache.source = Some(selection.source);
+    cache.last_attempt = Some(Instant::now());
 
     Ok(())
+}
+
+/// A fallback source is retried, since the provider may appear later
+fn is_fallback(source: ProviderSource) -> bool {
+    matches!(
+        source,
+        ProviderSource::RegistryUnavailable | ProviderSource::NoProviderMatch
+    )
+}
+
+/// Retry discovery while in a fallback, at most every `DISCOVERY_RETRY`
+fn discovery_retry_due(
+    source: Option<ProviderSource>,
+    last_attempt: Option<Instant>,
+    now: Instant,
+) -> bool {
+    source.is_some_and(is_fallback)
+        && last_attempt.is_none_or(|t| now.duration_since(t) >= DISCOVERY_RETRY)
+}
+
+/// The fallback WARN is logged once per episode: when a fallback starts, not on each retry
+fn fallback_warn_due(previous: Option<ProviderSource>, current: ProviderSource) -> bool {
+    is_fallback(current) && !previous.is_some_and(is_fallback)
+}
+
+/// Re-run discovery when the provider filter is still in a fallback
+async fn retry_discovery_if_due(
+    client: &HomeAssistantClient,
+    config: &fluxion_core::SolarForecastConfigCore,
+    discovered: &Arc<RwLock<DiscoveredSensors>>,
+) {
+    let (source, last_attempt) = {
+        let cache = discovered.read().await;
+        (cache.source, cache.last_attempt)
+    };
+    if !discovery_retry_due(source, last_attempt, Instant::now()) {
+        return;
+    }
+    if let Err(e) = discover_sensors(client, config, discovered).await {
+        tracing::warn!("⚠️ Solar sensor discovery retry failed: {}", e);
+    }
 }
 
 /// Entity registry rows over the websocket, for the provider filter
@@ -331,23 +395,23 @@ fn matches_sensor_pattern(entity_id: &str, pattern: &str) -> bool {
     false
 }
 
-/// Helper function to fetch solar forecast data and send through channel
-/// Fetch and send one solar forecast update. Returns the summed total-today forecast (kWh),
-/// 0.0 when the sensors are not discovered yet.
+/// Fetch and send one solar forecast update. Returns the total-today forecast (kWh) only when
+/// every total-today sensor gave a number; `None` otherwise (not discovered, or a sensor missing).
 async fn fetch_and_send_solar_forecast(
     client: &HomeAssistantClient,
     discovered: &Arc<RwLock<DiscoveredSensors>>,
     sender: &crossbeam_channel::Sender<SolarForecastUpdate>,
-) -> f32 {
+) -> Option<f32> {
     let cache = discovered.read().await;
 
     if !cache.initialized {
         tracing::warn!("⚠️ Solar forecast sensors not yet discovered, skipping fetch");
-        return 0.0;
+        return None;
     }
 
     // Fetch states for discovered sensors
-    let total_today = fetch_and_sum_sensors(client, &cache.total_today).await;
+    let today = fetch_sum_checked(client, &cache.total_today).await;
+    let total_today = today.total;
     let remaining_today = fetch_and_sum_sensors(client, &cache.remaining_today).await;
     let tomorrow = fetch_and_sum_sensors(client, &cache.tomorrow).await;
 
@@ -376,7 +440,7 @@ async fn fetch_and_send_solar_forecast(
     );
 
     let _ = sender.send(update);
-    total_today
+    today.complete.then_some(total_today)
 }
 
 /// Fetch per-block PV forecast (UTC block start, kWh) summed across the given sensors
@@ -448,28 +512,32 @@ fn parse_forecast_timestamp(ts: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Fetch states for specific entity IDs and sum their values
-async fn fetch_and_sum_sensors(client: &HomeAssistantClient, entity_ids: &[String]) -> f32 {
+/// Sum of the sensor states, and whether every requested sensor gave a number
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SensorSum {
+    total: f32,
+    complete: bool,
+}
+
+/// Sum the states of the requested sensors. Incomplete when a sensor is missing from the states
+/// or its value is not a number; the parsable sensors are still summed.
+fn sum_sensor_states(entity_ids: &[String], states: &[HaEntityState]) -> SensorSum {
     if entity_ids.is_empty() {
-        return 0.0;
+        return SensorSum {
+            total: 0.0,
+            complete: false,
+        };
     }
-
-    let states = match client.get_states(entity_ids).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("⚠️ Failed to fetch sensor states: {}", e);
-            return 0.0;
-        }
-    };
-
-    let mut sum = 0.0;
-    for state in &states {
+    let mut total = 0.0;
+    let mut complete = states.len() == entity_ids.len();
+    for state in states {
         match state.state.parse::<f32>() {
             Ok(value) => {
-                sum += value;
+                total += value;
                 tracing::trace!("   {} = {:.2} kWh", state.entity_id, value);
             }
             Err(_) => {
+                complete = false;
                 // Skip unavailable/unknown states silently at trace level
                 if state.state != "unavailable" && state.state != "unknown" {
                     tracing::warn!(
@@ -481,8 +549,26 @@ async fn fetch_and_sum_sensors(client: &HomeAssistantClient, entity_ids: &[Strin
             }
         }
     }
+    SensorSum { total, complete }
+}
 
-    sum
+/// Fetch states for specific entity IDs and sum their values
+async fn fetch_and_sum_sensors(client: &HomeAssistantClient, entity_ids: &[String]) -> f32 {
+    fetch_sum_checked(client, entity_ids).await.total
+}
+
+/// Fetch the states of the entity IDs and sum them, with the completeness check
+async fn fetch_sum_checked(client: &HomeAssistantClient, entity_ids: &[String]) -> SensorSum {
+    if entity_ids.is_empty() {
+        return sum_sensor_states(entity_ids, &[]);
+    }
+    match client.get_states(entity_ids).await {
+        Ok(states) => sum_sensor_states(entity_ids, &states),
+        Err(e) => {
+            tracing::warn!("⚠️ Failed to fetch sensor states: {}", e);
+            sum_sensor_states(entity_ids, &[])
+        }
+    }
 }
 
 /// Update system: poll solar forecast channel and update resource
@@ -765,5 +851,97 @@ mod tests {
             actual_pv_entities(&["sensor.custom_pv".to_string()], &[]),
             vec!["sensor.custom_pv".to_string()]
         );
+    }
+
+    fn sensor_state(entity_id: &str, state: &str) -> HaEntityState {
+        HaEntityState {
+            entity_id: entity_id.to_string(),
+            state: state.to_string(),
+            attributes: serde_json::Value::Null,
+            last_changed: String::new(),
+            last_updated: String::new(),
+        }
+    }
+
+    #[test]
+    fn discovery_retries_only_in_a_fallback_and_every_five_minutes() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(60);
+        let old = now - DISCOVERY_RETRY - Duration::from_secs(1);
+        assert!(discovery_retry_due(
+            Some(ProviderSource::RegistryUnavailable),
+            None,
+            now
+        ));
+        assert!(discovery_retry_due(
+            Some(ProviderSource::NoProviderMatch),
+            Some(old),
+            now
+        ));
+        assert!(!discovery_retry_due(
+            Some(ProviderSource::NoProviderMatch),
+            Some(recent),
+            now
+        ));
+        assert!(!discovery_retry_due(
+            Some(ProviderSource::Provider),
+            Some(old),
+            now
+        ));
+        assert!(!discovery_retry_due(
+            Some(ProviderSource::PatternOnly),
+            Some(old),
+            now
+        ));
+        assert!(!discovery_retry_due(None, None, now));
+    }
+
+    #[test]
+    fn fallback_warns_once_per_episode() {
+        use ProviderSource::*;
+        // Starts a fallback: warn
+        assert!(fallback_warn_due(None, RegistryUnavailable));
+        assert!(fallback_warn_due(Some(Provider), NoProviderMatch));
+        // Still in the same fallback on a retry: no warn
+        assert!(!fallback_warn_due(
+            Some(RegistryUnavailable),
+            RegistryUnavailable
+        ));
+        assert!(!fallback_warn_due(
+            Some(NoProviderMatch),
+            RegistryUnavailable
+        ));
+        // Provider found: no warn, and a later fallback is a new episode
+        assert!(!fallback_warn_due(Some(NoProviderMatch), Provider));
+        assert!(fallback_warn_due(Some(Provider), RegistryUnavailable));
+    }
+
+    #[test]
+    fn forecast_sum_is_complete_only_when_every_sensor_gave_a_number() {
+        let ids = ids(&[
+            "sensor.energy_production_today_4",
+            "sensor.energy_production_today_5",
+        ]);
+        let both = [
+            sensor_state("sensor.energy_production_today_4", "3.5"),
+            sensor_state("sensor.energy_production_today_5", "1.5"),
+        ];
+        let sum = sum_sensor_states(&ids, &both);
+        assert!(sum.complete);
+        assert!((sum.total - 5.0).abs() < 1e-4);
+
+        // One plane unavailable: the sum is partial and must not become a forecast
+        let one_unavailable = [
+            sensor_state("sensor.energy_production_today_4", "3.5"),
+            sensor_state("sensor.energy_production_today_5", "unavailable"),
+        ];
+        assert!(!sum_sensor_states(&ids, &one_unavailable).complete);
+
+        // One plane missing from the answer
+        let one_missing = [sensor_state("sensor.energy_production_today_4", "3.5")];
+        assert!(!sum_sensor_states(&ids, &one_missing).complete);
+
+        // No sensors at all
+        assert!(!sum_sensor_states(&[], &[]).complete);
     }
 }
