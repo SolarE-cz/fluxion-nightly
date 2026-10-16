@@ -10,6 +10,13 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.53] - 2026-10-16
+
+### Fixed
+
+- The add-on image builds again. 0.2.52 failed because the published workspace differs from the
+  lockfile's. This version carries everything listed under 0.2.51 and 0.2.52.
+
 ## [0.2.52] - 2026-10-16
 
 ### Changed

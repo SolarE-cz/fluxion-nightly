@@ -36,11 +36,13 @@ WORKDIR /build
 # overlay fs with "Cross-device link (os error 18)".
 # Cargo.lock pins every dependency. Without it the build resolves afresh and fails once an
 # upstream crate yanks the versions a dependency needs (zip 4.x, yanked 2026-10).
+# No --locked: the published workspace drops fluxion-integration-tests, so cargo prunes that
+# crate from the lock; every other version stays pinned.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
 # Build release binaries (fluxion and fluxion-upgrader)
-RUN cargo build --release --locked --bin fluxion --bin fluxion-upgrader
+RUN cargo build --release --bin fluxion --bin fluxion-upgrader
 
 # Create final image stages
 FROM ghcr.io/home-assistant/amd64-base:3.18 AS final-amd64
@@ -66,7 +68,7 @@ RUN chmod a+x /run.sh
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.52" \
+    io.hass.version="0.2.53" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 
