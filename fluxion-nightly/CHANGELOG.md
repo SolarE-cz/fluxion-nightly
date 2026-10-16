@@ -10,6 +10,14 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.51] - 2026-10-16
+
+### Fixed
+
+- **No more Self-Use / Hold flipping in the morning.** The 1 CZK switch threshold from 0.2.50 now
+  also keeps Self-Use in blocks with a solar forecast. A held Hold is still never kept while solar
+  is expected, so it can't block solar charging.
+
 ## [0.2.50] - 2026-10-16
 
 ### Fixed

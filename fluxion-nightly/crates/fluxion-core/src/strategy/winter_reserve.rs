@@ -666,9 +666,10 @@ pub fn plan_from(
             grid: &grid,
             next_values: &values[k + 1],
         };
-        // Keep the applied mode only in blocks without PV. The simulator models Hold as never
-        // charging from PV, so with a PV forecast a kept Hold could block real PV charging.
-        let keep = previous.filter(|_| block.pv_kwh <= 0.0);
+        // Keep the applied mode in blocks without PV, or when it is SelfUse at any PV. The simulator
+        // models Hold as never charging from PV, so a kept Hold could block real PV charging.
+        // SelfUse charges from PV, so keeping it is safe.
+        let keep = previous.filter(|m| block.pv_kwh <= 0.0 || *m == PlanMode::SelfUse);
         // Only block 0 is the live transition (keep is the mode on the inverter). Later blocks
         // are re-decided when they become block 0, so they get no SelfUse/Hold hysteresis.
         let switch_benefit = if k == 0 {
@@ -2058,6 +2059,37 @@ mod tests {
         let blocks: Vec<PlanBlock> = (0..4).map(|i| pblock(i, 3.0, 2.0, 0.4, 0.1)).collect();
         let p = plan_from(&blocks, 10.0, tz, &b, &params, Some(PlanMode::Hold));
         assert_eq!(p.blocks[0].mode, PlanMode::SelfUse);
+    }
+
+    /// Block 0 has PV 0.3 kWh, then 15 blocks without PV; `load` is the load of every block.
+    fn pv_block_zero_plan(load: f32, previous: PlanMode) -> PlanMode {
+        let tz = chrono_tz::Europe::Prague;
+        let params = WinterReserveParams::default();
+        let b = BatteryParams {
+            capacity_kwh: 10.0,
+            ..battery()
+        };
+        let mut blocks: Vec<PlanBlock> = (0..8).map(|i| pblock(i, 6.0, 2.0, load, 0.0)).collect();
+        blocks.extend((8..16).map(|i| pblock(i, 8.0, 2.0, load, 0.0)));
+        blocks[0].pv_kwh = 0.3;
+        let p = plan_from(&blocks, 40.0, tz, &b, &params, Some(previous));
+        p.blocks[0].mode
+    }
+
+    #[test]
+    fn pv_block_keeps_applied_selfuse_when_hold_gain_is_small() {
+        // Block 0 has PV. Hold gains 0.95 CZK at block 0, under the 1.0 CZK switch threshold:
+        // SelfUse is kept, since keeping SelfUse never blocks PV charging.
+        assert_eq!(
+            pv_block_zero_plan(1.5, PlanMode::SelfUse),
+            PlanMode::SelfUse
+        );
+    }
+
+    #[test]
+    fn pv_block_switches_to_hold_when_gain_is_above_threshold() {
+        // Block 0 has PV. Hold gains 1.19 CZK at block 0, above the 1.0 CZK switch threshold
+        assert_eq!(pv_block_zero_plan(2.0, PlanMode::SelfUse), PlanMode::Hold);
     }
 
     #[test]
