@@ -59,6 +59,9 @@ options:
   release_branch: nightly
   remote_access:
     enabled: false
+  solar_forecast:
+    actual_pv_power_entities: []
+    provider: open_meteo_solar_forecast
   staging_token: ''
   strategies:
     day_ahead_planning:
@@ -300,6 +303,9 @@ schema:
   release_branch: list(staging|nightly|stable)?
   remote_access:
     enabled: bool?
+  solar_forecast:
+    actual_pv_power_entities: list(str)?
+    provider: str?
   staging_token: str?
   strategies:
     day_ahead_planning:
@@ -450,4 +456,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.51
+version: 0.2.52

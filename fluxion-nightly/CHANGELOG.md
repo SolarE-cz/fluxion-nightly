@@ -10,6 +10,27 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.52] - 2026-10-16
+
+### Changed
+
+- **Solar forecast uses Open-Meteo only.** Forecast sensors are picked by integration
+  (`solar_forecast.provider`, default `open_meteo_solar_forecast`), so a second provider such as
+  Forecast.Solar is no longer added on top. Several Open-Meteo entries (one per roof plane) are
+  still summed.
+
+### Added
+
+- **Solar forecast accuracy check.** FluxION stores each morning's forecast for the day, compares
+  it with the actual PV production in the evening (`solar_forecast.actual_pv_power_entities`,
+  default each inverter's `pv_power_total`) and publishes `sensor.fluxion_solar_forecast_bias`.
+  When the 7-day bias exceeds 10 %, it posts a notification to fix the Open-Meteo setup.
+
+### Fixed
+
+- The add-on image is built from `Cargo.lock`; 0.2.51 failed to build after an upstream crate
+  was yanked. 0.2.51's fix (keep Self-Use in solar blocks) ships in this version.
+
 ## [0.2.51] - 2026-10-16
 
 ### Fixed

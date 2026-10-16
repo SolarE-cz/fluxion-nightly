@@ -12,14 +12,18 @@
 
 use crate::ha::HaClientResource;
 use crate::ha::client::HomeAssistantClient;
+use crate::ha::hot_standby::{RegistryEntry, fetch_registry};
+use crate::ha::solar_forecast_accuracy::{AccuracyMonitor, BIAS_STATE_PATH};
 use crate::ha::types::HaEntityState;
+use crate::ha::ws::websocket_url;
 use bevy_ecs::prelude::*;
 use chrono::{DateTime, Utc};
-use fluxion_core::SystemConfig;
 use fluxion_core::async_systems::{
     SolarForecastChannel, SolarForecastData, SolarForecastSender, SolarForecastUpdate,
 };
-use std::collections::BTreeMap;
+use fluxion_core::{SystemConfig, TimezoneConfig};
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -38,6 +42,7 @@ pub fn spawn_solar_forecast_fetcher(
     ha_client: Option<Res<HaClientResource>>,
     sender: Option<Res<SolarForecastSender>>,
     system_config: Res<SystemConfig>,
+    timezone: Option<Res<TimezoneConfig>>,
 ) {
     let Some(client_res) = ha_client else {
         tracing::warn!("⚠️ HaClientResource not available, cannot fetch solar forecast");
@@ -57,6 +62,19 @@ pub fn spawn_solar_forecast_fetcher(
     let client = client_res.0.clone();
     let sender = sender_res.sender.clone();
     let config = system_config.solar_forecast.clone();
+
+    // Forecast accuracy monitor: local days need the HA timezone (UTC when HA does not report one)
+    let tz = timezone.as_ref().and_then(|t| t.tz).unwrap_or_else(|| {
+        tracing::warn!("⚠️ Home Assistant timezone unknown, forecast accuracy uses UTC days");
+        chrono_tz::UTC
+    });
+    let prefixes: Vec<&str> = system_config
+        .inverters
+        .iter()
+        .map(|inv| inv.entity_prefix.as_str())
+        .collect();
+    let actual_entities = actual_pv_entities(&config.actual_pv_power_entities, &prefixes);
+    let mut accuracy = AccuracyMonitor::new(PathBuf::from(BIAS_STATE_PATH), tz, actual_entities);
 
     tracing::info!(
         "☀️ Spawning solar forecast fetcher (patterns: {}, {}, {})",
@@ -78,13 +96,15 @@ pub fn spawn_solar_forecast_fetcher(
 
         // Fetch immediately on startup
         tracing::debug!("📊 Fetching initial solar forecast from HA");
-        fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+        let forecast_total = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+        accuracy.tick(&client, Utc::now(), forecast_total).await;
 
         // Poll at configured interval (default 60 seconds)
         loop {
             tokio::time::sleep(Duration::from_secs(config.fetch_interval_seconds)).await;
             tracing::debug!("📊 Polling solar forecast from HA");
-            fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+            let forecast_total = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+            accuracy.tick(&client, Utc::now(), forecast_total).await;
         }
     });
 }
@@ -104,11 +124,43 @@ async fn discover_sensors(
         all_states.len()
     );
 
-    // Find matching sensors for each pattern
-    let total_today = find_matching_sensor_ids(&all_states, &config.sensor_total_today_pattern);
-    let remaining_today =
-        find_matching_sensor_ids(&all_states, &config.sensor_remaining_today_pattern);
-    let tomorrow = find_matching_sensor_ids(&all_states, &config.sensor_tomorrow_pattern);
+    // Find matching sensors for each pattern, then keep the configured provider's sensors
+    let pattern_sets = [
+        find_matching_sensor_ids(&all_states, &config.sensor_total_today_pattern),
+        find_matching_sensor_ids(&all_states, &config.sensor_remaining_today_pattern),
+        find_matching_sensor_ids(&all_states, &config.sensor_tomorrow_pattern),
+    ];
+    let registry = if config.provider.is_empty() {
+        None
+    } else {
+        match fetch_registry_for(client).await {
+            Ok(entries) => Some(entries),
+            Err(e) => {
+                tracing::warn!(
+                    "⚠️ Entity registry unavailable, solar sensors not filtered by provider: {}",
+                    e
+                );
+                None
+            }
+        }
+    };
+    let selection = select_provider_sensors(pattern_sets, registry.as_deref(), &config.provider);
+    match selection.source {
+        ProviderSource::PatternOnly => {}
+        ProviderSource::Provider => tracing::info!(
+            "☀️ Solar forecast provider '{}': using only its sensors",
+            config.provider
+        ),
+        ProviderSource::RegistryUnavailable => tracing::warn!(
+            "⚠️ Solar forecast provider '{}' not checked (registry unavailable), using pattern match only",
+            config.provider
+        ),
+        ProviderSource::NoProviderMatch => tracing::warn!(
+            "⚠️ No sensors of solar forecast provider '{}' match, using pattern match only",
+            config.provider
+        ),
+    }
+    let [total_today, remaining_today, tomorrow] = selection.sets;
 
     // Log discovered sensors
     if total_today.is_empty() {
@@ -160,6 +212,89 @@ async fn discover_sensors(
     Ok(())
 }
 
+/// Entity registry rows over the websocket, for the provider filter
+async fn fetch_registry_for(client: &HomeAssistantClient) -> Result<Vec<RegistryEntry>, String> {
+    let url = websocket_url(client.base_url()).ok_or("no websocket URL for the HA base URL")?;
+    fetch_registry(&url, client.token())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// How the provider filter was applied in one discovery run
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderSource {
+    /// No provider configured: pattern match only
+    PatternOnly,
+    /// Only the provider's sensors are kept
+    Provider,
+    /// The entity registry could not be read: pattern match only
+    RegistryUnavailable,
+    /// The provider matches none of the total-today sensors: pattern match only
+    NoProviderMatch,
+}
+
+/// Sensor sets for [total today, remaining today, tomorrow] after the provider filter
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderSelection {
+    sets: [Vec<String>; 3],
+    source: ProviderSource,
+}
+
+/// Keep only the pattern-matched sensors whose registry platform is `provider`.
+/// Falls back to the pattern-only sets when there is no provider, no registry, or no provider
+/// sensor for total today.
+fn select_provider_sensors(
+    pattern_sets: [Vec<String>; 3],
+    registry: Option<&[RegistryEntry]>,
+    provider: &str,
+) -> ProviderSelection {
+    if provider.is_empty() {
+        return ProviderSelection {
+            sets: pattern_sets,
+            source: ProviderSource::PatternOnly,
+        };
+    }
+    let Some(registry) = registry else {
+        return ProviderSelection {
+            sets: pattern_sets,
+            source: ProviderSource::RegistryUnavailable,
+        };
+    };
+    let platforms: HashMap<&str, &str> = registry
+        .iter()
+        .map(|e| (e.entity_id.as_str(), e.platform.as_str()))
+        .collect();
+    let keep = |ids: &[String]| -> Vec<String> {
+        ids.iter()
+            .filter(|id| platforms.get(id.as_str()) == Some(&provider))
+            .cloned()
+            .collect()
+    };
+    let filtered = pattern_sets.each_ref().map(|ids| keep(ids));
+    if filtered[0].is_empty() {
+        return ProviderSelection {
+            sets: pattern_sets,
+            source: ProviderSource::NoProviderMatch,
+        };
+    }
+    ProviderSelection {
+        sets: filtered,
+        source: ProviderSource::Provider,
+    }
+}
+
+/// Power sensors compared with the forecast: the configured list, or the total PV power of each
+/// inverter when none is configured
+fn actual_pv_entities(configured: &[String], prefixes: &[&str]) -> Vec<String> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    prefixes
+        .iter()
+        .map(|prefix| format!("sensor.{prefix}_pv_power_total"))
+        .collect()
+}
+
 /// Find all sensor entity IDs matching the pattern
 /// Pattern matching: "sensor.energy_production_today" matches:
 ///   - sensor.energy_production_today (exact match)
@@ -197,16 +332,18 @@ fn matches_sensor_pattern(entity_id: &str, pattern: &str) -> bool {
 }
 
 /// Helper function to fetch solar forecast data and send through channel
+/// Fetch and send one solar forecast update. Returns the summed total-today forecast (kWh),
+/// 0.0 when the sensors are not discovered yet.
 async fn fetch_and_send_solar_forecast(
     client: &HomeAssistantClient,
     discovered: &Arc<RwLock<DiscoveredSensors>>,
     sender: &crossbeam_channel::Sender<SolarForecastUpdate>,
-) {
+) -> f32 {
     let cache = discovered.read().await;
 
     if !cache.initialized {
         tracing::warn!("⚠️ Solar forecast sensors not yet discovered, skipping fetch");
-        return;
+        return 0.0;
     }
 
     // Fetch states for discovered sensors
@@ -239,6 +376,7 @@ async fn fetch_and_send_solar_forecast(
     );
 
     let _ = sender.send(update);
+    total_today
 }
 
 /// Fetch per-block PV forecast (UTC block start, kWh) summed across the given sensors
@@ -516,5 +654,116 @@ mod tests {
             "sensor.energy_production_today_",
             "sensor.energy_production_today"
         ));
+    }
+
+    fn row(entity_id: &str, platform: &str) -> RegistryEntry {
+        RegistryEntry {
+            entity_id: entity_id.to_string(),
+            platform: platform.to_string(),
+            unique_id: entity_id.to_string(),
+            config_entry_id: None,
+        }
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    const OPEN_METEO: &str = "open_meteo_solar_forecast";
+
+    #[test]
+    fn provider_keeps_only_open_meteo_when_forecast_solar_is_present() {
+        // (a) Forecast.Solar sensor and Open-Meteo sensor both match the pattern
+        let registry = [
+            row("sensor.energy_production_today", "forecast_solar"),
+            row("sensor.energy_production_today_2", OPEN_METEO),
+        ];
+        let pattern = [
+            ids(&[
+                "sensor.energy_production_today",
+                "sensor.energy_production_today_2",
+            ]),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let selection = select_provider_sensors(pattern, Some(&registry), OPEN_METEO);
+        assert_eq!(selection.source, ProviderSource::Provider);
+        assert_eq!(
+            selection.sets[0],
+            ids(&["sensor.energy_production_today_2"])
+        );
+    }
+
+    #[test]
+    fn provider_keeps_all_three_open_meteo_roof_planes() {
+        // (b) three Open-Meteo entries, one per roof plane, all keep summing
+        let registry = [
+            row("sensor.energy_production_today_4", OPEN_METEO),
+            row("sensor.energy_production_today_5", OPEN_METEO),
+            row("sensor.energy_production_today_6", OPEN_METEO),
+        ];
+        let total = ids(&[
+            "sensor.energy_production_today_4",
+            "sensor.energy_production_today_5",
+            "sensor.energy_production_today_6",
+        ]);
+        let selection = select_provider_sensors(
+            [total.clone(), Vec::new(), Vec::new()],
+            Some(&registry),
+            OPEN_METEO,
+        );
+        assert_eq!(selection.source, ProviderSource::Provider);
+        assert_eq!(selection.sets[0], total);
+    }
+
+    #[test]
+    fn no_open_meteo_falls_back_to_pattern_match() {
+        // (c) no Open-Meteo sensor: pattern-only sets with NoProviderMatch (WARN), and an
+        // unreachable registry also falls back
+        let registry = [row("sensor.energy_production_today", "forecast_solar")];
+        let total = ids(&["sensor.energy_production_today"]);
+        let pattern = [
+            total.clone(),
+            Vec::new(),
+            ids(&["sensor.energy_production_tomorrow"]),
+        ];
+        let selection = select_provider_sensors(pattern.clone(), Some(&registry), OPEN_METEO);
+        assert_eq!(selection.source, ProviderSource::NoProviderMatch);
+        assert_eq!(selection.sets, pattern);
+
+        let selection = select_provider_sensors(pattern.clone(), None, OPEN_METEO);
+        assert_eq!(selection.source, ProviderSource::RegistryUnavailable);
+        assert_eq!(selection.sets, pattern);
+    }
+
+    #[test]
+    fn empty_provider_keeps_the_old_pattern_behaviour() {
+        // (d) provider "" ignores the registry and keeps every pattern match
+        let registry = [row("sensor.energy_production_today", "forecast_solar")];
+        let pattern = [
+            ids(&[
+                "sensor.energy_production_today",
+                "sensor.energy_production_today_2",
+            ]),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let selection = select_provider_sensors(pattern.clone(), Some(&registry), "");
+        assert_eq!(selection.source, ProviderSource::PatternOnly);
+        assert_eq!(selection.sets, pattern);
+        let selection = select_provider_sensors(pattern.clone(), None, "");
+        assert_eq!(selection.sets, pattern);
+    }
+
+    #[test]
+    fn actual_entities_default_to_each_inverter_total_pv_power() {
+        assert_eq!(
+            actual_pv_entities(&[], &["solax"]),
+            vec!["sensor.solax_pv_power_total".to_string()]
+        );
+        assert_eq!(
+            actual_pv_entities(&["sensor.custom_pv".to_string()], &[]),
+            vec!["sensor.custom_pv".to_string()]
+        );
     }
 }

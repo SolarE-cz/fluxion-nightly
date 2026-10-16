@@ -1445,7 +1445,7 @@ impl Default for FixedPriceArbitrageConfig {
 }
 
 /// Solar forecast configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolarForecastConfig {
     /// Enable solar forecast fetching
     #[serde(default)]
@@ -1466,6 +1466,32 @@ pub struct SolarForecastConfig {
     /// Fetch interval in seconds
     #[serde(default)]
     pub fetch_interval_seconds: u64,
+
+    /// Forecast provider (registry platform); empty = pattern match only
+    #[serde(default = "default_solar_provider")]
+    pub provider: String,
+
+    /// Power sensors compared with the forecast; empty = `sensor.<prefix>_pv_power_total`
+    #[serde(default)]
+    pub actual_pv_power_entities: Vec<String>,
+}
+
+fn default_solar_provider() -> String {
+    "open_meteo_solar_forecast".to_string()
+}
+
+impl Default for SolarForecastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sensor_total_today_pattern: String::new(),
+            sensor_remaining_today_pattern: String::new(),
+            sensor_tomorrow_pattern: String::new(),
+            fetch_interval_seconds: 0,
+            provider: default_solar_provider(),
+            actual_pv_power_entities: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2685,6 +2711,8 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 } else {
                     app_config.solar_forecast.fetch_interval_seconds
                 },
+                provider: app_config.solar_forecast.provider,
+                actual_pv_power_entities: app_config.solar_forecast.actual_pv_power_entities,
             },
             remote_access: fluxion_core::RemoteAccessConfigCore {
                 enabled: app_config.remote_access.enabled,
@@ -3256,5 +3284,39 @@ mod addon_schema_tests {
             winter_reserve_checked >= 6,
             "winter_reserve numeric options were not all checked"
         );
+    }
+}
+
+#[cfg(test)]
+mod solar_forecast_config_tests {
+    use super::*;
+
+    #[test]
+    fn solar_provider_defaults_to_open_meteo_when_missing() {
+        // Section missing entirely, and section present without the key
+        assert_eq!(
+            SolarForecastConfig::default().provider,
+            "open_meteo_solar_forecast"
+        );
+        let section: SolarForecastConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(section.provider, "open_meteo_solar_forecast");
+        assert!(section.actual_pv_power_entities.is_empty());
+    }
+
+    #[test]
+    fn solar_provider_override_and_empty_round_trip() {
+        let json = r#"{
+            "provider": "forecast_solar",
+            "actual_pv_power_entities": ["sensor.solax_pv_power_total"]
+        }"#;
+        let section: SolarForecastConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(section.provider, "forecast_solar");
+        assert_eq!(
+            section.actual_pv_power_entities,
+            vec!["sensor.solax_pv_power_total".to_string()]
+        );
+        // Empty provider means pattern match only (old behaviour)
+        let empty: SolarForecastConfig = serde_json::from_str(r#"{"provider": ""}"#).unwrap();
+        assert_eq!(empty.provider, "");
     }
 }

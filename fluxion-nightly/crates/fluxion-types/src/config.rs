@@ -1557,6 +1557,20 @@ pub struct SolarForecastConfigCore {
     /// Fetch interval in seconds (default: 60)
     #[serde(default = "default_fetch_interval")]
     pub fetch_interval_seconds: u64,
+
+    /// Forecast provider: the entity registry platform of the sensors to use
+    /// (default: "open_meteo_solar_forecast"). Empty = pattern match only.
+    #[serde(default = "default_solar_provider")]
+    pub provider: String,
+
+    /// Power sensors compared with the forecast by the accuracy monitor.
+    /// Empty = `sensor.<entity_prefix>_pv_power_total` of every inverter.
+    #[serde(default)]
+    pub actual_pv_power_entities: Vec<String>,
+}
+
+fn default_solar_provider() -> String {
+    "open_meteo_solar_forecast".to_string()
 }
 
 impl Default for SolarForecastConfigCore {
@@ -1567,6 +1581,8 @@ impl Default for SolarForecastConfigCore {
             sensor_remaining_today_pattern: "sensor.energy_production_today_remaining".to_string(),
             sensor_tomorrow_pattern: "sensor.energy_production_tomorrow".to_string(),
             fetch_interval_seconds: 60,
+            provider: default_solar_provider(),
+            actual_pv_power_entities: Vec::new(),
         }
     }
 }
