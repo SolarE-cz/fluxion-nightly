@@ -10,6 +10,11 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.62] - 2026-10-17
+
+### Fixed
+- HDO grid fees are now add-on options (`pricing.hdo_low_tariff_czk`, `pricing.hdo_high_tariff_czk`). The runtime already used them, but the add-on schema had no such keys, so every site ran on the 0.5 / 1.8 defaults.
+
 ## [0.2.61] - 2026-10-17
 
 ### Fixed

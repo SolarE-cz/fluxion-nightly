@@ -3169,6 +3169,40 @@ mod tests {
         assert_eq!(config.pricing.spot_sell_fee, 0.35);
     }
 
+    #[test]
+    fn test_ha_addon_hdo_fee_options_are_honoured() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": [],
+                "hdo_low_tariff_czk": 0.36,
+                "hdo_high_tariff_czk": 1.0
+            },
+            "control": {
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            },
+            "system": {"debug_mode": true, "log_level": "info", "update_interval_secs": 60},
+            "strategies": {}
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(ha_addon_json).unwrap();
+        assert_eq!(config.pricing.hdo_low_tariff_czk, 0.36);
+        assert_eq!(config.pricing.hdo_high_tariff_czk, 1.0);
+    }
+
     /// Configs written under the runtime field names (config.toml, persisted JSON) still load.
     #[test]
     fn test_spot_fee_runtime_field_names_still_load() {
