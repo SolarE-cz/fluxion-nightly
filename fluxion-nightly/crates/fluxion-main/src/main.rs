@@ -74,6 +74,66 @@ fn main() -> Result<()> {
     })
 }
 
+/// What the backtest reads: the live entity ids (the controlled inverter, never a slave; PV adds
+/// `pv_extra_prefixes`), prices, control and Winter Reserve settings. `Err` says what is missing.
+fn backtest_site(
+    config: &config::AppConfig,
+    system_config: &SystemConfig,
+) -> std::result::Result<fluxion_core::backtest::BacktestSite, String> {
+    let timezone: chrono_tz::Tz = config
+        .system
+        .timezone
+        .as_deref()
+        .and_then(|tz| tz.parse().ok())
+        .ok_or("the Home Assistant timezone is not known, so local days cannot be built")?;
+    let master = config
+        .inverters
+        .iter()
+        .find(|inv| inv.topology != "slave")
+        .or(config.inverters.first())
+        .ok_or("no inverter is configured")?;
+    let mapper = fluxion_adapters::create_entity_mapper(master.inverter_type);
+    let mut pv = vec![mapper.get_pv_power_entity(&master.id)];
+    pv.extend(
+        config::AppConfig::pv_extra_prefixes(master)
+            .iter()
+            .map(|prefix| mapper.get_pv_power_entity(prefix)),
+    );
+    let non_empty = |entity: &Option<String>| entity.clone().filter(|e| !e.trim().is_empty());
+    let pricing = &system_config.pricing_config;
+    Ok(fluxion_core::backtest::BacktestSite {
+        timezone,
+        entities: fluxion_core::backtest::BacktestEntities {
+            soc: mapper.get_battery_soc_entity(&master.id),
+            house_load: non_empty(&system_config.history.house_load_power_entity)
+                .or_else(|| mapper.get_house_load_entity(&master.id))
+                .ok_or("no house load sensor is known for this inverter")?,
+            pv,
+            grid_import: mapper
+                .get_grid_import_power_entity(&master.id)
+                .ok_or("no grid import power sensor is known for this inverter")?,
+            grid_export: mapper
+                .get_grid_export_power_entity(&master.id)
+                .ok_or("no grid export power sensor is known for this inverter")?,
+            spot_price: pricing.spot_price_entity.clone(),
+            // Live, the buy sensor is used only when buying at spot
+            buy_price: non_empty(&pricing.buy_price_entity)
+                .filter(|_| pricing.use_spot_prices_to_buy),
+            // The HDO sensor key the live fetcher reads (resolved by content at load, as live)
+            hdo: non_empty(&Some(
+                system_config
+                    .strategies_config
+                    .winter_adaptive_v3
+                    .hdo_sensor_entity
+                    .clone(),
+            )),
+        },
+        pricing: pricing.clone(),
+        control: system_config.control_config.clone(),
+        winter_reserve: system_config.strategies_config.winter_reserve.clone(),
+    })
+}
+
 fn initialize_and_run() -> Result<()> {
     // Initialize tracing with env filter support
     // Respects RUST_LOG environment variable
@@ -330,11 +390,15 @@ fn initialize_and_run() -> Result<()> {
         serde_json::json!({})
     });
     let config_sender_for_web = config_update_sender.clone();
-    // Backtest is opt-in: only enabled when FLUXION_BACKTEST_DB names an existing file
-    let backtest_db_path = std::env::var("FLUXION_BACKTEST_DB")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_file());
+    // Backtest on this site's own HA history (read-only GETs on the web runtime, brief H28)
+    let backtest_state = fluxion_web::BacktestState::new(
+        Arc::new(fluxion_adapters::ha::HaBacktestHistory::new(
+            ha_client.clone(),
+        )),
+        backtest_site(&config, &system_config),
+        i18n.clone(),
+    )
+    .with_user_control(Arc::clone(&user_control_api_state.state));
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
     let remote_access_state =
         RemoteAccessApiState::new(std::path::Path::new("./data"), 8099, "FluxION".to_string());
@@ -345,7 +409,7 @@ fn initialize_and_run() -> Result<()> {
             8099,
             config_json,
             Some(config_sender_for_web),
-            backtest_db_path, // Backtest DB path - set via FLUXION_BACKTEST_DB to enable backtest feature
+            Some(backtest_state),   // Backtest on HA history
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
             Some(user_control_api_state),                        // User control API state

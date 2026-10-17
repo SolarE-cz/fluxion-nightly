@@ -4,7 +4,8 @@
 
 //! Replay recorded site history block by block with the Winter Reserve planner.
 //!
-//! Input: the JSON written by `fluxion/tools/winter_reserve/export_ha_history.py`.
+//! Input: the JSON written by `fluxion/tools/winter_reserve/export_ha_history.py`. The replay
+//! itself is `fluxion_core::backtest::replay`, shared with the add-on's backtest page.
 //! For every block the planner sees the horizon (today, plus tomorrow after 13:00 local)
 //! with a forecast (load: mean of the same local quarter-hour over the previous 7 local days,
 //! else the mean of all earlier blocks; never the block's own actual value. The planner plans
@@ -31,32 +32,17 @@
 //!  [--csv out.csv] [--pv-noise] [--pv-forecast-bias 0.5] [--profile forecast|import|house]
 //!  [--from 2026-10-14T14:30:00Z] [--param key=value]...`
 
-use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use fluxion_core::components::{
-    HourlyConsumptionProfile, aggregate_hourly_house_load, pick_hourly_profile,
+use fluxion_core::backtest::{
+    MODE_LETTERS, ProfileSource, ReplayOptions, ReplayRow, mode_index, replay,
 };
-use fluxion_core::strategy::winter_reserve::{
-    BatteryParams, PlanBlock, PlanMode, WinterReserveParams, plan_from, simulate_block,
-};
-use fluxion_core::traits::HistoryDataPoint;
-use fluxion_types::ControlConfig;
+use fluxion_core::savings::RecordedBlock;
+use fluxion_core::strategy::winter_reserve::{BatteryParams, WinterReserveParams};
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::fs;
 use std::process::ExitCode;
-
-/// Which load forecast the planner sees.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum ProfileSource {
-    /// Mean of the same local minute over the 7 days before (default, unchanged)
-    Forecast,
-    /// Hourly UTC profile of grid import (the old `consumption_entity` source)
-    Import,
-    /// Hourly UTC profile of house load: max(mean, p75) times the planner margin
-    House,
-}
 
 #[derive(Deserialize)]
 struct Dataset {
@@ -81,138 +67,6 @@ struct Block {
     pv_kwh: Option<f32>,
     import_kwh: Option<f32>,
     export_kwh: Option<f32>,
-}
-
-/// The hourly profile the live fetcher builds on `day` from the 7 local days before it, with the
-/// shared functions. House load: `pick_hourly_profile` of the house-load profile and the import one.
-/// `Import`: the import profile without p75, as the old source had (mean only).
-fn live_load_profile(
-    rows: &[Row],
-    day: NaiveDate,
-    source: ProfileSource,
-) -> Option<HourlyConsumptionProfile> {
-    if source == ProfileSource::Forecast {
-        return None;
-    }
-    let window_start = day - Duration::days(7);
-    // Each block is one sample at its start: its mean power in W (kWh per 15 min x 4000). The
-    // sample holds until the next block, so the time-weighted hourly mean equals kWh/h. The first
-    // block of `day` closes the last block before it.
-    let samples = |value: fn(&Row) -> f32| -> Vec<HistoryDataPoint> {
-        let mut points: Vec<HistoryDataPoint> = rows
-            .iter()
-            .filter(|r| {
-                let d = r.local.date_naive();
-                d >= window_start && d < day
-            })
-            .map(|r| HistoryDataPoint {
-                timestamp: r.start,
-                value: value(r) * 4000.0,
-            })
-            .collect();
-        if let Some(first) = rows.iter().find(|r| r.local.date_naive() == day) {
-            points.push(HistoryDataPoint {
-                timestamp: first.start,
-                value: value(first) * 4000.0,
-            });
-        }
-        points
-    };
-    let import = aggregate_hourly_house_load(&samples(|r| r.import)).map(|mut p| {
-        p.hourly_p75_kwh = None;
-        p
-    });
-    match source {
-        ProfileSource::House => {
-            let house = aggregate_hourly_house_load(&samples(|r| r.load));
-            pick_hourly_profile(house, import)
-        }
-        _ => import,
-    }
-}
-
-/// Load of one planned block (kWh), as the live planner computes it from the profile: with p75,
-/// max(mean, p75) times the planner margin; otherwise mean times the safety factor.
-fn planner_block_load(
-    profile: &HourlyConsumptionProfile,
-    hour: usize,
-    load_safety_factor: f32,
-    planner_load_margin: f32,
-) -> f32 {
-    match profile.hourly_p75_kwh {
-        Some(p75) => profile.hourly_avg_kwh[hour].max(p75[hour]) * 0.25 * planner_load_margin,
-        None => profile.hourly_avg_kwh[hour] * 0.25 * load_safety_factor,
-    }
-}
-
-/// One block after parsing, with local time resolved.
-struct Row {
-    start: DateTime<Utc>,
-    local: DateTime<Tz>,
-    buy: f32,
-    sell: f32,
-    load: f32,
-    pv: f32,
-    soc0_pct: f32,
-    import: f32,
-    export: f32,
-    /// A missing block directly follows this one in the data.
-    gap_after: bool,
-}
-
-#[derive(Default, Clone, Copy)]
-struct Acc {
-    cost: f32,
-    wear_cost: f32,
-    export_kwh: f32,
-    /// Battery charge the grid supplied, per block min(charge, import): kWh and its cost (CZK).
-    grid_charge_kwh: f32,
-    grid_charge_czk: f32,
-    min_night_soc: Option<f32>,
-}
-
-#[derive(Default)]
-struct DayAcc {
-    actual: f32,
-    su: Acc,
-    wr: Acc,
-    modes: [u32; 4],
-    blocks: u32,
-}
-
-fn mode_index(mode: PlanMode) -> usize {
-    match mode {
-        PlanMode::SelfUse => 0,
-        PlanMode::Charge => 1,
-        PlanMode::Hold => 2,
-        PlanMode::Export => 3,
-        // The replay passes no user levers, so the planner never produces NoDischarge.
-        PlanMode::NoDischarge => unreachable!("replay runs without user levers"),
-    }
-}
-
-const MODE_LETTERS: [char; 4] = ['S', 'C', 'H', 'E'];
-
-fn is_night(hour: u32) -> bool {
-    !(8..18).contains(&hour)
-}
-
-/// Mean of the lowest `ceil(percentile * n)` buy prices, the same reference as the planner's `cheap_ref`.
-fn cheap_reference(buys: &mut [f32], percentile: f32) -> f32 {
-    buys.sort_by(f32::total_cmp);
-    let n = buys.len();
-    let n_cheap = ((f64::from(percentile) * n as f64 - 1e-6).ceil() as usize).clamp(1, n);
-    buys[..n_cheap].iter().sum::<f32>() / n_cheap as f32
-}
-
-/// Deterministic factor in [0.5, 1.3] for the block at `index` (SplitMix64 of the index).
-fn pv_noise_factor(index: usize) -> f32 {
-    let mut z = (index as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
-    (0.5 + 0.8 * unit) as f32
 }
 
 fn set_param(params: &mut WinterReserveParams, assignment: &str) -> Result<(), String> {
@@ -299,10 +153,9 @@ fn run() -> Result<(), String> {
     let battery = dataset.site.battery;
     let capacity = battery.capacity_kwh;
     let e_min = battery.min_soc_pct / 100.0 * capacity;
-    let e_max = battery.max_soc_pct / 100.0 * capacity;
 
     // Non-missing blocks only. Missing blocks are skipped: no cost, no simulation, no forecast data.
-    let mut rows: Vec<Row> = Vec::new();
+    let mut rows: Vec<ReplayRow> = Vec::new();
     let mut missing = 0usize;
     for raw in &dataset.blocks {
         if raw.missing {
@@ -330,226 +183,64 @@ fn run() -> Result<(), String> {
                 raw.start_utc
             ));
         };
-        rows.push(Row {
-            start,
-            local: start.with_timezone(&tz),
-            buy,
-            sell,
-            load,
-            pv,
-            soc0_pct: soc,
-            import,
-            export,
+        rows.push(ReplayRow {
+            block: RecordedBlock {
+                start,
+                buy_czk: buy,
+                sell_czk: sell,
+                load_kwh: load,
+                pv_kwh: pv,
+                import_kwh: import,
+                export_kwh: export,
+            },
+            soc_pct: soc,
             gap_after: false,
         });
     }
-    if rows.is_empty() {
-        return Err("no usable blocks".into());
-    }
 
-    // Historical load per (local date, local minute-of-day), for the 7-day forecast.
-    let mut load_hist: HashMap<(NaiveDate, u32), f32> = HashMap::new();
-    for row in &rows {
-        let key = (
-            row.local.date_naive(),
-            row.local.hour() * 60 + row.local.minute(),
-        );
-        load_hist.insert(key, row.load);
-    }
+    let mut options = ReplayOptions::new(tz, battery, params);
+    options.profile = profile;
+    options.pv_forecast_bias = pv_forecast_bias;
+    options.pv_noise = pv_noise;
+    options.baseline_only = baseline_only;
+    options.from = from;
+    let run = replay(&rows, &options)?;
+    let days = &run.days;
+    let skipped_days = &run.skipped_days;
+    let (e_su, e_wr) = (run.energy_end_selfuse_kwh, run.energy_end_wr_kwh);
+    let planned_blocks = run.planned_blocks;
+    let fallback_blocks = run.fallback_blocks;
 
-    // First simulated block: the first one at or after `--from` (default: the first block).
-    let first = match from {
-        Some(t) => rows
-            .iter()
-            .position(|r| r.start >= t)
-            .ok_or("--from is after the last usable block")?,
-        None => 0,
-    };
-    let soc_start = rows[first].soc0_pct / 100.0 * capacity;
-    let e0_su = soc_start.clamp(e_min, e_max);
-    let mut e_su = e0_su;
-    let mut e_wr = e0_su;
-    let mut days: BTreeMap<NaiveDate, DayAcc> = BTreeMap::new();
     let mut csv_rows: Vec<String> = Vec::new();
-    // Days whose first block had no earlier data at all: excluded from the totals.
-    let mut skipped_days: BTreeSet<NaiveDate> = BTreeSet::new();
-    // Load forecast for horizon block `j` as seen from decision block `i`, using history only:
-    // the mean of the same local minute over the 7 local days before the *decision* day; without
-    // that history, the mean of all blocks before `i`. No earlier data at all -> None.
-    let mut prefix_load = vec![0.0f32; rows.len() + 1];
-    for (i, row) in rows.iter().enumerate() {
-        prefix_load[i + 1] = prefix_load[i] + row.load;
-    }
-    let mut fallback_blocks = 0usize;
-    let forecast_load = |i: usize, j: usize, fallbacks: &mut usize| -> Option<f32> {
-        let decision_day = rows[i].local.date_naive();
-        let minute = rows[j].local.hour() * 60 + rows[j].local.minute();
-        let (sum, count) = (1..=7i64)
-            .filter_map(|k| load_hist.get(&(decision_day - Duration::days(k), minute)))
-            .fold((0.0f32, 0u32), |(s, c), v| (s + v, c + 1));
-        if count > 0 {
-            Some(sum / count as f32)
-        } else if i > 0 {
-            *fallbacks += 1;
-            Some(prefix_load[i] / i as f32)
-        } else {
-            None
-        }
-    };
-    let mut planned_blocks = 0usize;
-    // Mode applied to the previous block: the planner keeps it while it is within the benefit
-    let mut applied: Option<PlanMode> = None;
-
-    for (i, row) in rows.iter().enumerate().skip(first) {
-        let day = row.local.date_naive();
-        let acc = days.entry(day).or_default();
-        acc.actual += row.import * row.buy - row.export * row.sell;
-        acc.blocks += 1;
-
-        // Baseline: SelfUse on the actual block.
-        let actual_block = PlanBlock {
-            start: row.start,
-            duration_minutes: 15,
-            buy_czk: row.buy,
-            sell_czk: row.sell,
-            load_kwh: row.load,
-            pv_kwh: row.pv,
-            reserve_load_kwh: row.load,
-            reserve_pv_kwh: row.pv,
-            force_charge: false,
-            no_discharge: false,
-            force_charge_at_or_below_czk: None,
-            export_min_soc_pct: None,
-            export_allowed: true,
-        };
-        let su_out = simulate_block(PlanMode::SelfUse, e_su, &actual_block, e_min, &battery);
-        acc.su.cost += su_out.grid_import_kwh * row.buy - su_out.grid_export_kwh * row.sell;
-        acc.su.wear_cost += su_out.battery_discharge_kwh * battery.wear_cost_czk_per_kwh;
-        acc.su.export_kwh += su_out.grid_export_kwh;
-        if is_night(row.local.hour()) {
-            let soc = e_su / capacity * 100.0;
-            acc.su.min_night_soc = Some(acc.su.min_night_soc.map_or(soc, |m| m.min(soc)));
-        }
-        let su_start = e_su;
-        e_su = su_out.energy_end_kwh;
-
-        if baseline_only {
-            csv_rows.push(format!(
+    for block in &run.blocks {
+        let recorded = &block.row.block;
+        let su = &block.selfuse;
+        match &block.winter_reserve {
+            None => csv_rows.push(format!(
                 "{},{:.4},{:.4},S,{:.2},{:.2},{:.2},{:.4},{:.4},baseline SelfUse",
-                row.local.format("%Y-%m-%dT%H:%M"),
-                row.buy,
-                row.sell,
-                su_start / capacity * 100.0,
-                e_su / capacity * 100.0,
+                block.local.format("%Y-%m-%dT%H:%M"),
+                recorded.buy_czk,
+                recorded.sell_czk,
+                su.energy_start_kwh / capacity * 100.0,
+                su.energy_end_kwh / capacity * 100.0,
                 e_min,
-                su_out.grid_import_kwh,
-                su_out.grid_export_kwh,
-            ));
-            continue;
+                su.outcome.grid_import_kwh,
+                su.outcome.grid_export_kwh,
+            )),
+            Some(wr) => csv_rows.push(format!(
+                "{},{:.4},{:.4},{},{:.2},{:.2},{:.2},{:.4},{:.4},{}",
+                block.local.format("%Y-%m-%dT%H:%M"),
+                recorded.buy_czk,
+                recorded.sell_czk,
+                MODE_LETTERS[mode_index(wr.mode)],
+                wr.energy_start_kwh / capacity * 100.0,
+                wr.energy_end_kwh / capacity * 100.0,
+                wr.floor_kwh,
+                wr.outcome.grid_import_kwh,
+                wr.outcome.grid_export_kwh,
+                wr.reason,
+            )),
         }
-
-        // Winter Reserve: horizon, forecasts, plan, then apply the first mode to the actual block.
-        let soc_now = e_wr / capacity * 100.0;
-        let (mode, floor_kwh, reason) = match forecast_load(i, i, &mut fallback_blocks) {
-            None => {
-                skipped_days.insert(day);
-                (
-                    PlanMode::SelfUse,
-                    e_min,
-                    "no earlier data, SelfUse".to_string(),
-                )
-            }
-            Some(_) => {
-                let horizon_end_day = if row.local.hour() >= 13 {
-                    day.succ_opt().ok_or("date overflow")?
-                } else {
-                    day
-                };
-                let live_profile = live_load_profile(&rows, day, profile)
-                    .filter(|p| p.hourly_avg_kwh.iter().sum::<f32>() > 0.0);
-                let mut horizon: Vec<PlanBlock> = Vec::new();
-                for (j, later) in rows.iter().enumerate().skip(i) {
-                    if later.local.date_naive() > horizon_end_day {
-                        break;
-                    }
-                    let Some(load_fc) = forecast_load(i, j, &mut fallback_blocks) else {
-                        break;
-                    };
-                    // Expected load is the hourly mean (as production); the reserve load is
-                    // max(mean, p75) times the planner margin, or mean times the safety factor.
-                    let (load_kwh, reserve_load_kwh) = match &live_profile {
-                        Some(p) => (
-                            p.hourly_avg_kwh[later.start.hour() as usize] * 0.25,
-                            planner_block_load(
-                                p,
-                                later.start.hour() as usize,
-                                params.load_safety_factor,
-                                ControlConfig::default().planner_load_margin,
-                            ),
-                        ),
-                        None => (load_fc, load_fc * params.load_safety_factor),
-                    };
-                    let noise = if pv_noise && j > i {
-                        pv_noise_factor(j)
-                    } else {
-                        1.0
-                    };
-                    let pv_kwh = later.pv * pv_forecast_bias * noise;
-                    horizon.push(PlanBlock {
-                        start: later.start,
-                        duration_minutes: 15,
-                        buy_czk: later.buy,
-                        sell_czk: later.sell,
-                        load_kwh,
-                        pv_kwh,
-                        reserve_load_kwh,
-                        reserve_pv_kwh: pv_kwh * params.pv_confidence,
-                        force_charge: false,
-                        no_discharge: false,
-                        force_charge_at_or_below_czk: None,
-                        export_min_soc_pct: None,
-                        export_allowed: true,
-                    });
-                    if later.gap_after {
-                        break;
-                    }
-                }
-
-                let result = plan_from(&horizon, soc_now, tz, &battery, &params, applied);
-                let first = result
-                    .blocks
-                    .first()
-                    .ok_or("planner returned an empty plan")?;
-                planned_blocks += 1;
-                applied = Some(first.mode);
-                (first.mode, first.floor_kwh, first.reason.clone())
-            }
-        };
-        acc.modes[mode_index(mode)] += 1;
-        let wr_out = simulate_block(mode, e_wr, &actual_block, floor_kwh, &battery);
-        acc.wr.cost += wr_out.grid_import_kwh * row.buy - wr_out.grid_export_kwh * row.sell;
-        acc.wr.wear_cost += wr_out.battery_discharge_kwh * battery.wear_cost_czk_per_kwh;
-        acc.wr.export_kwh += wr_out.grid_export_kwh;
-        let grid_charge = wr_out.battery_charge_kwh.min(wr_out.grid_import_kwh);
-        acc.wr.grid_charge_kwh += grid_charge;
-        acc.wr.grid_charge_czk += grid_charge * row.buy;
-        if is_night(row.local.hour()) {
-            acc.wr.min_night_soc = Some(acc.wr.min_night_soc.map_or(soc_now, |m| m.min(soc_now)));
-        }
-        csv_rows.push(format!(
-            "{},{:.4},{:.4},{},{:.2},{:.2},{:.2},{:.4},{:.4},{}",
-            row.local.format("%Y-%m-%dT%H:%M"),
-            row.buy,
-            row.sell,
-            MODE_LETTERS[mode_index(mode)],
-            soc_now,
-            wr_out.energy_end_kwh / capacity * 100.0,
-            floor_kwh,
-            wr_out.grid_import_kwh,
-            wr_out.grid_export_kwh,
-            reason,
-        ));
-        e_wr = wr_out.energy_end_kwh;
     }
 
     let mut out = String::new();
@@ -578,16 +269,8 @@ fn run() -> Result<(), String> {
     let wr_cols = !baseline_only;
 
     // End state: energy left above SelfUse's, valued at the last day's cheap_ref times efficiency.
-    let cheap_ref_last_day = rows.last().map_or(0.0, |last| {
-        let last_day = last.local.date_naive();
-        let mut buys: Vec<f32> = rows
-            .iter()
-            .filter(|r| r.local.date_naive() == last_day)
-            .map(|r| r.buy)
-            .collect();
-        cheap_reference(&mut buys, params.cheap_percentile)
-    });
-    let end_soc_adjustment_czk = (e_wr - e_su) * cheap_ref_last_day * battery.efficiency;
+    let cheap_ref_last_day = run.cheap_ref_last_day;
+    let end_soc_adjustment_czk = run.end_soc_adjustment_czk(&battery);
     let total_wr_adjusted = total_wr - end_soc_adjustment_czk;
 
     let _ = writeln!(
@@ -604,7 +287,7 @@ fn run() -> Result<(), String> {
         "wr_exp",
         "su_exp"
     );
-    for (day, d) in &days {
+    for (day, d) in days {
         let modes = if wr_cols {
             format!(
                 "{}/{}/{}/{}",
@@ -676,7 +359,7 @@ fn run() -> Result<(), String> {
     let _ = writeln!(
         out,
         "blocks: {} usable, {missing} missing (skipped), planned {planned_blocks}, load-forecast fallbacks (no 7-day history, mean of earlier blocks used) {fallback_blocks}",
-        rows.len(),
+        run.usable_blocks,
     );
     let _ = writeln!(
         out,

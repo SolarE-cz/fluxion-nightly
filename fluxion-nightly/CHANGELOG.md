@@ -10,6 +10,14 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.63] - 2026-10-17
+
+### Fixed
+- After a restart, the first plan waits (up to 30 s) for the HDO tariff schedule, so it is no longer priced at the high grid fee for every block.
+
+### Changed
+- The backtest page (`/backtest`) works on the add-on again, on this site's own Home Assistant history: pick a past local day (as far back as the recorder keeps, ~10 days) and compare what actually happened, plain self-use and Winter Reserve with the live settings, block by block, with the live fees and HDO tariff. The old SQLite backtest (`FLUXION_BACKTEST_DB`) is retired.
+
 ## [0.2.62] - 2026-10-17
 
 ### Fixed

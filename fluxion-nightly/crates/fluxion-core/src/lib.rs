@@ -12,6 +12,7 @@
 
 pub mod async_systems;
 pub mod async_tasks;
+pub mod backtest;
 pub mod components;
 pub mod config_events;
 pub mod continuous_systems;

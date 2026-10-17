@@ -13,7 +13,7 @@
 use bevy_ecs::prelude::*;
 // futures_timer::Delay no longer needed - removed channel polling
 // std::time::Duration removed - no longer needed for Delay
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     PluginManagerResource, PriceDataSourceResource,
@@ -99,6 +99,55 @@ pub fn setup_price_cache(mut commands: Commands, price_source: Res<PriceDataSour
     info!("✅ Price cache initialized with 3-second fetch interval");
 }
 
+/// Max wait at startup for the HDO tariff before the first schedule is built (brief H29).
+const HDO_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Startup state of the wait for the HDO tariff: when the first run happened, and whether the
+/// wait is over (HDO arrived, timed out, or no HDO sensor).
+#[derive(Default)]
+pub struct HdoStartup {
+    started: Option<std::time::Instant>,
+    done: bool,
+    logged: bool,
+    timed_out: bool,
+}
+
+/// True while the first schedule waits for the HDO tariff (max `HDO_STARTUP_WAIT`). Without it
+/// every block is priced at the high grid fee, and the executor's initial sync applies that plan
+/// (2026-10-17 restart). Only the first schedule waits; no wait without an HDO sensor.
+pub fn hdo_startup_wait(
+    hdo_configured: bool,
+    hdo_ready: bool,
+    startup: &mut HdoStartup,
+    now: std::time::Instant,
+) -> bool {
+    if startup.done {
+        return false;
+    }
+    let started = *startup.started.get_or_insert(now);
+    if !hdo_configured || hdo_ready {
+        startup.done = true;
+        return false;
+    }
+    if now.saturating_duration_since(started) >= HDO_STARTUP_WAIT {
+        warn!(
+            "HDO tariff not received {} s after startup, building the schedule without it (high grid fee)",
+            HDO_STARTUP_WAIT.as_secs()
+        );
+        startup.done = true;
+        startup.timed_out = true;
+        return false;
+    }
+    if !startup.logged {
+        info!(
+            "⏳ Waiting for the HDO tariff before the first schedule (max {} s)",
+            HDO_STARTUP_WAIT.as_secs()
+        );
+        startup.logged = true;
+    }
+    true
+}
+
 /// Simplified system that updates prices using direct cache access
 /// Replaces the complex channel polling with on-demand fetching
 #[allow(clippy::too_many_arguments)]
@@ -119,10 +168,11 @@ pub fn update_prices_system(
     plugin_manager_res: Res<PluginManagerResource>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
     solar_forecast: Option<Res<super::SolarForecastData>>,
-    (timezone_config, user_levers, mut last_planner_levers): (
+    (timezone_config, user_levers, mut last_planner_levers, mut hdo_startup): (
         Option<Res<crate::resources::TimezoneConfig>>,
         Option<Res<crate::resources::UserLeversResource>>,
         Local<Option<UserLevers>>,
+        Local<HdoStartup>,
     ),
 ) {
     // A change of the planner levers regenerates the schedule even when prices are fresh
@@ -131,6 +181,25 @@ pub fn update_prices_system(
 
     // Only fetch if cache is stale (non-blocking check)
     if !price_cache.is_stale() && !levers_changed {
+        return;
+    }
+
+    // Startup: the first schedule waits (max 30 s) for the HDO tariff when an HDO sensor is
+    // configured (the sensor the HA HDO fetcher reads). Ready = the HDO cache knows the tariff now.
+    let hdo_configured = !config
+        .strategies_config
+        .winter_adaptive_v3
+        .hdo_sensor_entity
+        .is_empty();
+    let hdo_ready = hdo_cache
+        .as_ref()
+        .is_some_and(|cache| cache.is_low_tariff(chrono::Utc::now()).is_some());
+    if hdo_startup_wait(
+        hdo_configured,
+        hdo_ready,
+        &mut hdo_startup,
+        std::time::Instant::now(),
+    ) {
         return;
     }
 
@@ -333,5 +402,239 @@ mod consumption_forecast_tests {
         let forecast =
             generate_consumption_forecast(&ConsumptionHistory::new(7), &control, 4).unwrap();
         assert_eq!(forecast, vec![0.5; 4]);
+    }
+}
+
+/// Brief H29: the first schedule after a restart waits for the HDO tariff.
+#[cfg(test)]
+mod hdo_startup_tests {
+    use super::*;
+    use crate::async_systems::HdoScheduleData;
+    use crate::resources::{GlobalHdoCache, PriceCache, TimezoneConfig};
+    use crate::traits::{GenericInverterState, PriceDataSource};
+    use async_trait::async_trait;
+    use chrono::{DurationRound, Utc};
+    use fluxion_i18n::Language;
+    use fluxion_types::config::{Currency, PriceSchedule, PricingConfig, SystemSettingsConfig};
+    use fluxion_types::pricing::TimeBlockPrice;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn first_schedule_waits_for_hdo_then_proceeds_when_it_arrives() {
+        let mut startup = HdoStartup::default();
+        let t0 = Instant::now();
+        assert!(hdo_startup_wait(true, false, &mut startup, t0));
+        assert!(hdo_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(10)
+        ));
+        assert!(!hdo_startup_wait(
+            true,
+            true,
+            &mut startup,
+            t0 + Duration::from_secs(11)
+        ));
+        assert!(!startup.timed_out);
+        // Only the first schedule waits: HDO missing later does not block replans
+        assert!(!hdo_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(12)
+        ));
+    }
+
+    #[test]
+    fn first_schedule_proceeds_after_30_s_without_hdo() {
+        let mut startup = HdoStartup::default();
+        let t0 = Instant::now();
+        assert!(hdo_startup_wait(true, false, &mut startup, t0));
+        assert!(hdo_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(29)
+        ));
+        assert!(!hdo_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(30)
+        ));
+        assert!(startup.timed_out);
+    }
+
+    #[test]
+    fn no_hdo_sensor_no_wait() {
+        let mut startup = HdoStartup::default();
+        assert!(!hdo_startup_wait(
+            false,
+            false,
+            &mut startup,
+            Instant::now()
+        ));
+        assert!(!startup.timed_out);
+    }
+
+    struct FlatPrices;
+
+    #[async_trait]
+    impl PriceDataSource for FlatPrices {
+        async fn read_prices(&self) -> anyhow::Result<SpotPriceData> {
+            let start = Utc::now()
+                .duration_trunc(chrono::Duration::minutes(15))
+                .unwrap();
+            Ok(SpotPriceData {
+                time_block_prices: (0..96)
+                    .map(|i| TimeBlockPrice {
+                        block_start: start + chrono::Duration::minutes(15 * i),
+                        duration_minutes: 15,
+                        price_czk_per_kwh: 3.0,
+                        effective_price_czk_per_kwh: 3.0,
+                        spot_sell_price_czk_per_kwh: Some(2.0),
+                        buy_price_czk_per_kwh: None,
+                    })
+                    .collect(),
+                block_duration_minutes: 15,
+                fetched_at: Utc::now(),
+                ha_last_updated: Utc::now(),
+            })
+        }
+
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn name(&self) -> &str {
+            "flat"
+        }
+    }
+
+    fn config(hdo_sensor: &str) -> SystemConfig {
+        let mut config = SystemConfig {
+            inverters: vec![],
+            pricing_config: PricingConfig {
+                spot_price_entity: "sensor.spot_price".to_string(),
+                tomorrow_price_entity: None,
+                buy_price_entity: None,
+                use_spot_prices_to_buy: true,
+                use_spot_prices_to_sell: true,
+                fixed_buy_price_czk: PriceSchedule::Flat(4.0),
+                fixed_sell_price_czk: PriceSchedule::Flat(2.0),
+                spot_buy_fee_czk: 0.5,
+                spot_sell_fee_czk: 0.5,
+                hdo_sensor_entity: hdo_sensor.to_string(),
+                hdo_low_tariff_czk: 0.36,
+                hdo_high_tariff_czk: 1.0,
+            },
+            control_config: ControlConfig::default(),
+            system_config: SystemSettingsConfig {
+                update_interval_secs: 60,
+                debug_mode: true,
+                display_currency: Currency::CZK,
+                language: Language::English,
+                timezone: None,
+                display_timezone: None,
+            },
+            strategies_config: Default::default(),
+            history: Default::default(),
+            solar_forecast: Default::default(),
+            remote_access: Default::default(),
+            notifications: Default::default(),
+        };
+        config
+            .strategies_config
+            .winter_adaptive_v3
+            .hdo_sensor_entity = hdo_sensor.to_string();
+        config
+    }
+
+    /// The price/schedule systems of a restart: HDO cache sync, then price update.
+    fn world(hdo_sensor: &str) -> (World, Schedule) {
+        let config = config(hdo_sensor);
+        let manager = crate::plugin_adapters::create_plugin_manager(
+            Some(&config.strategies_config),
+            &config.control_config,
+        );
+        let mut world = World::new();
+        world.insert_resource(PriceCache::new(Arc::new(FlatPrices), 3));
+        world.insert_resource(PluginManagerResource(Arc::new(RwLock::new(manager))));
+        world.insert_resource(config);
+        world.insert_resource(ConsumptionHistory::default());
+        world.insert_resource(HdoScheduleData::default());
+        world.insert_resource(GlobalHdoCache::default());
+        world.insert_resource(TimezoneConfig::new(Some("Europe/Prague".to_string())));
+        world.spawn(RawInverterState {
+            state: GenericInverterState {
+                battery_soc: 50.0,
+                ..Default::default()
+            },
+            last_updated: Utc::now(),
+        });
+        let mut schedule = Schedule::default();
+        schedule.add_systems(
+            (
+                crate::continuous_systems::sync_hdo_cache_system,
+                update_prices_system,
+            )
+                .chain(),
+        );
+        (world, schedule)
+    }
+
+    /// HDO sensor data for today and tomorrow (Prague): low tariff all day.
+    fn hdo_all_low() -> String {
+        let today = Utc::now()
+            .with_timezone(&chrono_tz::Europe::Prague)
+            .date_naive();
+        let days: Vec<String> = [today, today.succ_opt().unwrap()]
+            .iter()
+            .map(|d| {
+                format!(
+                    r#"{{"signal": "EVV1", "datum": "{}", "casy": "00:00-24:00"}}"#,
+                    d.format("%d.%m.%Y")
+                )
+            })
+            .collect();
+        format!(r#"{{"data": {{"signals": [{}]}}}}"#, days.join(","))
+    }
+
+    fn has_schedule(world: &mut World) -> bool {
+        world.query::<&OperationSchedule>().iter(world).count() > 0
+    }
+
+    #[test]
+    fn restart_builds_the_first_schedule_only_after_hdo_arrives() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, mut schedule) = world("sensor.cez_hdo_raw_data");
+        // HDO not received yet: no schedule (2026-10-17 16:13:20 built one at the high fee)
+        schedule.run(&mut world);
+        assert!(!has_schedule(&mut world));
+        // HDO arrives (poll_hdo_channel): the next run builds the schedule at the low fee
+        world.resource_mut::<HdoScheduleData>().raw_data = Some(hdo_all_low());
+        schedule.run(&mut world);
+        assert!(has_schedule(&mut world));
+        let prices = world
+            .query::<&SpotPriceData>()
+            .single(&world)
+            .unwrap()
+            .time_block_prices[0]
+            .effective_price_czk_per_kwh;
+        // spot 3.0 + low HDO fee 0.36 + buy fee 0.5
+        assert!((prices - 3.86).abs() < 1e-3, "effective price {prices}");
+    }
+
+    #[test]
+    fn restart_without_hdo_sensor_builds_the_schedule_at_once() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, mut schedule) = world("");
+        schedule.run(&mut world);
+        assert!(has_schedule(&mut world));
     }
 }

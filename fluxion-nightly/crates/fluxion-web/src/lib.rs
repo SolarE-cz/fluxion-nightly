@@ -230,7 +230,8 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 /// * `port` - Port to listen on (8099 for HA Ingress)
 /// * `config_json` - Current configuration as JSON
 /// * `config_update_sender` - Optional channel for config updates
-/// * `backtest_db_path` - Optional path to backtest database
+/// * `backtest_state` - Backtest on Home Assistant history; `None` serves the routes with a
+///   "not available" error
 /// * `plugin_api_state` - Optional plugin API state for plugin management
 /// * `scheduled_export_config` - Optional config for daily scheduled exports (for debugging)
 /// * `user_control_api_state` - Optional user control API state for user override features
@@ -254,7 +255,7 @@ pub async fn start_web_server(
     port: u16,
     config_json: serde_json::Value,
     config_update_sender: Option<ConfigUpdateSender>,
-    backtest_db_path: Option<std::path::PathBuf>,
+    backtest_state: Option<BacktestState>,
     plugin_api_state: Option<PluginApiState>,
     scheduled_export_config: Option<ScheduledExportConfig>,
     user_control_api_state: Option<UserControlApiState>,
@@ -312,35 +313,23 @@ pub async fn start_web_server(
             get(config_api::export_config_handler).with_state(config_state),
         );
 
-    // Backtest routes exist only when a database path is provided; otherwise they are not
-    // registered and return 404
-    let backtest_available = backtest_db_path.is_some();
-    if let Some(db_path) = backtest_db_path {
-        info!("📊 Backtest feature enabled with database: {:?}", db_path);
-        let backtest_state = backtest::BacktestState::new(db_path, i18n);
-
-        app = app
-            .route(
-                "/backtest",
-                get(backtest::backtest_page_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/days",
-                get(backtest::available_days_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/day/{date}",
-                get(backtest::day_data_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/simulate",
-                axum::routing::post(backtest::simulate_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/compare",
-                axum::routing::post(backtest::compare_handler).with_state(backtest_state),
-            );
-    }
+    // Backtest routes are always registered; without a state they answer "not available"
+    let backtest_state = backtest_state.unwrap_or_else(|| {
+        BacktestState::unavailable(i18n.clone(), "the backtest needs Home Assistant history")
+    });
+    app = app
+        .route(
+            "/backtest",
+            get(backtest::backtest_page_handler).with_state(backtest_state.clone()),
+        )
+        .route(
+            "/api/backtest/days",
+            get(backtest::available_days_handler).with_state(backtest_state.clone()),
+        )
+        .route(
+            "/api/backtest/day/{date}",
+            get(backtest::day_handler).with_state(backtest_state),
+        );
 
     // Add plugin management API routes if state is provided
     if let Some(plugin_state) = plugin_api_state {
@@ -377,10 +366,7 @@ pub async fn start_web_server(
         let simulator_state = simulator::SimulatorState::new();
         app = app
             // Simulator page
-            .route(
-                "/simulator",
-                get(simulator::simulator_page_handler).with_state(backtest_available),
-            )
+            .route("/simulator", get(simulator::simulator_page_handler))
             // API endpoints
             .route(
                 "/api/simulator/presets",
@@ -1091,7 +1077,7 @@ mod tests {
     }
 
     /// Start the real web server on a free local port and return that port
-    async fn start_test_server(backtest_db_path: Option<std::path::PathBuf>) -> u16 {
+    async fn start_test_server(backtest_state: Option<BacktestState>) -> u16 {
         let port = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap()
@@ -1106,7 +1092,7 @@ mod tests {
                 port,
                 serde_json::json!({}),
                 None,
-                backtest_db_path,
+                backtest_state,
                 None,
                 None,
                 None,
@@ -1140,42 +1126,349 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
-    #[tokio::test]
-    async fn backtest_routes_absent_without_db_path() {
-        let port = start_test_server(None).await;
-        let response = http_get(port, "/api/backtest/days").await;
-        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
-        assert!(!response.contains("/home/"));
+    /// JSON body of a raw HTTP response
+    fn json_body(response: &str) -> serde_json::Value {
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+    }
+
+    mod backtest_history {
+        use chrono::{DateTime, Duration, TimeZone, Utc};
+        use fluxion_core::backtest::{
+            BacktestEntities, BacktestSite, HistoryError, HistoryReader, HistoryState,
+        };
+        use fluxion_types::config::{
+            ControlConfig, PriceSchedule, PricingConfig, WinterReserveConfigCore,
+        };
+
+        pub const TZ: chrono_tz::Tz = chrono_tz::Europe::Prague;
+
+        /// Three days after the replayed day
+        pub fn now() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 10, 23, 12, 0, 0).unwrap()
+        }
+
+        pub fn site() -> BacktestSite {
+            BacktestSite {
+                timezone: TZ,
+                entities: BacktestEntities {
+                    soc: "sensor.solax_battery_capacity".to_owned(),
+                    house_load: "sensor.solax_house_load".to_owned(),
+                    pv: vec!["sensor.solax_pv_power_total".to_owned()],
+                    grid_import: "sensor.solax_grid_import".to_owned(),
+                    grid_export: "sensor.solax_grid_export".to_owned(),
+                    spot_price: "sensor.spot_price".to_owned(),
+                    buy_price: None,
+                    hdo: None,
+                },
+                pricing: PricingConfig {
+                    spot_price_entity: "sensor.spot_price".to_owned(),
+                    tomorrow_price_entity: None,
+                    buy_price_entity: None,
+                    use_spot_prices_to_buy: true,
+                    use_spot_prices_to_sell: true,
+                    fixed_buy_price_czk: PriceSchedule::Flat(0.0),
+                    fixed_sell_price_czk: PriceSchedule::Flat(0.0),
+                    spot_buy_fee_czk: 0.4,
+                    spot_sell_fee_czk: 0.3,
+                    hdo_sensor_entity: String::new(),
+                    hdo_low_tariff_czk: 0.5,
+                    hdo_high_tariff_czk: 1.8,
+                },
+                control: ControlConfig::default(),
+                winter_reserve: WinterReserveConfigCore::default(),
+            }
+        }
+
+        /// Mocked HA history: hourly load and price shapes from 11 days before `now()`.
+        #[derive(Debug)]
+        pub struct MockHistory;
+
+        fn series(entity: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<HistoryState> {
+            let first = now() - Duration::days(11);
+            let mut out = Vec::new();
+            let mut t = first;
+            while t <= end {
+                let hour = t
+                    .with_timezone(&TZ)
+                    .format("%H")
+                    .to_string()
+                    .parse::<u32>()
+                    .unwrap();
+                let value = match entity {
+                    "sensor.solax_battery_capacity" => 40.0,
+                    "sensor.solax_house_load" => {
+                        if (17..21).contains(&hour) {
+                            2500.0
+                        } else {
+                            600.0
+                        }
+                    }
+                    "sensor.solax_pv_power_total" => {
+                        if (10..15).contains(&hour) {
+                            800.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "sensor.solax_grid_import" => {
+                        if (17..21).contains(&hour) {
+                            2500.0
+                        } else {
+                            300.0
+                        }
+                    }
+                    "sensor.solax_grid_export" => 0.0,
+                    "sensor.spot_price" => {
+                        if (17..21).contains(&hour) {
+                            6.0
+                        } else if hour < 5 {
+                            1.0
+                        } else {
+                            3.0
+                        }
+                    }
+                    _ => return Vec::new(),
+                };
+                if t >= start || t + Duration::hours(1) > start {
+                    out.push(HistoryState::from_raw(
+                        t.max(start),
+                        &value.to_string(),
+                        None,
+                    ));
+                }
+                t += Duration::hours(1);
+            }
+            out
+        }
+
+        #[async_trait::async_trait]
+        impl HistoryReader for MockHistory {
+            async fn history(
+                &self,
+                entity_id: &str,
+                start: DateTime<Utc>,
+                end: DateTime<Utc>,
+                _with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                Ok(series(entity_id, start, end))
+            }
+        }
+
+        /// `MockHistory` that counts house-load reads (one per day load) and is slow
+        #[derive(Debug, Default)]
+        pub struct CountingHistory {
+            pub loads: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl HistoryReader for CountingHistory {
+            async fn history(
+                &self,
+                entity_id: &str,
+                start: DateTime<Utc>,
+                end: DateTime<Utc>,
+                with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                if entity_id == "sensor.solax_house_load" {
+                    self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                MockHistory
+                    .history(entity_id, start, end, with_attributes)
+                    .await
+            }
+        }
+
+        /// HA refuses every request
+        #[derive(Debug)]
+        pub struct RefusingHistory;
+
+        #[async_trait::async_trait]
+        impl HistoryReader for RefusingHistory {
+            async fn history(
+                &self,
+                _entity_id: &str,
+                _start: DateTime<Utc>,
+                _end: DateTime<Utc>,
+                _with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                Err(HistoryError::Unauthorized)
+            }
+        }
+    }
+
+    fn backtest_state(reader: Arc<dyn fluxion_core::backtest::HistoryReader>) -> BacktestState {
+        BacktestState::new(reader, Ok(backtest_history::site()), i18n())
+            .with_clock(backtest_history::now)
     }
 
     #[tokio::test]
-    async fn simulator_hides_backtest_link_without_db_path() {
+    async fn backtest_routes_registered_without_state() {
+        let port = start_test_server(None).await;
+        let response = http_get(port, "/api/backtest/days").await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(json_body(&response)["error"].is_string());
+        let page = http_get(port, "/backtest").await;
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn simulator_always_links_backtest() {
         let port = start_test_server(None).await;
         let response = http_get(port, "/simulator").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(!response.contains("href=\"/backtest\""));
-    }
-
-    #[tokio::test]
-    async fn simulator_links_backtest_when_db_path_set() {
-        let dir = tempfile::tempdir().unwrap();
-        let port = start_test_server(Some(dir.path().join("backtest.db"))).await;
-        let response = http_get(port, "/simulator").await;
         assert!(response.contains("href=\"/backtest\""));
     }
 
     #[tokio::test]
-    async fn backtest_error_body_hides_db_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("missing-backtest.db");
-        let port = start_test_server(Some(db_path.clone())).await;
-        let response = http_get(port, "/api/backtest/days").await;
-        assert!(!response.starts_with("HTTP/1.1 404"), "{response}");
-        assert!(
-            !response.contains(&db_path.display().to_string()),
-            "{response}"
+    async fn backtest_day_returns_three_series_and_totals() {
+        let state = backtest_state(Arc::new(backtest_history::MockHistory));
+        let port = start_test_server(Some(state)).await;
+
+        let days = json_body(&http_get(port, "/api/backtest/days").await);
+        let listed: Vec<&str> = days["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["date"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&"2026-10-20"), "{days}");
+
+        let response = http_get(port, "/api/backtest/day/2026-10-20").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let report = json_body(&response);
+        assert_eq!(report["labels"].as_array().unwrap().len(), 96);
+        for series in ["actual", "self_use", "winter_reserve"] {
+            assert_eq!(
+                report[series]["soc_pct"].as_array().unwrap().len(),
+                96,
+                "{series}"
+            );
+            assert_eq!(report[series]["import_kwh"].as_array().unwrap().len(), 96);
+        }
+        assert_eq!(
+            report["winter_reserve"]["mode"].as_array().unwrap().len(),
+            96
         );
-        assert!(!response.contains("/home/"), "{response}");
+        for totals in ["totals_actual", "totals_self_use", "totals_winter_reserve"] {
+            assert!(report[totals]["cost_czk"].is_number(), "{totals}");
+        }
+        assert_eq!(report["data"]["usable_blocks"], 96);
+        assert_eq!(report["data"]["history_days"], 7);
+        assert!((report["fees"]["spot_buy_fee_czk"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!(report["summary"].as_str().unwrap().contains("2026-10-20"));
+        // Recorded import: 300 W (0.075 kWh per block) at spot 1.0 for 00-05 (20 blocks) and 3.0
+        // for 60 blocks, 2500 W (0.625 kWh) at 6.0 for 17-21 (16 blocks); buy = spot + 0.4 trade
+        // fee + 1.8 high tariff (no HDO schedule), no export
+        let actual = report["totals_actual"]["cost_czk"].as_f64().unwrap();
+        let expected = 0.075 * 20.0 * 3.2 + 0.075 * 60.0 * 5.2 + 0.625 * 16.0 * 8.2;
+        assert!((actual - expected).abs() < 0.01, "{actual} vs {expected}");
+
+        // Second request is served from the cache: identical body
+        let again = json_body(&http_get(port, "/api/backtest/day/2026-10-20").await);
+        assert_eq!(again, report);
+    }
+
+    #[tokio::test]
+    async fn backtest_uses_the_live_back_up_floor_and_says_so() {
+        let user_control = Arc::new(RwLock::new(UserControlState {
+            default_mode: fluxion_types::DefaultMode::Backup,
+            backup_min_soc_pct: 45,
+            ..Default::default()
+        }));
+        let state = backtest_state(Arc::new(backtest_history::MockHistory))
+            .with_user_control(Arc::clone(&user_control));
+        let port = start_test_server(Some(state)).await;
+        let min = |series: &serde_json::Value| {
+            series
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(serde_json::Value::as_f64)
+                .fold(f64::MAX, f64::min)
+        };
+
+        let backup = json_body(&http_get(port, "/api/backtest/day/2026-10-20").await);
+        assert_eq!(backup["floor"]["source"], "back_up_default_mode");
+        assert!((backup["floor"]["min_soc_pct"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!(
+            min(&backup["self_use"]["soc_pct"]) >= 45.0 - 1e-3,
+            "{}",
+            backup["self_use"]["soc_pct"]
+        );
+        assert!(min(&backup["winter_reserve"]["soc_pct"]) >= 45.0 - 1e-3);
+
+        // Switching the dashboard to Self-Use replays with the control minimum (not the cache)
+        user_control.write().default_mode = fluxion_types::DefaultMode::SelfUse;
+        let self_use = json_body(&http_get(port, "/api/backtest/day/2026-10-20").await);
+        assert_eq!(self_use["floor"]["source"], "control_min_battery_soc");
+        assert!(min(&self_use["self_use"]["soc_pct"]) < 45.0);
+    }
+
+    #[tokio::test]
+    async fn backtest_out_of_range_dates_are_clear_400s() {
+        let state = backtest_state(Arc::new(backtest_history::MockHistory));
+        let port = start_test_server(Some(state)).await;
+        for date in ["-262143-01-01", "2019-12-31", "2026-10-25", "+262142-12-31"] {
+            let response = http_get(port, &format!("/api/backtest/day/{date}")).await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{date}: {response}");
+            assert!(json_body(&response)["error"].is_string(), "{date}");
+        }
+        // The server survived (no panic took the handler down)
+        let ok = http_get(port, "/api/backtest/day/2026-10-20").await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    }
+
+    #[tokio::test]
+    async fn backtest_loads_one_day_at_a_time_and_reuses_the_result() {
+        let reader = Arc::new(backtest_history::CountingHistory::default());
+        let state =
+            backtest_state(Arc::clone(&reader) as Arc<dyn fluxion_core::backtest::HistoryReader>);
+        let port = start_test_server(Some(state)).await;
+        let (a, b) = tokio::join!(
+            http_get(port, "/api/backtest/day/2026-10-20"),
+            http_get(port, "/api/backtest/day/2026-10-20")
+        );
+        assert!(a.starts_with("HTTP/1.1 200") && b.starts_with("HTTP/1.1 200"));
+        assert_eq!(json_body(&a), json_body(&b));
+        assert_eq!(reader.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2026-10-22: its next day has not ended at now (2026-10-23 12:00), so the horizon is
+        // cut and the result is not cached: every request loads again
+        for _ in 0..2 {
+            let r = http_get(port, "/api/backtest/day/2026-10-22").await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        }
+        assert_eq!(reader.loads.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn backtest_ha_error_is_clear_json_without_paths_or_tokens() {
+        let state = backtest_state(Arc::new(backtest_history::RefusingHistory));
+        let port = start_test_server(Some(state)).await;
+        for path in ["/api/backtest/day/2026-10-20", "/api/backtest/days"] {
+            let response = http_get(port, path).await;
+            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+            let body = json_body(&response);
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains("Home Assistant"), "{message}");
+            for leak in [
+                "/home/",
+                "/data/",
+                "http://",
+                "token",
+                "Bearer",
+                "supervisor",
+            ] {
+                assert!(!response.contains(leak), "{leak} in {response}");
+            }
+        }
+        // A bad date and an unfinished day are clear 400s
+        let bad = http_get(port, "/api/backtest/day/20-10-2026").await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let today = http_get(port, "/api/backtest/day/2026-10-23").await;
+        assert!(today.starts_with("HTTP/1.1 400"), "{today}");
     }
 
     #[test]

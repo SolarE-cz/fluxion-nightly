@@ -404,6 +404,32 @@ impl HomeAssistantClient {
         end_time: Option<DateTime<Utc>>,
         minimal: bool,
     ) -> HaResult<Vec<HistoryDataPoint>> {
+        let states = self
+            .get_history_states(entity_id, start_time, end_time, minimal)
+            .await?;
+        if states.is_empty() {
+            debug!("⚠️ [HA HISTORY] No history data returned for {}", entity_id);
+            return Ok(Vec::new());
+        }
+        let data_points = parse_history_states(&states);
+        info!(
+            "✅ [HA HISTORY] Retrieved {} data points for {}",
+            data_points.len(),
+            entity_id
+        );
+        Ok(data_points)
+    }
+
+    /// Raw recorded states of one entity (every state, including `unavailable`), oldest first.
+    /// `minimal` adds `minimal_response&no_attributes`; without it the states carry attributes.
+    /// Read-only: a GET of `/api/history/period`.
+    pub async fn get_history_states(
+        &self,
+        entity_id: &str,
+        start_time: DateTime<Utc>,
+        end_time: Option<DateTime<Utc>>,
+        minimal: bool,
+    ) -> HaResult<Vec<HaHistoryState>> {
         let end = end_time.unwrap_or_else(Utc::now);
 
         // HA history API expects ISO 8601 timestamps
@@ -431,21 +457,8 @@ impl HomeAssistantClient {
             StatusCode::OK => {
                 // HA returns an array of arrays, where each inner array is the history for one entity
                 let history: Vec<Vec<HaHistoryState>> = response.json().await?;
-
-                if history.is_empty() {
-                    debug!("⚠️ [HA HISTORY] No history data returned for {}", entity_id);
-                    return Ok(Vec::new());
-                }
-
                 // Take the first array (should be the only one since we filtered by entity_id)
-                let data_points = parse_history_states(&history[0]);
-
-                info!(
-                    "✅ [HA HISTORY] Retrieved {} data points for {}",
-                    data_points.len(),
-                    entity_id
-                );
-                Ok(data_points)
+                Ok(history.into_iter().next().unwrap_or_default())
             }
             StatusCode::NOT_FOUND => {
                 error!("❌ [HA HISTORY] Entity not found: {}", entity_id);

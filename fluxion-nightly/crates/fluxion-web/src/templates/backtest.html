@@ -278,6 +278,8 @@
     .timeline-segment.charge { background: var(--warning); color: #000; }
     .timeline-segment.discharge { background: var(--success); }
     .timeline-segment.selfuse { background: var(--info); }
+    .timeline-segment.hold { background: var(--text-secondary, #888); color: #000; }
+    .timeline-segment.missing { background: transparent; }
 
     .loading-overlay {
         position: absolute;
@@ -305,23 +307,36 @@
     .hidden {
         display: none !important;
     }
+
+    .notes-box {
+        background: var(--bg-secondary);
+        padding: 15px 20px;
+        border-radius: 8px;
+        margin-top: 20px;
+        font-size: 13px;
+        line-height: 1.5;
+    }
+    .notes-box h3 { margin: 0 0 8px 0; font-size: 15px; }
+    .notes-box ul { margin: 0; padding-left: 18px; }
+    .error-box {
+        background: var(--danger, #c62828);
+        color: #fff;
+        padding: 12px 16px;
+        border-radius: 8px;
+        margin-bottom: 20px;
+    }
 </style>
 
 <div class="container">
-    <!-- Header -->
     <div class="backtest-header">
         <h1>
             <i class="mdi mdi-chart-timeline-variant"></i>
-            Strategy Backtesting
+            Backtest
         </h1>
 
         <div class="day-selector">
             <label>Day:</label>
-            <select id="day-select">
-                {% for day in available_days %}
-                <option value="{{ day }}">{{ day }}</option>
-                {% endfor %}
-            </select>
+            <select id="day-select"></select>
         </div>
 
         <div class="nav-buttons">
@@ -332,468 +347,258 @@
         </div>
     </div>
 
-    <!-- Comparison Bar -->
-    <div class="comparison-bar" id="comparison-bar">
-        Select strategies to compare
+    <div class="error-box hidden" id="error-box"></div>
+    <div class="notes-box hidden" id="loading-note">
+        <span class="loading-spinner" style="display: inline-block; width: 14px; height: 14px; vertical-align: middle;"></span>
+        Loading: reading this day from Home Assistant history and replaying it. The first load of a day can take about 10 seconds.
     </div>
 
-    <!-- Twin View -->
+    <div class="comparison-bar" id="comparison-bar">Loading the days Home Assistant keeps history for...</div>
+
     <div class="twin-view">
-        <!-- Left Panel -->
-        <div class="panel" id="left-panel">
+        {% for side in sides %}
+        <div class="panel" id="{{ side }}-panel">
             <div class="panel-header">
-                <span class="panel-title">Left Panel</span>
-                <select class="strategy-select" id="left-strategy">
-                    {% for strategy in strategies %}
-                    <option value="{{ strategy.id }}"{% if strategy.id == "actual" %} selected{% endif %}>
-                        {{ strategy.name }}
-                    </option>
-                    {% endfor %}
+                <select class="strategy-select" id="{{ side }}-strategy">
+                    <option value="actual"{% if side == "left" %} selected{% endif %}>Actual (recorded)</option>
+                    <option value="self_use">Self-use</option>
+                    <option value="winter_reserve"{% if side == "right" %} selected{% endif %}>Winter Reserve</option>
                 </select>
-                <button class="params-toggle" id="left-params-toggle" style="display: none;">
-                    <i class="mdi mdi-tune"></i>
-                    Parameters
-                </button>
             </div>
             <div class="panel-body">
-                <div class="params-panel" id="left-params-panel">
-                    <div class="param-row">
-                        <span class="param-label">Target SOC (%)</span>
-                        <input type="number" class="param-input" id="left-target-soc" value="90" min="50" max="100">
-                    </div>
-                    <div class="param-row">
-                        <span class="param-label">Top Blocks</span>
-                        <input type="number" class="param-input" id="left-top-blocks" value="12" min="1" max="24">
-                    </div>
-                    <div class="param-row">
-                        <span class="param-label">Safety Mult.</span>
-                        <input type="number" class="param-input" id="left-safety-mult" value="1.3" min="1.0" max="2.0" step="0.1">
-                    </div>
-                    <button class="reset-btn" id="left-reset-params">Reset to Defaults</button>
-                </div>
-
                 <div class="summary-cards">
                     <div class="summary-card">
-                        <div class="summary-card-label">Net Cost</div>
-                        <div class="summary-card-value" id="left-net-cost">--</div>
+                        <div class="summary-card-label">Grid cost</div>
+                        <div class="summary-card-value" id="{{ side }}-cost">--</div>
                     </div>
                     <div class="summary-card">
-                        <div class="summary-card-label">Battery Value</div>
-                        <div class="summary-card-value" id="left-battery-value">--</div>
+                        <div class="summary-card-label">Saving vs self-use</div>
+                        <div class="summary-card-value" id="{{ side }}-savings">--</div>
                     </div>
                 </div>
-
                 <table class="energy-table">
-                    <tr><td>PV Generation</td><td id="left-pv">-- kWh</td></tr>
-                    <tr><td>Grid Import</td><td id="left-import">-- kWh</td></tr>
-                    <tr><td>Grid Export</td><td id="left-export">-- kWh</td></tr>
-                    <tr><td>Battery Charge</td><td id="left-charge">-- kWh</td></tr>
-                    <tr><td>Battery Discharge</td><td id="left-discharge">-- kWh</td></tr>
-                    <tr><td>Consumption</td><td id="left-consumption">-- kWh</td></tr>
+                    <tr><td>Grid import</td><td id="{{ side }}-import">--</td></tr>
+                    <tr><td>Grid export</td><td id="{{ side }}-export">--</td></tr>
+                    <tr><td>Battery wear</td><td id="{{ side }}-wear">--</td></tr>
+                    <tr><td>SOC start / end</td><td id="{{ side }}-soc">--</td></tr>
+                    <tr><td>End battery value</td><td id="{{ side }}-adj">--</td></tr>
                 </table>
             </div>
-            <div class="loading-overlay hidden" id="left-loading">
+            <div class="loading-overlay hidden" id="{{ side }}-loading">
                 <div class="loading-spinner"></div>
             </div>
         </div>
-
-        <!-- Right Panel -->
-        <div class="panel" id="right-panel">
-            <div class="panel-header">
-                <span class="panel-title">Right Panel</span>
-                <select class="strategy-select" id="right-strategy">
-                    {% for strategy in strategies %}
-                    <option value="{{ strategy.id }}"{% if strategy.id == "winter_adaptive" %} selected{% endif %}>
-                        {{ strategy.name }}
-                    </option>
-                    {% endfor %}
-                </select>
-                <button class="params-toggle" id="right-params-toggle">
-                    <i class="mdi mdi-tune"></i>
-                    Parameters
-                </button>
-            </div>
-            <div class="panel-body">
-                <div class="params-panel" id="right-params-panel">
-                    <div class="param-row">
-                        <span class="param-label">Target SOC (%)</span>
-                        <input type="number" class="param-input" id="right-target-soc" value="90" min="50" max="100">
-                    </div>
-                    <div class="param-row">
-                        <span class="param-label">Top Blocks</span>
-                        <input type="number" class="param-input" id="right-top-blocks" value="12" min="1" max="24">
-                    </div>
-                    <div class="param-row">
-                        <span class="param-label">Safety Mult.</span>
-                        <input type="number" class="param-input" id="right-safety-mult" value="1.3" min="1.0" max="2.0" step="0.1">
-                    </div>
-                    <button class="reset-btn" id="right-reset-params">Reset to Defaults</button>
-                </div>
-
-                <div class="summary-cards">
-                    <div class="summary-card">
-                        <div class="summary-card-label">Net Cost</div>
-                        <div class="summary-card-value" id="right-net-cost">--</div>
-                    </div>
-                    <div class="summary-card">
-                        <div class="summary-card-label">Battery Value</div>
-                        <div class="summary-card-value" id="right-battery-value">--</div>
-                    </div>
-                </div>
-
-                <table class="energy-table">
-                    <tr><td>PV Generation</td><td id="right-pv">-- kWh</td></tr>
-                    <tr><td>Grid Import</td><td id="right-import">-- kWh</td></tr>
-                    <tr><td>Grid Export</td><td id="right-export">-- kWh</td></tr>
-                    <tr><td>Battery Charge</td><td id="right-charge">-- kWh</td></tr>
-                    <tr><td>Battery Discharge</td><td id="right-discharge">-- kWh</td></tr>
-                    <tr><td>Consumption</td><td id="right-consumption">-- kWh</td></tr>
-                </table>
-            </div>
-            <div class="loading-overlay hidden" id="right-loading">
-                <div class="loading-spinner"></div>
-            </div>
-        </div>
+        {% endfor %}
     </div>
 
-    <!-- Combined Chart -->
     <div class="chart-section">
-        <div class="chart-title">Price & SOC Comparison</div>
+        <div class="chart-title">Prices and SOC</div>
         <div class="combined-chart-container">
             <canvas id="comparison-chart"></canvas>
         </div>
-
         <div class="mode-timeline">
             <div class="timeline-row">
-                <span class="timeline-label">Left:</span>
-                <div class="timeline-bar" id="left-timeline"></div>
-            </div>
-            <div class="timeline-row">
-                <span class="timeline-label">Right:</span>
-                <div class="timeline-bar" id="right-timeline"></div>
+                <span class="timeline-label">Winter Reserve:</span>
+                <div class="timeline-bar" id="wr-timeline"></div>
             </div>
         </div>
+    </div>
+
+    <div class="notes-box">
+        <h3>Data and assumptions</h3>
+        <ul id="notes-list"></ul>
     </div>
 </div>
 
 <script>
-// Backtest application state
-const state = {
-    selectedDay: '{{ available_days.first().unwrap_or(&"".to_string()) }}',
-    left: { strategy: 'actual', data: null, overrides: null },
-    right: { strategy: 'winter_adaptive', data: null, overrides: null },
-    chart: null
-};
+const baseUrl = '{{ ingress_path }}';
+const NAMES = { actual: 'Actual', self_use: 'Self-use', winter_reserve: 'Winter Reserve' };
+const state = { day: null, report: null, chart: null, left: 'actual', right: 'winter_reserve' };
 
-// API functions
-const api = {
-    baseUrl: '{{ ingress_path }}',
-
-    async getDayData(date) {
-        const response = await fetch(`${this.baseUrl}/api/backtest/day/${date}`);
-        if (!response.ok) throw new Error('Failed to fetch day data');
-        return response.json();
-    },
-
-    async simulate(date, strategy, overrides) {
-        const response = await fetch(`${this.baseUrl}/api/backtest/simulate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ date, strategy, config_overrides: overrides })
-        });
-        if (!response.ok) throw new Error('Simulation failed');
-        return response.json();
-    }
-};
-
-// UI update functions
-function updatePanel(side, data) {
-    const prefix = side;
-
-    document.getElementById(`${prefix}-net-cost`).textContent = `${data.net_cost_czk.toFixed(0)} CZK`;
-    document.getElementById(`${prefix}-battery-value`).textContent = `${data.battery_value_czk.toFixed(0)} CZK`;
-
-    document.getElementById(`${prefix}-pv`).textContent = `${data.pv_generation_kwh.toFixed(1)} kWh`;
-    document.getElementById(`${prefix}-import`).textContent = `${data.grid_import_kwh.toFixed(1)} kWh`;
-    document.getElementById(`${prefix}-export`).textContent = `${data.grid_export_kwh.toFixed(1)} kWh`;
-    document.getElementById(`${prefix}-charge`).textContent = `${data.battery_charge_kwh.toFixed(1)} kWh`;
-    document.getElementById(`${prefix}-discharge`).textContent = `${data.battery_discharge_kwh.toFixed(1)} kWh`;
-    document.getElementById(`${prefix}-consumption`).textContent = `${data.consumption_kwh.toFixed(1)} kWh`;
-
-    // Color code net cost
-    const netCostEl = document.getElementById(`${prefix}-net-cost`);
-    netCostEl.classList.remove('positive', 'negative');
-    if (data.net_cost_czk < 0) netCostEl.classList.add('positive');
+function fmt(v, digits, unit) {
+    return (v === null || v === undefined || Number.isNaN(v)) ? '--' : `${v.toFixed(digits)} ${unit}`;
 }
 
-function updateComparisonBar() {
-    const bar = document.getElementById('comparison-bar');
-
-    if (!state.left.data || !state.right.data) {
-        bar.textContent = 'Select strategies to compare';
-        return;
-    }
-
-    const diff = state.right.data.net_cost_czk - state.left.data.net_cost_czk;
-    const savingsPercent = state.left.data.net_cost_czk !== 0
-        ? ((state.left.data.net_cost_czk - state.right.data.net_cost_czk) / Math.abs(state.left.data.net_cost_czk)) * 100
-        : 0;
-
-    if (diff < 0) {
-        bar.textContent = `Right (${state.right.data.strategy}) saves ${Math.abs(diff).toFixed(0)} CZK (${savingsPercent.toFixed(1)}%) vs Left`;
-        bar.style.background = 'linear-gradient(135deg, #4caf50 0%, #2e7d32 100%)';
-    } else if (diff > 0) {
-        bar.textContent = `Left (${state.left.data.strategy}) saves ${diff.toFixed(0)} CZK (${Math.abs(savingsPercent).toFixed(1)}%) vs Right`;
-        bar.style.background = 'linear-gradient(135deg, #ff9800 0%, #f57c00 100%)';
+function showError(message) {
+    const box = document.getElementById('error-box');
+    if (message) {
+        box.textContent = message;
+        box.classList.remove('hidden');
     } else {
-        bar.textContent = `Both strategies have equal costs`;
-        bar.style.background = 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)';
+        box.classList.add('hidden');
     }
 }
 
-function updateChart() {
-    const ctx = document.getElementById('comparison-chart');
-
-    // Destroy existing chart
-    if (state.chart) {
-        state.chart.destroy();
+async function getJson(url) {
+    const response = await fetch(url);
+    let body = null;
+    try { body = await response.json(); } catch (e) { body = null; }
+    if (!response.ok) {
+        throw new Error((body && body.error) || `Request failed (HTTP ${response.status})`);
     }
-
-    if (!state.left.data || !state.right.data) return;
-
-    // Prepare data
-    const leftData = state.left.data.hourly_data;
-    const rightData = state.right.data.hourly_data;
-
-    // Use left data timestamps as labels
-    const labels = leftData.map(d => {
-        const date = new Date(d.timestamp);
-        return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-    });
-
-    // Prices (same for both)
-    const prices = leftData.map(d => d.price_czk);
-
-    // SOC data
-    const leftSoc = leftData.map(d => d.soc_percent);
-    const rightSoc = rightData.map(d => d.soc_percent);
-
-    state.chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: labels,
-            datasets: [
-                {
-                    label: 'Price (CZK/kWh)',
-                    data: prices,
-                    borderColor: 'rgba(255, 215, 0, 0.8)',
-                    backgroundColor: 'rgba(255, 215, 0, 0.1)',
-                    yAxisID: 'y-price',
-                    fill: true,
-                    tension: 0.1,
-                    pointRadius: 0
-                },
-                {
-                    label: `Left SOC (${state.left.data.strategy})`,
-                    data: leftSoc,
-                    borderColor: 'rgba(33, 150, 243, 1)',
-                    backgroundColor: 'transparent',
-                    yAxisID: 'y-soc',
-                    borderWidth: 2,
-                    tension: 0.2,
-                    pointRadius: 0
-                },
-                {
-                    label: `Right SOC (${state.right.data.strategy})`,
-                    data: rightSoc,
-                    borderColor: 'rgba(76, 175, 80, 1)',
-                    backgroundColor: 'transparent',
-                    yAxisID: 'y-soc',
-                    borderWidth: 2,
-                    tension: 0.2,
-                    pointRadius: 0,
-                    borderDash: [5, 5]
-                }
-            ]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            interaction: {
-                mode: 'index',
-                intersect: false
-            },
-            plugins: {
-                legend: {
-                    position: 'top',
-                    labels: { color: '#e0e0e0' }
-                },
-                tooltip: {
-                    backgroundColor: 'rgba(0, 0, 0, 0.9)',
-                    titleColor: '#fff',
-                    bodyColor: '#e0e0e0'
-                }
-            },
-            scales: {
-                'y-price': {
-                    type: 'linear',
-                    position: 'left',
-                    title: { display: true, text: 'Price (CZK/kWh)', color: '#ffd700' },
-                    grid: { color: 'rgba(255, 255, 255, 0.1)' },
-                    ticks: { color: '#ffd700' }
-                },
-                'y-soc': {
-                    type: 'linear',
-                    position: 'right',
-                    min: 0,
-                    max: 100,
-                    title: { display: true, text: 'SOC (%)', color: '#e0e0e0' },
-                    grid: { display: false },
-                    ticks: { color: '#e0e0e0' }
-                },
-                x: {
-                    ticks: {
-                        color: '#999',
-                        maxRotation: 45,
-                        autoSkip: true,
-                        maxTicksLimit: 24
-                    },
-                    grid: { display: false }
-                }
-            }
-        }
-    });
+    return body;
 }
 
-function updateTimeline(side, data) {
-    const timeline = document.getElementById(`${side}-timeline`);
-    if (!data || !data.hourly_data || data.hourly_data.length === 0) {
-        timeline.innerHTML = '';
-        return;
-    }
+function totals(key) {
+    const r = state.report;
+    return { actual: r.totals_actual, self_use: r.totals_self_use, winter_reserve: r.totals_winter_reserve }[key];
+}
 
-    // Group consecutive modes
+function updatePanel(side) {
+    const t = totals(state[side]);
+    document.getElementById(`${side}-cost`).textContent = fmt(t.cost_czk, 2, 'CZK');
+    const savings = document.getElementById(`${side}-savings`);
+    savings.textContent = state[side] === 'self_use' ? '--' : fmt(t.savings_vs_selfuse_czk, 2, 'CZK');
+    savings.classList.remove('positive', 'negative');
+    if (state[side] !== 'self_use') savings.classList.add(t.savings_vs_selfuse_czk >= 0 ? 'positive' : 'negative');
+    document.getElementById(`${side}-import`).textContent = fmt(t.import_kwh, 2, 'kWh');
+    document.getElementById(`${side}-export`).textContent = fmt(t.export_kwh, 2, 'kWh');
+    document.getElementById(`${side}-wear`).textContent = fmt(t.wear_czk, 2, 'CZK');
+    document.getElementById(`${side}-soc`).textContent = `${t.soc_start_pct.toFixed(0)} % / ${t.soc_end_pct.toFixed(0)} %`;
+    document.getElementById(`${side}-adj`).textContent = state[side] === 'self_use' ? '--' : fmt(t.end_adjustment_czk, 2, 'CZK');
+}
+
+function updateTimeline() {
+    const modes = state.report.winter_reserve.mode;
+    const el = document.getElementById('wr-timeline');
     const segments = [];
-    let currentMode = null;
-    let currentCount = 0;
-
-    data.hourly_data.forEach(point => {
-        const mode = point.mode.toLowerCase().replace(/[^a-z]/g, '');
-        if (mode === currentMode) {
-            currentCount++;
-        } else {
-            if (currentMode) {
-                segments.push({ mode: currentMode, count: currentCount });
-            }
-            currentMode = mode;
-            currentCount = 1;
-        }
+    modes.forEach(m => {
+        const mode = m || '-';
+        const last = segments[segments.length - 1];
+        if (last && last.mode === mode) last.count++; else segments.push({ mode, count: 1 });
     });
-    if (currentMode) {
-        segments.push({ mode: currentMode, count: currentCount });
-    }
-
-    const total = data.hourly_data.length;
-    timeline.innerHTML = segments.map(seg => {
-        const width = (seg.count / total) * 100;
-        let className = 'selfuse';
-        let label = 'SU';
-
-        if (seg.mode.includes('charge') && !seg.mode.includes('discharge')) {
-            className = 'charge';
-            label = 'CHG';
-        } else if (seg.mode.includes('discharge')) {
-            className = 'discharge';
-            label = 'DIS';
-        }
-
-        return `<div class="timeline-segment ${className}" style="width: ${width}%">${width > 5 ? label : ''}</div>`;
+    const cls = { S: 'selfuse', C: 'charge', H: 'hold', E: 'discharge', '-': 'missing' };
+    el.innerHTML = segments.map(seg => {
+        const width = (seg.count / modes.length) * 100;
+        return `<div class="timeline-segment ${cls[seg.mode] || 'selfuse'}" style="width: ${width}%">${width > 4 && seg.mode !== '-' ? seg.mode : ''}</div>`;
     }).join('');
 }
 
-// Data loading functions
-async function loadPanelData(side) {
-    const strategy = state[side].strategy;
-    const loadingEl = document.getElementById(`${side}-loading`);
-
-    try {
-        loadingEl.classList.remove('hidden');
-
-        let data;
-        if (strategy === 'actual') {
-            data = await api.getDayData(state.selectedDay);
-        } else {
-            const overrides = getOverrides(side);
-            data = await api.simulate(state.selectedDay, strategy, overrides);
+function updateChart() {
+    const r = state.report;
+    if (state.chart) state.chart.destroy();
+    const soc = { actual: r.actual.soc_pct, self_use: r.self_use.soc_pct, winter_reserve: r.winter_reserve.soc_pct };
+    const colors = { actual: 'rgba(33, 150, 243, 1)', self_use: 'rgba(158, 158, 158, 1)', winter_reserve: 'rgba(76, 175, 80, 1)' };
+    const datasets = [
+        { label: 'Buy (CZK/kWh)', data: r.buy_czk, borderColor: 'rgba(255, 215, 0, 0.9)', backgroundColor: 'rgba(255, 215, 0, 0.1)', yAxisID: 'y-price', fill: true, stepped: true, pointRadius: 0 },
+        { label: 'Sell (CZK/kWh)', data: r.sell_czk, borderColor: 'rgba(255, 152, 0, 0.8)', backgroundColor: 'transparent', yAxisID: 'y-price', stepped: true, pointRadius: 0 },
+    ];
+    Object.keys(soc).forEach(key => {
+        datasets.push({ label: `SOC ${NAMES[key]}`, data: soc[key], borderColor: colors[key], backgroundColor: 'transparent', yAxisID: 'y-soc', borderWidth: 2, tension: 0.2, pointRadius: 0, borderDash: key === 'self_use' ? [5, 5] : [] });
+    });
+    state.chart = new Chart(document.getElementById('comparison-chart'), {
+        type: 'line',
+        data: { labels: r.labels, datasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: { position: 'top', labels: { color: '#e0e0e0' } },
+                tooltip: {
+                    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+                    callbacks: {
+                        afterBody: items => {
+                            const i = items[0].dataIndex;
+                            const mode = r.winter_reserve.mode[i];
+                            return mode ? [`Winter Reserve: ${mode}`, r.winter_reserve.reason[i] || ''] : ['no data for this block'];
+                        }
+                    }
+                }
+            },
+            scales: {
+                'y-price': { type: 'linear', position: 'left', title: { display: true, text: 'CZK/kWh', color: '#ffd700' }, grid: { color: 'rgba(255, 255, 255, 0.1)' }, ticks: { color: '#ffd700' } },
+                'y-soc': { type: 'linear', position: 'right', min: 0, max: 100, title: { display: true, text: 'SOC (%)', color: '#e0e0e0' }, grid: { display: false }, ticks: { color: '#e0e0e0' } },
+                x: { ticks: { color: '#999', maxRotation: 45, autoSkip: true, maxTicksLimit: 24 }, grid: { display: false } }
+            }
         }
+    });
+}
 
-        state[side].data = data;
-        updatePanel(side, data);
-        updateTimeline(side, data);
-        updateComparisonBar();
-        updateChart();
+function updateNotes() {
+    const r = state.report;
+    const d = r.data;
+    const f = r.fees;
+    const items = [];
+    items.push(`${d.usable_blocks} of ${d.blocks} blocks have complete data${d.missing_blocks.length ? ` (missing: ${d.missing_blocks.join(', ')})` : ''}.`);
+    const fields = Object.entries(d.missing_per_field).map(([k, v]) => `${k} ${v}`);
+    if (fields.length) items.push(`Blocks without data per field: ${fields.join(', ')} (pv_partial: an extra PV unit had no data; PV is the sum of the units that had).`);
+    items.push(`Load forecast history: ${d.history_days} of 7 previous days.`);
+    if (d.degraded) items.push(d.degraded);
+    items.push(`HDO tariff: ${d.hdo_source}.`);
+    items.push(r.floor.source === 'back_up_default_mode'
+        ? `Minimum SOC of the simulated runs: ${r.floor.min_soc_pct.toFixed(0)} % (Back Up default mode, as the live planner uses it).`
+        : `Minimum SOC of the simulated runs: ${r.floor.min_soc_pct.toFixed(0)} % (control minimum).`);
+    items.push(`Prices as the live planner builds them: buy = ${f.buy_price_sensor ? 'buy sensor' : (f.use_spot_prices_to_buy ? 'spot' : 'fixed price')} + ${f.use_spot_prices_to_buy ? `trade fee ${f.spot_buy_fee_czk.toFixed(2)} + ` : ''}HDO fee (low ${f.hdo_low_tariff_czk.toFixed(2)}, high ${f.hdo_high_tariff_czk.toFixed(2)}); sell = ${f.use_spot_prices_to_sell ? `spot - ${f.spot_sell_fee_czk.toFixed(2)}` : `${f.export_price_czk.toFixed(2)}`} CZK/kWh.`);
+    r.notes.forEach(n => items.push(n));
+    const list = document.getElementById('notes-list');
+    list.innerHTML = '';
+    items.forEach(text => {
+        const li = document.createElement('li');
+        li.textContent = text;
+        list.appendChild(li);
+    });
+}
+
+function render() {
+    document.getElementById('comparison-bar').textContent = state.report.summary;
+    updatePanel('left');
+    updatePanel('right');
+    updateTimeline();
+    updateChart();
+    updateNotes();
+}
+
+function setLoading(on) {
+    ['left', 'right'].forEach(side => document.getElementById(`${side}-loading`).classList.toggle('hidden', !on));
+    // One day at a time: the first load of a day reads HA history and replays it (several seconds)
+    document.getElementById('day-select').disabled = on;
+    document.getElementById('loading-note').classList.toggle('hidden', !on);
+}
+
+async function loadDay(day) {
+    state.day = day;
+    showError(null);
+    setLoading(true);
+    document.getElementById('comparison-bar').textContent = `Reading ${day} from Home Assistant history and replaying it...`;
+    try {
+        state.report = await getJson(`${baseUrl}/api/backtest/day/${day}`);
+        if (state.day === day) render();
     } catch (error) {
-        console.error(`Error loading ${side} panel:`, error);
-        alert(`Failed to load data: ${error.message}`);
+        showError(error.message);
+        document.getElementById('comparison-bar').textContent = 'No result for this day';
     } finally {
-        loadingEl.classList.add('hidden');
+        setLoading(false);
     }
 }
 
-function getOverrides(side) {
-    const strategy = state[side].strategy;
-    if (strategy === 'actual' || strategy === 'self_use') return null;
-
-    return {
-        daily_charging_target_soc: parseFloat(document.getElementById(`${side}-target-soc`).value),
-        top_expensive_blocks: parseInt(document.getElementById(`${side}-top-blocks`).value),
-        charge_safety_multiplier: parseFloat(document.getElementById(`${side}-safety-mult`).value)
-    };
-}
-
-// Event listeners
-document.getElementById('day-select').addEventListener('change', async (e) => {
-    state.selectedDay = e.target.value;
-    await Promise.all([loadPanelData('left'), loadPanelData('right')]);
-});
-
 ['left', 'right'].forEach(side => {
-    document.getElementById(`${side}-strategy`).addEventListener('change', async (e) => {
-        state[side].strategy = e.target.value;
-
-        // Show/hide params toggle
-        const hasParams = e.target.value === 'winter_adaptive';
-        document.getElementById(`${side}-params-toggle`).style.display = hasParams ? 'flex' : 'none';
-
-        await loadPanelData(side);
-    });
-
-    document.getElementById(`${side}-params-toggle`).addEventListener('click', () => {
-        const panel = document.getElementById(`${side}-params-panel`);
-        panel.classList.toggle('active');
-    });
-
-    document.getElementById(`${side}-reset-params`).addEventListener('click', () => {
-        document.getElementById(`${side}-target-soc`).value = '90';
-        document.getElementById(`${side}-top-blocks`).value = '12';
-        document.getElementById(`${side}-safety-mult`).value = '1.3';
-        loadPanelData(side);
-    });
-
-    // Parameter change listeners
-    ['target-soc', 'top-blocks', 'safety-mult'].forEach(param => {
-        document.getElementById(`${side}-${param}`).addEventListener('change', () => {
-            if (state[side].strategy !== 'actual' && state[side].strategy !== 'self_use') {
-                loadPanelData(side);
-            }
-        });
+    document.getElementById(`${side}-strategy`).addEventListener('change', e => {
+        state[side] = e.target.value;
+        if (state.report) updatePanel(side);
     });
 });
 
-// Initial load
+document.getElementById('day-select').addEventListener('change', e => loadDay(e.target.value));
+
 document.addEventListener('DOMContentLoaded', async () => {
-    if (state.selectedDay) {
-        await Promise.all([loadPanelData('left'), loadPanelData('right')]);
+    try {
+        const body = await getJson(`${baseUrl}/api/backtest/days`);
+        const select = document.getElementById('day-select');
+        body.days.forEach(d => {
+            const option = document.createElement('option');
+            option.value = d.date;
+            option.textContent = d.history_days < 7 ? `${d.date} (${d.history_days}/7 days of history)` : d.date;
+            select.appendChild(option);
+        });
+        if (body.days.length) {
+            await loadDay(body.days[0].date);
+        } else {
+            document.getElementById('comparison-bar').textContent = 'Home Assistant has no complete past day in its history yet';
+        }
+    } catch (error) {
+        showError(error.message);
+        document.getElementById('comparison-bar').textContent = 'Backtest unavailable';
     }
 });
 </script>

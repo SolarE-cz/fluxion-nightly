@@ -1059,7 +1059,8 @@ impl WinterReserveStrategy {
     }
 }
 
-fn battery_params(control: &ControlConfig) -> BatteryParams {
+/// Battery limits the live planner derives from the control configuration.
+pub fn battery_params(control: &ControlConfig) -> BatteryParams {
     let max_discharge_kw = control.max_battery_charge_rate_kw;
     let mode_change_kwh = max_discharge_kw * control.min_mode_change_interval_secs as f32 / 3600.0;
     BatteryParams {
