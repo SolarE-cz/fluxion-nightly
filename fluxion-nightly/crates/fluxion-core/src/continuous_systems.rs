@@ -233,6 +233,178 @@ fn readback_matches(
     state.work_mode == expected
 }
 
+/// How long a block-boundary write waits for a schedule generated inside the new block (H25 C).
+const BOUNDARY_FRESH_SCHEDULE_WAIT_SECS: i64 = 60;
+
+/// What the user asked for: levers, user control, the control config and the Back Up discharge
+/// minimum. A difference from the value the block lock was taken under releases the lock for
+/// the rest of the block (brief H25 B).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserIntent {
+    levers: Option<fluxion_types::UserLevers>,
+    disallow_charge: bool,
+    disallow_discharge: bool,
+    fixed_slot: Option<(String, InverterOperationMode)>,
+    default_mode: Option<fluxion_types::user_control::DefaultMode>,
+    backup_min_soc_pct: Option<u8>,
+    /// Hash of the whole control config (force discharge, SOC limits, export caps, ...)
+    control_hash: u64,
+    /// `BackupDischargeMinSoc` from HA, as bits
+    backup_discharge_min_soc: Option<u32>,
+}
+
+/// Hash of the control config's serialised form: any edit changes it.
+fn control_config_hash(control: &ControlConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(control)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+impl UserIntent {
+    fn of(
+        levers: Option<fluxion_types::UserLevers>,
+        user_control: Option<&fluxion_types::UserControlState>,
+        control: &ControlConfig,
+        backup_discharge_min_soc: Option<f32>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            control_hash: control_config_hash(control),
+            backup_discharge_min_soc: backup_discharge_min_soc.map(f32::to_bits),
+            levers,
+            disallow_charge: user_control.is_some_and(|uc| uc.disallow_charge),
+            disallow_discharge: user_control.is_some_and(|uc| uc.disallow_discharge),
+            fixed_slot: user_control
+                .and_then(|uc| uc.get_fixed_slot_at(now))
+                .map(|slot| (slot.id.clone(), slot.mode)),
+            default_mode: user_control.map(|uc| uc.default_mode),
+            backup_min_soc_pct: user_control.map(|uc| uc.backup_min_soc_pct),
+        }
+    }
+}
+
+/// Block lock of one inverter: the mode of the block starting at `block_start` was applied (or
+/// confirmed) from a schedule generated inside that block, under `intent`.
+#[derive(Debug, Clone)]
+pub struct BlockLock {
+    block_start: DateTime<Utc>,
+    intent: UserIntent,
+    held_logged: bool,
+    /// The intent changed inside the block: the lock no longer holds anything until the next
+    /// block (the replan for the new intent may land after the executor saw the change).
+    released: bool,
+}
+
+/// What the executor does with a planner mode change (brief H25 B and C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockGate {
+    Apply,
+    /// The block's mode is locked: the change waits for the next block boundary.
+    HeldUntilBoundary,
+    /// The schedule predates the block start: wait (max 60 s) for the fresh one.
+    WaitForFreshSchedule,
+    /// The schedule still predates the block start after the 60 s wait: apply it anyway.
+    ApplyStale,
+}
+
+/// Mode changes happen at 15-minute block boundaries (owner ruling 2026-10-17). A change inside a
+/// block that was already applied from a schedule generated inside it waits for the next
+/// boundary, unless `good_reason` (initial sync, VPR, a fixed slot, a safety guard) or the user's
+/// intent changed since the lock was taken (that releases the lock for the rest of the block).
+/// At a boundary, a planner change from a schedule generated before the block started is applied
+/// only after `BOUNDARY_FRESH_SCHEDULE_WAIT_SECS`; `good_reason` changes never wait.
+fn block_gate(
+    lock: Option<&BlockLock>,
+    block_start: DateTime<Utc>,
+    schedule_generated_at: Option<DateTime<Utc>>,
+    intent: &UserIntent,
+    good_reason: bool,
+    now: DateTime<Utc>,
+) -> BlockGate {
+    if good_reason {
+        return BlockGate::Apply;
+    }
+    if let Some(lock) = lock.filter(|l| l.block_start == block_start) {
+        if !lock.released && lock.intent == *intent {
+            return BlockGate::HeldUntilBoundary;
+        }
+        return BlockGate::Apply;
+    }
+    let stale = schedule_generated_at.is_some_and(|generated| generated < block_start);
+    if !stale {
+        return BlockGate::Apply;
+    }
+    if (now - block_start).num_seconds() < BOUNDARY_FRESH_SCHEDULE_WAIT_SECS {
+        return BlockGate::WaitForFreshSchedule;
+    }
+    BlockGate::ApplyStale
+}
+
+/// Per-inverter executor state kept across runs (one `Local`, within the Bevy parameter limit).
+#[derive(Default)]
+pub struct ExecutorState {
+    drift: BTreeMap<String, ModeDriftWatch>,
+    locks: BTreeMap<String, BlockLock>,
+    /// Block start whose fresh-schedule wait was already logged, per inverter
+    wait_logged: BTreeMap<String, DateTime<Utc>>,
+    /// Block start whose stale-schedule fallback was already warned about, per inverter
+    stale_warned: BTreeMap<String, DateTime<Utc>>,
+}
+
+impl ExecutorState {
+    /// Release this block's lock when the intent changed since it was taken. Called on every run
+    /// before the gate, so a change seen before its replan lands still releases the lock.
+    fn observe_intent(
+        &mut self,
+        inverter_id: &str,
+        block_start: DateTime<Utc>,
+        intent: &UserIntent,
+    ) {
+        if let Some(lock) = self.locks.get_mut(inverter_id)
+            && lock.block_start == block_start
+            && !lock.released
+            && lock.intent != *intent
+        {
+            lock.released = true;
+            debug!(
+                "{inverter_id}: user or config change, block lock released until the next block"
+            );
+        }
+    }
+
+    /// Lock the block after its mode was applied or confirmed, when the schedule was generated
+    /// inside the block (a projection made before the block never locks it). A lock released in
+    /// this block stays released until the next block.
+    fn lock_block(
+        &mut self,
+        inverter_id: &str,
+        block_start: DateTime<Utc>,
+        schedule_generated_at: Option<DateTime<Utc>>,
+        intent: &UserIntent,
+    ) {
+        self.observe_intent(inverter_id, block_start, intent);
+        if schedule_generated_at.is_some_and(|generated| generated >= block_start)
+            && self
+                .locks
+                .get(inverter_id)
+                .is_none_or(|l| l.block_start != block_start)
+        {
+            self.locks.insert(
+                inverter_id.to_string(),
+                BlockLock {
+                    block_start,
+                    intent: intent.clone(),
+                    held_logged: false,
+                    released: false,
+                },
+            );
+        }
+    }
+}
+
 /// Drift watch for one inverter's mode: confirms a hardware mismatch over two state reads at
 /// least 30 s apart, then allows one re-apply per 5 minutes.
 #[derive(Debug, Default, Clone)]
@@ -435,13 +607,16 @@ pub fn schedule_execution_system(
     system_config: Res<crate::resources::SystemConfig>,
     mut sync_tracker: ResMut<InitialModeSyncTracker>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
-    levers: Option<Res<crate::resources::UserLeversResource>>,
+    (levers, backup_soc): (
+        Option<Res<crate::resources::UserLeversResource>>,
+        Option<Res<crate::async_systems::BackupDischargeMinSoc>>,
+    ),
     timezone: Option<Res<crate::resources::TimezoneConfig>>,
     mut debug_was_enabled: Local<Option<bool>>,
     mut vpr_was_active: Local<bool>,
     mut kill_was_active: Local<bool>,
     mut lever_startup: Local<LeversStartup>,
-    mut drift: Local<BTreeMap<String, ModeDriftWatch>>,
+    mut executor: Local<ExecutorState>,
     mut warned: Local<ScheduleWarnings>,
 ) {
     let now = Utc::now();
@@ -590,6 +765,16 @@ pub fn schedule_execution_system(
         None => schedule.and_then(|s| s.get_current_mode(now)).cloned(),
     };
 
+    // Block lock inputs (brief H25): when the schedule was generated, and what the user asked for
+    let schedule_generated_at = schedule.map(|s| s.generated_at);
+    let intent = UserIntent::of(
+        levers,
+        user_control.as_ref().map(|uc| &uc.state),
+        &system_config.control_config,
+        backup_soc.as_ref().map(|b| b.value),
+        now,
+    );
+
     // Default mode Back Up (brief H19): planner Self-Use runs as Back Up Mode with the user's
     // minimum SOC. Explicit overrides (VPR, a fixed slot active now) keep their own mode.
     let backup_default = user_control
@@ -709,11 +894,15 @@ pub fn schedule_execution_system(
                     && !debug.enabled
                     && scheduled_mode.mode == current_mode.mode
                     && let Some(raw) = raw_state
-                    && drift.entry(inverter.id.clone()).or_default().observe(
-                        raw.last_updated,
-                        readback_matches(&raw.state, current_mode.mode),
-                        now,
-                    )
+                    && executor
+                        .drift
+                        .entry(inverter.id.clone())
+                        .or_default()
+                        .observe(
+                            raw.last_updated,
+                            readback_matches(&raw.state, current_mode.mode),
+                            now,
+                        )
                 {
                     let soc_ok = battery_status.is_some_and(|b| {
                         !soc_blocks_mode(
@@ -759,6 +948,87 @@ pub fn schedule_execution_system(
                     || ambiguous_manual_resync
                     || backup_pending
                 {
+                    // Block boundaries (brief H25): a planner change inside a locked block waits for
+                    // the next boundary, and a boundary waits briefly for the fresh schedule.
+                    if scheduled_mode.mode != effective_current_mode {
+                        let soc = battery_status.map(|b| b.soc_percent as f32);
+                        let control = &system_config.control_config;
+                        let floor = backup_default.map_or(control.min_battery_soc, |uc| {
+                            uc.state.planner_min_soc_pct(
+                                control.min_battery_soc,
+                                control.max_battery_soc,
+                            )
+                        });
+                        let safety_stop = soc.is_some_and(|soc| {
+                            (current_mode.mode == InverterOperationMode::ForceCharge
+                                && soc >= control.max_battery_soc)
+                                || (current_mode.mode == InverterOperationMode::ForceDischarge
+                                    && soc <= floor)
+                        });
+                        // Not planner-originated: VPR, a fixed slot, initial sync, guards
+                        let good_reason = bypass_debounce
+                            || explicit_override
+                            || scheduled_mode.reason.contains("guard:")
+                            || safety_stop;
+                        executor.observe_intent(&inverter.id, scheduled_mode.block_start, &intent);
+                        match block_gate(
+                            executor.locks.get(&inverter.id),
+                            scheduled_mode.block_start,
+                            schedule_generated_at,
+                            &intent,
+                            good_reason,
+                            now,
+                        ) {
+                            BlockGate::Apply => {}
+                            BlockGate::ApplyStale => {
+                                if executor.stale_warned.get(&inverter.id)
+                                    != Some(&scheduled_mode.block_start)
+                                {
+                                    executor
+                                        .stale_warned
+                                        .insert(inverter.id.clone(), scheduled_mode.block_start);
+                                    warn!(
+                                        "{}: no schedule generated inside the block at {} after {} s, applying the earlier one",
+                                        inverter.id,
+                                        scheduled_mode.block_start,
+                                        BOUNDARY_FRESH_SCHEDULE_WAIT_SECS
+                                    );
+                                }
+                            }
+                            BlockGate::HeldUntilBoundary => {
+                                if let Some(lock) = executor.locks.get_mut(&inverter.id)
+                                    && !lock.held_logged
+                                {
+                                    lock.held_logged = true;
+                                    debug!(
+                                        "{} {:?} -> {:?} held until next block boundary: {}",
+                                        inverter.id,
+                                        effective_current_mode,
+                                        scheduled_mode.mode,
+                                        scheduled_mode.reason
+                                    );
+                                }
+                                continue;
+                            }
+                            BlockGate::WaitForFreshSchedule => {
+                                if executor.wait_logged.get(&inverter.id)
+                                    != Some(&scheduled_mode.block_start)
+                                {
+                                    executor
+                                        .wait_logged
+                                        .insert(inverter.id.clone(), scheduled_mode.block_start);
+                                    debug!(
+                                        "{}: schedule predates the block at {}, waiting for the fresh one (max {} s)",
+                                        inverter.id,
+                                        scheduled_mode.block_start,
+                                        BOUNDARY_FRESH_SCHEDULE_WAIT_SECS
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     // On initial sync: bypass debounce to apply plan immediately
                     // After initial sync: check minimum interval
                     if !bypass_debounce && !can_change_mode(&current_mode, &config, now) {
@@ -883,7 +1153,23 @@ pub fn schedule_execution_system(
                         sync_tracker.synced_inverters.insert(inverter.id.clone());
                         info!("🔄 Initial sync completed for {}", inverter.id);
                     }
+                    if vpr_override.is_none() {
+                        executor.lock_block(
+                            &inverter.id,
+                            scheduled_mode.block_start,
+                            schedule_generated_at,
+                            &intent,
+                        );
+                    }
                 } else {
+                    if vpr_override.is_none() {
+                        executor.lock_block(
+                            &inverter.id,
+                            scheduled_mode.block_start,
+                            schedule_generated_at,
+                            &intent,
+                        );
+                    }
                     // Mode matches schedule - mark as synced
                     if is_initial_sync {
                         sync_tracker.synced_inverters.insert(inverter.id.clone());
@@ -2809,6 +3095,453 @@ mod levers_execution_tests {
         }
 
         assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    // ---- Block boundaries (brief H25) ----
+
+    /// One 15-minute schedule block.
+    fn qblock(start: DateTime<Utc>, mode: InverterOperationMode, reason: &str) -> ScheduledMode {
+        ScheduledMode {
+            block_start: start,
+            duration_minutes: 15,
+            target_inverters: None,
+            mode,
+            reason: reason.to_string(),
+            decision_uid: None,
+            debug_info: None,
+        }
+    }
+
+    impl Harness {
+        /// Replace the schedule, generated at `generated_at`, with one block.
+        fn set_schedule(&mut self, block: ScheduledMode, generated_at: DateTime<Utc>) {
+            let mut query = self.world.query::<&mut OperationSchedule>();
+            for mut schedule in query.iter_mut(&mut self.world) {
+                schedule.scheduled_blocks = vec![block.clone()];
+                schedule.generated_at = generated_at;
+            }
+        }
+
+        /// The next run is 5+ minutes after the last change: the 300 s debounce has passed.
+        fn age_last_change(&mut self) {
+            let past = Utc::now() - Duration::minutes(6);
+            let mut query = self.world.query::<&mut CurrentMode>();
+            for mut current in query.iter_mut(&mut self.world) {
+                current.set_at = past;
+            }
+        }
+    }
+
+    const HOLD: InverterOperationMode = InverterOperationMode::NoChargeNoDischarge;
+    const SELF_USE: InverterOperationMode = InverterOperationMode::SelfUse;
+
+    /// Synced, Hold on the inverter, and a block that started `ago` before now.
+    fn boundary_harness(ago: Duration) -> (Harness, DateTime<Utc>) {
+        let block_start = Utc::now() - ago;
+        let mut h = harness(vec![qblock(block_start, HOLD, "WinterReserve HOLD")], false);
+        h.mark_synced();
+        h.set_current(HOLD);
+        h.set_hardware(HOLD, Utc::now());
+        h.age_last_change();
+        (h, block_start)
+    }
+
+    /// A block locked in Hold: the fresh in-block schedule confirmed it.
+    fn locked_hold_harness() -> (Harness, DateTime<Utc>) {
+        let (mut h, start) = boundary_harness(Duration::minutes(2));
+        h.set_schedule(qblock(start, HOLD, "WinterReserve HOLD"), Utc::now());
+        h.run();
+        h.age_last_change();
+        (h, start)
+    }
+
+    #[tokio::test]
+    async fn boundary_flap_from_the_evidence_sends_nothing() {
+        // 2026-10-17 04:00Z: the boundary ran the projection made before the block (SELF-USE),
+        // the head replan 0.3 s later kept HOLD, and the debounce let HOLD through at 04:05.
+        // Before H25 that was two writes: [SelfUse, Hold]. Hold is what the head keeps: no write.
+        let (mut h, start) = boundary_harness(Duration::seconds(1));
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE (projection)"),
+            start - Duration::seconds(3),
+        );
+        h.run();
+        h.set_schedule(qblock(start, HOLD, "WinterReserve HOLD"), Utc::now());
+        h.run();
+        // 04:05 and 04:10: the head replans keep HOLD
+        for _ in 0..2 {
+            h.age_last_change();
+            h.set_schedule(qblock(start, HOLD, "WinterReserve HOLD"), Utc::now());
+            h.run();
+        }
+        assert!(h.sent_modes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn boundary_change_writes_once_and_planner_change_waits_for_next_block() {
+        let (mut h, start) = boundary_harness(Duration::seconds(1));
+        // Fresh in-block schedule switches to SelfUse at the boundary: one write
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE"),
+            Utc::now(),
+        );
+        h.run();
+        // 04:05 and 04:10: forecast noise flips the head back to HOLD; held until 04:15
+        for _ in 0..2 {
+            h.age_last_change();
+            h.set_schedule(qblock(start, HOLD, "WinterReserve HOLD"), Utc::now());
+            h.run();
+        }
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+        assert_eq!(h.current_mode().mode, SELF_USE);
+    }
+
+    #[tokio::test]
+    async fn next_block_boundary_applies_the_held_change() {
+        let (mut h, start) = locked_hold_harness();
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE"),
+            Utc::now(),
+        );
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+        // The next block (a new block start, fresh schedule) is not locked
+        let next = Utc::now() - Duration::seconds(1);
+        h.set_schedule(qblock(next, SELF_USE, "WinterReserve SELF-USE"), Utc::now());
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn stale_schedule_at_boundary_waits_then_applies_after_60_s() {
+        // 10 s into the block, schedule from before the block: wait
+        let (mut h, start) = boundary_harness(Duration::seconds(10));
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE"),
+            start - Duration::seconds(5),
+        );
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        // 61 s into the block and still no fresh schedule: apply what is there
+        let (mut h, start) = boundary_harness(Duration::seconds(61));
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE"),
+            start - Duration::seconds(5),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn lever_change_mid_block_applies_at_once() {
+        let (mut h, start) = locked_hold_harness();
+        h.set_levers(UserLevers {
+            force_charge_at_or_below_czk: Some(3.0),
+            ..Default::default()
+        });
+        h.set_schedule(
+            qblock(
+                start,
+                InverterOperationMode::ForceCharge,
+                "lever: force charge",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn vpr_mid_block_applies_at_once() {
+        let (mut h, _) = locked_hold_harness();
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::Normal)),
+            ..Default::default()
+        });
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn kill_switch_mid_block_applies_at_once() {
+        let (mut h, _) = locked_hold_harness();
+        h.world.resource_mut::<UserControlResource>().state.enabled = false;
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn fixed_slot_start_and_end_mid_block_apply_at_once() {
+        let (mut h, _) = locked_hold_harness();
+        let now = Utc::now();
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .fixed_time_slots
+            .push(fluxion_types::FixedTimeSlot {
+                id: "slot1".to_string(),
+                from: now - Duration::minutes(1),
+                to: now + Duration::hours(1),
+                mode: SELF_USE,
+                note: None,
+                created_at: now,
+            });
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+        // The slot is removed: back to the planned Hold at once
+        h.age_last_change();
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .fixed_time_slots
+            .clear();
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE, HOLD]);
+    }
+
+    #[tokio::test]
+    async fn guard_change_mid_block_applies_at_once() {
+        let (mut h, start) = boundary_harness(Duration::minutes(2));
+        h.set_force_discharge(true);
+        h.set_current(InverterOperationMode::ForceDischarge);
+        h.set_hardware(InverterOperationMode::ForceDischarge, Utc::now());
+        h.set_schedule(
+            qblock(
+                start,
+                InverterOperationMode::ForceDischarge,
+                "WinterReserve EXPORT",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        h.age_last_change();
+        h.set_schedule(
+            qblock(
+                start,
+                SELF_USE,
+                "WinterReserve SELF-USE | guard: export held at night floor 40.0 kWh, SOC 50%",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn force_charge_stop_at_max_soc_mid_block_applies_at_once() {
+        let (mut h, start) = boundary_harness(Duration::minutes(2));
+        h.set_current(InverterOperationMode::ForceCharge);
+        h.set_hardware(InverterOperationMode::ForceCharge, Utc::now());
+        h.set_schedule(
+            qblock(
+                start,
+                InverterOperationMode::ForceCharge,
+                "WinterReserve CHARGE",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        // The battery (50 %) reaches the maximum SOC; the replan stops the charge
+        h.world
+            .resource_mut::<SystemConfig>()
+            .control_config
+            .max_battery_soc = 50.0;
+        h.age_last_change();
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE"),
+            Utc::now(),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn lever_change_seen_before_its_replan_still_applies_mid_block() {
+        // Review H25 #1: the executor sees the new lever with the old schedule (same mode), and
+        // only a later run sees the replan. The lever change must still apply in this block.
+        let (mut h, start) = locked_hold_harness();
+        h.set_levers(UserLevers {
+            force_charge_at_or_below_czk: Some(3.0),
+            ..Default::default()
+        });
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+        h.set_schedule(
+            qblock(
+                start,
+                InverterOperationMode::ForceCharge,
+                "lever: force charge",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    #[tokio::test]
+    async fn config_change_seen_before_its_replan_still_applies_mid_block() {
+        // Review H25 #2: locked in ForceDischarge, the owner disables force discharge in the web
+        // config; the replan then says SelfUse. Not held until the next block.
+        let (mut h, start) = boundary_harness(Duration::minutes(2));
+        h.set_force_discharge(true);
+        h.set_current(InverterOperationMode::ForceDischarge);
+        h.set_hardware(InverterOperationMode::ForceDischarge, Utc::now());
+        h.set_schedule(
+            qblock(
+                start,
+                InverterOperationMode::ForceDischarge,
+                "WinterReserve EXPORT",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        h.age_last_change();
+        h.set_force_discharge(false);
+        h.run();
+        h.set_schedule(
+            qblock(start, SELF_USE, "WinterReserve SELF-USE"),
+            Utc::now(),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn fixed_slot_at_boundary_does_not_wait_for_fresh_schedule() {
+        // Review H25 #3: only planner changes wait for the in-block schedule
+        let (mut h, start) = boundary_harness(Duration::seconds(1));
+        h.set_schedule(
+            qblock(start, HOLD, "WinterReserve HOLD (projection)"),
+            start - Duration::seconds(3),
+        );
+        let now = Utc::now();
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .fixed_time_slots
+            .push(fluxion_types::FixedTimeSlot {
+                id: "slot1".to_string(),
+                from: start,
+                to: now + Duration::hours(1),
+                mode: SELF_USE,
+                note: None,
+                created_at: now,
+            });
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[tokio::test]
+    async fn vpr_at_boundary_does_not_wait_for_fresh_schedule() {
+        let (mut h, start) = boundary_harness(Duration::seconds(1));
+        h.set_schedule(
+            qblock(start, HOLD, "WinterReserve HOLD (projection)"),
+            start - Duration::seconds(3),
+        );
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::Normal)),
+            ..Default::default()
+        });
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    #[test]
+    fn block_gate_rules() {
+        let start = Utc::now() - Duration::minutes(5);
+        let intent = UserIntent::of(None, None, &ControlConfig::default(), None, start);
+        let lock = BlockLock {
+            block_start: start,
+            intent: intent.clone(),
+            held_logged: false,
+            released: false,
+        };
+        let fresh = Some(start + Duration::seconds(1));
+        let now = start + Duration::minutes(5);
+        assert_eq!(
+            block_gate(Some(&lock), start, fresh, &intent, false, now),
+            BlockGate::HeldUntilBoundary
+        );
+        // Good reason, or the user's intent changed since the lock
+        assert_eq!(
+            block_gate(Some(&lock), start, fresh, &intent, true, now),
+            BlockGate::Apply
+        );
+        let changed = UserIntent {
+            disallow_charge: true,
+            ..intent.clone()
+        };
+        assert_eq!(
+            block_gate(Some(&lock), start, fresh, &changed, false, now),
+            BlockGate::Apply
+        );
+        // A lock of an earlier block does not hold the next one
+        let next = start + Duration::minutes(15);
+        assert_eq!(
+            block_gate(Some(&lock), next, Some(next), &intent, false, next),
+            BlockGate::Apply
+        );
+        // Stale schedule: wait under 60 s, apply from 60 s
+        assert_eq!(
+            block_gate(
+                None,
+                next,
+                fresh,
+                &intent,
+                false,
+                next + Duration::seconds(59)
+            ),
+            BlockGate::WaitForFreshSchedule
+        );
+        assert_eq!(
+            block_gate(
+                None,
+                next,
+                fresh,
+                &intent,
+                false,
+                next + Duration::seconds(60)
+            ),
+            BlockGate::ApplyStale
+        );
+        // Good reasons (VPR, fixed slot, guards) never wait for the fresh schedule
+        assert_eq!(
+            block_gate(
+                None,
+                next,
+                fresh,
+                &intent,
+                true,
+                next + Duration::seconds(1)
+            ),
+            BlockGate::Apply
+        );
+        // A released lock holds nothing for the rest of its block
+        let released = BlockLock {
+            released: true,
+            ..lock.clone()
+        };
+        assert_eq!(
+            block_gate(Some(&released), start, fresh, &intent, false, now),
+            BlockGate::Apply
+        );
+        // A control config edit or a new Back Up discharge minimum is an intent change
+        let edited = ControlConfig {
+            force_discharge_enabled: !ControlConfig::default().force_discharge_enabled,
+            ..ControlConfig::default()
+        };
+        assert_ne!(UserIntent::of(None, None, &edited, None, start), intent);
+        assert_ne!(
+            UserIntent::of(None, None, &ControlConfig::default(), Some(30.0), start),
+            intent
+        );
     }
 
     /// Export curtailment world: one inverter reading `read_back_w` (master or independent) and a

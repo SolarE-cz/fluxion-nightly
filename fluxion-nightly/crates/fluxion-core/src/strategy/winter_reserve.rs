@@ -57,7 +57,8 @@ pub struct WinterReserveParams {
     pub load_safety_factor: f32,
     pub pv_confidence: f32,
     pub min_mode_benefit_czk: f32,
-    /// Extra benefit (CZK) a SelfUse/Hold switch needs before a kept mode is dropped
+    /// Extra benefit (CZK) a SelfUse/Hold switch needs before a kept mode is dropped, counted
+    /// over the whole run of blocks the switch is made for (brief H25)
     pub mode_switch_min_benefit_czk: f32,
     pub soc_resolution_pct: f32,
 }
@@ -281,9 +282,9 @@ fn same_physical_outcome(a: &BlockOutcome, b: &BlockOutcome) -> bool {
 /// the inverter write would change nothing, and the planned cost is identical.
 ///
 /// Between SelfUse and Hold only, `keep` is also returned when it is within
-/// `mode_switch_min_benefit` of the chosen mode. Small forecast changes then do not flip the
-/// mode back and forth. Charge, Export and NoDischarge are never held this way. The forward pass
-/// passes this only for block 0, the live transition; later blocks pass 0.
+/// `mode_switch_min_benefit` of the chosen mode. Charge, Export and NoDischarge are never held
+/// this way. The planner's forward pass passes 0 here and applies the run-based keep rule
+/// (`KeepRule::Window`) itself; a per-block margin defers a long switch block after block.
 fn choose(
     dp: &DpStep,
     modes: &[PlanMode],
@@ -292,14 +293,32 @@ fn choose(
     mode_switch_min_benefit: f32,
     keep: Option<PlanMode>,
 ) -> (PlanMode, f32, BlockOutcome) {
-    let evals: Vec<(PlanMode, f32, BlockOutcome)> = modes
+    select_mode(
+        &evaluate_modes(dp, modes, energy_kwh),
+        min_benefit,
+        mode_switch_min_benefit,
+        keep,
+    )
+}
+
+/// Value and outcome of every candidate mode from `energy_kwh`.
+fn evaluate_modes(
+    dp: &DpStep,
+    modes: &[PlanMode],
+    energy_kwh: f32,
+) -> Vec<(PlanMode, f32, BlockOutcome)> {
+    modes
         .iter()
         .map(|&mode| {
             let (value, outcome) = dp.value(mode, energy_kwh);
             (mode, value, outcome)
         })
-        .collect();
-    select_mode(&evals, min_benefit, mode_switch_min_benefit, keep)
+        .collect()
+}
+
+/// The two modes the SelfUse/Hold keep rule applies to.
+fn switch_only(mode: PlanMode) -> bool {
+    matches!(mode, PlanMode::SelfUse | PlanMode::Hold)
 }
 
 /// The selection rule of `choose`, on evaluated candidates (`evals[0]` is SelfUse).
@@ -320,7 +339,6 @@ fn select_mode(
             .unwrap_or(evals[0])
     };
     if let Some(kept) = keep.and_then(|mode| evals.iter().find(|e| e.0 == mode)) {
-        let switch_only = |m: PlanMode| matches!(m, PlanMode::SelfUse | PlanMode::Hold);
         if same_physical_outcome(&kept.2, &chosen.2) {
             return *kept;
         }
@@ -586,10 +604,12 @@ pub fn plan(
     plan_from(blocks, soc_pct, tz, battery, params, None)
 }
 
-/// `plan`, with the mode currently applied to the inverter (`current`, None = unknown). In blocks
-/// without PV, a block keeps the previous block's mode (the first block keeps `current`) when both
-/// leave the battery and grid exactly the same, so the mode does not flip at each re-plan. With
-/// None the first block defaults to SelfUse.
+/// `plan`, with the mode currently applied to the inverter (`current`, None = unknown). Every
+/// block may keep the previous block's mode (the first block keeps `current`): when both leave
+/// the battery and grid exactly the same, or, between SelfUse and Hold, when switching saves at
+/// most `mode_switch_min_benefit_czk` over the run it is made for. Hold is kept only in blocks
+/// without PV. Projected blocks use the same rule as the head, so a block's projected mode is
+/// the head decision once it starts (brief H25). With None the first block defaults to SelfUse.
 pub fn plan_from(
     blocks: &[PlanBlock],
     soc_pct: f32,
@@ -597,6 +617,107 @@ pub fn plan_from(
     battery: &BatteryParams,
     params: &WinterReserveParams,
     current: Option<PlanMode>,
+) -> Plan {
+    plan_with_rule(blocks, soc_pct, tz, battery, params, current, KEEP_RULE)
+}
+
+/// How the forward pass compares a kept SelfUse/Hold mode with a switch to the other one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeepRule {
+    /// Keep when the kept mode costs at most `mode_switch_min_benefit_czk` more than switching,
+    /// both followed by the optimal plan. That is the cost of switching one block later, so a
+    /// long run of the cheaper mode can be deferred block after block (the H25 Hold lock-in).
+    /// Kept only for the closed-loop comparison in the tests.
+    #[cfg_attr(not(test), expect(dead_code))]
+    PerBlock,
+    /// Keep when keeping the mode for the whole run the switch is made for (until the switched
+    /// plan returns to the kept mode or leaves SelfUse/Hold) costs at most
+    /// `mode_switch_min_benefit_czk` more than switching now.
+    Window,
+}
+
+/// The keep rule of the planner (brief H25, chosen on the closed-loop table in the report).
+const KEEP_RULE: KeepRule = KeepRule::Window;
+
+/// The planned horizon as the forward pass sees it: blocks, floors, value function, candidates.
+struct Horizon<'a> {
+    blocks: &'a [PlanBlock],
+    floors: &'a [f32],
+    values: &'a [Vec<f32>],
+    grid: &'a [f32],
+    modes: &'a [Vec<PlanMode>],
+    battery: &'a BatteryParams,
+    min_benefit: f32,
+}
+
+impl Horizon<'_> {
+    fn step(&self, k: usize) -> DpStep<'_> {
+        DpStep {
+            block: &self.blocks[k],
+            floor_kwh: self.floors[k],
+            battery: self.battery,
+            grid: self.grid,
+            next_values: &self.values[k + 1],
+        }
+    }
+
+    /// Extra cost (CZK) of keeping `kept` at block `k` instead of switching to `chosen`.
+    /// The switch run is every block from `k` on in which the optimal plan after the switch stays
+    /// in the other SelfUse/Hold mode; it ends where that plan returns to `kept`, leaves
+    /// SelfUse/Hold, where `kept` is not allowed (not a candidate, or Hold in a PV block), or at
+    /// the horizon end. The kept path runs `kept` through the run, then continues optimally.
+    fn keep_run_extra_cost(
+        &self,
+        k: usize,
+        energy_kwh: f32,
+        kept: PlanMode,
+        chosen: &(PlanMode, f32, BlockOutcome),
+    ) -> f32 {
+        let n = self.blocks.len();
+        let mut len = 0;
+        let mut cur = *chosen;
+        while k + len < n {
+            let j = k + len;
+            let keep_allowed = self.modes[j].contains(&kept)
+                && (kept != PlanMode::Hold || self.blocks[j].pv_kwh <= 0.0);
+            if cur.0 == kept || !switch_only(cur.0) || !keep_allowed {
+                break;
+            }
+            len += 1;
+            if k + len < n {
+                cur = choose(
+                    &self.step(k + len),
+                    &self.modes[k + len],
+                    cur.2.energy_end_kwh,
+                    self.min_benefit,
+                    0.0,
+                    None,
+                );
+            }
+        }
+        if len == 0 {
+            return f32::INFINITY;
+        }
+        let mut energy = energy_kwh;
+        let mut cost = 0.0;
+        for j in k..k + len {
+            let block = &self.blocks[j];
+            let outcome = simulate_block(kept, energy, block, self.floors[j], self.battery);
+            cost += outcome_cost(&outcome, block, self.battery.wear_cost_czk_per_kwh);
+            energy = outcome.energy_end_kwh;
+        }
+        cost + interpolate(self.grid, &self.values[k + len], energy) - chosen.1
+    }
+}
+
+fn plan_with_rule(
+    blocks: &[PlanBlock],
+    soc_pct: f32,
+    tz: Tz,
+    battery: &BatteryParams,
+    params: &WinterReserveParams,
+    current: Option<PlanMode>,
+    rule: KeepRule,
 ) -> Plan {
     let n = blocks.len();
     if n == 0 {
@@ -656,13 +777,17 @@ pub fn plan_from(
         .collect();
 
     // values[k][i] = V_k at grid[i]; values[n] is the terminal value.
+    let all_modes: Vec<Vec<PlanMode>> = blocks
+        .iter()
+        .map(|b| candidate_modes(b, median_buy, cheap_ref, battery, params))
+        .collect();
     let mut values: Vec<Vec<f32>> = vec![Vec::new(); n + 1];
     // Leftover energy is worth what it saves later: a cheap purchase, minus the wear of using it.
     let terminal_price = (cheap_ref - battery.wear_cost_czk_per_kwh).max(0.0);
     values[n] = grid.iter().map(|&e| -e * terminal_price).collect();
     for (k, block) in blocks.iter().enumerate().rev() {
         let (current, later) = values.split_at_mut(k + 1);
-        let modes = candidate_modes(block, median_buy, cheap_ref, battery, params);
+        let modes = &all_modes[k];
         let dp = DpStep {
             block,
             floor_kwh: floors[k],
@@ -675,7 +800,7 @@ pub fn plan_from(
             .map(|&e| {
                 choose(
                     &dp,
-                    &modes,
+                    modes,
                     e,
                     params.min_mode_benefit_czk,
                     params.mode_switch_min_benefit_czk,
@@ -691,35 +816,53 @@ pub fn plan_from(
     let mut energy = (soc_pct / 100.0 * capacity).clamp(0.0, emax);
     let mut planned = Vec::with_capacity(n);
     let mut expected_cost = 0.0;
+    let horizon = Horizon {
+        blocks,
+        floors: &floors,
+        values: &values,
+        grid: &grid,
+        modes: &all_modes,
+        battery,
+        min_benefit: params.min_mode_benefit_czk,
+    };
     let mut previous = current;
     for (k, block) in blocks.iter().enumerate() {
-        let modes = candidate_modes(block, median_buy, cheap_ref, battery, params);
-        let dp = DpStep {
-            block,
-            floor_kwh: floors[k],
-            battery,
-            grid: &grid,
-            next_values: &values[k + 1],
-        };
+        let modes = &all_modes[k];
+        let dp = horizon.step(k);
         // Keep the applied mode in blocks without PV, or when it is SelfUse at any PV. The simulator
         // models Hold as never charging from PV, so a kept Hold could block real PV charging.
         // SelfUse charges from PV, so keeping it is safe.
         let keep = previous.filter(|m| block.pv_kwh <= 0.0 || *m == PlanMode::SelfUse);
-        // Only block 0 is the live transition (keep is the mode on the inverter). Later blocks
-        // are re-decided when they become block 0, so they get no SelfUse/Hold hysteresis.
-        let switch_benefit = if k == 0 {
-            params.mode_switch_min_benefit_czk
-        } else {
-            0.0
+        // Every block gets the same keep rule, with `keep` = the previous planned block (block 0:
+        // the applied mode). A later block is re-decided by this rule when it becomes block 0
+        // (`current` = the previous head), so with unchanged inputs its projected mode is the
+        // head decision (brief H25).
+        let (mode, _, outcome) = match rule {
+            KeepRule::PerBlock => choose(
+                &dp,
+                modes,
+                energy,
+                params.min_mode_benefit_czk,
+                params.mode_switch_min_benefit_czk,
+                keep,
+            ),
+            KeepRule::Window => {
+                let evals = evaluate_modes(&dp, modes, energy);
+                let chosen = select_mode(&evals, params.min_mode_benefit_czk, 0.0, keep);
+                match keep.and_then(|m| evals.iter().find(|e| e.0 == m)) {
+                    Some(kept)
+                        if kept.0 != chosen.0
+                            && switch_only(kept.0)
+                            && switch_only(chosen.0)
+                            && horizon.keep_run_extra_cost(k, energy, kept.0, &chosen)
+                                <= params.mode_switch_min_benefit_czk =>
+                    {
+                        *kept
+                    }
+                    _ => chosen,
+                }
+            }
         };
-        let (mode, _, outcome) = choose(
-            &dp,
-            &modes,
-            energy,
-            params.min_mode_benefit_czk,
-            switch_benefit,
-            keep,
-        );
         previous = Some(mode);
         let cost = outcome_cost(&outcome, block, battery.wear_cost_czk_per_kwh);
         let soc_start_pct = soc_pct_of(energy, capacity);
@@ -2893,7 +3036,8 @@ mod tests {
     }
 
     /// Block 0 has PV 0.3 kWh, then 15 blocks without PV; `load` is the load of every block.
-    fn pv_block_zero_plan(load: f32, previous: PlanMode) -> PlanMode {
+    /// Buy is 6.0 for 8 blocks, then `later`.
+    fn pv_block_zero_plan(load: f32, later: f32, previous: PlanMode) -> PlanMode {
         let tz = chrono_tz::Europe::Prague;
         let params = WinterReserveParams::default();
         let b = BatteryParams {
@@ -2901,7 +3045,7 @@ mod tests {
             ..battery()
         };
         let mut blocks: Vec<PlanBlock> = (0..8).map(|i| pblock(i, 6.0, 2.0, load, 0.0)).collect();
-        blocks.extend((8..16).map(|i| pblock(i, 8.0, 2.0, load, 0.0)));
+        blocks.extend((8..16).map(|i| pblock(i, later, 2.0, load, 0.0)));
         blocks[0].pv_kwh = 0.3;
         let p = plan_from(&blocks, 40.0, tz, &b, &params, Some(previous));
         p.blocks[0].mode
@@ -2909,10 +3053,12 @@ mod tests {
 
     #[test]
     fn pv_block_keeps_applied_selfuse_when_hold_gain_is_small() {
-        // Block 0 has PV. Hold gains 0.95 CZK at block 0, under the 1.0 CZK switch threshold:
-        // SelfUse is kept, since keeping SelfUse never blocks PV charging.
+        // Block 0 has PV. Later buy 6.2: Hold is the free choice, but over its whole run it gains
+        // only ~0.6 CZK, under the 1.0 CZK switch threshold: SelfUse is kept, since keeping
+        // SelfUse never blocks PV charging. (Before H25: later 8.0, Hold gained 0.95 CZK at
+        // block 0 alone; that case now switches, see below.)
         assert_eq!(
-            pv_block_zero_plan(1.5, PlanMode::SelfUse),
+            pv_block_zero_plan(1.5, 6.2, PlanMode::SelfUse),
             PlanMode::SelfUse
         );
     }
@@ -2920,7 +3066,16 @@ mod tests {
     #[test]
     fn pv_block_switches_to_hold_when_gain_is_above_threshold() {
         // Block 0 has PV. Hold gains 1.19 CZK at block 0, above the 1.0 CZK switch threshold
-        assert_eq!(pv_block_zero_plan(2.0, PlanMode::SelfUse), PlanMode::Hold);
+        assert_eq!(
+            pv_block_zero_plan(2.0, 8.0, PlanMode::SelfUse),
+            PlanMode::Hold
+        );
+        // H25: the switch threshold counts the whole Hold run, not one block of delay. At load 1.5
+        // Hold gains 0.95 CZK at block 0 but more than 1.0 CZK over its 7-block run: switch.
+        assert_eq!(
+            pv_block_zero_plan(1.5, 8.0, PlanMode::SelfUse),
+            PlanMode::Hold
+        );
     }
 
     #[test]
@@ -3003,9 +3158,10 @@ mod tests {
     }
 
     #[test]
-    fn mode_switch_hysteresis_is_zero_after_block_zero() {
-        // The forward pass passes the switch benefit only for block 0; later blocks pass 0.
-        // Previous Hold, SelfUse 0.5 CZK better: the switch happens with 0, and Hold stays with 1.0.
+    fn mode_switch_margin_zero_switches_and_one_keeps() {
+        // `select_mode` margin: the forward pass passes 0 and applies the run-based keep rule
+        // itself (H25). Previous Hold, SelfUse 0.5 CZK better: the switch happens with 0, and Hold
+        // stays with 1.0.
         let evals = [cand(PlanMode::SelfUse, 9.5), cand(PlanMode::Hold, 10.0)];
         let (mode, _, _) = select_mode(&evals, 0.10, 0.0, Some(PlanMode::Hold));
         assert_eq!(mode, PlanMode::SelfUse);
@@ -3542,5 +3698,480 @@ mod force_discharge_gate_tests {
         assert!(!battery_params(&control).force_discharge_enabled);
         control.force_discharge_enabled = true;
         assert!(battery_params(&control).force_discharge_enabled);
+    }
+}
+
+/// Keep-rule tests of brief H25: projection == head decision, no Hold lock-in, and the
+/// closed-loop comparison of keep rules (ignored; prints the table quoted in the H25 report).
+#[cfg(test)]
+mod keep_rule_tests {
+    use super::*;
+    use chrono::{TimeZone, Timelike};
+
+    /// 2026-10-17 00:00 Europe/Prague (CEST)
+    fn start() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 16, 22, 0, 0).unwrap()
+    }
+
+    fn blk(i: usize, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
+        PlanBlock {
+            start: start() + Duration::minutes(15 * i as i64),
+            duration_minutes: 15,
+            buy_czk: buy,
+            sell_czk: sell,
+            load_kwh: load,
+            pv_kwh: pv,
+            reserve_load_kwh: load * 1.1,
+            reserve_pv_kwh: pv * 0.7,
+            force_charge: false,
+            no_discharge: false,
+            force_charge_at_or_below_czk: None,
+            export_min_soc_pct: None,
+            export_allowed: true,
+        }
+    }
+
+    fn battery(capacity_kwh: f32) -> BatteryParams {
+        BatteryParams {
+            capacity_kwh,
+            min_soc_pct: 10.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.9,
+            wear_cost_czk_per_kwh: 0.125,
+            max_export_kw: 10.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: false,
+        }
+    }
+
+    const TZ: Tz = chrono_tz::Europe::Prague;
+
+    /// The flat buy price of the 2026-10-17 evidence (CZK/kWh).
+    #[expect(clippy::approx_constant, reason = "a price, not TAU")]
+    const FLAT_BUY: f32 = 6.28;
+
+    /// The evidence of 2026-10-17: Hold applied at 80 % SOC, flat buy 6.28, no PV, and SelfUse
+    /// is the cheaper mode (the rest of the horizon is cheaper, 5.5). Before H25 the head kept
+    /// Hold block after block, since switching one block later always cost less than 1 CZK.
+    #[test]
+    fn applied_hold_at_flat_price_is_released_at_the_next_boundary() {
+        let params = WinterReserveParams::default();
+        let b = battery(20.0);
+        let blocks: Vec<PlanBlock> = (0..72)
+            .map(|i| blk(i, if i < 16 { FLAT_BUY } else { 5.5 }, 1.0, 0.4, 0.0))
+            .collect();
+        let free = plan_from(&blocks, 80.0, TZ, &b, &params, None);
+        assert_eq!(free.blocks[0].mode, PlanMode::SelfUse);
+        // Head replan with Hold applied: SelfUse at once, and the plan does not return to Hold
+        let p = plan_from(&blocks, 80.0, TZ, &b, &params, Some(PlanMode::Hold));
+        let modes: Vec<PlanMode> = p.blocks.iter().map(|x| x.mode).collect();
+        assert_eq!(modes[0], PlanMode::SelfUse, "{modes:?}");
+        assert!(!modes.contains(&PlanMode::Hold), "{modes:?}");
+        // The old per-block rule locked Hold in for the whole horizon
+        let old = plan_with_rule(
+            &blocks,
+            80.0,
+            TZ,
+            &b,
+            &params,
+            Some(PlanMode::Hold),
+            KeepRule::PerBlock,
+        );
+        assert!(old.blocks.iter().all(|x| x.mode == PlanMode::Hold));
+        // Full objective: block costs minus the energy left, valued at cheap_ref minus wear
+        let objective = |plan: &Plan| {
+            let end = plan.blocks.last().map_or(0.0, |x| x.outcome.energy_end_kwh);
+            plan.expected_cost_czk - end * (plan.cheap_ref_czk - b.wear_cost_czk_per_kwh)
+        };
+        assert!(
+            objective(&old) > objective(&p) + 3.0,
+            "lock-in {:.2} vs released {:.2}",
+            objective(&old),
+            objective(&p)
+        );
+    }
+
+    /// A switch that saves less than the threshold over its run keeps the applied mode; one
+    /// that saves more switches at once.
+    #[test]
+    fn switch_needs_the_threshold_over_its_run() {
+        let params = WinterReserveParams::default();
+        let zero = WinterReserveParams {
+            mode_switch_min_benefit_czk: 0.0,
+            ..params
+        };
+        let b = battery(20.0);
+        // Hold applied; block 0 is dearer than the rest of the night, so SelfUse is the free choice
+        let plan_at = |head_buy: f32, p: &WinterReserveParams| {
+            let mut blocks: Vec<PlanBlock> = (0..40)
+                .map(|i| blk(i, if i < 24 { 5.0 } else { 9.0 }, 1.0, 0.4, 0.0))
+                .collect();
+            blocks[0].buy_czk = head_buy;
+            plan_from(&blocks, 30.0, TZ, &b, p, Some(PlanMode::Hold)).blocks[0].mode
+        };
+        // Small gain (head 9.2): kept; without a threshold it switches
+        assert_eq!(plan_at(9.2, &zero), PlanMode::SelfUse);
+        assert_eq!(plan_at(9.2, &params), PlanMode::Hold);
+        // Large gain (head 11.0): switches
+        assert_eq!(plan_at(11.0, &params), PlanMode::SelfUse);
+    }
+
+    /// Projection == head decision: the mode projected for block k is the head decision of a
+    /// replan at block k with unchanged inputs (projected SOC, previous planned mode applied).
+    /// Before H25 the projection had no hysteresis while the head had it, so 36 of these 180
+    /// scenarios disagreed (the 04:00 SELF-USE, 04:05 HOLD flap).
+    #[test]
+    fn projection_matches_head_decision_across_consecutive_replans() {
+        let params = WinterReserveParams::default();
+        let mut mismatches = Vec::new();
+        let mut compared = 0;
+        for cap in [10.0f32, 20.0, 40.0] {
+            for load in [0.2f32, 0.4, 0.6, 1.0] {
+                for later in [5.0f32, 6.0, 6.5, 7.0, 8.0] {
+                    for soc in [30.0f32, 50.0, 80.0] {
+                        let b = BatteryParams {
+                            force_discharge_enabled: true,
+                            ..battery(cap)
+                        };
+                        let blocks: Vec<PlanBlock> = (0..72)
+                            .map(|i| blk(i, if i < 16 { FLAT_BUY } else { later }, 1.0, load, 0.0))
+                            .collect();
+                        let p = plan_from(&blocks, soc, TZ, &b, &params, Some(PlanMode::Hold));
+                        for k in 1..8 {
+                            // Same inputs: the shorter horizon must keep the cheap reference, the
+                            // median and the floor (otherwise the head may rightly differ).
+                            if (cheap_reference(
+                                &blocks[k..].iter().map(|x| x.buy_czk).collect::<Vec<_>>(),
+                                params.cheap_percentile,
+                            ) - p.cheap_ref_czk)
+                                .abs()
+                                > 1e-4
+                            {
+                                continue;
+                            }
+                            let head = plan_from(
+                                &blocks[k..],
+                                p.blocks[k].soc_start_pct,
+                                TZ,
+                                &b,
+                                &params,
+                                Some(p.blocks[k - 1].mode),
+                            );
+                            if (head.median_buy_czk - p.median_buy_czk).abs() > 1e-4
+                                || (head.blocks[0].floor_kwh - p.blocks[k].floor_kwh).abs() > 1e-4
+                            {
+                                continue;
+                            }
+                            compared += 1;
+                            let (projected, decided) = (p.blocks[k].mode, head.blocks[0].mode);
+                            // Charge comes from the cheap reference of the shorter horizon, not
+                            // from the keep rule; only SelfUse/Hold disagreements count here.
+                            if projected != decided
+                                && switch_only(projected)
+                                && switch_only(decided)
+                            {
+                                mismatches.push(format!(
+                                    "cap {cap} load {load} later {later} soc {soc} k {k}: \
+                                     projected {projected:?}, head {decided:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(compared >= 600, "only {compared} comparable replans");
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
+    /// xorshift64*: deterministic noise without a new dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn unit(&mut self) -> f32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            ((self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32) / (1u64 << 24) as f32
+        }
+
+        /// Uniform in [1 - spread, 1 + spread].
+        fn factor(&mut self, spread: f32) -> f32 {
+            1.0 + spread * (2.0 * self.unit() - 1.0)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Scenario {
+        name: &'static str,
+        /// Flat 6.28 today; the next day (after 96 blocks) costs this
+        next_day: f32,
+        varying: bool,
+        pv: bool,
+        /// Load multiplier (0.5 = a small house, where one block of delay costs little)
+        load_scale: f32,
+        soc: f32,
+    }
+
+    fn local_hour(t: DateTime<Utc>) -> f32 {
+        let l = t.with_timezone(&TZ);
+        l.hour() as f32 + l.minute() as f32 / 60.0
+    }
+
+    fn truth_block(sc: Scenario, i: usize, rng: &mut Rng) -> PlanBlock {
+        let h = local_hour(start() + Duration::minutes(15 * i as i64));
+        let buy = if !sc.varying {
+            if i < 96 { FLAT_BUY } else { sc.next_day }
+        } else {
+            let base = match h {
+                h if h < 6.0 => 4.6,
+                h if h < 9.0 => 7.8,
+                h if h < 16.0 => 5.6,
+                h if h < 21.0 => 8.9,
+                _ => 5.2,
+            };
+            base + 0.15 * ((i % 4) as f32 - 1.5) / 1.5
+        };
+        let load = match h {
+            h if h < 6.0 => 0.3,
+            h if h < 9.0 => 0.55,
+            h if h < 16.0 => 0.4,
+            h if h < 22.0 => 0.7,
+            _ => 0.4,
+        } * sc.load_scale
+            * rng.factor(0.1);
+        let pv = if sc.pv && (8.0..16.0).contains(&h) {
+            0.9 * (std::f32::consts::PI * (h - 8.0) / 8.0).sin()
+        } else {
+            0.0
+        };
+        blk(i, buy, buy * 0.7, load, pv)
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct LoopResult {
+        cost: f32,
+        writes: u32,
+        flips: u32,
+        /// A-B-A over three consecutive boundaries
+        ping_pong: u32,
+        /// A-B-A-B over four consecutive boundaries
+        ping_pong4: u32,
+    }
+
+    /// One day closed loop: the head replans every 5 minutes on noisy forecasts (load and PV
+    /// ±15 % per replan, buy ±0.05 CZK) from the true SOC. Only the replan at the boundary is
+    /// written (executor block lock and boundary wait, brief H25 B and C); the planner's
+    /// `current` is the last head decision, as in `entry_for`. Reality runs the true flows.
+    fn closed_loop(
+        sc: Scenario,
+        seed: u64,
+        params: &WinterReserveParams,
+        rule: KeepRule,
+        noise: f32,
+    ) -> LoopResult {
+        let b = battery(20.0);
+        let mut truth_rng = Rng(seed);
+        let truth: Vec<PlanBlock> = (0..96 + 72)
+            .map(|i| truth_block(sc, i, &mut truth_rng))
+            .collect();
+        let mut rng = Rng(seed ^ 0x9E37_79B9_7F4A_7C15);
+        let start_energy = sc.soc / 100.0 * b.capacity_kwh;
+        let mut energy = start_energy;
+        let mut current = Some(PlanMode::Hold);
+        let mut applied: Vec<PlanMode> = vec![PlanMode::Hold];
+        let mut result = LoopResult::default();
+        for i in 0..96 {
+            let mut end_energy = energy;
+            for r in 0..3 {
+                let horizon: Vec<PlanBlock> = truth[i..i + 72]
+                    .iter()
+                    .map(|t| {
+                        let mut f = *t;
+                        f.load_kwh = t.load_kwh * rng.factor(0.15 * noise);
+                        f.reserve_load_kwh = f.load_kwh * 1.1;
+                        f.pv_kwh = t.pv_kwh * rng.factor(0.15 * noise);
+                        f.reserve_pv_kwh = f.pv_kwh * 0.7;
+                        f.buy_czk = t.buy_czk + 0.05 * noise * (2.0 * rng.unit() - 1.0);
+                        f
+                    })
+                    .collect();
+                let soc_now =
+                    (energy + (end_energy - energy) * r as f32 / 3.0) / b.capacity_kwh * 100.0;
+                let plan = plan_with_rule(&horizon, soc_now, TZ, &b, params, current, rule);
+                let head = &plan.blocks[0];
+                current = Some(head.mode);
+                if r == 0 {
+                    let mode = head.mode;
+                    let previous = *applied.last().unwrap_or(&mode);
+                    if mode != previous {
+                        result.writes += 1;
+                        if switch_only(mode) && switch_only(previous) {
+                            result.flips += 1;
+                        }
+                    }
+                    let n = applied.len();
+                    if n >= 2 && applied[n - 2] == mode && previous != mode {
+                        result.ping_pong += 1;
+                        if n >= 3 && applied[n - 3] == previous {
+                            result.ping_pong4 += 1;
+                        }
+                    }
+                    applied.push(mode);
+                    let outcome = simulate_block(mode, energy, &truth[i], head.floor_kwh, &b);
+                    result.cost += outcome_cost(&outcome, &truth[i], b.wear_cost_czk_per_kwh);
+                    end_energy = outcome.energy_end_kwh;
+                }
+            }
+            energy = end_energy;
+        }
+        // Energy left over is worth what the planner values it at (cheap reference minus wear).
+        let buys: Vec<f32> = truth.iter().map(|t| t.buy_czk).collect();
+        let terminal =
+            (cheap_reference(&buys, params.cheap_percentile) - b.wear_cost_czk_per_kwh).max(0.0);
+        result.cost -= (energy - start_energy) * terminal;
+        result
+    }
+
+    /// Prints the closed-loop keep-rule table of the H25 report (release build, ~1-2 min):
+    /// `cargo test -p fluxion-core --release --lib keep_rule_closed_loop_table -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints the H25 keep-rule table; slow"]
+    fn keep_rule_closed_loop_table() {
+        let mut scenarios = Vec::new();
+        for (name, next_day, varying, pv, load_scale) in [
+            ("flat 6.28, no PV", FLAT_BUY, false, false, 1.0),
+            ("flat 6.28, next day 5.5, no PV", 5.5, false, false, 1.0),
+            (
+                "flat 6.28, next day 5.5, no PV, half load",
+                5.5,
+                false,
+                false,
+                0.5,
+            ),
+            ("flat 6.28, next day 5.5, PV", 5.5, false, true, 1.0),
+            ("varying, no PV", 0.0, true, false, 1.0),
+            ("varying, no PV, half load", 0.0, true, false, 0.5),
+            ("varying, PV", 0.0, true, true, 1.0),
+        ] {
+            for soc in [80.0, 40.0] {
+                scenarios.push(Scenario {
+                    name,
+                    next_day,
+                    varying,
+                    pv,
+                    load_scale,
+                    soc,
+                });
+            }
+        }
+        let seeds = [11u64, 23, 37, 41, 59];
+        let mut rules: Vec<(String, KeepRule, f32)> = [0.0f32, 0.05, 0.10, 0.25, 0.5, 1.0]
+            .iter()
+            .map(|&t| (format!("per-block {t:.2}"), KeepRule::PerBlock, t))
+            .collect();
+        for t in [0.25f32, 0.5, 1.0, 2.0] {
+            rules.push((format!("window {t:.2}"), KeepRule::Window, t));
+        }
+        let run = |rule: KeepRule, t: f32, noise: f32| -> Vec<LoopResult> {
+            let params = WinterReserveParams {
+                mode_switch_min_benefit_czk: t,
+                ..WinterReserveParams::default()
+            };
+            scenarios
+                .iter()
+                .flat_map(|&sc| seeds.iter().map(move |&seed| (sc, seed)))
+                .map(|(sc, seed)| closed_loop(sc, seed, &params, rule, noise))
+                .collect()
+        };
+        let results: Vec<Vec<LoopResult>> = rules
+            .iter()
+            .map(|(_, rule, t)| run(*rule, *t, 1.0))
+            .collect();
+        let noisy_zero = results[0].clone();
+        let runs = noisy_zero.len() as f32;
+        // Reference: no threshold, planned on the noise-free forecast (the no-threshold optimum)
+        let quiet = run(KeepRule::PerBlock, 0.0, 0.0);
+        let reference = quiet.clone();
+        println!(
+            "Without forecast noise (per-block 0.00): writes/24h {:.1}, flips/24h {:.1}, A-B-A {}, A-B-A-B {}",
+            quiet.iter().map(|r| r.writes).sum::<u32>() as f32 / runs,
+            quiet.iter().map(|r| r.flips).sum::<u32>() as f32 / runs,
+            quiet.iter().map(|r| r.ping_pong).sum::<u32>(),
+            quiet.iter().map(|r| r.ping_pong4).sum::<u32>(),
+        );
+        println!(
+            "| rule | mean Δcost CZK/day vs optimum | worst Δcost CZK/day | mean Δ vs noisy no-threshold | writes/24h | SelfUse<->Hold flips/24h | A-B-A (total, {runs} days) | A-B-A-B (total) |"
+        );
+        println!("|---|---|---|---|---|---|---|---|");
+        for ((name, _, _), res) in rules.iter().zip(&results) {
+            let deltas: Vec<f32> = res
+                .iter()
+                .zip(&reference)
+                .map(|(r, base)| r.cost - base.cost)
+                .collect();
+            let mean = deltas.iter().sum::<f32>() / runs;
+            let worst = deltas.iter().copied().fold(f32::MIN, f32::max);
+            let worst_at = deltas.iter().position(|d| *d == worst).unwrap_or(0);
+            let worst_sc = scenarios[worst_at / seeds.len()];
+            eprintln!(
+                "{name}: worst {worst:+.2} in {} SOC {} seed {}",
+                worst_sc.name,
+                worst_sc.soc,
+                seeds[worst_at % seeds.len()]
+            );
+            let writes = res.iter().map(|r| r.writes).sum::<u32>() as f32 / runs;
+            let flips = res.iter().map(|r| r.flips).sum::<u32>() as f32 / runs;
+            let pp: u32 = res.iter().map(|r| r.ping_pong).sum();
+            let pp4: u32 = res.iter().map(|r| r.ping_pong4).sum();
+            let vs_noisy = res
+                .iter()
+                .zip(&noisy_zero)
+                .map(|(r, z)| r.cost - z.cost)
+                .sum::<f32>()
+                / runs;
+            println!(
+                "| {name} | {mean:+.2} | {worst:+.2} | {vs_noisy:+.2} | {writes:.1} | {flips:.1} | {pp} | {pp4} |"
+            );
+        }
+        println!();
+        println!(
+            "Per scenario (mean of {} seeds), reference = per-block 0.00:",
+            seeds.len()
+        );
+        for (si, sc) in scenarios.iter().enumerate() {
+            let pick = |v: &[LoopResult]| -> LoopResult {
+                let mut acc = LoopResult::default();
+                for r in &v[si * seeds.len()..(si + 1) * seeds.len()] {
+                    acc.cost += r.cost / seeds.len() as f32;
+                    acc.writes += r.writes;
+                    acc.flips += r.flips;
+                    acc.ping_pong += r.ping_pong;
+                    acc.ping_pong4 += r.ping_pong4;
+                }
+                acc
+            };
+            let base = pick(&reference);
+            let q = pick(&quiet);
+            let mut line = format!(
+                "{} SOC {}: ref {:.2} CZK, writes {} (no noise: w{} pp{})",
+                sc.name, sc.soc, base.cost, base.writes, q.writes, q.ping_pong
+            );
+            for ((name, _, _), res) in rules.iter().zip(&results) {
+                {
+                    let r = pick(res);
+                    line += &format!(
+                        " | {name}: {:+.2} w{} pp{}/{}",
+                        r.cost - base.cost,
+                        r.writes,
+                        r.ping_pong,
+                        r.ping_pong4
+                    );
+                }
+            }
+            println!("{line}");
+        }
     }
 }

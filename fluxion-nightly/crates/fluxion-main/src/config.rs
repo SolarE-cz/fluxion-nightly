@@ -149,12 +149,12 @@ pub struct PricingConfig {
     /// Can be 24 values (hourly) - will be expanded to 96 (15-min blocks)
     pub fixed_sell_prices: Vec<f32>,
 
-    /// Spot market buy fee (CZK/kWh)
-    #[serde(default = "default_spot_buy_fee")]
+    /// Spot market buy fee (CZK/kWh); HA addon option `spot_buy_fee_czk`
+    #[serde(default = "default_spot_buy_fee", alias = "spot_buy_fee_czk")]
     pub spot_buy_fee: f32,
 
-    /// Spot market sell fee (CZK/kWh)
-    #[serde(default = "default_spot_sell_fee")]
+    /// Spot market sell fee (CZK/kWh); HA addon option `spot_sell_fee_czk`
+    #[serde(default = "default_spot_sell_fee", alias = "spot_sell_fee_czk")]
     pub spot_sell_fee: f32,
 
     /// Home Assistant entity for HDO tariff schedule (e.g., "sensor.cez_hdo_raw_data")
@@ -3122,6 +3122,69 @@ mod tests {
             config.validate().is_ok(),
             "HA addon options format should produce valid config"
         );
+    }
+
+    /// The HA addon option names `pricing.spot_buy_fee_czk` / `spot_sell_fee_czk` must reach
+    /// the runtime fields, not fall back to the 0.5 default.
+    #[test]
+    fn test_ha_addon_spot_fee_options_are_honoured() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "solax",
+                    "vendor": "solax",
+                    "entity_prefix": "solax",
+                    "topology": "independent"
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": [],
+                "spot_buy_fee_czk": 0.35,
+                "spot_sell_fee_czk": 0.35
+            },
+            "control": {
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            },
+            "strategies": {}
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(ha_addon_json).unwrap();
+        assert_eq!(config.pricing.spot_buy_fee, 0.35);
+        assert_eq!(config.pricing.spot_sell_fee, 0.35);
+    }
+
+    /// Configs written under the runtime field names (config.toml, persisted JSON) still load.
+    #[test]
+    fn test_spot_fee_runtime_field_names_still_load() {
+        let json = r#"{
+            "spot_price_entity": "sensor.price",
+            "use_spot_prices_to_buy": true,
+            "use_spot_prices_to_sell": true,
+            "fixed_buy_prices": [],
+            "fixed_sell_prices": [],
+            "spot_buy_fee": 0.2,
+            "spot_sell_fee": 0.3
+        }"#;
+
+        let pricing: PricingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(pricing.spot_buy_fee, 0.2);
+        assert_eq!(pricing.spot_sell_fee, 0.3);
     }
 
     /// Test that master/slave topology works with HA addon field names (master_id, slave_ids)

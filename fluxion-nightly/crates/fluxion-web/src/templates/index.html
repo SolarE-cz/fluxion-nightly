@@ -1461,7 +1461,7 @@
                 <span><div class="legend-box charge"></div> Force Charge</span>
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
                 <span><div class="legend-box backup"></div> Back Up Mode</span>
-                <span><div class="legend-box no-charge-discharge"></div> No Charge/Discharge</span>
+                <span><div class="legend-box no-charge-discharge"></div> Hold</span>
                 <span><div class="legend-box self-use"></div> Self-Use</span>
                 <span><div class="legend-box feedin-priority"></div> Feed-in Priority</span>
                 <span><div class="legend-box hdo-low"></div> HDO Low Tariff</span>
@@ -1785,7 +1785,7 @@
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                     if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`; // Purple
-                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`; // Grey
+                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
 
@@ -1795,7 +1795,7 @@
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                     if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`; // Purple
-                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`; // Grey
+                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
 
@@ -2259,7 +2259,7 @@
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                                     if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
-                                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
+                                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                             }
@@ -3371,7 +3371,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                                     if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
-                                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
+                                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                                 spotDataset.borderColor = chartData.modes.map((mode, idx) => {
@@ -3380,7 +3380,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
                                     if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
-                                    if (mode === 'No Charge/Discharge') return `rgba(158, 158, 158, ${opacity})`;
+                                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                             }

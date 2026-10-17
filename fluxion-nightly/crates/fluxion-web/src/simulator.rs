@@ -75,6 +75,7 @@ impl Default for SimulatorState {
 #[template(path = "simulator.html")]
 pub struct SimulatorTemplate {
     pub ingress_path: String,
+    pub backtest_available: bool,
 }
 
 /// Extract ingress path from request headers
@@ -88,10 +89,16 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 
 /// GET /simulator
 /// Simulator page handler
-pub async fn simulator_page_handler(headers: axum::http::HeaderMap) -> impl IntoResponse {
+pub async fn simulator_page_handler(
+    State(backtest_available): State<bool>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     let ingress_path = extract_ingress_path(&headers);
 
-    let template = SimulatorTemplate { ingress_path };
+    let template = SimulatorTemplate {
+        ingress_path,
+        backtest_available,
+    };
 
     match template.render() {
         Ok(html) => Html(html).into_response(),

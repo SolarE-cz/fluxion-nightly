@@ -330,6 +330,11 @@ fn initialize_and_run() -> Result<()> {
         serde_json::json!({})
     });
     let config_sender_for_web = config_update_sender.clone();
+    // Backtest is opt-in: only enabled when FLUXION_BACKTEST_DB names an existing file
+    let backtest_db_path = std::env::var("FLUXION_BACKTEST_DB")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file());
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
     let remote_access_state =
         RemoteAccessApiState::new(std::path::Path::new("./data"), 8099, "FluxION".to_string());
@@ -340,11 +345,11 @@ fn initialize_and_run() -> Result<()> {
             8099,
             config_json,
             Some(config_sender_for_web),
-            Some(std::path::PathBuf::from("/home/daniel/Repositories/solare/fluxion/fluxion/crates/fluxion-integration-tests/solax_data.db")), // Backtest DB path - set to enable backtest feature
+            backtest_db_path, // Backtest DB path - set via FLUXION_BACKTEST_DB to enable backtest feature
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
-            Some(user_control_api_state), // User control API state
-            Some(remote_access_state), // Remote access pairing API
+            Some(user_control_api_state),                        // User control API state
+            Some(remote_access_state),                           // Remote access pairing API
         )
         .await
         {

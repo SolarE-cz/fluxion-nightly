@@ -161,6 +161,8 @@ pub fn display_mode_label(block: &fluxion_core::web_bridge::PriceBlockData) -> S
             Some(min_soc) => format!("Back Up Mode ({min_soc}%)"),
             None => "Back Up Mode".to_owned(),
         },
+        "no-charge-discharge" => "Hold".to_owned(),
+        "feedin-priority" => "Feed-in Priority".to_owned(),
         _ => "Self-Use".to_owned(),
     }
 }
@@ -924,5 +926,28 @@ mod tests {
             labels,
             ["00:00", "01:00", "02:00", "02:00", "03:00", "04:00"]
         );
+    }
+
+    #[test]
+    fn display_mode_label_names_hold_and_feedin_blocks() {
+        let mut block = fluxion_core::web_bridge::PriceBlockData {
+            timestamp: "2026-10-17T10:00:00Z".parse().unwrap(),
+            price: 2.0,
+            effective_buy_price: None,
+            block_type: "no-charge-discharge".to_owned(),
+            target_soc: None,
+            strategy: None,
+            expected_profit: None,
+            reason: None,
+            decision_uid: None,
+            debug_info: None,
+            is_historical: false,
+            solar_forecast_kw: None,
+            backup_min_soc_pct: None,
+        };
+        assert_eq!(display_mode_label(&block), "Hold");
+
+        block.block_type = "feedin-priority".to_owned();
+        assert_eq!(display_mode_label(&block), "Feed-in Priority");
     }
 }

@@ -22,7 +22,7 @@ use fluxion_backtest::{
 };
 use fluxion_i18n::I18n;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// State for backtest handlers
 #[derive(Clone, Debug)]
@@ -137,10 +137,10 @@ pub async fn available_days_handler(State(state): State<BacktestState>) -> impl 
             Json(response).into_response()
         }
         Err(e) => {
-            error!("Failed to get available days: {}", e);
+            warn!("Failed to get available days: {}", e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get available days: {e}"),
+                "Failed to get available days",
             )
                 .into_response()
         }
@@ -168,10 +168,10 @@ pub async fn day_data_handler(
     match fluxion_backtest::analyze_actual_day(state.data_source.as_ref(), date) {
         Ok(analysis) => Json(analysis).into_response(),
         Err(e) => {
-            error!("Failed to analyze day {}: {}", date, e);
+            warn!("Failed to analyze day {}: {}", date, e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to analyze day: {e}"),
+                "Failed to analyze day",
             )
                 .into_response()
         }
@@ -229,10 +229,10 @@ pub async fn simulate_handler(
     ) {
         Ok(analysis) => Json(analysis).into_response(),
         Err(e) => {
-            error!("Failed to simulate day {}: {}", date, e);
+            warn!("Failed to simulate day {}: {}", date, e);
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to simulate: {e}"),
+                "Failed to simulate",
             )
                 .into_response()
         }
@@ -316,9 +316,10 @@ pub async fn compare_handler(
     ) {
         Ok(a) => a,
         Err(e) => {
+            warn!("Left simulation failed for {}: {}", date, e);
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Left simulation failed: {e}"),
+                "Left simulation failed",
             )
                 .into_response();
         }
@@ -332,9 +333,10 @@ pub async fn compare_handler(
     ) {
         Ok(a) => a,
         Err(e) => {
+            warn!("Right simulation failed for {}: {}", date, e);
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Right simulation failed: {e}"),
+                "Right simulation failed",
             )
                 .into_response();
         }

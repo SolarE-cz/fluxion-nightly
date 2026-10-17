@@ -10,6 +10,15 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.61] - 2026-10-17
+
+### Fixed
+- Inverter mode changes now happen at 15-minute block boundaries. Inside a block the mode only changes for a user action (levers, VPR, kill switch, fixed slot, default mode, config change) or a safety stop; planner re-decisions wait for the next block. This ends the write at :00 being undone at :05 on every block.
+- The planner no longer keeps Hold forever once applied: Self-Use/Hold hysteresis now compares keeping the mode for the whole run the plan would switch for, and the projection of later blocks uses the same rule as the current block.
+- The `pricing.spot_buy_fee_czk` / `spot_sell_fee_czk` add-on options are now honoured (they were ignored and 0.5 was used).
+- Dashboard labels planner Hold blocks as "Hold" instead of "Self-Use".
+- The backtest page is opt-in (`FLUXION_BACKTEST_DB`); it no longer returns errors with developer file paths on the add-on.
+
 ## [0.2.60] - 2026-10-16
 
 ### Fixed

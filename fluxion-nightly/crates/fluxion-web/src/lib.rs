@@ -312,7 +312,9 @@ pub async fn start_web_server(
             get(config_api::export_config_handler).with_state(config_state),
         );
 
-    // Add backtest routes if database path is provided
+    // Backtest routes exist only when a database path is provided; otherwise they are not
+    // registered and return 404
+    let backtest_available = backtest_db_path.is_some();
     if let Some(db_path) = backtest_db_path {
         info!("📊 Backtest feature enabled with database: {:?}", db_path);
         let backtest_state = backtest::BacktestState::new(db_path, i18n);
@@ -375,7 +377,10 @@ pub async fn start_web_server(
         let simulator_state = simulator::SimulatorState::new();
         app = app
             // Simulator page
-            .route("/simulator", get(simulator::simulator_page_handler))
+            .route(
+                "/simulator",
+                get(simulator::simulator_page_handler).with_state(backtest_available),
+            )
             // API endpoints
             .route(
                 "/api/simulator/presets",
@@ -1083,6 +1088,94 @@ mod tests {
 
     fn i18n() -> Arc<I18n> {
         Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap())
+    }
+
+    /// Start the real web server on a free local port and return that port
+    async fn start_test_server(backtest_db_path: Option<std::path::PathBuf>) -> u16 {
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (query_sender, _query_channel) = WebQuerySender::new();
+        tokio::spawn(async move {
+            let _ = start_web_server(
+                query_sender,
+                i18n(),
+                port,
+                serde_json::json!({}),
+                None,
+                backtest_db_path,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return port;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("web server did not start on port {port}");
+    }
+
+    /// Send a raw HTTP/1.1 GET and return the full response text
+    async fn http_get(port: u16, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test]
+    async fn backtest_routes_absent_without_db_path() {
+        let port = start_test_server(None).await;
+        let response = http_get(port, "/api/backtest/days").await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(!response.contains("/home/"));
+    }
+
+    #[tokio::test]
+    async fn simulator_hides_backtest_link_without_db_path() {
+        let port = start_test_server(None).await;
+        let response = http_get(port, "/simulator").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!response.contains("href=\"/backtest\""));
+    }
+
+    #[tokio::test]
+    async fn simulator_links_backtest_when_db_path_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = start_test_server(Some(dir.path().join("backtest.db"))).await;
+        let response = http_get(port, "/simulator").await;
+        assert!(response.contains("href=\"/backtest\""));
+    }
+
+    #[tokio::test]
+    async fn backtest_error_body_hides_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing-backtest.db");
+        let port = start_test_server(Some(db_path.clone())).await;
+        let response = http_get(port, "/api/backtest/days").await;
+        assert!(!response.starts_with("HTTP/1.1 404"), "{response}");
+        assert!(
+            !response.contains(&db_path.display().to_string()),
+            "{response}"
+        );
+        assert!(!response.contains("/home/"), "{response}");
     }
 
     #[test]

@@ -1065,7 +1065,8 @@ pub struct WinterReserveConfigCore {
     /// Benefit (CZK) required to leave SelfUse for another mode (default: 0.10)
     #[serde(default = "default_wr_min_mode_benefit")]
     pub min_mode_benefit_czk: f32,
-    /// Extra benefit (CZK) to drop a kept SelfUse or Hold for the other one (default: 1.0)
+    /// Extra benefit (CZK) to drop a kept SelfUse or Hold for the other one, over the run of
+    /// blocks the switch is made for (default: 1.0)
     #[serde(default = "default_wr_mode_switch_min_benefit")]
     pub mode_switch_min_benefit_czk: f32,
     /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
