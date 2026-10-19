@@ -600,6 +600,7 @@ mod hdo_startup_tests {
                 block_duration_minutes: 15,
                 fetched_at: Utc::now(),
                 ha_last_updated: Utc::now(),
+                fallback_block_starts: Vec::new(),
             })
         }
 

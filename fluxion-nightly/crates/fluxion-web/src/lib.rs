@@ -631,6 +631,11 @@ struct ChartDataJson {
     /// Cost of charge of the battery energy (brief H33)
     #[serde(skip_serializing_if = "Option::is_none")]
     battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
+    /// Price source per block when not the HA price entity (`"ote_fallback"`, brief H35)
+    price_sources: Vec<Option<String>>,
+    /// Health of the spot price feed and the OTE fallback (brief H35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_feed: Option<fluxion_core::price_feed::PriceFeedStatus>,
 }
 
 /// Build the chart refresh JSON from a dashboard response; `None` when there is no price data
@@ -697,6 +702,8 @@ fn build_chart_data_json(response: &WebQueryResponse, i18n: Arc<I18n>) -> Option
         solar_forecast_tomorrow_kwh: solar_tomorrow,
         utc_offset_minutes,
         battery_cost_basis: response.battery_cost_basis,
+        price_sources: chart.price_sources,
+        price_feed: response.price_feed.clone(),
     })
 }
 
@@ -791,6 +798,9 @@ fn create_compact_export(response: &WebQueryResponse) -> serde_json::Value {
             "errs": response.health.errors
         },
 
+        // Spot price feed and OTE fallback (brief H35)
+        "price_feed": response.price_feed,
+
         // Compact inverter data
         "inv": response.inverters.iter().map(|inv| {
             serde_json::json!({
@@ -862,7 +872,8 @@ fn create_compact_export(response: &WebQueryResponse) -> serde_json::Value {
                         "pr": block.expected_profit.map(round_2_decimals),
                         "r": block.reason.as_ref().map(|r| abbreviate_reason(r)),
                         "uid": block.decision_uid.as_ref(),
-                        "h": block.is_historical
+                        "h": block.is_historical,
+                        "src": block.price_source.as_ref()
                     })
                 }).collect::<Vec<_>>(),
 
@@ -987,6 +998,7 @@ mod tests {
             solar_forecast_kw,
             solar_forecast_raw_kw: None,
             backup_min_soc_pct: None,
+            price_source: None,
         }
     }
 
@@ -1083,6 +1095,7 @@ mod tests {
             pricing_fees: None,
             solar_forecast: None,
             battery_cost_basis: None,
+            price_feed: None,
         }
     }
 
@@ -1692,6 +1705,54 @@ mod tests {
         assert_eq!(info.usable_text(), "4.2");
         assert_eq!(info.cost_text().as_deref(), Some("1.85"));
         assert_eq!(info.shares_text(), Some(("60".into(), "40".into())));
+    }
+
+    #[test]
+    fn missing_prices_show_a_banner_and_fallback_blocks_are_marked() {
+        let mut fallback = block("2026-10-17T10:00:00Z", None);
+        fallback.price_source = Some("ote_fallback".to_owned());
+        let blocks = vec![block("2026-10-16T10:00:00Z", None), fallback];
+        let mut resp = response(blocks, None);
+
+        // All well: no banner, no status in the JSON
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert!(json.get("price_feed").is_none());
+        let html =
+            DashboardTemplate::from_query_response(resp.clone(), i18n(), String::new(), None)
+                .render()
+                .unwrap();
+        assert!(!html.contains("price-feed-banner"));
+
+        let banner = "Tomorrow's prices missing from sensor.current_spot_electricity_price_15min since 13:45 — using OTE fallback";
+        resp.price_feed = Some(fluxion_core::price_feed::PriceFeedStatus {
+            entity: "sensor.current_spot_electricity_price_15min".to_owned(),
+            check_time: "13:45".to_owned(),
+            tomorrow_missing: true,
+            fallback: fluxion_core::price_feed::FallbackState::Active,
+            fallback_slots: 96,
+            banner: Some(banner.to_owned()),
+            ..Default::default()
+        });
+
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert_eq!(
+            json["price_sources"],
+            serde_json::json!([null, "ote_fallback"])
+        );
+        assert_eq!(json["price_feed"]["fallback"], "active");
+        assert_eq!(json["price_feed"]["tomorrow_missing"], true);
+        assert_eq!(json["price_feed"]["banner"], banner);
+
+        let export = create_compact_export(&resp);
+        assert_eq!(export["prices"]["blocks"][1]["src"], "ote_fallback");
+        assert_eq!(export["price_feed"]["fallback_slots"], 96);
+
+        let html = DashboardTemplate::from_query_response(resp, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("price-feed-banner"));
+        assert!(html.contains("Tomorrow&#x27;s prices missing from sensor.current_spot_electricity_price_15min since 13:45 — using OTE fallback")
+            || html.contains(banner), "banner text on the page");
     }
 
     #[test]

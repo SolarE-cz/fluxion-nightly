@@ -171,6 +171,38 @@ Optional list of fixed electricity buy prices if not using spot prices.
 
 Optional list of fixed electricity sell prices if not using spot prices.
 
+#### Option: `pricing.tomorrow_prices_check_time`
+
+Time of day (Europe/Prague, `HH:MM`) after which tomorrow's 15-minute prices are expected in the
+spot price entity. If they are missing after this time (or prices for the rest of today are
+missing), FluxION logs a warning once per hour and shows a banner on the dashboard.
+
+Default value: `"13:45"`
+
+#### Option: `pricing.ote_fallback_enabled`
+
+When the spot price entity lacks prices, fetch the OTE day-ahead prices directly (converted to
+CZK/kWh with the CNB EUR rate, like the Czech Energy Spot Prices integration) and fill only the
+missing slots. The OTE prices are used only if they match the entity on at least 90 % of today's
+slots (within 0.5 % or 0.01 CZK/kWh). With a separate buy price entity, the buy price of filled
+slots is derived as `a × spot + b` from today's prices; when that fit is not exact (within
+0.01 CZK/kWh) nothing is filled. The last successful check is kept in `/data`: when the entity has
+no prices of today at all (second day of an outage), a check at most 48 hours old is used instead
+and the banner says "validated <date>" (a check of one day covers that day and the next only).
+The add-on options `ote_fallback_enabled`, `price_alert_notification`,
+`tomorrow_prices_check_time`, `battery_wear_cost_czk_per_kwh`, `battery_efficiency` and
+`pv_forecast_correction_enabled` always apply from the add-on configuration, also on installs
+whose settings were saved in the web UI. The entity's prices always win once it has them again.
+
+Default value: `true`
+
+#### Option: `pricing.price_alert_notification`
+
+Show one Home Assistant notification (`fluxion_prices_missing`) while prices are missing, and
+dismiss it when they are complete again.
+
+Default value: `true`
+
 ### Option Group: `control`
 
 Fine-tune FluxION's control behavior.

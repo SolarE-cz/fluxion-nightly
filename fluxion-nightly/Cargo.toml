@@ -18,7 +18,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.65"
+version = "0.2.66"
 edition = "2024"
 license = "CC-BY-NC-ND-4.0"
 repository = "https://github.com/SolarE-cz/fluxion-nightly"
@@ -103,6 +103,7 @@ fluent-bundle = "0.16.0"
 unic-langid = "0.9.6"
 intl-memoizer = "0.5.3"
 mockito = "1.7.0"
+quick-xml = "0.38.4"
 tempfile = "3.23.0"
 calamine = "0.32.0"
 

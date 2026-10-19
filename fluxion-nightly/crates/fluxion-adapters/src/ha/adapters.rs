@@ -899,6 +899,8 @@ pub struct ConfigurablePriceDataSource {
     buy_fetch_interval: Duration,
     /// Buy sensor state kept between price reads
     buy_state: Mutex<BuyPriceState>,
+    /// Price feed health check and OTE fallback (brief H35)
+    fallback: Option<Arc<crate::price_fallback::PriceFallback>>,
 }
 
 /// Default minimum time between two reads of the buy price sensor (prices change per 15 minutes,
@@ -937,6 +939,7 @@ impl ConfigurablePriceDataSource {
             buy_price_entity: None,
             buy_fetch_interval: BUY_PRICE_FETCH_INTERVAL,
             buy_state: Mutex::new(BuyPriceState::default()),
+            fallback: None,
         }
     }
 
@@ -992,6 +995,7 @@ impl ConfigurablePriceDataSource {
             block_duration_minutes: 15,
             fetched_at: Utc::now(),
             ha_last_updated: Utc::now(),
+            fallback_block_starts: Vec::new(),
         };
 
         info!(
@@ -1017,6 +1021,71 @@ impl ConfigurablePriceDataSource {
         self.buy_fetch_interval = interval;
         self
     }
+
+    /// Check the spot prices for missing slots and fill them from OTE (brief H35)
+    pub fn with_price_fallback(
+        mut self,
+        fallback: Option<Arc<crate::price_fallback::PriceFallback>>,
+    ) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// Spot prices from the entity, checked by the fallback (missing slots filled from OTE).
+    /// With `with_buy`, the buy entity is read first and its prices go to the fallback, which
+    /// fills fallback blocks only when it can derive their buy price (brief H35). A failed
+    /// entity read is reported to the fallback as an entity without prices; the read still fails
+    /// unless the fallback filled blocks (second day of an outage).
+    async fn read_spot_prices(&self, with_buy: bool) -> Result<SpotPriceData> {
+        let read = self.spot_adapter.read_prices().await;
+        let buy_entity = self.buy_price_entity.as_deref().filter(|_| with_buy);
+        let Some(fallback) = &self.fallback else {
+            let data = read?;
+            if let Some(entity_id) = buy_entity {
+                self.refresh_buy_prices(entity_id, &data).await;
+            }
+            return Ok(data);
+        };
+        let (mut data, error) = match read {
+            Ok(data) => (data, None),
+            Err(e) => (SpotPriceData::default(), Some(e)),
+        };
+        let buy = match buy_entity {
+            Some(entity_id) => {
+                self.refresh_buy_prices(entity_id, &data).await;
+                Some(self.buy_state.lock().last_good.clone())
+            }
+            None => None,
+        };
+        fallback.apply(&mut data, buy.as_ref(), fallback.now());
+        match error {
+            Some(e) if data.fallback_block_starts.is_empty() => Err(e),
+            Some(e) => {
+                debug!("💰 Price entity unreadable ({e:#}); using OTE fallback prices only");
+                Ok(data)
+            }
+            None => Ok(data),
+        }
+    }
+}
+
+/// Fixed-buy blocks: sell at spot minus `fee`, matched by block start. Blocks whose spot price
+/// is from the OTE fallback keep that marker (brief H35).
+fn set_spot_sell_prices(data: &mut SpotPriceData, spot_data: &SpotPriceData, fee: f32) {
+    for block in &mut data.time_block_prices {
+        if let Some(spot_block) = spot_data
+            .time_block_prices
+            .iter()
+            .find(|sb| sb.block_start == block.block_start)
+        {
+            block.spot_sell_price_czk_per_kwh = Some(spot_block.price_czk_per_kwh - fee);
+            if spot_data.is_fallback_block(block.block_start) {
+                data.fallback_block_starts.push(block.block_start);
+            }
+        }
+    }
+    data.fallback_block_starts.sort();
+    data.fallback_block_starts.dedup();
 }
 
 /// Median of buy/spot over the blocks that have both prices (None when there are none)
@@ -1039,50 +1108,56 @@ fn buy_to_spot_ratio(blocks: &[TimeBlockPrice], buy: &HashMap<DateTime<Utc>, f32
 }
 
 impl ConfigurablePriceDataSource {
-    /// Set the buy price of every block (brief H13, H13b).
-    ///
-    /// The buy sensor is read at most once per `buy_fetch_interval`; in between, and when a read
-    /// fails, the last good buy prices are used. Blocks the sensor never covered get spot scaled by
-    /// the median buy/spot ratio, or plain spot when no ratio is known. WARN and INFO only when the
-    /// state changes.
-    async fn apply_buy_prices(&self, entity_id: &str, data: &mut SpotPriceData) {
+    /// Read the buy sensor (brief H13, H13b) at most once per `buy_fetch_interval`; a failed
+    /// read keeps the last good buy prices. WARN and INFO only when the state changes.
+    async fn refresh_buy_prices(&self, entity_id: &str, data: &SpotPriceData) {
         let due = {
             let state = self.buy_state.lock();
             state
                 .last_fetch
                 .is_none_or(|t| t.elapsed() >= self.buy_fetch_interval)
         };
-        if due {
-            let result = self.spot_adapter.read_block_prices(entity_id).await;
-            let mut state = self.buy_state.lock();
-            state.last_fetch = Some(Instant::now());
-            match result {
-                Ok(prices) => {
-                    if state.failing {
-                        info!("✅ Buy price sensor {entity_id} readable again");
-                        state.failing = false;
-                    }
-                    state.last_good.extend(prices);
-                    if let Some(first) = data.time_block_prices.iter().map(|b| b.block_start).min()
-                    {
-                        state.last_good.retain(|start, _| *start >= first);
-                    }
+        if !due {
+            return;
+        }
+        let result = self.spot_adapter.read_block_prices(entity_id).await;
+        let mut state = self.buy_state.lock();
+        state.last_fetch = Some(Instant::now());
+        match result {
+            Ok(prices) => {
+                if state.failing {
+                    info!("✅ Buy price sensor {entity_id} readable again");
+                    state.failing = false;
                 }
-                Err(e) => {
-                    if !state.failing {
-                        warn!(
-                            "⚠️ Buy price sensor {entity_id} unavailable ({e:#}); keeping last good buy prices"
-                        );
-                        state.failing = true;
-                    }
+                state.last_good.extend(prices);
+                if let Some(first) = data.time_block_prices.iter().map(|b| b.block_start).min() {
+                    state.last_good.retain(|start, _| *start >= first);
+                }
+            }
+            Err(e) => {
+                if !state.failing {
+                    warn!(
+                        "⚠️ Buy price sensor {entity_id} unavailable ({e:#}); keeping last good buy prices"
+                    );
+                    state.failing = true;
                 }
             }
         }
+    }
 
+    /// Set the buy price of every entity block (brief H13, H13b): the last good buy price, or
+    /// for blocks the sensor never covered spot scaled by the median buy/spot ratio (plain spot
+    /// when no ratio is known). OTE fallback blocks keep the buy price the fallback derived.
+    fn fill_buy_prices(&self, entity_id: &str, data: &mut SpotPriceData) {
         let mut state = self.buy_state.lock();
         let ratio = buy_to_spot_ratio(&data.time_block_prices, &state.last_good);
+        let fallback_starts: std::collections::HashSet<DateTime<Utc>> =
+            data.fallback_block_starts.iter().copied().collect();
         let mut missing = 0;
         for block in &mut data.time_block_prices {
+            if fallback_starts.contains(&block.block_start) {
+                continue;
+            }
             if let Some(buy) = state.last_good.get(&block.block_start) {
                 block.buy_price_czk_per_kwh = Some(*buy);
             } else {
@@ -1114,9 +1189,9 @@ impl PriceDataSource for ConfigurablePriceDataSource {
         // If using spot prices for buying, fetch from spot adapter
         if self.use_spot_for_buy {
             debug!("💰 [ConfigurablePrice] Using spot prices for buy decisions");
-            let mut data = self.spot_adapter.read_prices().await?;
+            let mut data = self.read_spot_prices(true).await?;
             if let Some(entity_id) = &self.buy_price_entity {
-                self.apply_buy_prices(entity_id, &mut data).await;
+                self.fill_buy_prices(entity_id, &mut data);
             }
 
             // When using spot for both buy and sell, compute spot sell price from raw spot price
@@ -1143,20 +1218,9 @@ impl PriceDataSource for ConfigurablePriceDataSource {
             // When selling at spot but buying at fixed price, fetch spot prices separately
             // to populate spot_sell_price_czk_per_kwh for arbitrage strategies
             if self.use_spot_for_sell {
-                match self.spot_adapter.read_prices().await {
+                match self.read_spot_prices(false).await {
                     Ok(spot_data) => {
-                        // Match spot prices to fixed price blocks by timestamp
-                        for block in &mut data.time_block_prices {
-                            if let Some(spot_block) = spot_data
-                                .time_block_prices
-                                .iter()
-                                .find(|sb| sb.block_start == block.block_start)
-                            {
-                                let sell_price =
-                                    spot_block.price_czk_per_kwh - self.spot_sell_fee_czk;
-                                block.spot_sell_price_czk_per_kwh = Some(sell_price);
-                            }
-                        }
+                        set_spot_sell_prices(&mut data, &spot_data, self.spot_sell_fee_czk);
                         debug!(
                             "💰 [ConfigurablePrice] Populated spot sell prices on fixed-buy blocks (fee: {:.2} CZK/kWh)",
                             self.spot_sell_fee_czk
@@ -2342,5 +2406,370 @@ mod buy_price_tests {
         assert!((ratio - 1.3).abs() < 1e-4);
 
         assert_eq!(buy_to_spot_ratio(&blocks, &HashMap::new()), None);
+    }
+}
+
+/// The OTE price fallback inside the price source (brief H35); fixtures as in
+/// `price_fallback::tests`
+#[cfg(test)]
+mod price_fallback_source_tests {
+    use super::*;
+    use crate::price_fallback::{PriceFallback, PriceFallbackConfig, parse_check_time};
+    use chrono::TimeZone;
+    use chrono_tz::Europe::Prague;
+    use mockito::{Matcher, Server};
+    use serde_json::json;
+
+    const SPOT: &str = "sensor.current_spot_electricity_price_15min";
+    const BUY: &str = "sensor.current_buy_electricity_price_15min";
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/price_fallback/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn now() -> DateTime<Utc> {
+        Prague
+            .with_ymd_and_hms(2026, 10, 13, 18, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Recorded integration values of 2026-10-13 (00:00–21:45 Prague)
+    fn recorded() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(&fixture(
+            "integration-spot-attrs-2026-10-13.json",
+        ))
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    fn entity_body(
+        entity: &str,
+        attributes: &serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        json!({
+            "entity_id": entity,
+            "state": "4.0",
+            "attributes": attributes,
+            "last_changed": "2026-10-13T16:00:00Z",
+            "last_updated": "2026-10-13T16:00:00Z",
+        })
+        .to_string()
+    }
+
+    /// Buy entity from spot: `buy(local time, spot)`
+    fn buy_attrs(buy: impl Fn(&str, f64) -> f64) -> serde_json::Map<String, serde_json::Value> {
+        recorded()
+            .into_iter()
+            .map(|(k, v)| {
+                let price = buy(&k, v.as_f64().unwrap());
+                (k, json!(price))
+            })
+            .collect()
+    }
+
+    async fn mocks(server: &mut Server, buy: serde_json::Map<String, serde_json::Value>) {
+        server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(200)
+            .with_body(entity_body(SPOT, &recorded()))
+            .create_async()
+            .await;
+        server
+            .mock("GET", format!("/api/states/{BUY}").as_str())
+            .with_status(200)
+            .with_body(entity_body(BUY, &buy))
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/ote")
+            .with_status(200)
+            .with_body(fixture("ote-dam-2026-10-13_14.xml"))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/cnb")
+            .match_query(Matcher::UrlEncoded("date".into(), "2026-10-12".into()))
+            .with_status(200)
+            .with_body(fixture("cnb-daily-2026-10-12.json"))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/cnb")
+            .match_query(Matcher::UrlEncoded("date".into(), "2026-10-13".into()))
+            .with_status(200)
+            .with_body(fixture("cnb-daily-2026-10-13.json"))
+            .create_async()
+            .await;
+    }
+
+    fn source(url: &str) -> (ConfigurablePriceDataSource, Arc<PriceFallback>) {
+        let mut config =
+            PriceFallbackConfig::new(SPOT, parse_check_time("13:45").unwrap(), true, false);
+        config.ote_url = format!("{url}/ote");
+        config.cnb_url = format!("{url}/cnb");
+        config.fixed_now = Some(now());
+        config.alert_delay = chrono::Duration::zero();
+        let fallback = Arc::new(
+            PriceFallback::new(config, Arc::new(RwLock::new(Default::default()))).unwrap(),
+        );
+        let client = Arc::new(HomeAssistantClient::new(url, "t").unwrap());
+        let spot = Arc::new(CzSpotPriceAdapter::new(client, SPOT));
+        let source = ConfigurablePriceDataSource::new(spot, true, true, vec![], vec![], 0.5)
+            .with_buy_price_entity(Some(BUY.to_owned()))
+            .with_buy_fetch_interval(Duration::ZERO)
+            .with_price_fallback(Some(fallback.clone()));
+        (source, fallback)
+    }
+
+    fn block(data: &SpotPriceData, start: DateTime<Utc>) -> TimeBlockPrice {
+        data.time_block_prices
+            .iter()
+            .find(|b| b.block_start == start)
+            .cloned()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fallback_slots_get_buy_from_an_exact_fit() {
+        let mut server = Server::new_async().await;
+        mocks(
+            &mut server,
+            buy_attrs(|_, s| (s * 1.21 * 10_000.0).round() / 10_000.0),
+        )
+        .await;
+        let (source, fallback) = source(&server.url());
+
+        let first = source.read_prices().await.unwrap();
+        assert!(first.fallback_block_starts.is_empty());
+        assert!(fallback.wants_fetch());
+        fallback.maybe_fetch(now()).await;
+        let data = source.read_prices().await.unwrap();
+
+        // 22:00–23:45 today and all of tomorrow came from OTE
+        assert_eq!(data.fallback_block_starts.len(), 8 + 96);
+        let tomorrow = Prague
+            .with_ymd_and_hms(2026, 10, 14, 8, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let b = block(&data, tomorrow);
+        let buy = b.buy_price_czk_per_kwh.unwrap();
+        assert!((buy - b.price_czk_per_kwh * 1.21).abs() < 1e-3, "{b:?}");
+        assert_eq!(
+            b.spot_sell_price_czk_per_kwh,
+            Some(b.price_czk_per_kwh - 0.5)
+        );
+        // Entity slots keep the entity's buy price
+        let entity_slot = Prague
+            .with_ymd_and_hms(2026, 10, 13, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let e = block(&data, entity_slot);
+        assert!(!data.is_fallback_block(entity_slot));
+        assert!((e.buy_price_czk_per_kwh.unwrap() - e.price_czk_per_kwh * 1.21).abs() < 1e-3);
+
+        let status = fallback.status();
+        let fit = status.buy_fit.unwrap();
+        assert!(fit.used && (fit.a - 1.21).abs() < 1e-3, "{fit:?}");
+        assert_eq!(
+            status.banner.as_deref(),
+            Some(
+                "Today's and tomorrow's prices missing from sensor.current_spot_electricity_price_15min — using OTE fallback"
+            )
+        );
+    }
+
+    /// Owner ruling: a buy fit that is not exact fills nothing (wrong prices are worse than a
+    /// shorter horizon)
+    #[tokio::test]
+    async fn fallback_fills_nothing_when_the_buy_fit_is_not_exact() {
+        let mut server = Server::new_async().await;
+        // A buy price with a tariff step: not a × spot + b
+        mocks(
+            &mut server,
+            buy_attrs(|k, s| {
+                let hour: u32 = k[11..13].parse().unwrap();
+                s * 1.21 + if hour < 6 { 0.3 } else { 1.2 }
+            }),
+        )
+        .await;
+        let (source, fallback) = source(&server.url());
+
+        source.read_prices().await.unwrap();
+        fallback.maybe_fetch(now()).await;
+        let data = source.read_prices().await.unwrap();
+
+        assert!(data.fallback_block_starts.is_empty());
+        assert_eq!(data.time_block_prices.len(), 88);
+        assert!(
+            data.time_block_prices
+                .iter()
+                .all(|b| b.buy_price_czk_per_kwh.is_some())
+        );
+        let status = fallback.status();
+        assert_eq!(
+            status.fallback,
+            fluxion_core::price_feed::FallbackState::Rejected
+        );
+        assert!(
+            status
+                .banner
+                .unwrap()
+                .contains("— no fallback available (buy price fit failed:")
+        );
+    }
+
+    /// Second day of an outage: the entities are unavailable, the stored validation of
+    /// yesterday stands in, and the price read returns the OTE prices instead of failing
+    #[tokio::test]
+    async fn unreadable_entity_on_day_two_uses_the_stored_validation() {
+        let mut server = Server::new_async().await;
+        for entity in [SPOT, BUY] {
+            server
+                .mock("GET", format!("/api/states/{entity}").as_str())
+                .with_status(404)
+                .create_async()
+                .await;
+        }
+        server
+            .mock("POST", "/ote")
+            .with_status(200)
+            .with_body(fixture("ote-dam-2026-10-13_14.xml"))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/cnb")
+            .match_query(Matcher::UrlEncoded("date".into(), "2026-10-13".into()))
+            .with_status(200)
+            .with_body(fixture("cnb-daily-2026-10-13.json"))
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("price_fallback_validation.json");
+        std::fs::write(
+            &path,
+            json!({
+                "validated_at": "2026-10-13T16:00:00Z",
+                "day": "2026-10-13",
+                "rate_source": "before_today",
+                "rate_valid_for": "2026-10-12",
+                "eur_czk": 24.39,
+                "match_share": 1.0,
+                "buy_fit": {"a": 1.21, "b": 0.0, "max_residual": 0.0001, "slots": 88, "used": true}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let day_two = Prague
+            .with_ymd_and_hms(2026, 10, 14, 10, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut config =
+            PriceFallbackConfig::new(SPOT, parse_check_time("13:45").unwrap(), true, false);
+        config.ote_url = format!("{}/ote", server.url());
+        config.cnb_url = format!("{}/cnb", server.url());
+        config.fixed_now = Some(day_two);
+        config.alert_delay = chrono::Duration::zero();
+        config.validation_path = Some(path);
+        let fallback = Arc::new(
+            PriceFallback::new(config, Arc::new(RwLock::new(Default::default()))).unwrap(),
+        );
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "t").unwrap());
+        let source = ConfigurablePriceDataSource::new(
+            Arc::new(CzSpotPriceAdapter::new(client, SPOT)),
+            true,
+            true,
+            vec![],
+            vec![],
+            0.5,
+        )
+        .with_buy_price_entity(Some(BUY.to_owned()))
+        .with_buy_fetch_interval(Duration::ZERO)
+        .with_price_fallback(Some(fallback.clone()));
+
+        assert!(source.read_prices().await.is_err());
+        fallback.maybe_fetch(day_two).await;
+        let data = source.read_prices().await.unwrap();
+
+        assert_eq!(data.fallback_block_starts.len(), 56);
+        let b = block(&data, day_two);
+        assert!((b.buy_price_czk_per_kwh.unwrap() - b.price_czk_per_kwh * 1.21).abs() < 1e-3);
+        assert_eq!(
+            b.spot_sell_price_czk_per_kwh,
+            Some(b.price_czk_per_kwh - 0.5)
+        );
+        assert!(
+            fallback
+                .status()
+                .banner
+                .unwrap()
+                .ends_with("— using OTE fallback, validated 2026-10-13")
+        );
+    }
+
+    /// Review #7: on the fixed-buy path the spot sell price of a fallback block keeps the
+    /// `ote_fallback` marker
+    #[test]
+    fn fixed_buy_blocks_keep_the_fallback_marker_of_their_spot_sell_price() {
+        let t0 = now();
+        let blk = |i: i64, price: f32| TimeBlockPrice {
+            block_start: t0 + chrono::Duration::minutes(15 * i),
+            duration_minutes: 15,
+            price_czk_per_kwh: price,
+            effective_price_czk_per_kwh: price,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
+        };
+        let mut fixed = SpotPriceData {
+            time_block_prices: (0..4).map(|i| blk(i, 5.0)).collect(),
+            ..SpotPriceData::default()
+        };
+        let spot = SpotPriceData {
+            time_block_prices: (0..4).map(|i| blk(i, 2.0)).collect(),
+            fallback_block_starts: vec![t0 + chrono::Duration::minutes(30)],
+            ..SpotPriceData::default()
+        };
+
+        set_spot_sell_prices(&mut fixed, &spot, 0.5);
+
+        assert!(
+            fixed
+                .time_block_prices
+                .iter()
+                .all(|b| b.spot_sell_price_czk_per_kwh == Some(1.5))
+        );
+        assert_eq!(
+            fixed.fallback_block_starts,
+            vec![t0 + chrono::Duration::minutes(30)]
+        );
+        assert!(!fixed.is_fallback_block(t0));
+    }
+
+    #[tokio::test]
+    async fn unreadable_entity_is_reported_as_missing_prices() {
+        let mut server = Server::new_async().await;
+        server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(404)
+            .create_async()
+            .await;
+        let (source, fallback) = source(&server.url());
+
+        assert!(source.read_prices().await.is_err());
+
+        let status = fallback.status();
+        assert!(status.today_missing && status.tomorrow_missing);
+        assert!(
+            status
+                .banner
+                .unwrap()
+                .starts_with("Today's and tomorrow's prices missing from sensor.current_spot_electricity_price_15min — no fallback available")
+        );
     }
 }

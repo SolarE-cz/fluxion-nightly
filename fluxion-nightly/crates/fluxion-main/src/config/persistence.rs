@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 /// Configuration metadata for tracking changes
@@ -146,8 +146,9 @@ pub fn load_config_with_fallback() -> Result<AppConfig> {
     // Try web UI persistent config first
     if persistence.exists() {
         match persistence.load() {
-            Ok(persisted) => {
+            Ok(mut persisted) => {
                 info!("✅ Loaded configuration from web UI persistent storage");
+                overlay_addon_options_file(&mut persisted.config, Path::new(HA_OPTIONS_PATH));
                 persisted.config.validate()?;
                 return Ok(persisted.config);
             }
@@ -169,6 +170,82 @@ pub fn load_config_with_fallback() -> Result<AppConfig> {
     }
 
     Ok(config)
+}
+
+/// The add-on options written by the HA Supervisor
+pub const HA_OPTIONS_PATH: &str = "/data/options.json";
+
+/// Add-on options that only the add-on UI sets (the web UI has no field for them). On an existing
+/// install `/data/config.json` wins over `options.json`, so without this overlay a change of
+/// these in the add-on UI would never apply (H33, H34, H35).
+pub const ADDON_ONLY_OPTIONS: &[(&str, &str)] = &[
+    ("control", "battery_wear_cost_czk_per_kwh"),
+    ("control", "battery_efficiency"),
+    ("solar_forecast", "pv_forecast_correction_enabled"),
+    ("pricing", "ote_fallback_enabled"),
+    ("pricing", "price_alert_notification"),
+    ("pricing", "tomorrow_prices_check_time"),
+];
+
+/// Apply the add-on-only options of `path` (HA `options.json`) over `config`; a missing or
+/// unreadable file changes nothing
+pub fn overlay_addon_options_file(config: &mut AppConfig, path: &Path) {
+    let options = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!("Add-on options {} unreadable: {e}", path.display());
+            return;
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(&options) {
+        Ok(options) => {
+            overlay_addon_options(config, &options);
+        }
+        Err(e) => warn!("Add-on options {} invalid: {e}", path.display()),
+    }
+}
+
+/// Set each of [`ADDON_ONLY_OPTIONS`] present in `options` on `config`; returns the keys that
+/// changed. Other keys keep the precedence of `config.json`.
+pub fn overlay_addon_options(config: &mut AppConfig, options: &serde_json::Value) -> Vec<String> {
+    let mut current = match serde_json::to_value(&*config) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!("Add-on options not applied: {e}");
+            return Vec::new();
+        }
+    };
+    let mut changed = Vec::new();
+    for (section, key) in ADDON_ONLY_OPTIONS {
+        let Some(value) = options.get(section).and_then(|s| s.get(key)) else {
+            continue;
+        };
+        let Some(slot) = current.get_mut(section).and_then(|s| s.get_mut(key)) else {
+            continue;
+        };
+        if slot != value {
+            *slot = value.clone();
+            changed.push(format!("{section}.{key}"));
+        }
+    }
+    if changed.is_empty() {
+        return changed;
+    }
+    match serde_json::from_value::<AppConfig>(current) {
+        Ok(updated) => {
+            info!(
+                "⚙️ Add-on options applied over the web UI config: {}",
+                changed.join(", ")
+            );
+            *config = updated;
+            changed
+        }
+        Err(e) => {
+            warn!("Add-on options not applied ({}): {e}", changed.join(", "));
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +273,73 @@ mod tests {
         let loaded = persistence.load().unwrap();
         assert_eq!(loaded.metadata.modified_by, "test");
         assert_eq!(loaded.config.system.debug_mode, config.system.debug_mode);
+    }
+
+    /// H33/H34/H35: on an existing install the add-on UI's values of the add-on-only options
+    /// apply over `/data/config.json`; other keys keep the precedence of `config.json`
+    #[test]
+    fn addon_only_options_override_the_web_ui_config() {
+        let (persistence, dir) = create_test_persistence();
+        let mut saved = AppConfig::default();
+        saved.pricing.spot_price_entity = "sensor.from_web_ui".to_owned();
+        saved.pricing.buy_price_entity = Some("sensor.buy_from_web_ui".to_owned());
+        persistence.save(&saved, "web_ui").unwrap();
+        let mut config = persistence.load().unwrap().config;
+
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({
+                "pricing": {
+                    "spot_price_entity": "sensor.from_addon_ui",
+                    "ote_fallback_enabled": false,
+                    "price_alert_notification": false,
+                    "tomorrow_prices_check_time": "15:10"
+                },
+                "control": {
+                    "battery_wear_cost_czk_per_kwh": 0.42,
+                    "battery_efficiency": 0.9,
+                    "min_battery_soc": 55.0
+                },
+                "solar_forecast": {"pv_forecast_correction_enabled": false}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        overlay_addon_options_file(&mut config, &options);
+
+        assert!(!config.pricing.ote_fallback_enabled);
+        assert!(!config.pricing.price_alert_notification);
+        assert_eq!(config.pricing.tomorrow_prices_check_time, "15:10");
+        assert!((config.control.battery_wear_cost_czk_per_kwh - 0.42).abs() < 1e-6);
+        assert!((config.control.battery_efficiency - 0.9).abs() < 1e-6);
+        assert!(!config.solar_forecast.pv_forecast_correction_enabled);
+        // Other keys: config.json still wins
+        assert_eq!(config.pricing.spot_price_entity, "sensor.from_web_ui");
+        assert_eq!(
+            config.pricing.buy_price_entity.as_deref(),
+            Some("sensor.buy_from_web_ui")
+        );
+        assert!((config.control.min_battery_soc - saved.control.min_battery_soc).abs() < 1e-6);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn missing_or_invalid_addon_options_change_nothing() {
+        let (_, dir) = create_test_persistence();
+        let mut config = AppConfig::default();
+        let before = serde_json::to_value(&config).unwrap();
+
+        overlay_addon_options_file(&mut config, &dir.path().join("absent.json"));
+        let garbage = dir.path().join("options.json");
+        fs::write(&garbage, "{not json").unwrap();
+        overlay_addon_options_file(&mut config, &garbage);
+        // Keys absent from the options keep the config value; a wrong type is not applied
+        let changed = overlay_addon_options(
+            &mut config,
+            &serde_json::json!({"pricing": {"ote_fallback_enabled": "maybe"}}),
+        );
+        assert!(changed.is_empty());
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
     }
 }

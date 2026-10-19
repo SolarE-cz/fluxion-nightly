@@ -25,6 +25,7 @@ crossbeam-channel.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 urlencoding = "2.1"
+quick-xml.workspace = true
 
 [dev-dependencies]
 mockito.workspace = true

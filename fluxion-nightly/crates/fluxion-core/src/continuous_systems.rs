@@ -3636,6 +3636,7 @@ mod levers_execution_tests {
             block_duration_minutes: 15,
             fetched_at: now,
             ha_last_updated: now,
+            fallback_block_starts: Vec::new(),
         }
     }
 

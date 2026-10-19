@@ -314,6 +314,62 @@ fn initialize_and_run() -> Result<()> {
     let price_adapter_tz_handle = PriceAdapterTimezoneHandle::new(spot_adapter.timezone_handle());
     info!("🌍 Price adapter timezone handle created for HA timezone sync");
 
+    // Price feed health check and OTE fallback (brief H35): status for the dashboard, fallback
+    // fetches and the HA notification in a background task, off the scheduling loop
+    let price_feed_status = fluxion_core::price_feed::PriceFeedStatusResource::default();
+    let price_fallback = {
+        let check_time = fluxion_adapters::price_fallback::parse_check_time(
+            &config.pricing.tomorrow_prices_check_time,
+        )
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                "⚠️ pricing.tomorrow_prices_check_time '{}' is not HH:MM, using {}",
+                config.pricing.tomorrow_prices_check_time,
+                fluxion_adapters::price_fallback::DEFAULT_CHECK_TIME
+            );
+            fluxion_adapters::price_fallback::parse_check_time(
+                fluxion_adapters::price_fallback::DEFAULT_CHECK_TIME,
+            )
+            .unwrap_or_default()
+        });
+        let mut fallback_config = fluxion_adapters::PriceFallbackConfig::new(
+            config.pricing.spot_price_entity.clone(),
+            check_time,
+            config.pricing.ote_fallback_enabled,
+            config.pricing.price_alert_notification,
+        );
+        // The last validation survives restarts (second day of an outage)
+        if std::path::Path::new("/data").is_dir() {
+            fallback_config.validation_path =
+                Some(fluxion_adapters::price_fallback::DEFAULT_VALIDATION_PATH.into());
+        }
+        match fluxion_adapters::PriceFallback::new(fallback_config, price_feed_status.0.clone()) {
+            Ok(fallback) => {
+                let fallback = Arc::new(fallback);
+                info!(
+                    "💰 Price feed check after {} Europe/Prague; OTE fallback {}, HA notification {}",
+                    check_time.format("%H:%M"),
+                    if config.pricing.ote_fallback_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                    if config.pricing.price_alert_notification {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+                fallback.clone().spawn(Some(ha_client.clone()));
+                Some(fallback)
+            }
+            Err(e) => {
+                tracing::error!("❌ Price feed check not started: {e:#}");
+                None
+            }
+        }
+    };
+
     // Wrap spot adapter in configurable source that respects use_spot_prices_to_buy/sell flags
     let price_source: Arc<dyn fluxion_core::PriceDataSource> = Arc::new(
         fluxion_adapters::ConfigurablePriceDataSource::new(
@@ -324,7 +380,8 @@ fn initialize_and_run() -> Result<()> {
             config.pricing.fixed_sell_prices.clone(),
             config.pricing.spot_sell_fee,
         )
-        .with_buy_price_entity(config.pricing.buy_price_entity.clone()),
+        .with_buy_price_entity(config.pricing.buy_price_entity.clone())
+        .with_price_fallback(price_fallback),
     );
     info!("💰 Price data source: {}", price_source.name());
 
@@ -510,6 +567,7 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(price_adapter_tz_handle)
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
         .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
+        .insert_resource(price_feed_status)
         .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
             history_source,
         ))

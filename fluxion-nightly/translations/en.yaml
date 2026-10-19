@@ -58,6 +58,18 @@ configuration:
     description: >-
       Enable using spot prices to determine when to sell electricity to the
       grid (discharge batteries when prices are high).
+  ote_fallback_enabled:
+    name: OTE Price Fallback
+    description: >-
+      When the spot price entity lacks prices (tomorrow's after the check time, or the rest of today), fetch the OTE day-ahead prices directly and fill only the missing slots, after checking them against the entity's prices of today.
+  price_alert_notification:
+    name: Missing Price Notification
+    description: >-
+      Show a Home Assistant notification while the spot price entity lacks prices, and dismiss it when they are back.
+  tomorrow_prices_check_time:
+    name: Tomorrow's Prices Check Time
+    description: >-
+      Time of day (Europe/Prague, HH:MM) after which tomorrow's prices are expected in the spot price entity. Default 13:45.
   force_charge_hours:
     name: Force Charge Hours
     description: >-

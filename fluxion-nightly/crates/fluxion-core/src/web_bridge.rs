@@ -370,6 +370,9 @@ pub struct WebQueryResponse {
     /// Cost of charge of the battery energy (brief H33)
     #[serde(default)]
     pub battery_cost_basis: Option<BatteryCostBasisInfo>,
+    /// Health of the spot price feed and the OTE fallback (brief H35)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_feed: Option<crate::price_feed::PriceFeedStatus>,
 }
 
 /// Inverter component data bundle
@@ -501,6 +504,9 @@ pub struct PriceBlockData {
     /// default mode (brief H19); `None` otherwise
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_min_soc_pct: Option<u8>,
+    /// Where the price came from when not the HA price entity: `"ote_fallback"` (brief H35)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<String>,
 }
 
 /// System health data
@@ -579,6 +585,7 @@ fn extract_strategy_info(reason: &str) -> (Option<String>, Option<f32>) {
 
 /// ECS system that processes web query requests
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::type_complexity)]
 pub fn web_query_system(
     debug_config: Res<DebugModeConfig>,
     system_config: Res<SystemConfig>,
@@ -594,8 +601,11 @@ pub fn web_query_system(
     consumption_history_config: Option<Res<ConsumptionHistoryConfig>>,
     hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
     solar_forecast: Option<Res<crate::async_systems::SolarForecastData>>,
-    user_control: Option<Res<UserControlResource>>,
-    cost_basis: Option<Res<crate::battery_cost_basis::BatteryCostTracker>>,
+    (user_control, cost_basis, price_feed): (
+        Option<Res<UserControlResource>>,
+        Option<Res<crate::battery_cost_basis::BatteryCostTracker>>,
+        Option<Res<crate::price_feed::PriceFeedStatusResource>>,
+    ),
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -609,6 +619,7 @@ pub fn web_query_system(
                 battery_cost_basis: cost_basis
                     .as_deref()
                     .map(|t| BatteryCostBasisInfo::from_basis(&t.basis)),
+                price_feed: price_feed.as_deref().map(|p| p.snapshot()),
                 ..build_dashboard_response(
                     &debug_config,
                     &system_config,
@@ -1040,6 +1051,9 @@ fn build_dashboard_response(
                             solar_forecast_raw_kw,
                             backup_min_soc_pct: backup_display_min_soc
                                 .filter(|_| block_type_is_backup),
+                            price_source: prices
+                                .is_fallback_block(block.block_start)
+                                .then(|| crate::price_feed::PRICE_SOURCE_OTE_FALLBACK.to_owned()),
                         }
                     })
                     .collect();
@@ -1377,6 +1391,7 @@ fn build_dashboard_response(
         pricing_fees,
         solar_forecast,
         battery_cost_basis: None,
+        price_feed: None,
     }
 }
 

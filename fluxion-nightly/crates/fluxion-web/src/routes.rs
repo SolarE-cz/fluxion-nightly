@@ -110,6 +110,9 @@ pub struct ChartData {
     pub solar_forecast_raw_kw: Vec<Option<f32>>,
     /// The correction in force: factor and the days it rests on
     pub pv_forecast_correction: Option<fluxion_core::pv_correction::CorrectionResult>,
+    /// Price source per block when not the HA price entity (`"ote_fallback"`, brief H35).
+    /// Aligned with `labels`.
+    pub price_sources: Vec<Option<String>>,
 }
 
 /// Live data template (for SSE updates only)
@@ -213,6 +216,8 @@ pub struct DashboardTemplate {
     pub user_control: Option<UserControlState>,
     /// Cost of charge of the battery energy (brief H33)
     pub battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
+    /// Missing-price banner (brief H35); `None` when the price feed is complete
+    pub price_feed_banner: Option<String>,
 }
 
 impl DashboardTemplate {
@@ -285,6 +290,7 @@ impl DashboardTemplate {
             let mut effective_prices = Vec::new();
             let mut solar_forecast_kw = Vec::new();
             let mut solar_forecast_raw_kw = Vec::new();
+            let mut price_sources = Vec::new();
 
             // Get HDO and pricing fee info from response
             let hdo_schedule = response.hdo_schedule.as_ref();
@@ -328,6 +334,7 @@ impl DashboardTemplate {
                 decision_uids.push(block.decision_uid.clone());
                 solar_forecast_kw.push(block.solar_forecast_kw);
                 solar_forecast_raw_kw.push(block.solar_forecast_raw_kw);
+                price_sources.push(block.price_source.clone());
 
                 modes.push(display_mode_label(block));
 
@@ -564,6 +571,7 @@ impl DashboardTemplate {
                         .solar_forecast
                         .as_ref()
                         .and_then(|sf| sf.correction),
+                    price_sources,
                 },
             }
         });
@@ -593,6 +601,7 @@ impl DashboardTemplate {
             solar_forecast: response.solar_forecast,
             user_control,
             battery_cost_basis: response.battery_cost_basis,
+            price_feed_banner: response.price_feed.and_then(|p| p.banner),
         }
     }
 }
@@ -922,6 +931,7 @@ mod tests {
             pricing_fees: None,
             solar_forecast: None,
             battery_cost_basis: None,
+            price_feed: None,
         }
     }
 
@@ -995,6 +1005,7 @@ mod tests {
             solar_forecast_kw: None,
             solar_forecast_raw_kw: None,
             backup_min_soc_pct: None,
+            price_source: None,
         };
         assert_eq!(display_mode_label(&block), "Hold");
 

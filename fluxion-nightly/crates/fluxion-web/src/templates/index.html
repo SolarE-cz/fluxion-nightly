@@ -1447,6 +1447,11 @@
     {% endif %}
 
     <!-- Price Chart (Outside SSE update area - updates once per minute) -->
+    {% if let Some(banner) = price_feed_banner %}
+    <div class="price-feed-banner" role="alert" style="padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; border: 1px solid var(--warning); background: var(--bg-tertiary); color: var(--text-primary);">
+        ⚠️ {{ banner|e }}
+    </div>
+    {% endif %}
     {% if timezone_unknown %}
     <div class="timezone-banner" role="alert" style="padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary);">
         Timezone unknown, times shown in UTC — <a href="#" onclick="openDisplayTimezoneSelector(event)">choose your timezone</a>

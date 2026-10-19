@@ -10,6 +10,11 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.66] - 2026-10-19
+
+### Added
+- Price feed check and OTE fallback: when the spot price entity lacks tomorrow's prices after 13:45 Europe/Prague (option `pricing.tomorrow_prices_check_time`), or prices for the rest of today, FluxION warns once per hour, shows a dashboard banner, keeps one HA notification (`fluxion_prices_missing`, option `pricing.price_alert_notification`, default on) and fills only the missing slots from the OTE day-ahead market (option `pricing.ote_fallback_enabled`, default on), after checking OTE against the entity's prices of today (on the second day of an outage, against the last check, used for its own day and the next only). With a separate buy price entity, slots are filled only when buy = a × spot + b fits exactly. Add-on options of H33/H34/H35 (`battery_wear_cost_czk_per_kwh`, `battery_efficiency`, `pv_forecast_correction_enabled`, `ote_fallback_enabled`, `price_alert_notification`, `tomorrow_prices_check_time`) now apply on installs with a web UI config (`/data/config.json`), which used to hide them. Filled blocks carry `price_source: "ote_fallback"` in the chart and export data.
+
 ## [0.2.65] - 2026-10-19
 
 ### Added

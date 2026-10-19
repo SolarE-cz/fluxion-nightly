@@ -58,6 +58,18 @@ configuration:
     description: >-
       Povolit použití spotových cen k určení, kdy prodávat elektřinu do sítě
       (vybíjet baterie při vysokých cenách).
+  ote_fallback_enabled:
+    name: Záložní ceny z OTE
+    description: >-
+      Když entitě spotové ceny chybí ceny (zítřejší po čase kontroly nebo zbytek dneška), stáhnout denní trh přímo z OTE a doplnit jen chybějící úseky, po kontrole proti dnešním cenám entity.
+  price_alert_notification:
+    name: Upozornění na chybějící ceny
+    description: >-
+      Zobrazit upozornění v Home Assistantu, dokud entitě spotové ceny chybí ceny, a zrušit ho, až budou zpět.
+  tomorrow_prices_check_time:
+    name: Čas kontroly zítřejších cen
+    description: >-
+      Čas (Europe/Prague, HH:MM), od kterého se v entitě spotové ceny očekávají zítřejší ceny. Výchozí 13:45.
   force_charge_hours:
     name: Hodiny vynuceného dobíjení
     description: >-

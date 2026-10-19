@@ -110,6 +110,7 @@ fn test_config_update_flow() {
         block_duration_minutes: 15,
         fetched_at: chrono::Utc::now(),
         ha_last_updated: chrono::Utc::now(),
+        fallback_block_starts: Vec::new(),
     };
     app.world_mut().spawn(price_data);
 

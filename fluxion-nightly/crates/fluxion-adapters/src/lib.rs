@@ -11,6 +11,7 @@
 // For commercial licensing, please contact: info@solare.cz
 
 pub mod ha;
+pub mod price_fallback;
 pub mod solax;
 
 // Re-export commonly used types for convenience
@@ -19,6 +20,8 @@ pub use ha::{
     HaEntityState, HaError, HaHistoryState, HaPlugin, HaResult, HistoryDataPoint,
     HomeAssistantClient, HomeAssistantInverterAdapter, PriceAdapterTimezoneHandle,
 };
+
+pub use price_fallback::{PriceFallback, PriceFallbackConfig};
 
 pub use solax::{
     SolaxChargerUseMode, SolaxEntityMapper, SolaxManualMode, SolaxUltraEntityMapper,

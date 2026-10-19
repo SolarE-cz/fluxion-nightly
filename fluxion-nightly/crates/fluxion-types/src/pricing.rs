@@ -32,6 +32,19 @@ pub struct SpotPriceData {
 
     /// HA entity last_updated timestamp
     pub ha_last_updated: DateTime<Utc>,
+
+    /// Block starts whose price came from the OTE fallback, not from the HA price entity
+    /// (brief H35); empty when every block is from the entity
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_block_starts: Vec<DateTime<Utc>>,
+}
+
+impl SpotPriceData {
+    /// True when the price of the block starting at `start` came from the OTE fallback
+    #[must_use]
+    pub fn is_fallback_block(&self, start: DateTime<Utc>) -> bool {
+        self.fallback_block_starts.contains(&start)
+    }
 }
 
 impl Default for SpotPriceData {
@@ -41,6 +54,7 @@ impl Default for SpotPriceData {
             block_duration_minutes: 15,
             fetched_at: Utc::now(),
             ha_last_updated: Utc::now(),
+            fallback_block_starts: Vec::new(),
         }
     }
 }

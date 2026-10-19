@@ -57,9 +57,12 @@ options:
     fixed_sell_prices: []
     hdo_high_tariff_czk: 1.8
     hdo_low_tariff_czk: 0.5
+    ote_fallback_enabled: true
+    price_alert_notification: true
     spot_buy_fee_czk: 0.5
     spot_price_entity: sensor.current_spot_electricity_price_15min
     spot_sell_fee_czk: 0.5
+    tomorrow_prices_check_time: '13:45'
     use_spot_prices_to_buy: true
     use_spot_prices_to_sell: true
   release_branch: nightly
@@ -310,9 +313,12 @@ schema:
     - float?
     hdo_high_tariff_czk: float(0,)?
     hdo_low_tariff_czk: float(0,)?
+    ote_fallback_enabled: bool?
+    price_alert_notification: bool?
     spot_buy_fee_czk: float(0,)?
     spot_price_entity: str?
     spot_sell_fee_czk: float(0,)?
+    tomorrow_prices_check_time: match(^([01][0-9]|2[0-3]):[0-5][0-9]$)?
     use_spot_prices_to_buy: bool?
     use_spot_prices_to_sell: bool?
   release_branch: list(staging|nightly|stable)?
@@ -473,4 +479,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.65
+version: 0.2.66

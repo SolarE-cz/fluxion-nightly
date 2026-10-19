@@ -185,6 +185,7 @@ fn parse_forecast_sensor(
         block_duration_minutes: 15,
         fetched_at: Utc::now(),
         ha_last_updated,
+        fallback_block_starts: Vec::new(),
     };
 
     info!(
@@ -366,6 +367,7 @@ fn parse_single_day_array(
         block_duration_minutes: 15,
         fetched_at: Utc::now(),
         ha_last_updated,
+        fallback_block_starts: Vec::new(),
     };
 
     info!(
@@ -575,6 +577,7 @@ fn parse_price_arrays(
         block_duration_minutes: 15,
         fetched_at: Utc::now(),
         ha_last_updated,
+        fallback_block_starts: Vec::new(),
     };
 
     // Always 96 blocks per day after conversion to 15-minute intervals
@@ -675,6 +678,7 @@ fn parse_timestamp_keyed_attributes(
         block_duration_minutes: 15,
         fetched_at: Utc::now(),
         ha_last_updated,
+        fallback_block_starts: Vec::new(),
     };
 
     let source_blocks = if detected_duration == 15 {

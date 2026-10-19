@@ -168,6 +168,18 @@ pub struct PricingConfig {
     /// Grid fee during HDO high tariff periods (CZK/kWh)
     #[serde(default = "default_hdo_high_tariff_czk")]
     pub hdo_high_tariff_czk: f32,
+
+    /// Fill slots missing from the price entity with OTE day-ahead prices (brief H35)
+    #[serde(default = "default_true")]
+    pub ote_fallback_enabled: bool,
+
+    /// Keep an HA persistent notification up while prices are missing (brief H35)
+    #[serde(default = "default_true")]
+    pub price_alert_notification: bool,
+
+    /// Time of day (Europe/Prague, "HH:MM") after which tomorrow's prices are expected
+    #[serde(default = "default_tomorrow_prices_check_time")]
+    pub tomorrow_prices_check_time: String,
 }
 
 /// Control configuration
@@ -361,6 +373,10 @@ fn default_hdo_low_tariff_czk() -> f32 {
 
 fn default_hdo_high_tariff_czk() -> f32 {
     1.80
+}
+
+fn default_tomorrow_prices_check_time() -> String {
+    fluxion_adapters::price_fallback::DEFAULT_CHECK_TIME.to_string()
 }
 
 /// System configuration
@@ -1594,6 +1610,9 @@ impl Default for AppConfig {
                 hdo_sensor_entity: default_hdo_sensor_entity(),
                 hdo_low_tariff_czk: default_hdo_low_tariff_czk(),
                 hdo_high_tariff_czk: default_hdo_high_tariff_czk(),
+                ote_fallback_enabled: true,
+                price_alert_notification: true,
+                tomorrow_prices_check_time: default_tomorrow_prices_check_time(),
             },
             control: ControlConfig {
                 maximum_export_power_w: 5000,
@@ -1804,6 +1823,20 @@ impl AppConfig {
             result.add_error(
                 "pricing.spot_price_entity",
                 "Spot price entity cannot be empty",
+            );
+        }
+
+        if fluxion_adapters::price_fallback::parse_check_time(
+            &self.pricing.tomorrow_prices_check_time,
+        )
+        .is_none()
+        {
+            result.add_error(
+                "pricing.tomorrow_prices_check_time",
+                format!(
+                    "Must be HH:MM, got '{}'",
+                    self.pricing.tomorrow_prices_check_time
+                ),
             );
         }
 
@@ -3324,6 +3357,65 @@ mod tests {
         let config: AppConfig = serde_json::from_str(&ha_addon_control_json("")).unwrap();
         assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.1);
         assert_eq!(config.control.battery_efficiency, 0.95);
+    }
+
+    #[test]
+    fn test_ha_addon_price_fallback_options_are_honoured() {
+        let addon_json = |pricing_extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [
+                    {{"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}}
+                ],
+                "pricing": {{
+                    "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                    "use_spot_prices_to_buy": true,
+                    "use_spot_prices_to_sell": true,
+                    "fixed_buy_prices": [],
+                    "fixed_sell_prices": []{pricing_extra}
+                }},
+                "control": {{
+                    "maximum_export_power_w": 10000,
+                    "force_charge_hours": 4,
+                    "force_discharge_hours": 2,
+                    "min_battery_soc": 10,
+                    "max_battery_soc": 100,
+                    "battery_capacity_kwh": 23.0,
+                    "max_battery_charge_rate_kw": 5.0,
+                    "average_household_load_kw": 0.5
+                }},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}},
+                "strategies": {{}}
+            }}"#
+            )
+        };
+
+        // Options set in the add-on are honoured
+        let config: AppConfig = serde_json::from_str(&addon_json(
+            r#", "ote_fallback_enabled": false, "price_alert_notification": false, "tomorrow_prices_check_time": "14:30""#,
+        ))
+        .unwrap();
+        assert!(!config.pricing.ote_fallback_enabled);
+        assert!(!config.pricing.price_alert_notification);
+        assert_eq!(config.pricing.tomorrow_prices_check_time, "14:30");
+
+        // Options missing (options.json of an older add-on version): defaults on, 13:45
+        let config: AppConfig = serde_json::from_str(&addon_json("")).unwrap();
+        assert!(config.pricing.ote_fallback_enabled);
+        assert!(config.pricing.price_alert_notification);
+        assert_eq!(config.pricing.tomorrow_prices_check_time, "13:45");
+
+        // The add-on's config.yaml declares them with the same defaults
+        let addon_yaml = include_str!("../../../fluxion/config.yaml");
+        for line in [
+            "    ote_fallback_enabled: true",
+            "    price_alert_notification: true",
+            "    tomorrow_prices_check_time: \"13:45\"",
+            "    ote_fallback_enabled: bool?",
+            "    price_alert_notification: bool?",
+        ] {
+            assert!(addon_yaml.contains(line), "config.yaml lacks `{line}`");
+        }
     }
 
     /// Configs written under the runtime field names (config.toml, persisted JSON) still load.

@@ -21,6 +21,7 @@ pub mod day_profiling;
 pub mod debug;
 pub mod execution;
 pub mod plugin_adapters;
+pub mod price_feed;
 pub mod pricing;
 pub mod pv_correction;
 pub mod resources;
