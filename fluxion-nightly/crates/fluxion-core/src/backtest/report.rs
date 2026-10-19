@@ -274,6 +274,9 @@ pub fn build_report(
             "schedule of {} recorded on that day",
             loaded.hdo_entity.as_deref().unwrap_or("the HDO sensor")
         )
+    } else if let Some(error) = &loaded.hdo_lookup_error {
+        notes.push(format!("The HDO sensor could not be looked up ({error}): every block is priced at the high tariff, as the live planner does without HDO data."));
+        "lookup failed (high tariff)".to_owned()
     } else if loaded.hdo_entity.is_none() {
         notes.push("No HDO sensor was found (configured entity missing and none found by content): every block is priced at the high tariff, as the live planner does without a schedule.".to_owned());
         "none found (high tariff)".to_owned()

@@ -1030,8 +1030,15 @@ pub fn schedule_execution_system(
                     }
 
                     // On initial sync: bypass debounce to apply plan immediately
-                    // After initial sync: check minimum interval
-                    if !bypass_debounce && !can_change_mode(&current_mode, &config, now) {
+                    // After initial sync: check minimum interval. The debounce stops flapping
+                    // within a block; the first change of a block whose last write was made in an
+                    // earlier block (e.g. a guard stop) is a boundary change and is not held by it
+                    // (brief H30). Later changes in the block are debounced from this write.
+                    let first_change_in_block = current_mode.set_at < scheduled_mode.block_start;
+                    if !bypass_debounce
+                        && !first_change_in_block
+                        && !can_change_mode(&current_mode, &config, now)
+                    {
                         debug!(
                             "Skipping mode change for {}: too soon since last change",
                             inverter.id
@@ -3357,6 +3364,65 @@ mod levers_execution_tests {
         );
         h.run();
         assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+    }
+
+    /// Last mode write at `at` (the debounce counts from it).
+    fn set_last_change(h: &mut Harness, at: DateTime<Utc>) {
+        let mut query = h.world.query::<&mut CurrentMode>();
+        for mut current in query.iter_mut(&mut h.world) {
+            current.set_at = at;
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_write_in_previous_block_does_not_delay_the_boundary_change() {
+        // 2026-10-19: ForceCharge from 00:45, the guard wrote Self-Use at 00:57:11, and the Hold
+        // planned for 01:00 was written at 01:02:11, when the 300 s debounce from the guard
+        // write ran out. The boundary change is written at once; within the new block the
+        // debounce still applies.
+        // The charge block started 12 minutes ago (the guard write is now, at "00:57")
+        let previous = Utc::now() - Duration::minutes(12);
+        let mut h = harness(
+            vec![qblock(
+                previous,
+                InverterOperationMode::ForceCharge,
+                "WinterReserve CHARGE",
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::ForceCharge);
+        h.set_hardware(InverterOperationMode::ForceCharge, Utc::now());
+        h.age_last_change();
+        // 00:57:11: the guard stops the charge mid-block (a good reason: applied at once)
+        h.set_schedule(
+            qblock(
+                previous,
+                SELF_USE,
+                "WinterReserve SELF-USE | guard: charge held at SOC 100%",
+            ),
+            previous + Duration::minutes(12),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE]);
+        // The next block starts: the guard write was 3 minutes before its boundary
+        let boundary = Utc::now() - Duration::seconds(2);
+        set_last_change(&mut h, boundary - Duration::minutes(3));
+        // 01:00:02: the fresh in-block replan plans Hold
+        h.set_schedule(qblock(boundary, HOLD, "WinterReserve HOLD"), Utc::now());
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE, HOLD]);
+        // A second change inside the new block, even a guard, still waits for the debounce
+        h.set_schedule(
+            qblock(
+                boundary,
+                SELF_USE,
+                "WinterReserve SELF-USE | guard: export held at night floor 40.0 kWh, SOC 50%",
+            ),
+            Utc::now(),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![SELF_USE, HOLD]);
     }
 
     #[tokio::test]

@@ -529,8 +529,11 @@ pub struct LoadedDay {
     /// The HDO entity read (after live-style discovery), if any
     pub hdo_entity: Option<String>,
     /// The next day was loaded in full; `false` when `now` cut the planner horizon (the result
-    /// can still change, so it should not be cached)
+    /// can still change, so it should be cached only briefly)
     pub horizon_complete: bool,
+    /// Looking up the HDO entity (`/api/states`) failed: every block is priced at the high
+    /// tariff, as live without HDO data (the result can change, so cache it only briefly)
+    pub hdo_lookup_error: Option<HistoryError>,
 }
 
 impl LoadedDay {
@@ -616,9 +619,18 @@ pub async fn load_day(
     if let Some(buy) = &entities.buy_price {
         history.buy = Some(read_numeric(reader, buy, range_start, range_end).await?);
     }
-    // The HDO sensor as live resolves it (exact entity, else found by content)
+    // The HDO sensor as live resolves it (exact entity, else found by content). When the lookup
+    // fails, price at the high tariff as live does without HDO data rather than fail the day.
+    let mut hdo_lookup_error = None;
     let hdo_entity = match &entities.hdo {
-        Some(configured) => reader.resolve_hdo_entity(configured).await?,
+        Some(configured) => match reader.resolve_hdo_entity(configured).await {
+            Ok(entity) => entity,
+            Err(e) => {
+                tracing::warn!("Backtest {date}: HDO entity lookup failed ({e}); high tariff");
+                hdo_lookup_error = Some(e);
+                None
+            }
+        },
         None => None,
     };
     if let Some(hdo) = &hdo_entity {
@@ -646,6 +658,7 @@ pub async fn load_day(
         hdo_from_sensor,
         hdo_entity,
         horizon_complete: range_end >= horizon_end,
+        hdo_lookup_error,
     })
 }
 

@@ -1256,9 +1256,30 @@ mod tests {
         }
 
         /// `MockHistory` that counts house-load reads (one per day load) and is slow
-        #[derive(Debug, Default)]
+        #[derive(Debug)]
         pub struct CountingHistory {
             pub loads: std::sync::atomic::AtomicUsize,
+            /// How long each house-load read takes
+            pub delay: std::time::Duration,
+        }
+
+        impl Default for CountingHistory {
+            fn default() -> Self {
+                Self::with_delay(std::time::Duration::from_millis(200))
+            }
+        }
+
+        impl CountingHistory {
+            pub fn with_delay(delay: std::time::Duration) -> Self {
+                Self {
+                    loads: std::sync::atomic::AtomicUsize::new(0),
+                    delay,
+                }
+            }
+
+            pub fn count(&self) -> usize {
+                self.loads.load(std::sync::atomic::Ordering::SeqCst)
+            }
         }
 
         #[async_trait::async_trait]
@@ -1272,11 +1293,37 @@ mod tests {
             ) -> Result<Vec<HistoryState>, HistoryError> {
                 if entity_id == "sensor.solax_house_load" {
                     self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(self.delay).await;
                 }
                 MockHistory
                     .history(entity_id, start, end, with_attributes)
                     .await
+            }
+        }
+
+        /// `MockHistory` whose HDO entity lookup (`/api/states`) fails
+        #[derive(Debug)]
+        pub struct HdoLookupFails;
+
+        #[async_trait::async_trait]
+        impl HistoryReader for HdoLookupFails {
+            async fn history(
+                &self,
+                entity_id: &str,
+                start: DateTime<Utc>,
+                end: DateTime<Utc>,
+                with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                MockHistory
+                    .history(entity_id, start, end, with_attributes)
+                    .await
+            }
+
+            async fn resolve_hdo_entity(
+                &self,
+                _configured: &str,
+            ) -> Result<Option<String>, HistoryError> {
+                Err(HistoryError::Status(500))
             }
         }
 
@@ -1435,12 +1482,151 @@ mod tests {
         assert_eq!(reader.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // 2026-10-22: its next day has not ended at now (2026-10-23 12:00), so the horizon is
-        // cut and the result is not cached: every request loads again
+        // cut; the result is still cached (briefly, see the TTL test)
         for _ in 0..2 {
             let r = http_get(port, "/api/backtest/day/2026-10-22").await;
             assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         }
-        assert_eq!(reader.loads.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(reader.count(), 2);
+    }
+
+    /// State whose clock is `backtest_history::now()` plus the seconds in the returned cell
+    fn backtest_state_with_offset_clock(
+        reader: Arc<dyn fluxion_core::backtest::HistoryReader>,
+    ) -> (BacktestState, Arc<std::sync::atomic::AtomicI64>) {
+        let offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let clock_offset = Arc::clone(&offset);
+        let state = BacktestState::new(reader, Ok(backtest_history::site()), i18n()).with_clock(
+            move || {
+                backtest_history::now()
+                    + chrono::Duration::seconds(
+                        clock_offset.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+            },
+        );
+        (state, offset)
+    }
+
+    #[tokio::test]
+    async fn backtest_incomplete_day_is_cached_for_15_minutes_complete_day_stays() {
+        let reader = Arc::new(backtest_history::CountingHistory::with_delay(
+            std::time::Duration::ZERO,
+        ));
+        let (state, offset) = backtest_state_with_offset_clock(
+            Arc::clone(&reader) as Arc<dyn fluxion_core::backtest::HistoryReader>
+        );
+        let port = start_test_server(Some(state)).await;
+        let set = |secs: i64| offset.store(secs, std::sync::atomic::Ordering::SeqCst);
+        let get = |date: &'static str| async move {
+            let r = http_get(port, &format!("/api/backtest/day/{date}")).await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{date}: {r}");
+        };
+
+        // 2026-10-22 is incomplete at now (its next day has not ended); 2026-10-20 is complete
+        get("2026-10-22").await;
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 2);
+        // Within 15 minutes both come from the cache
+        set(14 * 60 + 59);
+        get("2026-10-22").await;
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 2);
+        // After 15 minutes the incomplete day is read again (and cached again), the complete
+        // one is not
+        set(15 * 60);
+        get("2026-10-22").await;
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 3);
+        get("2026-10-22").await;
+        assert_eq!(reader.count(), 3);
+        set(10 * 3600);
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 3);
+    }
+
+    #[tokio::test]
+    async fn backtest_waiting_for_another_load_is_bounded_with_a_clear_503() {
+        let reader = Arc::new(backtest_history::CountingHistory::with_delay(
+            std::time::Duration::from_millis(1500),
+        ));
+        let state =
+            backtest_state(Arc::clone(&reader) as Arc<dyn fluxion_core::backtest::HistoryReader>)
+                .with_load_wait(std::time::Duration::from_millis(200));
+        let port = start_test_server(Some(state)).await;
+        let first = tokio::spawn(http_get(port, "/api/backtest/day/2026-10-20"));
+        // Let the first request take the permit
+        while reader.count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let waited = std::time::Instant::now();
+        let turned_away = http_get(port, "/api/backtest/day/2026-10-19").await;
+        assert!(waited.elapsed() < std::time::Duration::from_millis(1200));
+        assert!(turned_away.starts_with("HTTP/1.1 503"), "{turned_away}");
+        let message = json_body(&turned_away)["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(message, "another backtest day is loading, try again");
+        for leak in [
+            "/home/",
+            "/data/",
+            "http://",
+            "token",
+            "Bearer",
+            "supervisor",
+        ] {
+            assert!(!turned_away.contains(leak), "{leak} in {turned_away}");
+        }
+        // The first load finishes normally; the turned-away day never loaded
+        let first = first.await.unwrap();
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert_eq!(reader.count(), 1);
+        // Once the permit is free the other day loads
+        let later = http_get(port, "/api/backtest/day/2026-10-19").await;
+        assert!(later.starts_with("HTTP/1.1 200"), "{later}");
+        assert_eq!(reader.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn backtest_failed_hdo_lookup_falls_back_to_high_tariff() {
+        let site = || {
+            let mut site = backtest_history::site();
+            site.entities.hdo = Some("sensor.hdo_schedule".to_owned());
+            site
+        };
+        let state = |reader: Arc<dyn fluxion_core::backtest::HistoryReader>| {
+            BacktestState::new(reader, Ok(site()), i18n()).with_clock(backtest_history::now)
+        };
+        let port = start_test_server(Some(state(Arc::new(backtest_history::HdoLookupFails)))).await;
+        let response = http_get(port, "/api/backtest/day/2026-10-20").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let report = json_body(&response);
+        assert_eq!(report["data"]["hdo_source"], "lookup failed (high tariff)");
+        assert_eq!(report["data"]["missing_per_field"]["hdo"], 96);
+        assert!(
+            report["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("could not be looked up")),
+            "{}",
+            report["notes"]
+        );
+        // Priced like the day whose HDO sensor recorded no schedule (spot + 0.4 trade fee + 1.8
+        // high tariff)
+        let reference = json_body(
+            &http_get(
+                start_test_server(Some(state(Arc::new(backtest_history::MockHistory)))).await,
+                "/api/backtest/day/2026-10-20",
+            )
+            .await,
+        );
+        assert_eq!(reference["data"]["hdo_source"], "none (high tariff)");
+        assert_eq!(report["buy_czk"], reference["buy_czk"]);
+        assert_eq!(
+            report["totals_actual"]["cost_czk"],
+            reference["totals_actual"]["cost_czk"]
+        );
     }
 
     #[tokio::test]

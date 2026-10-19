@@ -72,6 +72,8 @@ struct FakeRecorder {
     states: HashMap<String, Vec<HistoryState>>,
     /// HDO discovery result per configured entity (absent: the configured entity)
     hdo_resolution: HashMap<String, Option<String>>,
+    /// The HDO entity lookup (`/api/states`) fails with this error
+    hdo_lookup_error: Option<HistoryError>,
     calls: std::sync::Mutex<Vec<(String, bool)>>,
 }
 
@@ -101,6 +103,9 @@ impl HistoryReader for FakeRecorder {
     }
 
     async fn resolve_hdo_entity(&self, configured: &str) -> Result<Option<String>, HistoryError> {
+        if let Some(e) = &self.hdo_lookup_error {
+            return Err(e.clone());
+        }
         Ok(self
             .hdo_resolution
             .get(configured)
@@ -651,6 +656,54 @@ async fn hdo_entity_is_resolved_like_live_before_reading_its_history() {
     let report = build_report(&loaded, &site, None).unwrap();
     assert_eq!(report.data.hdo_source, "none found (high tariff)");
     assert_eq!(report.data.missing_per_field.get(&Field::Hdo), Some(&96));
+}
+
+#[tokio::test]
+async fn failed_hdo_lookup_prices_the_day_at_the_high_tariff_and_says_so() {
+    let day = date(2026, 10, 20);
+    let now = local_midnight_utc(day + Duration::days(3), PRAGUE);
+    let site = site(false, false);
+    let mut rec = constant_recorder(local_midnight_utc(day - Duration::days(8), PRAGUE), &[day]);
+    rec.hdo_lookup_error = Some(HistoryError::Timeout);
+
+    // The day loads (no 502) without reading the HDO history
+    let loaded = load_day(&rec, &site, day, now).await.unwrap();
+    assert_eq!(loaded.hdo_lookup_error, Some(HistoryError::Timeout));
+    assert_eq!(loaded.hdo_entity, None);
+    assert!(!loaded.hdo_from_sensor);
+    assert!(rec.calls.lock().unwrap().iter().all(|(_, attrs)| !attrs));
+
+    // Every block at the high tariff, as live without HDO data; counted like no schedule
+    for block in loaded.day_blocks() {
+        assert_eq!(block.hdo_low, None);
+    }
+    let report = build_report(&loaded, &site, None).unwrap();
+    assert_eq!(report.data.hdo_source, "lookup failed (high tariff)");
+    assert_eq!(report.data.missing_per_field.get(&Field::Hdo), Some(&96));
+    assert_eq!(report.data.usable_blocks, 96);
+    let note = report
+        .notes
+        .iter()
+        .find(|n| n.contains("could not be looked up"))
+        .expect("note");
+    assert!(
+        note.contains("high tariff") && note.contains("timed out"),
+        "{note}"
+    );
+
+    // Same prices as a day whose sensor recorded no schedule
+    let no_schedule = constant_recorder(local_midnight_utc(day - Duration::days(8), PRAGUE), &[]);
+    let reference = load_day(&no_schedule, &site, day, now).await.unwrap();
+    let prices = |d: &LoadedDay| d.day_blocks().map(|b| b.buy_czk).collect::<Vec<_>>();
+    assert!(prices(&loaded).iter().all(Option::is_some));
+    assert_eq!(prices(&loaded), prices(&reference));
+    assert_eq!(
+        build_report(&reference, &site, None)
+            .unwrap()
+            .data
+            .hdo_source,
+        "none (high tariff)"
+    );
 }
 
 #[tokio::test]

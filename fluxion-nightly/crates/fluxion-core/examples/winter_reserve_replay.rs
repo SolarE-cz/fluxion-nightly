@@ -38,7 +38,7 @@ use fluxion_core::backtest::{
     MODE_LETTERS, ProfileSource, ReplayOptions, ReplayRow, mode_index, replay,
 };
 use fluxion_core::savings::RecordedBlock;
-use fluxion_core::strategy::winter_reserve::{BatteryParams, WinterReserveParams};
+use fluxion_core::strategy::winter_reserve::{BatteryParams, WinterReserveParams, min_charge_kwh};
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::fs;
@@ -150,7 +150,16 @@ fn run() -> Result<(), String> {
         .timezone
         .parse()
         .map_err(|_| format!("unknown timezone {}", dataset.site.timezone))?;
-    let battery = dataset.site.battery;
+    let mut battery = dataset.site.battery;
+    // The live planner derives the minimum useful charge from the charge power and the
+    // mode-change debounce (brief H30); a dataset without it gets the live default.
+    if battery.min_charge_kwh <= 0.0 {
+        battery.min_charge_kwh = min_charge_kwh(
+            battery.max_charge_kw,
+            fluxion_types::config::ControlConfig::default().min_mode_change_interval_secs,
+        );
+    }
+    eprintln!("min_charge_kwh {:.3}", battery.min_charge_kwh);
     let capacity = battery.capacity_kwh;
     let e_min = battery.min_soc_pct / 100.0 * capacity;
 

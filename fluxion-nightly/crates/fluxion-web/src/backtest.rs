@@ -6,8 +6,9 @@
 //! Assistant history, with what actually happened, plain self-use and the Winter Reserve replay.
 //!
 //! The history is read on the web server's runtime (never on the scheduling loop) and only with
-//! GET requests; the replay runs on a blocking thread. Finished days are cached in memory, so
-//! reloading a day does not read HA again.
+//! GET requests; the replay runs on a blocking thread. Days are cached in memory, so reloading
+//! a day does not read HA again: complete days until evicted, days whose result can still change
+//! (horizon cut at now, HDO lookup failed) for `PROVISIONAL_TTL`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,9 +39,20 @@ const LOOKBACK_DAYS: i64 = 14;
 const DAYS_CACHE_TTL: Duration = Duration::from_secs(600);
 /// Finished days kept in memory.
 const MAX_CACHED_DAYS: usize = 32;
+/// Lifetime of a cached day whose result can still change: its next day had not ended when it
+/// was loaded (typically yesterday, the day the page opens on), or the HDO lookup failed.
+const PROVISIONAL_TTL: chrono::Duration = chrono::Duration::minutes(15);
+/// Longest wait for the one-at-a-time load permit before answering 503.
+const LOAD_WAIT: Duration = Duration::from_secs(120);
 
 /// A cached report: the day and the floor (bits of the f32 percentage) it was replayed with.
 type ReportKey = (NaiveDate, Option<u32>);
+
+/// A cached report and, for a provisional one, when it expires (on the state's clock).
+type CachedReport = (Arc<DayReport>, Option<DateTime<Utc>>);
+
+/// Wall clock of the handlers (replaceable in tests).
+type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
 /// The day list and when it was read.
 type CachedDays = (Instant, Vec<AvailableDay>);
@@ -55,12 +67,14 @@ pub struct BacktestState {
     /// Live dashboard state: its default mode sets the Back Up floor of the replay
     user_control: Option<Arc<parking_lot::RwLock<UserControlState>>>,
     /// Reports per day and floor used (the floor follows the current default mode)
-    reports: Arc<Mutex<HashMap<ReportKey, Arc<DayReport>>>>,
+    reports: Arc<Mutex<HashMap<ReportKey, CachedReport>>>,
     /// One day load at a time: HA history reads are heavy, and a second request for the same
     /// day waits and then takes the cached result
     loads: Arc<tokio::sync::Semaphore>,
+    /// Longest wait for that permit
+    load_wait: Duration,
     days: Arc<Mutex<Option<CachedDays>>>,
-    clock: fn() -> DateTime<Utc>,
+    clock: Clock,
 }
 
 impl std::fmt::Debug for BacktestState {
@@ -87,8 +101,9 @@ impl BacktestState {
             user_control: None,
             reports: Arc::new(Mutex::new(HashMap::new())),
             loads: Arc::new(tokio::sync::Semaphore::new(1)),
+            load_wait: LOAD_WAIT,
             days: Arc::new(Mutex::new(None)),
-            clock: Utc::now,
+            clock: Arc::new(Utc::now),
         }
     }
 
@@ -120,9 +135,51 @@ impl BacktestState {
 
     /// Replace the wall clock (tests).
     #[must_use]
-    pub fn with_clock(mut self, clock: fn() -> DateTime<Utc>) -> Self {
-        self.clock = clock;
+    pub fn with_clock(mut self, clock: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
         self
+    }
+
+    /// Replace the longest wait for the load permit (tests).
+    #[must_use]
+    pub fn with_load_wait(mut self, wait: Duration) -> Self {
+        self.load_wait = wait;
+        self
+    }
+
+    /// The cached report for `key`, unless it has expired at `now` (an expired one is dropped).
+    fn cached(&self, key: &ReportKey, now: DateTime<Utc>) -> Option<Arc<DayReport>> {
+        let mut reports = self.reports.lock();
+        match reports.get(key) {
+            Some((report, expires)) if expires.is_none_or(|at| now < at) => {
+                Some(Arc::clone(report))
+            }
+            Some(_) => {
+                reports.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Cache `report`; `expires` is `Some` for a provisional result. Keeps at most
+    /// `MAX_CACHED_DAYS`: expired entries go first, then the oldest day.
+    fn store(
+        &self,
+        key: ReportKey,
+        report: Arc<DayReport>,
+        expires: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) {
+        let mut reports = self.reports.lock();
+        reports.retain(|_, (_, at)| at.is_none_or(|at| now < at));
+        if reports.len() >= MAX_CACHED_DAYS
+            && !reports.contains_key(&key)
+            && let Some(oldest) = reports.keys().min().copied()
+        {
+            reports.remove(&oldest);
+        }
+        reports.insert(key, (report, expires));
     }
 }
 
@@ -254,18 +311,29 @@ pub async fn day_handler(
     };
     let floor = state.backup_floor(&site);
     let key = (date, floor.map(f32::to_bits));
-    if let Some(report) = state.reports.lock().get(&key) {
+    if let Some(report) = state.cached(&key, (state.clock)()) {
         debug!("Backtest {date} served from cache");
         return Json(report.as_ref()).into_response();
     }
-    // One load at a time; whoever waited for the permit may find the result cached now
-    let Ok(_permit) = state.loads.acquire().await else {
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the backtest is shutting down",
-        );
+    // One load at a time, waiting at most `load_wait`; whoever waited for the permit may find
+    // the result cached now
+    let _permit = match tokio::time::timeout(state.load_wait, state.loads.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the backtest is shutting down",
+            );
+        }
+        Err(_) => {
+            info!("Backtest {date}: another day is still loading, request turned away");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "another backtest day is loading, try again",
+            );
+        }
     };
-    if let Some(report) = state.reports.lock().get(&key) {
+    if let Some(report) = state.cached(&key, (state.clock)()) {
         debug!("Backtest {date} served from cache after waiting");
         return Json(report.as_ref()).into_response();
     }
@@ -281,8 +349,9 @@ pub async fn day_handler(
             return json_error(StatusCode::BAD_GATEWAY, e.to_string());
         }
     };
-    // A horizon cut at `now` (the day after has not ended) can still change: do not cache it
-    let cacheable = loaded.horizon_complete;
+    // A horizon cut at `now` (the day after has not ended) or a failed HDO lookup can still
+    // change: cache it only briefly
+    let provisional = !loaded.horizon_complete || loaded.hdo_lookup_error.is_some();
     let replay_site = Arc::clone(&site);
     let report =
         match tokio::task::spawn_blocking(move || build_report(&loaded, &replay_site, floor)).await
@@ -300,15 +369,9 @@ pub async fn day_handler(
         report.data.blocks,
         started.elapsed().as_secs_f32()
     );
-    if cacheable {
-        let mut reports = state.reports.lock();
-        if reports.len() >= MAX_CACHED_DAYS
-            && let Some(oldest) = reports.keys().min().copied()
-        {
-            reports.remove(&oldest);
-        }
-        reports.insert(key, Arc::clone(&report));
-    }
+    let now = (state.clock)();
+    let expires = provisional.then(|| now + PROVISIONAL_TTL);
+    state.store(key, Arc::clone(&report), expires, now);
     Json(report.as_ref()).into_response()
 }
 

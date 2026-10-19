@@ -102,14 +102,90 @@ pub fn setup_price_cache(mut commands: Commands, price_source: Res<PriceDataSour
 /// Max wait at startup for the HDO tariff before the first schedule is built (brief H29).
 const HDO_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Startup state of the wait for the HDO tariff: when the first run happened, and whether the
-/// wait is over (HDO arrived, timed out, or no HDO sensor).
+/// Max wait at startup for the house-load profile before the first schedule is built (brief H31).
+/// The history fetch reads three entities in turn, each HA history request with a 60 s timeout:
+/// a normal fetch takes about 20 s (2026-10-18 restart, 7 days on a 96 kWh site). 90 s covers a
+/// slow HA after its own restart and is a small part of a 15-minute block. The executor's 120 s
+/// lever-sync wait ends as soon as the levers sync (normally within seconds), so it does not hide
+/// this wait: with the history slow or down, the first mode write moves from about 30 s (HDO
+/// bound, H29) to about 90 s after start, during which the inverter keeps its pre-restart mode.
+const PROFILE_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// One planner input the first schedule after a restart waits for.
+struct StartupInput {
+    bound: std::time::Duration,
+    /// What is awaited, as in "Waiting for the {name}"
+    name: &'static str,
+    /// What the schedule is built with instead after the bound
+    fallback: &'static str,
+}
+
+const HDO_INPUT: StartupInput = StartupInput {
+    bound: HDO_STARTUP_WAIT,
+    name: "HDO tariff",
+    fallback: "high grid fee",
+};
+
+const PROFILE_INPUT: StartupInput = StartupInput {
+    bound: PROFILE_STARTUP_WAIT,
+    name: "house-load profile",
+    fallback: "load forecast without the profile",
+};
+
+/// Startup state of the wait for one planner input: when the first run happened, and whether the
+/// wait is over (input arrived, timed out, or not configured).
 #[derive(Default)]
-pub struct HdoStartup {
+pub struct StartupWait {
     started: Option<std::time::Instant>,
     done: bool,
     logged: bool,
     timed_out: bool,
+}
+
+/// Startup waits of the first schedule, one per input (kept in one `Local`).
+#[derive(Default)]
+pub struct StartupWaits {
+    hdo: StartupWait,
+    profile: StartupWait,
+}
+
+/// True while the first schedule waits for `input` (max `input.bound` from the first run). Only
+/// the first schedule waits; no wait when the input is not configured.
+fn startup_input_wait(
+    input: &StartupInput,
+    configured: bool,
+    ready: bool,
+    startup: &mut StartupWait,
+    now: std::time::Instant,
+) -> bool {
+    if startup.done {
+        return false;
+    }
+    let started = *startup.started.get_or_insert(now);
+    if !configured || ready {
+        startup.done = true;
+        return false;
+    }
+    if now.saturating_duration_since(started) >= input.bound {
+        warn!(
+            "{} not received {} s after startup, building the schedule without it ({})",
+            input.name,
+            input.bound.as_secs(),
+            input.fallback
+        );
+        startup.done = true;
+        startup.timed_out = true;
+        return false;
+    }
+    if !startup.logged {
+        info!(
+            "⏳ Waiting for the {} before the first schedule (max {} s)",
+            input.name,
+            input.bound.as_secs()
+        );
+        startup.logged = true;
+    }
+    true
 }
 
 /// True while the first schedule waits for the HDO tariff (max `HDO_STARTUP_WAIT`). Without it
@@ -118,34 +194,43 @@ pub struct HdoStartup {
 pub fn hdo_startup_wait(
     hdo_configured: bool,
     hdo_ready: bool,
-    startup: &mut HdoStartup,
+    startup: &mut StartupWait,
     now: std::time::Instant,
 ) -> bool {
-    if startup.done {
-        return false;
-    }
-    let started = *startup.started.get_or_insert(now);
-    if !hdo_configured || hdo_ready {
-        startup.done = true;
-        return false;
-    }
-    if now.saturating_duration_since(started) >= HDO_STARTUP_WAIT {
-        warn!(
-            "HDO tariff not received {} s after startup, building the schedule without it (high grid fee)",
-            HDO_STARTUP_WAIT.as_secs()
-        );
-        startup.done = true;
-        startup.timed_out = true;
-        return false;
-    }
-    if !startup.logged {
-        info!(
-            "⏳ Waiting for the HDO tariff before the first schedule (max {} s)",
-            HDO_STARTUP_WAIT.as_secs()
-        );
-        startup.logged = true;
-    }
-    true
+    startup_input_wait(&HDO_INPUT, hdo_configured, hdo_ready, startup, now)
+}
+
+/// True while the first schedule waits for the house-load profile (max `PROFILE_STARTUP_WAIT`).
+/// Without it the planner falls back to a flat load forecast (31 kWh instead of 86 on the
+/// 2026-10-18 restart), and the executor's initial sync applies that plan. Ready = the profile is
+/// there, or the history fetch delivered its result without one (waiting longer gains nothing).
+/// Only the first schedule waits; no wait without a history source.
+pub fn profile_startup_wait(
+    profile_configured: bool,
+    profile_ready: bool,
+    startup: &mut StartupWait,
+    now: std::time::Instant,
+) -> bool {
+    startup_input_wait(
+        &PROFILE_INPUT,
+        profile_configured,
+        profile_ready,
+        startup,
+        now,
+    )
+}
+
+/// Whether the first schedule still waits for an input. Both waits run from the same first run
+/// (both are evaluated every time), so the combined worst case is the longer bound, not the sum.
+fn first_schedule_waits(
+    (hdo_configured, hdo_ready): (bool, bool),
+    (profile_configured, profile_ready): (bool, bool),
+    waits: &mut StartupWaits,
+    now: std::time::Instant,
+) -> bool {
+    let hdo = hdo_startup_wait(hdo_configured, hdo_ready, &mut waits.hdo, now);
+    let profile = profile_startup_wait(profile_configured, profile_ready, &mut waits.profile, now);
+    hdo || profile
 }
 
 /// Simplified system that updates prices using direct cache access
@@ -168,11 +253,11 @@ pub fn update_prices_system(
     plugin_manager_res: Res<PluginManagerResource>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
     solar_forecast: Option<Res<super::SolarForecastData>>,
-    (timezone_config, user_levers, mut last_planner_levers, mut hdo_startup): (
+    (timezone_config, user_levers, mut last_planner_levers, mut startup_waits): (
         Option<Res<crate::resources::TimezoneConfig>>,
         Option<Res<crate::resources::UserLeversResource>>,
         Local<Option<UserLevers>>,
-        Local<HdoStartup>,
+        Local<StartupWaits>,
     ),
 ) {
     // A change of the planner levers regenerates the schedule even when prices are fresh
@@ -184,8 +269,12 @@ pub fn update_prices_system(
         return;
     }
 
-    // Startup: the first schedule waits (max 30 s) for the HDO tariff when an HDO sensor is
-    // configured (the sensor the HA HDO fetcher reads). Ready = the HDO cache knows the tariff now.
+    // Startup: the first schedule waits for the inputs it would otherwise be built without, each
+    // only when its source is configured:
+    // - the HDO tariff (max 30 s, H29), from the sensor the HA HDO fetcher reads. Ready = the HDO
+    //   cache knows the tariff now.
+    // - the house-load profile (max 90 s, H31), from the history fetcher's entities. Ready = the
+    //   profile is there, or the fetch delivered its result without one.
     let hdo_configured = !config
         .strategies_config
         .winter_adaptive_v3
@@ -194,10 +283,18 @@ pub fn update_prices_system(
     let hdo_ready = hdo_cache
         .as_ref()
         .is_some_and(|cache| cache.is_low_tariff(chrono::Utc::now()).is_some());
-    if hdo_startup_wait(
-        hdo_configured,
-        hdo_ready,
-        &mut hdo_startup,
+    let profile_configured = !config.history.consumption_entity.trim().is_empty()
+        || config
+            .history
+            .house_load_power_entity
+            .as_deref()
+            .is_some_and(|entity| !entity.trim().is_empty());
+    let profile_ready =
+        consumption_history.hourly_profile().is_some() || consumption_history.fetch_received();
+    if first_schedule_waits(
+        (hdo_configured, hdo_ready),
+        (profile_configured, profile_ready),
+        &mut startup_waits,
         std::time::Instant::now(),
     ) {
         return;
@@ -405,7 +502,8 @@ mod consumption_forecast_tests {
     }
 }
 
-/// Brief H29: the first schedule after a restart waits for the HDO tariff.
+/// Briefs H29 and H31: the first schedule after a restart waits for the HDO tariff and the
+/// house-load profile.
 #[cfg(test)]
 mod hdo_startup_tests {
     use super::*;
@@ -423,7 +521,7 @@ mod hdo_startup_tests {
 
     #[test]
     fn first_schedule_waits_for_hdo_then_proceeds_when_it_arrives() {
-        let mut startup = HdoStartup::default();
+        let mut startup = StartupWait::default();
         let t0 = Instant::now();
         assert!(hdo_startup_wait(true, false, &mut startup, t0));
         assert!(hdo_startup_wait(
@@ -450,7 +548,7 @@ mod hdo_startup_tests {
 
     #[test]
     fn first_schedule_proceeds_after_30_s_without_hdo() {
-        let mut startup = HdoStartup::default();
+        let mut startup = StartupWait::default();
         let t0 = Instant::now();
         assert!(hdo_startup_wait(true, false, &mut startup, t0));
         assert!(hdo_startup_wait(
@@ -470,7 +568,7 @@ mod hdo_startup_tests {
 
     #[test]
     fn no_hdo_sensor_no_wait() {
-        let mut startup = HdoStartup::default();
+        let mut startup = StartupWait::default();
         assert!(!hdo_startup_wait(
             false,
             false,
@@ -514,7 +612,8 @@ mod hdo_startup_tests {
         }
     }
 
-    fn config(hdo_sensor: &str) -> SystemConfig {
+    /// `history_entity`: the house-load entity of the history fetcher; empty = no history source.
+    fn config(hdo_sensor: &str, history_entity: &str) -> SystemConfig {
         let mut config = SystemConfig {
             inverters: vec![],
             pricing_config: PricingConfig {
@@ -550,12 +649,24 @@ mod hdo_startup_tests {
             .strategies_config
             .winter_adaptive_v3
             .hdo_sensor_entity = hdo_sensor.to_string();
+        config.history.consumption_entity = String::new();
+        config.history.solar_production_entity = String::new();
+        config.history.house_load_power_entity =
+            (!history_entity.is_empty()).then(|| history_entity.to_string());
         config
     }
 
-    /// The price/schedule systems of a restart: HDO cache sync, then price update.
-    fn world(hdo_sensor: &str) -> (World, Schedule) {
-        let config = config(hdo_sensor);
+    /// The price/schedule systems of a restart: HDO cache sync and the history channel poll, then
+    /// the price update. The sender plays the history fetcher.
+    fn world(
+        hdo_sensor: &str,
+        history_entity: &str,
+    ) -> (
+        World,
+        Schedule,
+        crossbeam_channel::Sender<crate::async_tasks::ConsumptionHistoryUpdate>,
+    ) {
+        let config = config(hdo_sensor, history_entity);
         let manager = crate::plugin_adapters::create_plugin_manager(
             Some(&config.strategies_config),
             &config.control_config,
@@ -575,15 +686,32 @@ mod hdo_startup_tests {
             },
             last_updated: Utc::now(),
         });
+        let (history_tx, history_rx) = crossbeam_channel::unbounded();
+        world.spawn(crate::async_tasks::ConsumptionHistoryChannel {
+            receiver: history_rx,
+        });
         let mut schedule = Schedule::default();
         schedule.add_systems(
             (
                 crate::continuous_systems::sync_hdo_cache_system,
+                crate::async_systems::poll_consumption_history_channel,
                 update_prices_system,
             )
                 .chain(),
         );
-        (world, schedule)
+        (world, schedule, history_tx)
+    }
+
+    /// History fetch result with the 7-day house-load profile (or without one).
+    fn history_update(with_profile: bool) -> crate::async_tasks::ConsumptionHistoryUpdate {
+        crate::async_tasks::ConsumptionHistoryUpdate {
+            daily_summaries: Vec::new(),
+            hourly_profile: with_profile.then_some(HourlyConsumptionProfile {
+                hourly_avg_kwh: [3.5; 24],
+                days_averaged: 7,
+                hourly_p75_kwh: None,
+            }),
+        }
     }
 
     /// HDO sensor data for today and tomorrow (Prague): low tariff all day.
@@ -611,7 +739,7 @@ mod hdo_startup_tests {
     fn restart_builds_the_first_schedule_only_after_hdo_arrives() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
-        let (mut world, mut schedule) = world("sensor.cez_hdo_raw_data");
+        let (mut world, mut schedule, _history) = world("sensor.cez_hdo_raw_data", "");
         // HDO not received yet: no schedule (2026-10-17 16:13:20 built one at the high fee)
         schedule.run(&mut world);
         assert!(!has_schedule(&mut world));
@@ -633,8 +761,199 @@ mod hdo_startup_tests {
     fn restart_without_hdo_sensor_builds_the_schedule_at_once() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
-        let (mut world, mut schedule) = world("");
+        let (mut world, mut schedule, _history) = world("", "");
         schedule.run(&mut world);
         assert!(has_schedule(&mut world));
+    }
+
+    // ---- H31: the house-load profile ----
+
+    #[test]
+    fn first_schedule_waits_for_the_profile_then_proceeds_when_it_arrives() {
+        let mut startup = StartupWait::default();
+        let t0 = Instant::now();
+        assert!(profile_startup_wait(true, false, &mut startup, t0));
+        assert!(profile_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(60)
+        ));
+        assert!(!profile_startup_wait(
+            true,
+            true,
+            &mut startup,
+            t0 + Duration::from_secs(61)
+        ));
+        assert!(!startup.timed_out);
+        // Only the first schedule waits: a later failed history refresh does not block replans
+        assert!(!profile_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(3600)
+        ));
+    }
+
+    #[test]
+    fn first_schedule_proceeds_after_90_s_without_the_profile() {
+        let mut startup = StartupWait::default();
+        let t0 = Instant::now();
+        assert!(profile_startup_wait(true, false, &mut startup, t0));
+        assert!(profile_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(89)
+        ));
+        // The WARN path
+        assert!(!profile_startup_wait(
+            true,
+            false,
+            &mut startup,
+            t0 + Duration::from_secs(90)
+        ));
+        assert!(startup.timed_out);
+    }
+
+    #[test]
+    fn no_history_source_no_profile_wait() {
+        let mut startup = StartupWait::default();
+        assert!(!profile_startup_wait(
+            false,
+            false,
+            &mut startup,
+            Instant::now()
+        ));
+        assert!(!startup.timed_out);
+    }
+
+    #[test]
+    fn hdo_and_profile_waits_run_together_bounded_by_the_longer() {
+        let mut waits = StartupWaits::default();
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        // Both missing
+        assert!(first_schedule_waits(
+            (true, false),
+            (true, false),
+            &mut waits,
+            at(0)
+        ));
+        // HDO arrives, profile still missing: still waiting
+        assert!(first_schedule_waits(
+            (true, true),
+            (true, false),
+            &mut waits,
+            at(5)
+        ));
+        // Profile arrives: the first schedule is built
+        assert!(!first_schedule_waits(
+            (true, true),
+            (true, true),
+            &mut waits,
+            at(20)
+        ));
+
+        // Neither ever arrives: HDO gives up at 30 s, the profile at 90 s (measured from the same
+        // first run), so the combined worst case is 90 s, not 120 s
+        let mut waits = StartupWaits::default();
+        assert!(first_schedule_waits(
+            (true, false),
+            (true, false),
+            &mut waits,
+            at(0)
+        ));
+        assert!(first_schedule_waits(
+            (true, false),
+            (true, false),
+            &mut waits,
+            at(30)
+        ));
+        assert!(waits.hdo.timed_out);
+        assert!(first_schedule_waits(
+            (true, false),
+            (true, false),
+            &mut waits,
+            at(89)
+        ));
+        assert!(!first_schedule_waits(
+            (true, false),
+            (true, false),
+            &mut waits,
+            at(90)
+        ));
+        assert!(waits.profile.timed_out);
+    }
+
+    #[test]
+    fn restart_builds_the_first_schedule_only_after_the_profile_arrives() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, mut schedule, history) = world("", "sensor.house_load");
+        // Profile not loaded yet: no prices, no schedule (2026-10-18 14:53:11 built one with a
+        // flat 31 kWh load instead of 86 kWh, and the initial sync applied it)
+        schedule.run(&mut world);
+        schedule.run(&mut world);
+        assert!(!has_schedule(&mut world));
+        assert_eq!(world.query::<&SpotPriceData>().iter(&world).count(), 0);
+        // The history fetch delivers the profile: the next run builds the schedule with it
+        history.send(history_update(true)).unwrap();
+        schedule.run(&mut world);
+        assert!(has_schedule(&mut world));
+        assert!(
+            world
+                .resource::<ConsumptionHistory>()
+                .hourly_profile()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn restart_proceeds_when_the_history_fetch_returns_no_profile() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, mut schedule, history) = world("", "sensor.house_load");
+        schedule.run(&mut world);
+        assert!(!has_schedule(&mut world));
+        // The fetch finished without a profile (too little data, or HA failed): no point waiting
+        history.send(history_update(false)).unwrap();
+        schedule.run(&mut world);
+        assert!(has_schedule(&mut world));
+    }
+
+    #[test]
+    fn restart_waits_for_both_hdo_and_profile() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, mut schedule, history) =
+            world("sensor.cez_hdo_raw_data", "sensor.house_load");
+        schedule.run(&mut world);
+        assert!(!has_schedule(&mut world));
+        // HDO first: the profile is still missing
+        world.resource_mut::<HdoScheduleData>().raw_data = Some(hdo_all_low());
+        schedule.run(&mut world);
+        assert!(!has_schedule(&mut world));
+        // Then the profile: the schedule is built, at the low HDO fee
+        history.send(history_update(true)).unwrap();
+        schedule.run(&mut world);
+        assert!(has_schedule(&mut world));
+        let price = world
+            .query::<&SpotPriceData>()
+            .single(&world)
+            .unwrap()
+            .time_block_prices[0]
+            .effective_price_czk_per_kwh;
+        assert!((price - 3.86).abs() < 1e-3, "effective price {price}");
+
+        // Profile first, then HDO: same, the schedule waits for the last one
+        let (mut world2, mut schedule2, history2) =
+            self::world("sensor.cez_hdo_raw_data", "sensor.house_load");
+        history2.send(history_update(true)).unwrap();
+        schedule2.run(&mut world2);
+        assert!(!has_schedule(&mut world2));
+        world2.resource_mut::<HdoScheduleData>().raw_data = Some(hdo_all_low());
+        schedule2.run(&mut world2);
+        assert!(has_schedule(&mut world2));
     }
 }

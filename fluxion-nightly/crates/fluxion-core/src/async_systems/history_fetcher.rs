@@ -103,6 +103,10 @@ pub fn poll_consumption_history_channel(
 
     // NON-BLOCKING: try to receive from channel
     while let Ok(update) = channel.receiver.try_recv() {
+        // Any result, even an empty one, ends the first schedule's wait for the load profile
+        if !consumption_history.fetch_received() {
+            consumption_history.mark_fetch_received();
+        }
         // The hourly profile comes from house-load power and stands on its own: a site whose
         // consumption entity is missing has no daily summaries but still has a profile.
         if update.daily_summaries.is_empty() && update.hourly_profile.is_none() {
@@ -302,5 +306,7 @@ mod poll_tests {
             hourly_profile: None,
         });
         assert!(history.hourly_profile().is_none());
+        // ...except that a fetch result arrived: the first schedule stops waiting (H31)
+        assert!(history.fetch_received());
     }
 }

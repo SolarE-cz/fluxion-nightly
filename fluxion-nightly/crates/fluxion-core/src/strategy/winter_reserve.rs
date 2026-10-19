@@ -46,6 +46,14 @@ pub struct BatteryParams {
     /// Export is a battery discharge: offered only when `control.force_discharge_enabled`
     #[serde(default)]
     pub force_discharge_enabled: bool,
+    /// Smallest stored energy (kWh) a Charge block must be able to add before the runtime guard
+    /// stops it (max SOC − 1 %): max_charge_kw × one mode-change interval, at least 0.5 kWh (the
+    /// export guard margin's rule). Stored at η × max_charge_kw, that takes longer than the
+    /// interval, so a planned charge never trips the guard within one debounce. A smaller top-up
+    /// ends within minutes and the guard flips the mode mid-block (brief H30). 0 disables the
+    /// check. Price-lever (forced) charges are exempt.
+    #[serde(default)]
+    pub min_charge_kwh: f32,
 }
 
 /// Tunables of the strategy (`strategies.winter_reserve` config section).
@@ -162,7 +170,15 @@ pub struct Plan {
     pub expected_cost_czk: f32,
 }
 
+/// The runtime guard stops a planned Charge once the live SOC reaches `max_soc_pct` minus this.
+const CHARGE_GUARD_MARGIN_PCT: f32 = 1.0;
+
 impl BatteryParams {
+    /// Stored energy (kWh) at which the runtime guard stops a Charge.
+    fn guard_cutoff_kwh(&self) -> f32 {
+        (self.max_soc_pct - CHARGE_GUARD_MARGIN_PCT) / 100.0 * self.capacity_kwh
+    }
+
     /// Stored-energy bounds in kWh: (Emin, Emax).
     fn bounds_kwh(&self) -> (f32, f32) {
         (
@@ -216,6 +232,19 @@ struct DpStep<'a> {
 }
 
 impl DpStep<'_> {
+    /// A Charge from `energy_kwh` would store less than `min_charge_kwh` before the runtime
+    /// guard stops it (at `max_soc_pct - CHARGE_GUARD_MARGIN_PCT`), counted in stored energy and
+    /// capped at what one block stores at full power (a whole-block charge is always allowed).
+    fn charge_too_small(&self, energy_kwh: f32) -> bool {
+        let b = self.battery;
+        let (_, emax) = b.bounds_kwh();
+        let eta = b.efficiency.max(1e-6);
+        let block_stored = b.max_charge_kw * self.block.duration_minutes as f32 / 60.0 * eta;
+        let guard_kwh = b.guard_cutoff_kwh().min(emax);
+        let before_guard = block_stored.min((guard_kwh - energy_kwh.clamp(0.0, emax)).max(0.0));
+        before_guard + 1e-6 < b.min_charge_kwh.min(block_stored)
+    }
+
     /// Block cost of `mode` from `energy_kwh`, plus the interpolated value of the energy it leaves.
     fn value(&self, mode: PlanMode, energy_kwh: f32) -> (f32, BlockOutcome) {
         let outcome = simulate_block(mode, energy_kwh, self.block, self.floor_kwh, self.battery);
@@ -301,7 +330,8 @@ fn choose(
     )
 }
 
-/// Value and outcome of every candidate mode from `energy_kwh`.
+/// Value and outcome of every candidate mode from `energy_kwh`. Charge is left out where it
+/// could store less than `min_charge_kwh` before the guard (brief H30), unless a lever forces it.
 fn evaluate_modes(
     dp: &DpStep,
     modes: &[PlanMode],
@@ -309,6 +339,9 @@ fn evaluate_modes(
 ) -> Vec<(PlanMode, f32, BlockOutcome)> {
     modes
         .iter()
+        .filter(|&&mode| {
+            mode != PlanMode::Charge || dp.block.force_charge || !dp.charge_too_small(energy_kwh)
+        })
         .map(|&mode| {
             let (value, outcome) = dp.value(mode, energy_kwh);
             (mode, value, outcome)
@@ -1059,6 +1092,13 @@ impl WinterReserveStrategy {
     }
 }
 
+/// Smallest useful charge (stored kWh) for `max_charge_kw` and the executor's mode-change
+/// debounce: max_charge_kw × one debounce interval, at least 0.5 kWh. The same rule
+/// as the export guard margin (PRD review fixes), on the charge side (brief H30).
+pub fn min_charge_kwh(max_charge_kw: f32, mode_change_interval_secs: u64) -> f32 {
+    (max_charge_kw * mode_change_interval_secs as f32 / 3600.0).max(0.5)
+}
+
 /// Battery limits the live planner derives from the control configuration.
 pub fn battery_params(control: &ControlConfig) -> BatteryParams {
     let max_discharge_kw = control.max_battery_charge_rate_kw;
@@ -1074,6 +1114,10 @@ pub fn battery_params(control: &ControlConfig) -> BatteryParams {
         max_export_kw: control.maximum_export_power_w as f32 / 1000.0,
         export_guard_margin_kwh: mode_change_kwh.max(0.5),
         force_discharge_enabled: control.force_discharge_enabled,
+        min_charge_kwh: min_charge_kwh(
+            control.max_battery_charge_rate_kw,
+            control.min_mode_change_interval_secs,
+        ),
     }
 }
 
@@ -1391,7 +1435,10 @@ impl super::EconomicStrategy for WinterReserveStrategy {
                 "WinterReserve SELF-USE | guard: export held at night floor {:.1} kWh, SOC {live_soc:.0}%",
                 entry.floor_kwh
             );
-        } else if is_head && mode == PlanMode::Charge && live_soc >= battery.max_soc_pct - 1.0 {
+        } else if is_head
+            && mode == PlanMode::Charge
+            && live_soc >= battery.max_soc_pct - CHARGE_GUARD_MARGIN_PCT
+        {
             mode = PlanMode::SelfUse;
             reason = format!("WinterReserve SELF-USE | guard: charge held at SOC {live_soc:.0}%");
         }
@@ -1463,6 +1510,7 @@ mod tests {
             max_export_kw: 10.0,
             export_guard_margin_kwh: 0.0,
             force_discharge_enabled: true,
+            min_charge_kwh: 0.0,
         }
     }
 
@@ -3645,6 +3693,7 @@ mod force_discharge_gate_tests {
             wear_cost_czk_per_kwh: 0.125,
             max_export_kw: 10.0,
             export_guard_margin_kwh: 0.0,
+            min_charge_kwh: 0.0,
             force_discharge_enabled,
         }
     }
@@ -3743,6 +3792,7 @@ mod keep_rule_tests {
             wear_cost_czk_per_kwh: 0.125,
             max_export_kw: 10.0,
             export_guard_margin_kwh: 0.0,
+            min_charge_kwh: 0.0,
             force_discharge_enabled: false,
         }
     }
@@ -4174,5 +4224,220 @@ mod keep_rule_tests {
             }
             println!("{line}");
         }
+    }
+}
+
+/// Brief H30: no tiny top-up charges near the maximum SOC.
+#[cfg(test)]
+mod h30_tests {
+    use super::*;
+    use chrono::{TimeZone, Timelike};
+
+    const TZ: Tz = chrono_tz::Europe::Prague;
+
+    /// 2026-10-19 03:00 UTC (05:00 Europe/Prague, CEST), the first block of the evidence
+    fn start() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 19, 3, 0, 0).unwrap()
+    }
+
+    /// The evidence site class: 23 kWh, Back Up minimum 25 %, 10 kW charge, export disabled.
+    fn battery() -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 25.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.9,
+            wear_cost_czk_per_kwh: 0.125,
+            max_export_kw: 10.0,
+            export_guard_margin_kwh: 0.0,
+            min_charge_kwh: min_charge_kwh(10.0, 300),
+            force_discharge_enabled: false,
+        }
+    }
+
+    /// Blocks from `first` (index from 03:00 UTC) to the end of the local day: cheap night
+    /// (4.86, 5.07, ... like the evidence), morning and evening peaks, a sunny midday.
+    fn day_from(first: usize) -> Vec<PlanBlock> {
+        (first..76)
+            .map(|i| {
+                let t = start() + Duration::minutes(15 * i as i64);
+                let l = t.with_timezone(&TZ);
+                let h = l.hour() as f32 + l.minute() as f32 / 60.0;
+                let buy = match h {
+                    h if h < 6.0 => [4.86, 5.07, 5.2, 5.3][i % 4],
+                    h if h < 9.0 => 6.9,
+                    h if h < 16.0 => 6.0,
+                    h if h < 21.0 => 7.6,
+                    _ => 6.2,
+                };
+                let pv = if (9.0..16.0).contains(&h) {
+                    0.6 * (std::f32::consts::PI * (h - 9.0) / 7.0).sin()
+                } else {
+                    0.0
+                };
+                let load = 0.35;
+                PlanBlock {
+                    start: t,
+                    duration_minutes: 15,
+                    buy_czk: buy,
+                    sell_czk: buy - 3.5,
+                    load_kwh: load,
+                    pv_kwh: pv,
+                    reserve_load_kwh: load * 1.1,
+                    reserve_pv_kwh: pv * 0.7,
+                    force_charge: false,
+                    no_discharge: false,
+                    force_charge_at_or_below_czk: None,
+                    export_min_soc_pct: None,
+                    export_allowed: true,
+                }
+            })
+            .collect()
+    }
+
+    fn head(first: usize, soc: f32) -> PlannedBlock {
+        let params = WinterReserveParams::default();
+        plan_from(&day_from(first), soc, TZ, &battery(), &params, None)
+            .blocks
+            .swap_remove(0)
+    }
+
+    /// 2026-10-19 evidence: 03:00 CHARGE 98→100, guard at 03:07; 03:15 CHARGE 98→100 again,
+    /// guard at 03:20; 03:30 HOLD at 97. A top-up of 2 % (0.46 kWh) is not a Charge block, and
+    /// neither is the block after a guard stop (SOC 99).
+    #[test]
+    fn tiny_top_up_near_full_is_not_planned() {
+        for (first, soc) in [(0, 98.0), (1, 98.0), (1, 99.0), (2, 97.0), (0, 97.0)] {
+            let b = head(first, soc);
+            assert_ne!(
+                b.mode,
+                PlanMode::Charge,
+                "block {first} SOC {soc}: {}",
+                b.reason
+            );
+        }
+    }
+
+    /// A real charge is chosen as before: from 90 % the cheap 03:00 block charges a full block
+    /// (2.25 kWh stored, to 99.8 %), and from 95 % it tops up to 100 % (0.92 kWh to the guard
+    /// at 99 %, above the 0.83 kWh minimum).
+    #[test]
+    fn meaningful_charge_is_unchanged() {
+        for soc in [90.0, 95.0] {
+            let b = head(0, soc);
+            assert_eq!(b.mode, PlanMode::Charge, "SOC {soc}: {}", b.reason);
+            assert!(b.soc_end_pct > 99.5, "{}", b.reason);
+        }
+    }
+
+    /// No planned (unforced) Charge block anywhere in the horizon stores less than the minimum.
+    #[test]
+    fn no_planned_charge_block_is_below_the_minimum() {
+        let bat = battery();
+        let params = WinterReserveParams::default();
+        for first in 0..4 {
+            for soc in (60..=100).map(|s| s as f32) {
+                let p = plan_from(&day_from(first), soc, TZ, &bat, &params, None);
+                for b in p.blocks.iter().filter(|b| b.mode == PlanMode::Charge) {
+                    let stored = (b.soc_end_pct - b.soc_start_pct) / 100.0 * bat.capacity_kwh;
+                    assert!(
+                        stored + 1e-4 >= bat.min_charge_kwh,
+                        "first {first} SOC {soc}: {} stores {stored:.3} kWh",
+                        b.reason
+                    );
+                }
+            }
+        }
+    }
+
+    /// Review H30 #1: the minimum is stored energy, so low-power sites (0.5 kWh floor) do not
+    /// top up 98→100 either. 2 % of 23 kWh is 0.46 kWh stored (0.51 kWh drawn).
+    #[test]
+    fn low_power_sites_do_not_top_up_two_percent() {
+        let params = WinterReserveParams::default();
+        for kw in [5.0f32, 3.0] {
+            let bat = BatteryParams {
+                max_charge_kw: kw,
+                max_discharge_kw: kw,
+                min_charge_kwh: min_charge_kwh(kw, 300),
+                ..battery()
+            };
+            for (first, soc) in [(0, 98.0), (1, 98.0), (0, 99.0), (0, 97.0)] {
+                let b = plan_from(&day_from(first), soc, TZ, &bat, &params, None)
+                    .blocks
+                    .swap_remove(0);
+                assert_ne!(b.mode, PlanMode::Charge, "{kw} kW SOC {soc}: {}", b.reason);
+            }
+        }
+    }
+
+    /// Review H30 #2: on both site shapes (23 kWh / 10 kW, 96 kWh / 30 kW), no planned Charge
+    /// block reaches the guard (max SOC − 1 %) within one 300 s debounce. A charge that stays
+    /// below the guard for the whole block never trips it.
+    #[test]
+    fn no_planned_charge_trips_the_guard_within_one_debounce() {
+        let params = WinterReserveParams::default();
+        for (capacity, kw) in [(23.0f32, 10.0f32), (96.0, 30.0)] {
+            let bat = BatteryParams {
+                capacity_kwh: capacity,
+                max_charge_kw: kw,
+                max_discharge_kw: kw,
+                min_charge_kwh: min_charge_kwh(kw, 300),
+                ..battery()
+            };
+            let cutoff = bat.guard_cutoff_kwh();
+            let stored_kw = kw * bat.efficiency;
+            let mut charges = 0;
+            for first in 0..4 {
+                for half_pct in 120..=200 {
+                    let soc = half_pct as f32 / 2.0;
+                    let p = plan_from(&day_from(first), soc, TZ, &bat, &params, None);
+                    for b in p.blocks.iter().filter(|b| b.mode == PlanMode::Charge) {
+                        charges += 1;
+                        let start = b.soc_start_pct / 100.0 * capacity;
+                        if b.outcome.energy_end_kwh < cutoff {
+                            continue;
+                        }
+                        let secs = (cutoff - start).max(0.0) / stored_kw * 3600.0;
+                        assert!(
+                            secs >= 300.0,
+                            "{capacity} kWh / {kw} kW, head {first} SOC {soc}: {} trips the guard after {secs:.0} s",
+                            b.reason
+                        );
+                    }
+                }
+            }
+            assert!(charges > 0, "{capacity} kWh: no charge planned at all");
+        }
+    }
+
+    /// The price lever still forces a charge, however small.
+    #[test]
+    fn forced_charge_is_exempt() {
+        let mut blocks = day_from(0);
+        blocks[0].force_charge = true;
+        let p = plan(
+            &blocks,
+            99.0,
+            TZ,
+            &battery(),
+            &WinterReserveParams::default(),
+        );
+        assert_eq!(p.blocks[0].mode, PlanMode::Charge);
+    }
+
+    /// The live minimum: one debounce interval at full charge power, at least 0.5 kWh.
+    #[test]
+    fn live_min_charge_follows_charge_power_and_debounce() {
+        let mut control = ControlConfig {
+            max_battery_charge_rate_kw: 10.0,
+            min_mode_change_interval_secs: 300,
+            ..ControlConfig::default()
+        };
+        assert!((battery_params(&control).min_charge_kwh - 10.0 * 300.0 / 3600.0).abs() < 1e-6);
+        control.max_battery_charge_rate_kw = 3.0;
+        assert!((battery_params(&control).min_charge_kwh - 0.5).abs() < 1e-6);
     }
 }

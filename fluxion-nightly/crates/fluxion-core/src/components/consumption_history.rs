@@ -70,6 +70,11 @@ pub struct ConsumptionHistory {
 
     /// Cached hourly consumption profile, computed from daily summaries
     hourly_profile: Option<HourlyConsumptionProfile>,
+
+    /// True once a history fetch result arrived (even an empty one): the first schedule after a
+    /// restart stops waiting for the load profile then (brief H31).
+    #[serde(skip)]
+    fetch_received: bool,
 }
 
 impl Default for ConsumptionHistory {
@@ -86,6 +91,7 @@ impl ConsumptionHistory {
             max_days,
             last_update: None,
             hourly_profile: None,
+            fetch_received: false,
         }
     }
 
@@ -158,6 +164,16 @@ impl ConsumptionHistory {
     /// Get the cached hourly consumption profile, if available
     pub fn hourly_profile(&self) -> Option<&HourlyConsumptionProfile> {
         self.hourly_profile.as_ref()
+    }
+
+    /// Whether a history fetch result arrived since startup (with or without a profile)
+    pub fn fetch_received(&self) -> bool {
+        self.fetch_received
+    }
+
+    /// Record that a history fetch result arrived
+    pub fn mark_fetch_received(&mut self) {
+        self.fetch_received = true;
     }
 
     /// Set the hourly consumption profile

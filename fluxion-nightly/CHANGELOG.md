@@ -10,6 +10,14 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.64] - 2026-10-19
+
+### Fixed
+- Winter Reserve no longer plans tiny grid top-ups into an almost full battery (e.g. 98→100 %), which the SOC guard stopped within minutes and the next block repeated. A charge block must store at least one mode-change interval's worth of energy before the guard cutoff (max SOC − 1 %).
+- After a guard write inside a block, the next block's planned mode change is applied at the boundary instead of being held by the 5-minute debounce.
+- After a restart, the first plan waits (up to 90 s) for the house-load history, so it is no longer built on a flat default load.
+- Backtest: yesterday (still incomplete) is cached for 15 minutes, a request queued behind another day's load gives up after 120 s with a clear message, and a failed HDO sensor lookup prices the day at the high tariff instead of failing.
+
 ## [0.2.63] - 2026-10-17
 
 ### Fixed
