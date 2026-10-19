@@ -211,12 +211,12 @@ pub struct ControlConfig {
     /// This represents the cost of battery degradation
     /// Example: 23 kWh battery with 6000 cycles and 115,000 CZK cost
     /// = 115000 / (23 * 6000) = 0.833 CZK per full cycle = ~0.036 CZK/kWh per half-cycle
-    /// Conservative estimate: 0.125 CZK/kWh
+    /// Default: 0.1 CZK/kWh
     #[serde(default = "default_battery_wear_cost")]
     pub battery_wear_cost_czk_per_kwh: f32,
 
-    /// Battery round-trip efficiency (0.0 to 1.0)
-    /// Typical lithium-ion batteries: 0.90-0.95
+    /// Battery one-way efficiency (0.0 to 1.0, default 0.95). The cost of charge (brief H33)
+    /// uses its square as the round trip; the Winter Reserve planner applies it once, on charge.
     #[serde(default = "default_battery_efficiency")]
     pub battery_efficiency: f32,
 
@@ -295,11 +295,11 @@ fn default_battery_capacity() -> f32 {
 }
 
 fn default_battery_wear_cost() -> f32 {
-    0.125 // CZK per kWh cycled (conservative estimate)
+    0.1 // CZK per kWh cycled
 }
 
 fn default_battery_efficiency() -> f32 {
-    0.95 // 95% round-trip efficiency
+    0.95 // one-way; the round trip is its square (0.9025)
 }
 
 fn default_min_mode_change_interval() -> u64 {
@@ -1508,6 +1508,14 @@ pub struct SolarForecastConfig {
     /// Power sensors compared with the forecast; empty = `sensor.<prefix>_pv_power_total`
     #[serde(default)]
     pub actual_pv_power_entities: Vec<String>,
+
+    /// Scale the planner's PV forecast by the 7-day measured/forecast ratio (brief H34)
+    #[serde(default = "default_pv_forecast_correction_enabled")]
+    pub pv_forecast_correction_enabled: bool,
+}
+
+fn default_pv_forecast_correction_enabled() -> bool {
+    true
 }
 
 fn default_solar_provider() -> String {
@@ -1524,6 +1532,7 @@ impl Default for SolarForecastConfig {
             fetch_interval_seconds: 0,
             provider: default_solar_provider(),
             actual_pv_power_entities: Vec::new(),
+            pv_forecast_correction_enabled: default_pv_forecast_correction_enabled(),
         }
     }
 }
@@ -2785,6 +2794,9 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 },
                 provider: app_config.solar_forecast.provider,
                 actual_pv_power_entities: app_config.solar_forecast.actual_pv_power_entities,
+                pv_forecast_correction_enabled: app_config
+                    .solar_forecast
+                    .pv_forecast_correction_enabled,
             },
             remote_access: fluxion_core::RemoteAccessConfigCore {
                 enabled: app_config.remote_access.enabled,
@@ -3203,6 +3215,117 @@ mod tests {
         assert_eq!(config.pricing.hdo_high_tariff_czk, 1.0);
     }
 
+    /// H34: `solar_forecast.pv_forecast_correction_enabled` loads from the add-on options,
+    /// defaults to true when missing, and reaches the runtime config
+    #[test]
+    fn test_ha_addon_pv_forecast_correction_option() {
+        let options = |solar: &str| {
+            format!(
+                r#"{{
+            "inverters": [
+                {{"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}}
+            ],
+            "pricing": {{
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            }},
+            "control": {{
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            }},
+            "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}},
+            {solar}
+            "strategies": {{}}
+        }}"#
+            )
+        };
+
+        // Off in the options: off at runtime
+        let config: AppConfig = serde_json::from_str(&options(
+            r#""solar_forecast": {"provider": "open_meteo_solar_forecast", "actual_pv_power_entities": [], "pv_forecast_correction_enabled": false},"#,
+        ))
+        .unwrap();
+        assert!(!config.solar_forecast.pv_forecast_correction_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(!system.solar_forecast.pv_forecast_correction_enabled);
+
+        // Key missing (options saved before H34), or the section missing: on
+        let config: AppConfig = serde_json::from_str(&options(
+            r#""solar_forecast": {"provider": "open_meteo_solar_forecast", "actual_pv_power_entities": []},"#,
+        ))
+        .unwrap();
+        assert!(config.solar_forecast.pv_forecast_correction_enabled);
+        let config: AppConfig = serde_json::from_str(&options("")).unwrap();
+        assert!(config.solar_forecast.pv_forecast_correction_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(system.solar_forecast.pv_forecast_correction_enabled);
+
+        // The add-on defaults and schema carry the key
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    pv_forecast_correction_enabled: true\n"));
+        assert!(addon.contains("    pv_forecast_correction_enabled: bool?\n"));
+    }
+
+    /// Add-on options JSON with the given extra `control` keys (brief H33).
+    fn ha_addon_control_json(extra_control: &str) -> String {
+        format!(
+            r#"{{
+            "inverters": [
+                {{"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}}
+            ],
+            "pricing": {{
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            }},
+            "control": {{
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                {extra_control}
+                "average_household_load_kw": 0.5
+            }},
+            "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}},
+            "strategies": {{}}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn test_ha_addon_wear_and_efficiency_options_are_honoured() {
+        let json = ha_addon_control_json(
+            r#""battery_wear_cost_czk_per_kwh": 0.25, "battery_efficiency": 0.97,"#,
+        );
+        let config: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.25);
+        assert_eq!(config.control.battery_efficiency, 0.97);
+        let core = fluxion_core::SystemConfig::from(config);
+        assert_eq!(core.control_config.battery_wear_cost_czk_per_kwh, 0.25);
+        assert_eq!(core.control_config.battery_efficiency, 0.97);
+    }
+
+    #[test]
+    fn test_ha_addon_wear_and_efficiency_default_when_missing() {
+        let config: AppConfig = serde_json::from_str(&ha_addon_control_json("")).unwrap();
+        assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.1);
+        assert_eq!(config.control.battery_efficiency, 0.95);
+    }
+
     /// Configs written under the runtime field names (config.toml, persisted JSON) still load.
     #[test]
     fn test_spot_fee_runtime_field_names_still_load() {
@@ -3419,7 +3542,7 @@ mod winter_reserve_config_tests {
 
         assert!(wr.enabled);
         assert_eq!(wr.priority, 120);
-        assert!((wr.min_arbitrage_profit_czk - 3.0).abs() < 1e-6);
+        assert!((wr.min_arbitrage_profit_czk - 2.0).abs() < 1e-6);
         assert!((wr.insane_price_multiplier - 3.0).abs() < 1e-6);
         assert!((wr.cheap_percentile - 0.20).abs() < 1e-6);
         assert!((wr.load_safety_factor - 1.10).abs() < 1e-6);

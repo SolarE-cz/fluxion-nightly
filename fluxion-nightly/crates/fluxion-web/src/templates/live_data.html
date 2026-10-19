@@ -155,6 +155,12 @@
             <span class="stat-value">{{ output }} {{ self.t("unit-kilowatt-hour") }}</span>
         </div>
         {% endif %}
+        {% if loop.first %}{% if let Some(basis) = battery_cost_basis %}
+        <div class="stat">
+            <span class="stat-label"><i class="mdi mdi-cash"></i>{{ self.t("battery-cost-basis") }}</span>
+            <span class="stat-value">{{ basis.usable_text() }} {{ self.t("unit-kilowatt-hour") }} {{ self.t("battery-cost-usable-at") }} {% if let Some(cost) = basis.cost_text() %}{{ cost }} CZK/kWh{% else %}{{ self.t("battery-cost-unknown") }}{% endif %}{% if let Some((solar, grid)) = basis.shares_text() %} ({{ self.t("battery-cost-solar") }} {{ solar }} % / {{ self.t("battery-cost-grid") }} {{ grid }} %){% endif %}</span>
+        </div>
+        {% endif %}{% endif %}
     </div>
     {% endfor %}
 </div>
@@ -352,7 +358,12 @@
     <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
     <div class="stat">
         <span class="stat-label">Predicted Today</span>
-        <span class="stat-value">{{ format!("{:.1}", forecast.total_today_kwh) }} kWh</span>
+        <span class="stat-value">
+            {{ format!("{:.1}", forecast.total_today_kwh) }} kWh
+            {% if let Some(corrected) = forecast.corrected_total_today_kwh() %}
+            <span style="font-size: 0.85em; color: var(--text-secondary);" title="Forecast the planner uses (corrected)">→ {{ format!("{:.1}", corrected) }} kWh</span>
+            {% endif %}
+        </span>
     </div>
     {% if let Some(actual) = forecast.actual_today_kwh %}
     <div class="stat">
@@ -375,6 +386,20 @@
         <span class="stat-label">Tomorrow</span>
         <span class="stat-value">{{ format!("{:.1}", forecast.tomorrow_kwh) }} kWh</span>
     </div>
+    {% if let Some(correction) = forecast.correction %}
+    <div class="stat">
+        <span class="stat-label">Forecast Correction</span>
+        {% if correction.is_applied() %}
+        <span class="stat-value" title="Measured / forecast PV over the valid hours of the last 7 days: {{ format!("{:.1}", correction.measured_kwh) }} / {{ format!("{:.1}", correction.forecast_kwh) }} kWh. Predicted Today shows the raw forecast, then the corrected one.">
+            ×{{ format!("{:.2}", correction.factor) }}
+            <span style="font-size: 0.85em; color: var(--text-secondary);">({{ correction.days_used }} days)</span>
+        {% else %}
+        <span class="stat-value" style="color: var(--text-secondary);" title="Needs at least 3 valid days of measured vs forecast PV">
+            no correction yet ({{ correction.days_used }} days)
+        {% endif %}
+        </span>
+    </div>
+    {% endif %}
     {% else %}
     <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
     <p style="color: var(--text-secondary); font-size: 0.9em;">No solar forecast data available.</p>

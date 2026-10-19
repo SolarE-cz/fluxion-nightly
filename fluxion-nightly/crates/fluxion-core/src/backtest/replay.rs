@@ -17,6 +17,7 @@ use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::battery_cost_basis::{BatteryCostBasis, CostBasisBattery, CostBasisStep};
 use crate::components::{
     HourlyConsumptionProfile, aggregate_hourly_house_load, pick_hourly_profile,
 };
@@ -67,6 +68,9 @@ pub struct ReplayOptions {
     pub from: Option<DateTime<Utc>>,
     /// Simulate only blocks starting before this instant; later rows still feed the horizon
     pub until: Option<DateTime<Utc>>,
+    /// Track the cost of charge of the simulated Winter Reserve battery and plan with it
+    /// (brief H33). Off: the planner sees "cost unknown", as the backtest page does.
+    pub track_cost_basis: bool,
 }
 
 impl ReplayOptions {
@@ -84,6 +88,7 @@ impl ReplayOptions {
             baseline_only: false,
             from: None,
             until: None,
+            track_cost_basis: false,
         }
     }
 }
@@ -361,6 +366,16 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
         }
     };
     let mut planned_blocks = 0usize;
+    // Cost of charge of the simulated Winter Reserve battery (with `track_cost_basis`). The
+    // simulator applies `efficiency` once, on charge; the tracker treats it as one-way.
+    let cost_battery = CostBasisBattery {
+        capacity_kwh: capacity,
+        min_soc_pct: battery.min_soc_pct,
+        max_soc_pct: battery.max_soc_pct,
+        efficiency: battery.efficiency,
+        wear_czk_per_kwh: battery.wear_cost_czk_per_kwh,
+    };
+    let mut cost_basis: Option<BatteryCostBasis> = None;
     // Mode applied to the previous block: the planner keeps it while it is within the benefit
     let mut applied: Option<PlanMode> = None;
     // The live profile depends only on the day: build it once per day.
@@ -482,7 +497,17 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                 }
             }
 
-            let result = plan_from(&horizon, soc_now, tz, &battery, &params, applied);
+            let mut plan_battery = battery;
+            if opts.track_cost_basis {
+                let basis = cost_basis.get_or_insert_with(|| {
+                    // Start without a saved cost: unknown until the battery reaches the minimum.
+                    let mut b = BatteryCostBasis::default();
+                    b.resume(soc_now, recorded.buy_czk, &cost_battery, row.start);
+                    b
+                });
+                plan_battery.charge_cost_czk_per_kwh = basis.cost_czk_per_kwh;
+            }
+            let result = plan_from(&horizon, soc_now, tz, &plan_battery, &params, applied);
             let first = result
                 .blocks
                 .first()
@@ -519,6 +544,22 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
             }),
         });
         e_wr = wr_out.energy_end_kwh;
+        if let Some(basis) = cost_basis.as_mut() {
+            basis.update(
+                &CostBasisStep {
+                    soc_pct: e_wr / capacity * 100.0,
+                    battery_charge_kwh: wr_out.battery_charge_kwh,
+                    grid_import_kwh: wr_out.grid_import_kwh,
+                    export_headroom_kwh: Some(
+                        battery.max_export_kw * 0.25 - wr_out.grid_export_kwh,
+                    ),
+                    sell_czk: recorded.sell_czk,
+                    buy_czk: recorded.buy_czk,
+                    at: row.start,
+                },
+                &cost_battery,
+            );
+        }
     }
 
     // cheap_ref of the last simulated day (the last row's day when everything is simulated)

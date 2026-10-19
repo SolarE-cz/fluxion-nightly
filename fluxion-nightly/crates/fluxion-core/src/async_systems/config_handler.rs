@@ -104,6 +104,7 @@ pub struct ConfigEventParams<'w, 's> {
     solar_forecast: Option<Res<'w, super::SolarForecastData>>,
     timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
     user_levers: Option<Res<'w, UserLeversResource>>,
+    cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
 }
 
 /// System that processes config update events from the web UI
@@ -276,31 +277,23 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 .iter()
                 .map(|b| b.block_start)
                 .collect();
-            let solar_forecast =
-                super::solar_block_forecast(params.solar_forecast.as_deref(), &block_starts);
+            // Corrected by the PV forecast correction factor (brief H34) when in force
+            let solar =
+                super::planner_solar_inputs(params.solar_forecast.as_deref(), &block_starts);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
                 current_soc,
-                solar_forecast.as_deref(),       // PV forecast per block
+                solar.per_block_kwh.as_deref(), // PV forecast per block
                 consumption_forecast.as_deref(), // Enhanced consumption forecast
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
                 hdo_raw_data,
-                params
-                    .solar_forecast
-                    .as_ref()
-                    .map_or(0.0, |s| s.total_today_kwh),
-                params
-                    .solar_forecast
-                    .as_ref()
-                    .map_or(0.0, |s| s.remaining_today_kwh),
-                params
-                    .solar_forecast
-                    .as_ref()
-                    .map_or(0.0, |s| s.tomorrow_kwh),
+                solar.total_today_kwh,
+                solar.remaining_today_kwh,
+                solar.tomorrow_kwh,
                 user_control_state,
                 params
                     .consumption_history
@@ -315,6 +308,10 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                     .as_ref()
                     .and_then(|tz| tz.timezone.as_deref()),
                 active_user_levers(params.user_levers.as_deref()),
+                params
+                    .cost_basis
+                    .as_ref()
+                    .and_then(|t| t.cost_czk_per_kwh()),
             );
 
             // Update schedule
@@ -375,6 +372,7 @@ pub struct UserControlEventParams<'w, 's> {
     solar_forecast: Option<Res<'w, super::SolarForecastData>>,
     timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
     user_levers: Option<Res<'w, UserLeversResource>>,
+    cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
 }
 
 /// System that processes user control update events from the web UI
@@ -460,31 +458,23 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                 .iter()
                 .map(|b| b.block_start)
                 .collect();
-            let solar_forecast =
-                super::solar_block_forecast(params.solar_forecast.as_deref(), &block_starts);
+            // Corrected by the PV forecast correction factor (brief H34) when in force
+            let solar =
+                super::planner_solar_inputs(params.solar_forecast.as_deref(), &block_starts);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
                 current_soc,
-                solar_forecast.as_deref(),
+                solar.per_block_kwh.as_deref(),
                 consumption_forecast.as_deref(),
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
                 hdo_raw_data,
-                params
-                    .solar_forecast
-                    .as_ref()
-                    .map_or(0.0, |s| s.total_today_kwh),
-                params
-                    .solar_forecast
-                    .as_ref()
-                    .map_or(0.0, |s| s.remaining_today_kwh),
-                params
-                    .solar_forecast
-                    .as_ref()
-                    .map_or(0.0, |s| s.tomorrow_kwh),
+                solar.total_today_kwh,
+                solar.remaining_today_kwh,
+                solar.tomorrow_kwh,
                 Some(&params.user_control.state),
                 params
                     .consumption_history
@@ -499,6 +489,10 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                     .as_ref()
                     .and_then(|tz| tz.timezone.as_deref()),
                 active_user_levers(params.user_levers.as_deref()),
+                params
+                    .cost_basis
+                    .as_ref()
+                    .and_then(|t| t.cost_czk_per_kwh()),
             );
 
             // Update schedule

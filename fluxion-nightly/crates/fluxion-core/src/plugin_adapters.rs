@@ -103,6 +103,7 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
             solar_forecast_remaining_today_kwh: request.solar_forecast_remaining_today_kwh,
             solar_forecast_tomorrow_kwh: request.solar_forecast_tomorrow_kwh,
             battery_avg_charge_price_czk_per_kwh: request.battery_avg_charge_price_czk_per_kwh,
+            battery_charge_cost_czk_per_kwh: request.battery_charge_cost_czk_per_kwh,
             hourly_consumption_profile: request
                 .historical
                 .hourly_consumption_profile

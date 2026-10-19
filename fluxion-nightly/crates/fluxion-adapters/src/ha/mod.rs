@@ -19,6 +19,7 @@ pub mod errors;
 pub mod hot_standby;
 pub mod levers;
 pub mod plugin;
+pub mod pv_forecast_correction;
 pub mod solar_forecast_accuracy;
 pub mod solar_forecast_fetcher;
 pub mod types;

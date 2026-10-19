@@ -1646,6 +1646,10 @@ impl Plugin for ContinuousSystemsPlugin {
             .init_resource::<InitialModeSyncTracker>()
             // Persisted export limit to restore (a restart while curtailed restores it)
             .insert_resource(ExportCurtailmentState::load(EXPORT_LIMIT_RESTORE_PATH))
+            // Cost of charge of the battery energy (brief H33), persisted across restarts
+            .insert_resource(crate::battery_cost_basis::BatteryCostTracker::load(
+                crate::battery_cost_basis::BATTERY_COST_BASIS_PATH,
+            ))
             .add_systems(
                 Startup,
                 (
@@ -1667,6 +1671,7 @@ impl Plugin for ContinuousSystemsPlugin {
                     crate::async_systems::read_inverter_states_system,
                     // Decompose RawInverterState into individual components
                     crate::async_systems::decompose_inverter_state,
+                    crate::battery_cost_basis::battery_cost_basis_system,
                     // Keep schedule execution but update to use channels
                     schedule_execution_system,
                     export_curtailment_system,

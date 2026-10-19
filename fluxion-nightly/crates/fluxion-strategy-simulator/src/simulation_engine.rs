@@ -355,6 +355,7 @@ impl SimulationEngine {
                 solar_forecast_remaining_today_kwh,
                 solar_forecast_tomorrow_kwh: 0.0, // Single-day simulation, no tomorrow data
                 battery_avg_charge_price_czk_per_kwh: 0.0, // Not tracked in simulator
+                battery_charge_cost_czk_per_kwh: None,
                 hourly_consumption_profile: None,
                 hourly_consumption_p75: None,
                 block_forecasts: None,

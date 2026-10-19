@@ -166,6 +166,7 @@ mod tests {
             export_guard_margin_kwh: 0.0,
             force_discharge_enabled: false,
             min_charge_kwh: 0.0,
+            charge_cost_czk_per_kwh: None,
         }
     }
 

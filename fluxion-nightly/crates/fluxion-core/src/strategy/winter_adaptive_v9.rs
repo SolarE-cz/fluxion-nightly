@@ -1795,6 +1795,7 @@ mod tests {
             solar_forecast_remaining_today_kwh: 10.0, // High solar -> SolarFirst mode
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
             hourly_consumption_p75: None,
             block_forecasts: None,
@@ -1845,6 +1846,7 @@ mod tests {
             solar_forecast_remaining_today_kwh: 10.0, // High solar -> SolarFirst mode
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
             hourly_consumption_p75: None,
             block_forecasts: None,
@@ -1922,6 +1924,7 @@ mod tests {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
             hourly_consumption_p75: None,
             block_forecasts: None,
@@ -2377,6 +2380,7 @@ mod tests {
                 solar_forecast_remaining_today_kwh: 0.0,
                 solar_forecast_tomorrow_kwh: 0.0,
                 battery_avg_charge_price_czk_per_kwh: 0.0,
+                battery_charge_cost_czk_per_kwh: None,
                 hourly_consumption_profile: None,
                 hourly_consumption_p75: None,
                 block_forecasts: None,

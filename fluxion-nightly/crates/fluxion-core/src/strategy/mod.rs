@@ -263,6 +263,10 @@ pub struct EvaluationContext<'a> {
     /// Tracks cost basis of energy currently stored in battery
     pub battery_avg_charge_price_czk_per_kwh: f32,
 
+    /// Measured cost of charge of the energy in the battery, per kWh delivered (CZK/kWh, losses
+    /// and wear included; brief H33). `None` = unknown.
+    pub battery_charge_cost_czk_per_kwh: Option<f32>,
+
     /// Average hourly consumption profile (kWh per hour, 24 entries, index = UTC hour of day)
     /// Averaged over last 7 days of historical data
     /// Enables strategies to understand when energy demand is highest

@@ -62,6 +62,11 @@ pub struct GenericInverterState {
     /// PV generation power (total)
     pub pv_power_w: f32,
 
+    /// Battery power (W, positive = charge) of the read-only parallel units
+    /// (`pv_extra_prefixes`) that report one, summed; `None` when none does. Each unit reports
+    /// only its own battery's share (brief H33).
+    pub extra_battery_power_w: Option<f32>,
+
     /// Is inverter reachable?
     pub online: bool,
 

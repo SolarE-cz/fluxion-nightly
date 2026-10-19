@@ -30,7 +30,11 @@
 //! Usage:
 //! `cargo run -p fluxion-core --example winter_reserve_replay -- data.json [--baseline-only]
 //!  [--csv out.csv] [--pv-noise] [--pv-forecast-bias 0.5] [--profile forecast|import|house]
-//!  [--from 2026-10-14T14:30:00Z] [--param key=value]...`
+//!  [--from 2026-10-14T14:30:00Z] [--force-discharge] [--cost-basis] [--param key=value]...`
+//!
+//! `--force-discharge` sets `force_discharge_enabled` (export to the grid allowed) on the battery.
+//! `--cost-basis` tracks the cost of charge of the simulated battery and plans with it (brief
+//! H33); without it the planner sees "cost unknown".
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -109,12 +113,16 @@ fn run() -> Result<(), String> {
     let mut profile = ProfileSource::Forecast;
     let mut from: Option<DateTime<Utc>> = None;
     let mut params = WinterReserveParams::default();
+    let mut force_discharge = false;
+    let mut cost_basis = false;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--baseline-only" => baseline_only = true,
             "--pv-noise" => pv_noise = true,
+            "--force-discharge" => force_discharge = true,
+            "--cost-basis" => cost_basis = true,
             "--pv-forecast-bias" => {
                 let text = iter.next().ok_or("--pv-forecast-bias needs a factor")?;
                 pv_forecast_bias = text
@@ -151,6 +159,8 @@ fn run() -> Result<(), String> {
         .parse()
         .map_err(|_| format!("unknown timezone {}", dataset.site.timezone))?;
     let mut battery = dataset.site.battery;
+    // `control.force_discharge_enabled` (export to the grid); off unless the flag is given.
+    battery.force_discharge_enabled |= force_discharge;
     // The live planner derives the minimum useful charge from the charge power and the
     // mode-change debounce (brief H30); a dataset without it gets the live default.
     if battery.min_charge_kwh <= 0.0 {
@@ -213,6 +223,7 @@ fn run() -> Result<(), String> {
     options.pv_noise = pv_noise;
     options.baseline_only = baseline_only;
     options.from = from;
+    options.track_cost_basis = cost_basis;
     let run = replay(&rows, &options)?;
     let days = &run.days;
     let skipped_days = &run.skipped_days;
@@ -355,6 +366,32 @@ fn run() -> Result<(), String> {
             out,
             "end state: WinterReserve {e_wr:.2} kWh vs SelfUse {e_su:.2} kWh, cheap_ref_last_day {cheap_ref_last_day:.3} CZK/kWh, end_soc_adjustment_czk {end_soc_adjustment_czk:.2} (efficiency {:.2}) | WinterReserve raw {total_wr:.2} CZK, adjusted {total_wr_adjusted:.2} CZK (adjusted = raw - end_soc_adjustment_czk)",
             battery.efficiency,
+        );
+    }
+    if wr_cols {
+        // Counted days only, as the totals above.
+        let counted_blocks = || {
+            run.blocks.iter().filter(|b| {
+                !skipped_days.contains(&b.local.date_naive()) && b.winter_reserve.is_some()
+            })
+        };
+        let curtailed: f32 = counted_blocks()
+            .filter_map(|b| b.winter_reserve.as_ref())
+            .map(|wr| wr.outcome.curtailed_kwh)
+            .sum();
+        let exported: f32 = counted().map(|d| d.wr.export_kwh).sum();
+        let mut mode_changes = 0usize;
+        let mut previous = None;
+        for wr in counted_blocks().filter_map(|b| b.winter_reserve.as_ref()) {
+            if previous.is_some_and(|m| m != wr.mode) {
+                mode_changes += 1;
+            }
+            previous = Some(wr.mode);
+        }
+        let _ = writeln!(
+            out,
+            "flows: WinterReserve exported {exported:.2} kWh, curtailed {curtailed:.2} kWh, mode changes {mode_changes} (force_discharge_enabled {}, cost_basis {cost_basis})",
+            battery.force_discharge_enabled,
         );
     }
     if !skipped_days.is_empty() {

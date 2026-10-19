@@ -50,6 +50,8 @@ struct PvExtras {
     power_w: f32,
     today_kwh: f32,
     total_kwh: f32,
+    /// Battery power (W, positive = charge) summed over the extra units that report one
+    battery_power_w: Option<f32>,
 }
 
 impl HomeAssistantInverterAdapter {
@@ -110,6 +112,16 @@ impl HomeAssistantInverterAdapter {
                         }
                     }
                 }
+            }
+            // Read-only battery power of a parallel unit with its own battery (brief H33): each
+            // unit reports only its own share. A unit without the entity is skipped.
+            let entity = self.mapper.get_battery_power_entity(prefix);
+            match self.read_sensor_float(&entity).await {
+                Ok(value) => *extras.battery_power_w.get_or_insert(0.0) += value,
+                Err(e) => debug!(
+                    "Extra battery power {} unreadable, skipped: {:#}",
+                    entity, e
+                ),
             }
         }
         extras
@@ -446,6 +458,7 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             // Solar energy
             today_solar_energy_kwh,
             total_solar_energy_kwh,
+            extra_battery_power_w: extras.battery_power_w,
             // All other optional fields default to None
             ..Default::default()
         };
@@ -1467,9 +1480,10 @@ mod tests {
         mock_state(&mut server, "sensor.solax_81_pv_power_total", "5500").await;
         mock_state(&mut server, "sensor.solax_81_today_s_solar_energy", "143.2").await;
         mock_state(&mut server, "sensor.solax_81_total_solar_energy", "3000").await;
-        // Battery, house load and grid of the parallel unit are never read
+        // House load, grid and SOC of the parallel unit are never read (its battery power is,
+        // read-only, brief H33)
         let untouched = server
-            .mock("GET", Matcher::Regex(r"^/api/states/(sensor|select|number)\.solax_81_(battery|house|grid|charger|export|lock|manual)".to_owned()))
+            .mock("GET", Matcher::Regex(r"^/api/states/(sensor|select|number)\.solax_81_(battery_capacity|house|grid|charger|export|lock|manual)".to_owned()))
             .expect(0)
             .create_async()
             .await;
@@ -1486,6 +1500,68 @@ mod tests {
         assert!((state.battery_power_w - 1200.0).abs() < 0.01);
         assert_eq!(state.house_load_w, Some(800.0));
         untouched.assert_async().await;
+    }
+
+    /// Two-unit site (brief H33): master `solax` and parallel unit `solax_extra`, each with
+    /// its own battery. Each reports only its own share; the master's meter is the site meter.
+    #[tokio::test]
+    async fn extra_unit_battery_power_is_read_only_and_reported_separately() {
+        let mut server = Server::new_async().await;
+        for (entity, state) in [
+            ("sensor.solax_battery_capacity", "60"),
+            ("sensor.solax_grid_import", "0"),
+            ("sensor.solax_battery_power_charge", "839"),
+            ("sensor.solax_pv_power_total", "1335"),
+            ("select.solax_charger_use_mode", "Self Use Mode"),
+            ("sensor.solax_house_load", "447"),
+            ("sensor.solax_extra_pv_power_total", "2256"),
+            ("sensor.solax_extra_battery_power_charge", "703"),
+        ] {
+            mock_state(&mut server, entity, state).await;
+        }
+        // The extra unit's house load, grid, SOC and controls are never read
+        let untouched = server
+            .mock("GET", Matcher::Regex(r"^/api/states/(sensor|select|number)\.solax_extra_(battery_capacity|house|grid|charger|export|lock|manual)".to_owned()))
+            .expect(0)
+            .create_async()
+            .await;
+        let no_writes = server
+            .mock("POST", Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "test_token").unwrap());
+        let adapter = HomeAssistantInverterAdapter::new(
+            client,
+            Arc::new(crate::solax::SolaxEntityMapper::new()),
+        )
+        .with_guard(guard(true))
+        .with_pv_extra_prefixes(HashMap::from([(
+            "solax".to_owned(),
+            vec!["solax_extra".to_owned()],
+        )]));
+
+        let state = adapter.read_state("solax").await.unwrap();
+
+        assert!((state.pv_power_w - 3591.0).abs() < 0.01);
+        assert!((state.battery_power_w - 839.0).abs() < 0.01);
+        assert_eq!(state.extra_battery_power_w, Some(703.0));
+        assert_eq!(state.house_load_w, Some(447.0));
+        untouched.assert_async().await;
+        no_writes.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn extra_unit_without_a_battery_entity_reports_no_battery_power() {
+        let mut server = Server::new_async().await;
+        master_states(&mut server).await;
+        mock_state(&mut server, "sensor.solax_81_pv_power_total", "500").await;
+        let state = extras_adapter(server.url())
+            .read_state("solax_80")
+            .await
+            .unwrap();
+        assert_eq!(state.extra_battery_power_w, None);
+        assert!((state.battery_power_w - 1200.0).abs() < 0.01);
     }
 
     #[tokio::test]

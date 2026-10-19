@@ -190,6 +190,13 @@ pub fn setup_async_workers(
         sender: solar_forecast_tx,
     });
     commands.init_resource::<SolarForecastData>();
+    // PV forecast correction factor (brief H34): sent by the correction worker, applied to
+    // SolarForecastData by the HA plugin's poll system
+    let (pv_correction_tx, pv_correction_rx) = crossbeam_channel::bounded(4);
+    commands.insert_resource(PvCorrectionChannel {
+        sender: pv_correction_tx,
+        receiver: pv_correction_rx,
+    });
 
     info!("🎉 All async workers initialized successfully");
 }
@@ -212,11 +219,75 @@ pub struct SolarForecastData {
     /// Solar production forecast for tomorrow (kWh)
     pub tomorrow_kwh: f32,
 
-    /// Per-block PV forecast (UTC block start, kWh). Empty when unavailable.
+    /// Per-block PV forecast (UTC block start, kWh) as the provider gave it, uncorrected.
+    /// Empty when unavailable.
     pub block_kwh: Vec<(DateTime<Utc>, f32)>,
 
     /// Last successful update timestamp
     pub last_updated: Instant,
+
+    /// PV forecast correction (brief H34) in force; `None` = no correction (option off or not
+    /// computed yet). The totals and `block_kwh` above stay raw; the planner reads them through
+    /// the corrected accessors.
+    pub correction: Option<crate::pv_correction::CorrectionResult>,
+}
+
+impl SolarForecastData {
+    /// Factor applied to the PV forecast the planner uses (1.0 = none)
+    #[must_use]
+    pub fn correction_factor(&self) -> f32 {
+        self.correction.map_or(1.0, |c| c.factor)
+    }
+
+    /// Corrected total-today forecast (kWh)
+    #[must_use]
+    pub fn planner_total_today_kwh(&self) -> f32 {
+        self.total_today_kwh * self.correction_factor()
+    }
+
+    /// Corrected remaining-today forecast (kWh)
+    #[must_use]
+    pub fn planner_remaining_today_kwh(&self) -> f32 {
+        self.remaining_today_kwh * self.correction_factor()
+    }
+
+    /// Corrected tomorrow forecast (kWh)
+    #[must_use]
+    pub fn planner_tomorrow_kwh(&self) -> f32 {
+        self.tomorrow_kwh * self.correction_factor()
+    }
+}
+
+/// PV inputs of the planner: the per-block forecast and the day totals, all corrected
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannerSolarInputs {
+    pub per_block_kwh: Option<Vec<f32>>,
+    pub total_today_kwh: f32,
+    pub remaining_today_kwh: f32,
+    pub tomorrow_kwh: f32,
+}
+
+/// The PV forecast the planner uses for `block_starts`, scaled by the correction in force
+#[must_use]
+pub fn planner_solar_inputs(
+    data: Option<&SolarForecastData>,
+    block_starts: &[DateTime<Utc>],
+) -> PlannerSolarInputs {
+    PlannerSolarInputs {
+        per_block_kwh: solar_block_forecast(data, block_starts),
+        total_today_kwh: data.map_or(0.0, SolarForecastData::planner_total_today_kwh),
+        remaining_today_kwh: data.map_or(0.0, SolarForecastData::planner_remaining_today_kwh),
+        tomorrow_kwh: data.map_or(0.0, SolarForecastData::planner_tomorrow_kwh),
+    }
+}
+
+/// The correction to apply: none when the option is off; an invalid factor becomes 1.0
+#[must_use]
+pub fn correction_to_apply(
+    enabled: bool,
+    result: crate::pv_correction::CorrectionResult,
+) -> Option<crate::pv_correction::CorrectionResult> {
+    enabled.then(|| result.sanitized())
 }
 
 /// PV forecast (kWh) for each block start, 0.0 where unknown.
@@ -229,9 +300,25 @@ pub fn solar_block_forecast(
         .map(|blocks| blocks.into_iter().map(|kwh| kwh.unwrap_or(0.0)).collect())
 }
 
-/// PV forecast (kWh per 15-min forecast block) for each block start, `None` where no forecast
-/// key covers the start. Returns `None` when no per-block forecast is available.
+/// Corrected PV forecast (kWh per 15-min forecast block) for each block start, `None` where no
+/// forecast key covers the start. Returns `None` when no per-block forecast is available.
 pub fn solar_block_forecast_covered(
+    data: Option<&SolarForecastData>,
+    block_starts: &[DateTime<Utc>],
+) -> Option<Vec<Option<f32>>> {
+    let factor = data.map_or(1.0, SolarForecastData::correction_factor);
+    solar_block_forecast_raw_covered(data, block_starts).map(|blocks| {
+        blocks
+            .into_iter()
+            .map(|kwh| kwh.map(|k| k * factor))
+            .collect()
+    })
+}
+
+/// Raw (uncorrected) PV forecast per block start, `None` where no forecast key covers it.
+/// Step-hold: a key covers the block starts up to (not including) one hour after it, so hourly
+/// keys fill all four 15-min blocks of their hour.
+pub fn solar_block_forecast_raw_covered(
     data: Option<&SolarForecastData>,
     block_starts: &[DateTime<Utc>],
 ) -> Option<Vec<Option<f32>>> {
@@ -239,22 +326,10 @@ pub fn solar_block_forecast_covered(
     if data.block_kwh.is_empty() {
         return None;
     }
-    let by_key: std::collections::BTreeMap<DateTime<Utc>, f32> =
-        data.block_kwh.iter().copied().collect();
-    // Step-hold: a key covers the block starts up to (not including) one hour after it,
-    // so hourly keys fill all four 15-min blocks of their hour.
-    Some(
-        block_starts
-            .iter()
-            .map(|start| {
-                by_key
-                    .range(..=*start)
-                    .next_back()
-                    .filter(|(key, _)| *start - **key < chrono::Duration::minutes(60))
-                    .map(|(_, kwh)| *kwh)
-            })
-            .collect(),
-    )
+    Some(crate::pv_correction::covered_block_kwh(
+        &data.block_kwh,
+        block_starts,
+    ))
 }
 
 impl Default for SolarForecastData {
@@ -265,6 +340,7 @@ impl Default for SolarForecastData {
             tomorrow_kwh: 0.0,
             block_kwh: Vec::new(),
             last_updated: Instant::now(),
+            correction: None,
         }
     }
 }
@@ -280,6 +356,13 @@ pub struct SolarForecastUpdate {
 #[derive(Resource)]
 pub struct SolarForecastSender {
     pub sender: crossbeam_channel::Sender<SolarForecastUpdate>,
+}
+
+/// Correction factors from the PV forecast correction worker (brief H34)
+#[derive(Resource, Clone)]
+pub struct PvCorrectionChannel {
+    pub sender: crossbeam_channel::Sender<crate::pv_correction::CorrectionResult>,
+    pub receiver: crossbeam_channel::Receiver<crate::pv_correction::CorrectionResult>,
 }
 
 #[derive(Component)]
@@ -346,5 +429,55 @@ mod solar_block_forecast_tests {
     fn test_no_forecast_returns_none() {
         assert!(solar_block_forecast(None, &[utc(10, 0)]).is_none());
         assert!(solar_block_forecast(Some(&data(vec![])), &[utc(10, 0)]).is_none());
+    }
+
+    fn corrected(factor: f32) -> crate::pv_correction::CorrectionResult {
+        crate::pv_correction::CorrectionResult {
+            factor,
+            days_used: 7,
+            measured_kwh: 117.0,
+            forecast_kwh: 100.0,
+        }
+    }
+
+    #[test]
+    fn test_planner_receives_scaled_pv() {
+        let mut forecast = data(vec![(utc(10, 0), 0.4), (utc(10, 15), 0.2)]);
+        forecast.total_today_kwh = 20.0;
+        forecast.remaining_today_kwh = 10.0;
+        forecast.tomorrow_kwh = 30.0;
+        forecast.correction = Some(corrected(1.17));
+        let starts = [utc(10, 0), utc(10, 15), utc(11, 30)];
+
+        let inputs = planner_solar_inputs(Some(&forecast), &starts);
+        let blocks = inputs.per_block_kwh.unwrap();
+        assert!((blocks[0] - 0.468).abs() < 1e-5, "{blocks:?}");
+        assert!((blocks[1] - 0.234).abs() < 1e-5, "{blocks:?}");
+        assert_eq!(blocks[2], 0.0);
+        assert!((inputs.total_today_kwh - 23.4).abs() < 1e-4);
+        assert!((inputs.remaining_today_kwh - 11.7).abs() < 1e-4);
+        assert!((inputs.tomorrow_kwh - 35.1).abs() < 1e-4);
+
+        // The raw forecast stays available (dashboard) and unscaled
+        let raw = solar_block_forecast_raw_covered(Some(&forecast), &starts).unwrap();
+        assert_eq!(raw, vec![Some(0.4), Some(0.2), None]);
+        let covered = solar_block_forecast_covered(Some(&forecast), &starts).unwrap();
+        assert!((covered[0].unwrap() - 0.468).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_option_off_applies_factor_one() {
+        let mut forecast = data(vec![(utc(10, 0), 0.4)]);
+        forecast.total_today_kwh = 20.0;
+        forecast.correction = correction_to_apply(false, corrected(1.17));
+        assert_eq!(forecast.correction_factor(), 1.0);
+        let inputs = planner_solar_inputs(Some(&forecast), &[utc(10, 0)]);
+        assert_eq!(inputs.per_block_kwh, Some(vec![0.4]));
+        assert_eq!(inputs.total_today_kwh, 20.0);
+
+        forecast.correction = correction_to_apply(true, corrected(1.17));
+        assert!((forecast.correction_factor() - 1.17).abs() < 1e-6);
+        // Not computed yet: no correction
+        assert_eq!(data(vec![]).correction_factor(), 1.0);
     }
 }

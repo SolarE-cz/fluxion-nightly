@@ -38,6 +38,11 @@ battery-energy-discharged = Energie vybito dnes
 battery-capacity = Kapacita baterie
 battery-input-today = Dnes nabito do baterie
 battery-output-today = Dnes vybito z baterie
+battery-cost-basis = Baterie
+battery-cost-usable-at = využitelné za
+battery-cost-unknown = cena zatím neznámá
+battery-cost-solar = solár
+battery-cost-grid = síť
 
 # Solární panely (FV)
 pv-power = Výkon FV

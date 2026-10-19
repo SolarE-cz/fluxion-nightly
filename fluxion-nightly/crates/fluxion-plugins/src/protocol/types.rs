@@ -127,6 +127,11 @@ pub struct EvaluationRequest {
     #[serde(default)]
     pub battery_avg_charge_price_czk_per_kwh: f32,
 
+    /// Measured cost of charge of the energy in the battery, per kWh delivered (CZK/kWh, losses
+    /// and wear included). `None` = unknown.
+    #[serde(default)]
+    pub battery_charge_cost_czk_per_kwh: Option<f32>,
+
     /// Per-block forecasts aligned with `all_blocks` (empty = unknown)
     #[serde(default)]
     pub block_forecasts: Vec<BlockForecast>,

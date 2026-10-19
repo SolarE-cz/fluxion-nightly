@@ -233,6 +233,7 @@ pub fn gate_force_discharge(blocks: &mut [ScheduledMode], enabled: bool) -> usiz
 /// * `solar_forecast_tomorrow_kwh` - Solar forecast for tomorrow (kWh)
 /// * `user_control` - Optional user control state for overrides and restrictions
 /// * `timezone` - Optional IANA timezone of the site (e.g. "Europe/Prague"), passed to strategies
+/// * `battery_charge_cost_czk_per_kwh` - Measured cost of charge of the battery energy (brief H33)
 ///
 /// # Returns
 /// Planner minimum SOC (%) in Back Up default mode: the higher of the control and Back Up
@@ -281,6 +282,7 @@ pub fn generate_schedule_with_optimizer(
     hourly_consumption_p75: Option<&[f32; 24]>,
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
+    battery_charge_cost_czk_per_kwh: Option<f32>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
@@ -397,6 +399,7 @@ pub fn generate_schedule_with_optimizer(
             timezone,
             user_levers,
             planner_min_soc_pct,
+            battery_charge_cost_czk_per_kwh,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -544,6 +547,7 @@ pub fn generate_schedule_with_optimizer(
             timezone,
             user_levers,
             planner_min_soc_pct,
+            battery_charge_cost_czk_per_kwh,
         );
 
         // Get decision from plugin manager
@@ -1082,6 +1086,7 @@ fn create_evaluation_request(
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
     planner_min_soc_pct: Option<f32>,
+    battery_charge_cost_czk_per_kwh: Option<f32>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -1127,6 +1132,7 @@ fn create_evaluation_request(
         solar_forecast_remaining_today_kwh,
         solar_forecast_tomorrow_kwh,
         battery_avg_charge_price_czk_per_kwh,
+        battery_charge_cost_czk_per_kwh,
         block_forecasts,
         timezone: timezone.map(str::to_owned),
         user_levers: user_levers.copied(),
@@ -1288,6 +1294,7 @@ mod tests {
             None,
             None,
             Some("Europe/Prague"),
+            None,
             None,
         );
 
@@ -1568,6 +1575,7 @@ mod tests {
                 None,
                 None,
                 active_user_levers(res),
+                None,
             );
             plugin
         };

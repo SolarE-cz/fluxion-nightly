@@ -134,6 +134,49 @@ fn backtest_site(
     })
 }
 
+/// What the PV forecast correction reads (brief H34): the same live PV entities as the backtest
+/// (master plus `pv_extra_prefixes`), the master's SOC, grid export and export limit, and the
+/// export cap and curtailment settings. `None` when the site cannot be built.
+fn pv_correction_site(
+    config: &config::AppConfig,
+    system_config: &SystemConfig,
+) -> Option<fluxion_core::pv_correction::CorrectionSite> {
+    let timezone: chrono_tz::Tz = config.system.timezone.as_deref()?.parse().ok()?;
+    let master = config
+        .inverters
+        .iter()
+        .find(|inv| inv.topology != "slave")
+        .or(config.inverters.first())?;
+    let mapper = fluxion_adapters::create_entity_mapper(master.inverter_type);
+    let mut pv = vec![mapper.get_pv_power_entity(&master.id)];
+    pv.extend(
+        config::AppConfig::pv_extra_prefixes(master)
+            .iter()
+            .map(|prefix| mapper.get_pv_power_entity(prefix)),
+    );
+    let control = &system_config.control_config;
+    let export_cap_w = control
+        .export_limit_hard_cap_w
+        .map_or(control.maximum_export_power_w, |cap| {
+            cap.min(control.maximum_export_power_w)
+        });
+    Some(fluxion_core::pv_correction::CorrectionSite {
+        timezone,
+        pv,
+        soc: mapper.get_battery_soc_entity(&master.id),
+        grid_export: mapper.get_grid_export_power_entity(&master.id)?,
+        export_limit: Some(mapper.get_export_limit_entity(&master.id)),
+        limits: fluxion_core::pv_correction::CurtailLimits {
+            max_soc_pct: control.max_battery_soc,
+            export_cap_w,
+            export_off_w: control
+                .export_limit_min_w
+                .max(fluxion_core::pv_correction::EXPORT_OFF_MIN_W),
+            export_curtailment_enabled: control.export_curtailment_enabled,
+        },
+    })
+}
+
 fn initialize_and_run() -> Result<()> {
     // Initialize tracing with env filter support
     // Respects RUST_LOG environment variable
@@ -391,6 +434,9 @@ fn initialize_and_run() -> Result<()> {
     });
     let config_sender_for_web = config_update_sender.clone();
     // Backtest on this site's own HA history (read-only GETs on the web runtime, brief H28)
+    let pv_correction_site = fluxion_core::pv_correction::PvCorrectionSiteResource(
+        pv_correction_site(&config, &system_config),
+    );
     let backtest_state = fluxion_web::BacktestState::new(
         Arc::new(fluxion_adapters::ha::HaBacktestHistory::new(
             ha_client.clone(),
@@ -458,6 +504,7 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(query_channel)
         .insert_resource(config_update_channel)
         .insert_resource(timezone_config)
+        .insert_resource(pv_correction_site)
         .insert_resource(HaClientResource(ha_client))
         .insert_resource(actuation_state)
         .insert_resource(price_adapter_tz_handle)

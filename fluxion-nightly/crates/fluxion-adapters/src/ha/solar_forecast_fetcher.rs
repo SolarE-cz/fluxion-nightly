@@ -13,14 +13,17 @@
 use crate::ha::HaClientResource;
 use crate::ha::client::HomeAssistantClient;
 use crate::ha::hot_standby::{RegistryEntry, fetch_registry};
+use crate::ha::pv_forecast_correction::{CorrectionWorker, SharedForecastStore, SharedSensorList};
 use crate::ha::solar_forecast_accuracy::{AccuracyMonitor, BIAS_STATE_PATH};
 use crate::ha::types::HaEntityState;
 use crate::ha::ws::websocket_url;
 use bevy_ecs::prelude::*;
 use chrono::{DateTime, Utc};
 use fluxion_core::async_systems::{
-    SolarForecastChannel, SolarForecastData, SolarForecastSender, SolarForecastUpdate,
+    PvCorrectionChannel, SolarForecastChannel, SolarForecastData, SolarForecastSender,
+    SolarForecastUpdate, correction_to_apply,
 };
+use fluxion_core::pv_correction::{ForecastStore, PvCorrectionSiteResource, SNAPSHOT_PATH};
 use fluxion_core::{SystemConfig, TimezoneConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -50,6 +53,10 @@ pub fn spawn_solar_forecast_fetcher(
     sender: Option<Res<SolarForecastSender>>,
     system_config: Res<SystemConfig>,
     timezone: Option<Res<TimezoneConfig>>,
+    correction: (
+        Option<Res<PvCorrectionSiteResource>>,
+        Option<Res<PvCorrectionChannel>>,
+    ),
 ) {
     let Some(client_res) = ha_client else {
         tracing::warn!("⚠️ HaClientResource not available, cannot fetch solar forecast");
@@ -87,6 +94,10 @@ pub fn spawn_solar_forecast_fetcher(
     let actual_entities = actual_pv_entities(&config.actual_pv_power_entities, &prefixes);
     let mut accuracy = AccuracyMonitor::new(PathBuf::from(BIAS_STATE_PATH), tz, actual_entities);
 
+    // PV forecast correction (brief H34): daily snapshots of the planner's forecast here, the
+    // factor in its own task once the sensors are discovered
+    let correction = correction_setup(&config, correction);
+
     tracing::info!(
         "☀️ Spawning solar forecast fetcher (patterns: {}, {}, {})",
         config.sensor_total_today_pattern,
@@ -107,18 +118,114 @@ pub fn spawn_solar_forecast_fetcher(
 
         // Fetch immediately on startup
         tracing::debug!("📊 Fetching initial solar forecast from HA");
-        let forecast_total = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
-        accuracy.tick(&client, Utc::now(), forecast_total).await;
+        let fetched = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+        record_snapshot(correction.as_ref(), &fetched);
+        accuracy
+            .tick(&client, Utc::now(), fetched.total_today)
+            .await;
+
+        if let Some(setup) = &correction {
+            share_sensors(setup, &discovered).await;
+            let forecast_entities = setup.sensors.clone();
+            let worker = CorrectionWorker {
+                reader: crate::ha::HaBacktestHistory::new(client.clone()),
+                site: setup.site.clone(),
+                store: setup.store.clone(),
+                path: PathBuf::from(SNAPSHOT_PATH),
+                forecast_entities,
+                sender: setup.sender.clone(),
+            };
+            tokio::spawn(worker.run());
+        }
 
         // Poll at configured interval (default 60 seconds)
         loop {
             tokio::time::sleep(Duration::from_secs(config.fetch_interval_seconds)).await;
             retry_discovery_if_due(&client, &config, &discovered).await;
             tracing::debug!("📊 Polling solar forecast from HA");
-            let forecast_total = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
-            accuracy.tick(&client, Utc::now(), forecast_total).await;
+            if let Some(setup) = &correction {
+                share_sensors(setup, &discovered).await;
+            }
+            let fetched = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+            record_snapshot(correction.as_ref(), &fetched);
+            accuracy
+                .tick(&client, Utc::now(), fetched.total_today)
+                .await;
         }
     });
+}
+
+/// What the PV forecast correction needs in the fetcher task
+struct CorrectionSetup {
+    site: fluxion_core::pv_correction::CorrectionSite,
+    store: SharedForecastStore,
+    sender: crossbeam_channel::Sender<fluxion_core::pv_correction::CorrectionResult>,
+    /// Discovered total-today sensors, for the worker's bootstrap
+    sensors: SharedSensorList,
+}
+
+/// Publish the current discovered total-today sensors to the correction worker
+async fn share_sensors(setup: &CorrectionSetup, discovered: &Arc<RwLock<DiscoveredSensors>>) {
+    let current = discovered.read().await.total_today.clone();
+    let mut shared = setup.sensors.lock().unwrap_or_else(|e| e.into_inner());
+    if *shared != current {
+        *shared = current;
+    }
+}
+
+/// The correction runs when the option is on and the site and channel exist
+fn correction_setup(
+    config: &fluxion_core::SolarForecastConfigCore,
+    (site, channel): (
+        Option<Res<PvCorrectionSiteResource>>,
+        Option<Res<PvCorrectionChannel>>,
+    ),
+) -> Option<CorrectionSetup> {
+    if !config.pv_forecast_correction_enabled {
+        tracing::info!(
+            "ℹ️ PV forecast correction off (solar_forecast.pv_forecast_correction_enabled)"
+        );
+        return None;
+    }
+    let Some(site) = site.and_then(|s| s.0.clone()) else {
+        tracing::warn!(
+            "⚠️ PV forecast correction: site entities or timezone unknown, factor stays 1.0"
+        );
+        return None;
+    };
+    let channel = channel?;
+    Some(CorrectionSetup {
+        site,
+        store: Arc::new(std::sync::Mutex::new(ForecastStore::load(
+            std::path::Path::new(SNAPSHOT_PATH),
+        ))),
+        sender: channel.sender.clone(),
+        sensors: Arc::new(std::sync::Mutex::new(Vec::new())),
+    })
+}
+
+/// Snapshot today's forecast (raw, as the planner gets it) once after local midnight, only when
+/// every discovered total-today sensor forecast the day
+fn record_snapshot(setup: Option<&CorrectionSetup>, fetched: &Fetched) {
+    let Some(setup) = setup else {
+        return;
+    };
+    let tz = setup.site.timezone;
+    let mut store = setup.store.lock().unwrap_or_else(|e| e.into_inner());
+    if store.record_snapshot(Utc::now(), tz, &fetched.per_sensor_blocks, fetched.sensors) {
+        if let Some(day) = store.days.last() {
+            let kwh: f32 = day.hours.iter().map(|h| h.kwh).sum();
+            tracing::info!(
+                "☀️ PV forecast snapshot for {}: {:.1} kWh over {} hours",
+                day.date,
+                kwh,
+                day.hours.len()
+            );
+        }
+        if let Err(e) = store.save(std::path::Path::new(SNAPSHOT_PATH)) {
+            tracing::warn!("⚠️ Failed to save PV forecast snapshots: {}", e);
+        }
+    }
 }
 
 /// Discover sensors matching the configured patterns
@@ -399,18 +506,28 @@ fn matches_sensor_pattern(entity_id: &str, pattern: &str) -> bool {
     false
 }
 
-/// Fetch and send one solar forecast update. Returns the total-today forecast (kWh) only when
-/// every total-today sensor gave a number; `None` otherwise (not discovered, or a sensor missing).
+/// One fetch: the total-today forecast (kWh) only when every total-today sensor gave a number
+/// (`None` when not discovered, or a sensor is missing), and the per-block forecast sent
+#[derive(Debug, Default)]
+struct Fetched {
+    total_today: Option<f32>,
+    /// Per-block forecast of each sensor that answered (today and tomorrow sensors)
+    per_sensor_blocks: Vec<Vec<(DateTime<Utc>, f32)>>,
+    /// Discovered total-today sensors (one per array)
+    sensors: usize,
+}
+
+/// Fetch and send one solar forecast update
 async fn fetch_and_send_solar_forecast(
     client: &HomeAssistantClient,
     discovered: &Arc<RwLock<DiscoveredSensors>>,
     sender: &crossbeam_channel::Sender<SolarForecastUpdate>,
-) -> Option<f32> {
+) -> Fetched {
     let cache = discovered.read().await;
 
     if !cache.initialized {
         tracing::warn!("⚠️ Solar forecast sensors not yet discovered, skipping fetch");
-        return None;
+        return Fetched::default();
     }
 
     // Fetch states for discovered sensors
@@ -426,7 +543,8 @@ async fn fetch_and_send_solar_forecast(
         .chain(cache.tomorrow.iter())
         .cloned()
         .collect();
-    let block_kwh = fetch_block_kwh(client, &forecast_sensor_ids).await;
+    let per_sensor_blocks = fetch_block_kwh(client, &forecast_sensor_ids).await;
+    let block_kwh = merge_sensor_blocks(&per_sensor_blocks);
 
     // Send update
     let update = SolarForecastUpdate {
@@ -444,20 +562,27 @@ async fn fetch_and_send_solar_forecast(
     );
 
     let _ = sender.send(update);
-    today.complete.then_some(total_today)
+    Fetched {
+        total_today: today.complete.then_some(total_today),
+        per_sensor_blocks,
+        sensors: cache.total_today.len(),
+    }
 }
 
-/// Fetch per-block PV forecast (UTC block start, kWh) summed across the given sensors
+/// Fetch the per-block PV forecast (UTC block start, kWh) of each sensor that answered
 async fn fetch_block_kwh(
     client: &HomeAssistantClient,
     entity_ids: &[String],
-) -> Vec<(DateTime<Utc>, f32)> {
+) -> Vec<Vec<(DateTime<Utc>, f32)>> {
     if entity_ids.is_empty() {
         return Vec::new();
     }
 
     match client.get_states(entity_ids).await {
-        Ok(states) => block_kwh_from_states(&states),
+        Ok(states) => states
+            .iter()
+            .map(|state| sensor_block_kwh(&state.attributes))
+            .collect(),
         Err(e) => {
             tracing::warn!("⚠️ Failed to fetch solar forecast attributes: {}", e);
             Vec::new()
@@ -466,11 +591,21 @@ async fn fetch_block_kwh(
 }
 
 /// Sum per-block PV kWh of all sensors, keyed by UTC block start
+#[cfg(test)]
 fn block_kwh_from_states(states: &[HaEntityState]) -> Vec<(DateTime<Utc>, f32)> {
+    let per_sensor: Vec<Vec<(DateTime<Utc>, f32)>> = states
+        .iter()
+        .map(|state| sensor_block_kwh(&state.attributes))
+        .collect();
+    merge_sensor_blocks(&per_sensor)
+}
+
+/// Sum per-block PV kWh of the sensors, keyed by UTC block start
+fn merge_sensor_blocks(per_sensor: &[Vec<(DateTime<Utc>, f32)>]) -> Vec<(DateTime<Utc>, f32)> {
     let mut per_block: BTreeMap<DateTime<Utc>, f32> = BTreeMap::new();
-    for state in states {
-        for (block_start, kwh) in sensor_block_kwh(&state.attributes) {
-            *per_block.entry(block_start).or_insert(0.0) += kwh;
+    for blocks in per_sensor {
+        for (block_start, kwh) in blocks {
+            *per_block.entry(*block_start).or_insert(0.0) += kwh;
         }
     }
     per_block.into_iter().collect()
@@ -610,9 +745,129 @@ pub fn poll_solar_forecast_channel(
     }
 }
 
+/// Update system: apply the PV forecast correction factor (brief H34) to the forecast data.
+/// The option is checked here too, so with it off the factor is 1.0 whatever arrives.
+pub fn poll_pv_correction_channel(
+    channel: Option<Res<PvCorrectionChannel>>,
+    config: Res<SystemConfig>,
+    mut forecast_data: Option<ResMut<SolarForecastData>>,
+) {
+    let Some(channel) = channel else {
+        return;
+    };
+    let enabled = config.solar_forecast.pv_forecast_correction_enabled;
+    while let Ok(result) = channel.receiver.try_recv() {
+        if let Some(data) = forecast_data.as_mut() {
+            apply_correction(data, enabled, result);
+        }
+    }
+}
+
+/// Store a received correction: none when the option is off, and the factor validated
+/// (finite, within [0.5, 1.5], else 1.0)
+fn apply_correction(
+    data: &mut SolarForecastData,
+    enabled: bool,
+    result: fluxion_core::pv_correction::CorrectionResult,
+) {
+    data.correction = correction_to_apply(enabled, result);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxion_core::pv_correction::CorrectionResult;
+
+    fn correction(factor: f32) -> CorrectionResult {
+        CorrectionResult {
+            factor,
+            days_used: 7,
+            measured_kwh: 117.0,
+            forecast_kwh: 100.0,
+        }
+    }
+
+    #[test]
+    fn received_factor_is_validated_and_dropped_when_off() {
+        let mut data = SolarForecastData::default();
+        apply_correction(&mut data, true, correction(1.17));
+        assert!((data.correction_factor() - 1.17).abs() < 1e-6);
+        for bad in [f32::NAN, f32::INFINITY, 1.6, 0.4, -2.0] {
+            apply_correction(&mut data, true, correction(bad));
+            assert_eq!(data.correction_factor(), 1.0, "{bad}");
+        }
+        apply_correction(&mut data, false, correction(1.17));
+        assert!(data.correction.is_none());
+        assert_eq!(data.correction_factor(), 1.0);
+    }
+
+    /// Per-block forecast of one sensor for one local day: `kwh` in each daylight block
+    fn sensor_day(date: chrono::NaiveDate, kwh: f32) -> Vec<(DateTime<Utc>, f32)> {
+        fluxion_core::backtest::day_block_starts(date, chrono_tz::Europe::Prague)
+            .into_iter()
+            .map(|t| {
+                let hour = chrono::Timelike::hour(&t.with_timezone(&chrono_tz::Europe::Prague));
+                (t, if (8..16).contains(&hour) { kwh } else { 0.0 })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_needs_every_array_sensor_and_a_complete_one_replaces_a_partial() {
+        // Three arrays (_4, _5, _6): today sensors forecast the 19th, tomorrow sensors the 20th
+        let tz = chrono_tz::Europe::Prague;
+        let d19 = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let d20 = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let at = |m: u32| {
+            chrono::TimeZone::with_ymd_and_hms(&tz, 2026, 10, 19, 0, m, 0)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let mut store = ForecastStore::default();
+        // One today sensor did not answer: two of three arrays, no snapshot
+        let partial = vec![
+            sensor_day(d19, 0.25),
+            sensor_day(d19, 0.25),
+            sensor_day(d20, 0.5),
+            sensor_day(d20, 0.5),
+            sensor_day(d20, 0.5),
+        ];
+        assert!(!store.record_snapshot(at(5), tz, &partial, 3));
+        assert!(store.day(d19).is_none());
+        // The next fetch in the window has all three
+        let mut complete = partial.clone();
+        complete.insert(2, sensor_day(d19, 0.25));
+        assert!(store.record_snapshot(at(6), tz, &complete, 3));
+        let day = store.day(d19).unwrap().clone();
+        assert_eq!(day.sensors, 3);
+        let noon = day
+            .hours
+            .iter()
+            .find(|h| chrono::Timelike::hour(&h.start.with_timezone(&tz)) == 12);
+        assert!(
+            (noon.unwrap().kwh - 3.0).abs() < 1e-5,
+            "3 sensors × 4 blocks × 0.25"
+        );
+        // Done for the day
+        assert!(!store.record_snapshot(at(7), tz, &complete, 3));
+
+        // A partial day stored earlier (before the completeness rule) is replaced
+        let mut old = ForecastStore::default();
+        let mut stale = day.clone();
+        stale.sensors = 0;
+        stale.hours.iter_mut().for_each(|h| h.kwh /= 3.0);
+        assert!(old.insert(stale));
+        assert!(old.record_snapshot(at(8), tz, &complete, 3));
+        assert_eq!(old.day(d19).unwrap().sensors, 3);
+        assert_eq!(old.days.len(), 1);
+    }
+
+    #[test]
+    fn merged_forecast_still_sums_every_sensor() {
+        let d19 = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let merged = merge_sensor_blocks(&[sensor_day(d19, 0.25), sensor_day(d19, 0.5)]);
+        assert!(merged.iter().any(|(_, k)| (*k - 0.75).abs() < 1e-6));
+    }
 
     #[test]
     fn test_matches_sensor_pattern_exact() {

@@ -535,14 +535,22 @@ fn printed_totals(run: &ReplayRun) -> String {
 
 #[test]
 fn replay_totals_equal_the_example_on_the_fixture() {
-    // Expected lines are the `winter_reserve_replay` example's output on this fixture before the
-    // replay moved into the library (default flags, and `--profile house`).
-    let (tz, battery, rows) = fixture_rows();
+    // Expected lines are the `winter_reserve_replay` example's output on this fixture (default
+    // flags, and `--profile house`). Like the example (and the live planner), the battery gets
+    // the H30 minimum useful charge from the charge power and the live mode-change debounce.
+    // Brief H33 (solar headroom on daytime grid charges) moved them from 150.67 (wear 13.21)
+    // and 155.46 (wear 12.62).
+    let (tz, mut battery, rows) = fixture_rows();
+    assert!(battery.min_charge_kwh <= 0.0);
+    battery.min_charge_kwh = crate::strategy::winter_reserve::min_charge_kwh(
+        battery.max_charge_kw,
+        ControlConfig::default().min_mode_change_interval_secs,
+    );
     let options = ReplayOptions::new(tz, battery, WinterReserveParams::default());
     let run = replay(&rows, &options).unwrap();
     assert_eq!(
         printed_totals(&run),
-        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 150.67 CZK (wear 13.21)"
+        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 148.63 CZK (wear 13.30)"
     );
     assert_eq!(run.planned_blocks, 863);
     assert_eq!(run.fallback_blocks, 6151);
@@ -556,7 +564,7 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     let run = replay(&rows, &house).unwrap();
     assert_eq!(
         printed_totals(&run),
-        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 155.46 CZK (wear 12.62)"
+        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 156.03 CZK (wear 12.60)"
     );
 }
 

@@ -224,6 +224,54 @@ pub struct PricingFees {
     pub sell_fee_czk: f32,
 }
 
+/// Cost of charge of the battery energy for the dashboard (brief H33)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BatteryCostBasisInfo {
+    /// Usable energy (kWh above the current minimum SOC)
+    pub usable_kwh: f32,
+    /// Cost per kWh delivered (CZK/kWh, losses and wear included); `None` = unknown
+    pub cost_czk_per_kwh: Option<f32>,
+    /// Share of the usable energy from solar / from the grid (%); `None` when empty
+    pub solar_pct: Option<f32>,
+    pub grid_pct: Option<f32>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl BatteryCostBasisInfo {
+    #[must_use]
+    pub fn from_basis(basis: &crate::battery_cost_basis::BatteryCostBasis) -> Self {
+        let solar = basis.solar_share();
+        Self {
+            usable_kwh: basis.usable_kwh,
+            cost_czk_per_kwh: basis.cost_czk_per_kwh,
+            solar_pct: solar.map(|s| s * 100.0),
+            grid_pct: solar.map(|s| (1.0 - s) * 100.0),
+            updated_at: basis.updated_at,
+        }
+    }
+
+    /// Usable energy, rounded for display
+    #[must_use]
+    pub fn usable_text(&self) -> String {
+        format!("{:.1}", self.usable_kwh)
+    }
+
+    /// Cost of charge for display, `None` when unknown
+    #[must_use]
+    pub fn cost_text(&self) -> Option<String> {
+        self.cost_czk_per_kwh.map(|c| format!("{c:.2}"))
+    }
+
+    /// Solar and grid shares (whole percent), `None` when empty
+    #[must_use]
+    pub fn shares_text(&self) -> Option<(String, String)> {
+        Some((
+            format!("{:.0}", self.solar_pct?),
+            format!("{:.0}", self.grid_pct?),
+        ))
+    }
+}
+
 /// Solar forecast data for dashboard display
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SolarForecastInfo {
@@ -240,6 +288,25 @@ pub struct SolarForecastInfo {
     pub accuracy_percent: Option<f32>,
     /// Whether data is available (sensors discovered)
     pub available: bool,
+    /// PV forecast correction in force (brief H34); `None` when off or not computed yet. The
+    /// totals above are the provider's raw values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<crate::pv_correction::CorrectionResult>,
+}
+
+impl SolarForecastInfo {
+    /// The correction that scales the planner's forecast, when it rests on enough days
+    #[must_use]
+    pub fn applied_correction(&self) -> Option<&crate::pv_correction::CorrectionResult> {
+        self.correction.as_ref().filter(|c| c.is_applied())
+    }
+
+    /// Total-today forecast as the planner uses it, when a correction applies
+    #[must_use]
+    pub fn corrected_total_today_kwh(&self) -> Option<f32> {
+        self.applied_correction()
+            .map(|c| self.total_today_kwh * c.factor)
+    }
 }
 
 /// Where the display timezone of a response came from
@@ -300,6 +367,9 @@ pub struct WebQueryResponse {
     pub pricing_fees: Option<PricingFees>,
     /// Solar forecast data
     pub solar_forecast: Option<SolarForecastInfo>,
+    /// Cost of charge of the battery energy (brief H33)
+    #[serde(default)]
+    pub battery_cost_basis: Option<BatteryCostBasisInfo>,
 }
 
 /// Inverter component data bundle
@@ -423,6 +493,10 @@ pub struct PriceBlockData {
     /// `None` for past blocks and where no forecast covers the block
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solar_forecast_kw: Option<f32>,
+    /// The same forecast before the PV forecast correction (brief H34); `None` like
+    /// `solar_forecast_kw`, and when no correction is in force
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solar_forecast_raw_kw: Option<f32>,
     /// Minimum SOC (%) Back Up Mode keeps, for blocks that run as Back Up Mode in the Back Up
     /// default mode (brief H19); `None` otherwise
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -521,6 +595,7 @@ pub fn web_query_system(
     hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
     solar_forecast: Option<Res<crate::async_systems::SolarForecastData>>,
     user_control: Option<Res<UserControlResource>>,
+    cost_basis: Option<Res<crate::battery_cost_basis::BatteryCostTracker>>,
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -530,22 +605,27 @@ pub fn web_query_system(
         );
 
         let response = match request.query_type {
-            QueryType::Dashboard => build_dashboard_response(
-                &debug_config,
-                &system_config,
-                timezone_config.as_deref(),
-                &inverters,
-                &schedule,
-                &price_data,
-                &price_analysis,
-                &battery_history,
-                &pv_history,
-                consumption_history.as_deref(),
-                consumption_history_config.as_deref(),
-                hdo_data.as_deref(),
-                solar_forecast.as_deref(),
-                user_control.as_deref().map(|uc| &uc.state),
-            ),
+            QueryType::Dashboard => WebQueryResponse {
+                battery_cost_basis: cost_basis
+                    .as_deref()
+                    .map(|t| BatteryCostBasisInfo::from_basis(&t.basis)),
+                ..build_dashboard_response(
+                    &debug_config,
+                    &system_config,
+                    timezone_config.as_deref(),
+                    &inverters,
+                    &schedule,
+                    &price_data,
+                    &price_analysis,
+                    &battery_history,
+                    &pv_history,
+                    consumption_history.as_deref(),
+                    consumption_history_config.as_deref(),
+                    hdo_data.as_deref(),
+                    solar_forecast.as_deref(),
+                    user_control.as_deref().map(|uc| &uc.state),
+                )
+            },
         };
 
         // Send response (ignore if receiver dropped)
@@ -815,6 +895,15 @@ fn build_dashboard_response(
                     solar_forecast_data,
                     &price_block_starts,
                 );
+                // Raw forecast only when a correction changes it
+                let solar_forecast_raw_kwh = solar_forecast_data
+                    .filter(|sf| sf.correction.is_some_and(|c| c.is_applied()))
+                    .and_then(|sf| {
+                        crate::async_systems::solar_block_forecast_raw_covered(
+                            Some(sf),
+                            &price_block_starts,
+                        )
+                    });
 
                 // Build price blocks with classification
                 let blocks: Vec<PriceBlockData> = prices
@@ -929,6 +1018,11 @@ fn build_dashboard_response(
                             .filter(|_| block_end > now)
                             // Forecast values are kWh per 15-min block
                             .map(|kwh| kwh * 4.0);
+                        let solar_forecast_raw_kw = solar_forecast_raw_kwh
+                            .as_ref()
+                            .and_then(|f| f.get(idx).copied().flatten())
+                            .filter(|_| block_end > now)
+                            .map(|kwh| kwh * 4.0);
 
                         PriceBlockData {
                             timestamp: block.block_start,
@@ -943,6 +1037,7 @@ fn build_dashboard_response(
                             debug_info,
                             is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
                             solar_forecast_kw,
+                            solar_forecast_raw_kw,
                             backup_min_soc_pct: backup_display_min_soc
                                 .filter(|_| block_type_is_backup),
                         }
@@ -1257,6 +1352,7 @@ fn build_dashboard_response(
             actual_today_kwh: actual_solar_today,
             accuracy_percent,
             available: has_data,
+            correction: sf.correction,
         }
     });
 
@@ -1280,6 +1376,7 @@ fn build_dashboard_response(
         hdo_schedule,
         pricing_fees,
         solar_forecast,
+        battery_cost_basis: None,
     }
 }
 

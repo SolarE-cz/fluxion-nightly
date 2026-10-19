@@ -106,6 +106,11 @@ const REQUIRED_KEYS: &[&str] = &[
     "battery-capacity",
     "battery-input-today",
     "battery-output-today",
+    "battery-cost-basis",
+    "battery-cost-usable-at",
+    "battery-cost-unknown",
+    "battery-cost-solar",
+    "battery-cost-grid",
     // Web - Grid Extended
     "grid-import-power",
     "grid-export-power",

@@ -28,3 +28,4 @@ urlencoding = "2.1"
 
 [dev-dependencies]
 mockito.workspace = true
+tempfile.workspace = true

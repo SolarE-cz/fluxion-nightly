@@ -253,11 +253,12 @@ pub fn update_prices_system(
     plugin_manager_res: Res<PluginManagerResource>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
     solar_forecast: Option<Res<super::SolarForecastData>>,
-    (timezone_config, user_levers, mut last_planner_levers, mut startup_waits): (
+    (timezone_config, user_levers, mut last_planner_levers, mut startup_waits, cost_basis): (
         Option<Res<crate::resources::TimezoneConfig>>,
         Option<Res<crate::resources::UserLeversResource>>,
         Local<Option<UserLevers>>,
         Local<StartupWaits>,
+        Option<Res<crate::battery_cost_basis::BatteryCostTracker>>,
     ),
 ) {
     // A change of the planner levers regenerates the schedule even when prices are fresh
@@ -436,25 +437,23 @@ pub fn update_prices_system(
         .iter()
         .map(|b| b.block_start)
         .collect();
-    let solar_forecast_per_block =
-        super::solar_block_forecast(solar_forecast.as_deref(), &block_starts);
+    // Corrected by the PV forecast correction factor (brief H34) when it is in force
+    let solar = super::planner_solar_inputs(solar_forecast.as_deref(), &block_starts);
 
     let new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
         &schedule_config,
         current_soc,
-        solar_forecast_per_block.as_deref(), // PV forecast per block
-        consumption_forecast.as_deref(),     // Enhanced consumption forecast
+        solar.per_block_kwh.as_deref(),  // PV forecast per block
+        consumption_forecast.as_deref(), // Enhanced consumption forecast
         backup_discharge_min_soc,
         grid_import_today_kwh,
         &plugin_manager,
         hdo_raw_data,
-        solar_forecast.as_ref().map_or(0.0, |s| s.total_today_kwh),
-        solar_forecast
-            .as_ref()
-            .map_or(0.0, |s| s.remaining_today_kwh),
-        solar_forecast.as_ref().map_or(0.0, |s| s.tomorrow_kwh),
+        solar.total_today_kwh,
+        solar.remaining_today_kwh,
+        solar.tomorrow_kwh,
         user_control_state,
         consumption_history
             .hourly_profile()
@@ -466,6 +465,7 @@ pub fn update_prices_system(
             .as_ref()
             .and_then(|tz| tz.timezone.as_deref()),
         active_user_levers(user_levers.as_deref()),
+        cost_basis.as_ref().and_then(|t| t.cost_czk_per_kwh()),
     );
 
     // Update or create PriceAnalysis entity

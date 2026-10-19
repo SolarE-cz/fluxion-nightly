@@ -38,6 +38,11 @@ battery-energy-discharged = Energy Discharged Today
 battery-capacity = Battery Capacity
 battery-input-today = Battery Input Today
 battery-output-today = Battery Output Today
+battery-cost-basis = Battery
+battery-cost-usable-at = usable at
+battery-cost-unknown = cost not known yet
+battery-cost-solar = solar
+battery-cost-grid = grid
 
 # Solar (PV)
 pv-power = PV Power

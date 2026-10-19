@@ -314,7 +314,7 @@ impl Default for ControlConfig {
             max_battery_soc: 100.0,
             maximum_export_power_w: 10000,
             battery_capacity_kwh: 20.0,
-            battery_wear_cost_czk_per_kwh: 0.125,
+            battery_wear_cost_czk_per_kwh: 0.1,
             battery_efficiency: 0.95,
             min_mode_change_interval_secs: 300,
             average_household_load_kw: 1.0,
@@ -1047,7 +1047,8 @@ pub struct WinterReserveConfigCore {
     /// Priority for conflict resolution (0-100, higher wins)
     #[serde(default = "default_winter_reserve_priority")]
     pub priority: u8,
-    /// Minimum profit (CZK/kWh) after all fees for arbitrage export (default: 3.0)
+    /// Minimum profit (CZK/kWh) of a battery export over the battery's cost of charge and wear
+    /// (default: 2.0)
     #[serde(default = "default_wr_min_arbitrage_profit")]
     pub min_arbitrage_profit_czk: f32,
     /// Sell price multiple of cheap_ref above which the night reserve is released (default: 2.0)
@@ -1078,7 +1079,7 @@ fn default_winter_reserve_priority() -> u8 {
     120
 }
 fn default_wr_min_arbitrage_profit() -> f32 {
-    3.0
+    2.0
 }
 fn default_wr_insane_price_multiplier() -> f32 {
     3.0
@@ -1573,6 +1574,11 @@ pub struct SolarForecastConfigCore {
     /// Empty = `sensor.<entity_prefix>_pv_power_total` of every inverter.
     #[serde(default)]
     pub actual_pv_power_entities: Vec<String>,
+
+    /// Scale the PV forecast the planner uses by the 7-day measured/forecast ratio (brief H34).
+    /// Default: true
+    #[serde(default = "default_true")]
+    pub pv_forecast_correction_enabled: bool,
 }
 
 fn default_solar_provider() -> String {
@@ -1589,6 +1595,7 @@ impl Default for SolarForecastConfigCore {
             fetch_interval_seconds: 60,
             provider: default_solar_provider(),
             actual_pv_power_entities: Vec::new(),
+            pv_forecast_correction_enabled: true,
         }
     }
 }

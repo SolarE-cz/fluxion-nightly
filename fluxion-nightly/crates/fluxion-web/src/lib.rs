@@ -566,6 +566,7 @@ async fn stream_handler(
                         next_change_formatted: dashboard.next_change_formatted,
                         consumption_stats: dashboard.consumption_stats,
                         solar_forecast: dashboard.solar_forecast,
+                        battery_cost_basis: dashboard.battery_cost_basis,
                     };
 
                     let html = live_template.render().unwrap_or_else(|e| {
@@ -614,14 +615,22 @@ struct ChartDataJson {
     tariff_known: bool,
     /// Actual PV power (kW) per block from PV history, aligned with `labels`
     pv_actual_kw: Vec<Option<f32>>,
-    /// Forecast PV power (kW) per not-yet-ended block, aligned with `labels`
+    /// Forecast PV power (kW) per not-yet-ended block, aligned with `labels` (corrected)
     solar_forecast_kw: Vec<Option<f32>>,
+    /// The same forecast before the PV forecast correction (brief H34)
+    solar_forecast_raw_kw: Vec<Option<f32>>,
+    /// The PV forecast correction in force: factor, days, measured and forecast kWh
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pv_forecast_correction: Option<fluxion_core::pv_correction::CorrectionResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     solar_forecast_remaining_today_kwh: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     solar_forecast_tomorrow_kwh: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     utc_offset_minutes: Option<i32>,
+    /// Cost of charge of the battery energy (brief H33)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
 }
 
 /// Build the chart refresh JSON from a dashboard response; `None` when there is no price data
@@ -682,9 +691,12 @@ fn build_chart_data_json(response: &WebQueryResponse, i18n: Arc<I18n>) -> Option
         tariff_known: chart.tariff_known,
         pv_actual_kw: chart.pv_actual_kw,
         solar_forecast_kw: chart.solar_forecast_kw,
+        solar_forecast_raw_kw: chart.solar_forecast_raw_kw,
+        pv_forecast_correction: chart.pv_forecast_correction,
         solar_forecast_remaining_today_kwh: solar_remaining,
         solar_forecast_tomorrow_kwh: solar_tomorrow,
         utc_offset_minutes,
+        battery_cost_basis: response.battery_cost_basis,
     })
 }
 
@@ -973,6 +985,7 @@ mod tests {
             debug_info: None,
             is_historical: false,
             solar_forecast_kw,
+            solar_forecast_raw_kw: None,
             backup_min_soc_pct: None,
         }
     }
@@ -1069,6 +1082,7 @@ mod tests {
             hdo_schedule: hdo,
             pricing_fees: None,
             solar_forecast: None,
+            battery_cost_basis: None,
         }
     }
 
@@ -1658,6 +1672,29 @@ mod tests {
     }
 
     #[test]
+    fn chart_json_carries_the_battery_cost_of_charge() {
+        let blocks = vec![block("2026-10-16T10:00:00Z", None)];
+        let mut resp = response(blocks, None);
+        let none = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert!(none.get("battery_cost_basis").is_none());
+        resp.battery_cost_basis = Some(fluxion_core::web_bridge::BatteryCostBasisInfo {
+            usable_kwh: 4.25,
+            cost_czk_per_kwh: Some(1.854),
+            solar_pct: Some(60.0),
+            grid_pct: Some(40.0),
+            updated_at: None,
+        });
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        let basis = &json["battery_cost_basis"];
+        assert!((basis["usable_kwh"].as_f64().unwrap() - 4.25).abs() < 1e-6);
+        assert!((basis["cost_czk_per_kwh"].as_f64().unwrap() - 1.854).abs() < 1e-6);
+        let info = resp.battery_cost_basis.unwrap();
+        assert_eq!(info.usable_text(), "4.2");
+        assert_eq!(info.cost_text().as_deref(), Some("1.85"));
+        assert_eq!(info.shares_text(), Some(("60".into(), "40".into())));
+    }
+
+    #[test]
     fn chart_json_carries_solar_forecast_series() {
         let blocks = vec![
             block("2026-10-16T10:00:00Z", None),
@@ -1683,6 +1720,85 @@ mod tests {
         );
         // No HDO schedule: tariff types are a default, not a known tariff
         assert_eq!(json["tariff_known"], false);
+    }
+
+    /// H34: the chart carries the corrected and the raw forecast, and the factor with its days
+    #[test]
+    fn chart_json_carries_raw_and_corrected_forecast_with_factor() {
+        let mut corrected = block("2026-10-16T10:15:00Z", Some(3.51));
+        corrected.solar_forecast_raw_kw = Some(3.0);
+        let blocks = vec![block("2026-10-16T10:00:00Z", None), corrected];
+        let mut response = response(blocks, None);
+        let correction = fluxion_core::pv_correction::CorrectionResult {
+            factor: 1.17,
+            days_used: 7,
+            measured_kwh: 812.3,
+            forecast_kwh: 694.3,
+        };
+        response.solar_forecast = Some(fluxion_core::web_bridge::SolarForecastInfo {
+            total_today_kwh: 40.0,
+            remaining_today_kwh: 20.0,
+            tomorrow_kwh: 50.0,
+            actual_today_kwh: None,
+            accuracy_percent: None,
+            available: true,
+            correction: Some(correction),
+        });
+        let chart = build_chart_data_json(&response, i18n()).unwrap();
+        let json = serde_json::to_value(&chart).unwrap();
+        assert_eq!(
+            json["solar_forecast_raw_kw"],
+            serde_json::json!([null, 3.0])
+        );
+        let corrected: Vec<Option<f64>> =
+            serde_json::from_value(json["solar_forecast_kw"].clone()).unwrap();
+        assert!((corrected[1].unwrap() - 3.51).abs() < 1e-6);
+        assert!((json["pv_forecast_correction"]["factor"].as_f64().unwrap() - 1.17).abs() < 1e-6);
+        assert_eq!(json["pv_forecast_correction"]["days_used"], 7);
+
+        // The dashboard shows the factor and the days in the solar card, and the raw series
+        let html = DashboardTemplate::from_query_response(response, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("Forecast Correction"));
+        assert!(html.contains("×1.17"));
+        // The raw total, then the corrected one the planner uses (40 × 1.17)
+        assert!(html.contains("→ 46.8 kWh"), "corrected total");
+        assert!(html.contains("(7 days)"));
+        assert!(html.contains("Solar Forecast raw (kW)"));
+        assert!(html.contains(r#"id="solarForecastCorrection""#));
+
+        // Fewer than 3 valid days: "no correction yet", no factor, no corrected total
+        let mut early =
+            super::tests::response(vec![block("2026-10-16T10:00:00Z", Some(1.0))], None);
+        early.solar_forecast = Some(fluxion_core::web_bridge::SolarForecastInfo {
+            total_today_kwh: 40.0,
+            remaining_today_kwh: 20.0,
+            tomorrow_kwh: 50.0,
+            actual_today_kwh: None,
+            accuracy_percent: None,
+            available: true,
+            correction: Some(fluxion_core::pv_correction::CorrectionResult {
+                days_used: 2,
+                ..fluxion_core::pv_correction::CorrectionResult::neutral()
+            }),
+        });
+        let html = DashboardTemplate::from_query_response(early, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("no correction yet (2 days)"), "card");
+        assert!(!html.contains("×1.00"));
+        assert!(!html.contains("→ 40.0 kWh"));
+
+        // Without a correction no raw series and no factor are sent
+        let plain = build_chart_data_json(
+            &super::tests::response(vec![block("2026-10-16T10:00:00Z", Some(1.0))], None),
+            i18n(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("pv_forecast_correction").is_none());
+        assert_eq!(json["solar_forecast_raw_kw"], serde_json::json!([null]));
     }
 
     #[test]

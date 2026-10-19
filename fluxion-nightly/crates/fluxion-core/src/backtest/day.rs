@@ -309,6 +309,27 @@ impl Timeline {
     /// part of the interval has one. The last state holds until `end`.
     #[must_use]
     pub fn mean(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Option<f32> {
+        let (weighted, covered) = self.weighted_sum(start, end);
+        (covered > 0.0).then(|| (weighted / covered) as f32)
+    }
+
+    /// Like `mean`, but `None` unless segments with a value cover at least `min_coverage`
+    /// (0..=1) of `[start, end)`.
+    #[must_use]
+    pub fn mean_covering(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        min_coverage: f64,
+    ) -> Option<f32> {
+        let span = (end - start).num_milliseconds() as f64 / 1000.0;
+        let (weighted, covered) = self.weighted_sum(start, end);
+        (covered > 0.0 && span > 0.0 && covered >= min_coverage * span)
+            .then(|| (weighted / covered) as f32)
+    }
+
+    /// Σ value × seconds and the seconds with a value over `[start, end)`
+    fn weighted_sum(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> (f64, f64) {
         let first = self.index_at(start).unwrap_or(0);
         let mut weighted = 0.0f64;
         let mut covered = 0.0f64;
@@ -327,7 +348,7 @@ impl Timeline {
                 covered += secs;
             }
         }
-        (covered > 0.0).then(|| (weighted / covered) as f32)
+        (weighted, covered)
     }
 }
 

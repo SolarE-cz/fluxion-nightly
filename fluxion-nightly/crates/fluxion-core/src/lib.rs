@@ -13,6 +13,7 @@
 pub mod async_systems;
 pub mod async_tasks;
 pub mod backtest;
+pub mod battery_cost_basis;
 pub mod components;
 pub mod config_events;
 pub mod continuous_systems;
@@ -21,6 +22,7 @@ pub mod debug;
 pub mod execution;
 pub mod plugin_adapters;
 pub mod pricing;
+pub mod pv_correction;
 pub mod resources;
 pub mod savings;
 pub mod scheduling;

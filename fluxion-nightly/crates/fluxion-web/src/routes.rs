@@ -103,8 +103,13 @@ pub struct ChartData {
     /// block has no samples. Aligned with `labels`.
     pub pv_actual_kw: Vec<Option<f32>>,
     /// Forecast PV power (kW) for blocks that have not ended yet; `None` elsewhere.
-    /// Aligned with `labels`.
+    /// Aligned with `labels`. Corrected by the PV forecast correction when one is in force.
     pub solar_forecast_kw: Vec<Option<f32>>,
+    /// The forecast before the PV forecast correction (brief H34); all `None` when no
+    /// correction is in force. Aligned with `labels`.
+    pub solar_forecast_raw_kw: Vec<Option<f32>>,
+    /// The correction in force: factor and the days it rests on
+    pub pv_forecast_correction: Option<fluxion_core::pv_correction::CorrectionResult>,
 }
 
 /// Live data template (for SSE updates only)
@@ -127,6 +132,8 @@ pub struct LiveDataTemplate {
     pub consumption_stats: Option<fluxion_core::web_bridge::ConsumptionStats>,
     /// Solar forecast data
     pub solar_forecast: Option<fluxion_core::web_bridge::SolarForecastInfo>,
+    /// Cost of charge of the battery energy (brief H33)
+    pub battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
 }
 
 impl LiveDataTemplate {
@@ -204,6 +211,8 @@ pub struct DashboardTemplate {
     pub solar_forecast: Option<fluxion_core::web_bridge::SolarForecastInfo>,
     /// User control state for dashboard panel
     pub user_control: Option<UserControlState>,
+    /// Cost of charge of the battery energy (brief H33)
+    pub battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
 }
 
 impl DashboardTemplate {
@@ -275,6 +284,7 @@ impl DashboardTemplate {
             let mut buy_fees = Vec::new();
             let mut effective_prices = Vec::new();
             let mut solar_forecast_kw = Vec::new();
+            let mut solar_forecast_raw_kw = Vec::new();
 
             // Get HDO and pricing fee info from response
             let hdo_schedule = response.hdo_schedule.as_ref();
@@ -317,6 +327,7 @@ impl DashboardTemplate {
                 reasons.push(block.reason.clone());
                 decision_uids.push(block.decision_uid.clone());
                 solar_forecast_kw.push(block.solar_forecast_kw);
+                solar_forecast_raw_kw.push(block.solar_forecast_raw_kw);
 
                 modes.push(display_mode_label(block));
 
@@ -548,6 +559,11 @@ impl DashboardTemplate {
                     tariff_known,
                     pv_actual_kw,
                     solar_forecast_kw,
+                    solar_forecast_raw_kw,
+                    pv_forecast_correction: response
+                        .solar_forecast
+                        .as_ref()
+                        .and_then(|sf| sf.correction),
                 },
             }
         });
@@ -576,6 +592,7 @@ impl DashboardTemplate {
             consumption_stats: response.consumption_stats,
             solar_forecast: response.solar_forecast,
             user_control,
+            battery_cost_basis: response.battery_cost_basis,
         }
     }
 }
@@ -850,6 +867,38 @@ mod tests {
         assert!(!is_time_in_low_tariff("12:00", &periods));
     }
 
+    #[test]
+    fn dashboard_shows_the_battery_cost_of_charge_once() {
+        let inverter = |id: &str| -> InverterData {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "topology": "independent", "mode": "SelfUse", "mode_reason": "",
+                "mode_synced": true, "battery_soc": 50.0, "battery_power_w": 0.0,
+                "battery_voltage_v": 0.0, "battery_current_a": 0.0, "battery_temperature_c": 0.0,
+                "grid_power_w": 0.0, "grid_voltage_v": 0.0, "grid_frequency_hz": 50.0,
+                "pv_power_w": 0.0, "pv1_power_w": 0.0, "pv2_power_w": 0.0,
+                "daily_energy_kwh": 0.0, "total_energy_kwh": 0.0, "online": true,
+                "run_mode": "Normal", "error_code": 0, "inverter_temperature_c": 0.0
+            }))
+            .unwrap()
+        };
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.inverters = vec![inverter("master"), inverter("slave")];
+        response.battery_cost_basis = Some(fluxion_core::web_bridge::BatteryCostBasisInfo {
+            usable_kwh: 4.0,
+            cost_czk_per_kwh: Some(1.854),
+            solar_pct: Some(60.0),
+            grid_pct: Some(40.0),
+            updated_at: None,
+        });
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let html = DashboardTemplate::from_query_response(response, i18n, String::new(), None)
+            .render()
+            .unwrap();
+        let line = "4.0 kWh usable at 1.85 CZK/kWh (solar 60 % / grid 40 %)";
+        assert_eq!(html.matches(line).count(), 1, "{line} once in the page");
+    }
+
     fn response_with_timezone(timezone: Option<&str>, source: TimezoneSource) -> WebQueryResponse {
         WebQueryResponse {
             timestamp: Utc::now(),
@@ -872,6 +921,7 @@ mod tests {
             hdo_schedule: None,
             pricing_fees: None,
             solar_forecast: None,
+            battery_cost_basis: None,
         }
     }
 
@@ -943,6 +993,7 @@ mod tests {
             debug_info: None,
             is_historical: false,
             solar_forecast_kw: None,
+            solar_forecast_raw_kw: None,
             backup_min_soc_pct: None,
         };
         assert_eq!(display_mode_label(&block), "Hold");

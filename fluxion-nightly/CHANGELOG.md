@@ -10,6 +10,17 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.65] - 2026-10-19
+
+### Added
+- Battery cost of charge: FluxION tracks what the energy in the battery cost — solar at the sale it replaced (0 when it could not have been sold), grid at the full buy price, both divided by the round-trip efficiency plus wear — as a weighted average over the usable energy, reset when the battery reaches its minimum. Shown on the dashboard battery card.
+- Self-correcting solar forecast: the Open-Meteo forecast is scaled by measured ÷ forecast PV over the last 7 days (curtailed and incomplete hours excluded, clamped 0.5–1.5, at least 3 valid days). The chart shows the raw and corrected forecast. Option `solar_forecast.pv_forecast_correction_enabled` (default on).
+- Add-on options `control.battery_wear_cost_czk_per_kwh` (default 0.1) and `control.battery_efficiency` (one-way, default 0.95).
+
+### Changed
+- The battery is planned as a buffer: while solar is still expected today, a grid charge stops short of full by the expected solar surplus; late in the day and at night it may fill to 100 % in the cheapest blocks.
+- Battery export (only with `force_discharge_enabled`) requires sell − cost of charge ≥ `min_arbitrage_profit_czk` (default now 2.0) and never goes below the night reserve. Energy left at the end of the plan is valued at the cost of charge, capped at the previous value.
+
 ## [0.2.64] - 2026-10-19
 
 ### Fixed
