@@ -105,6 +105,19 @@ The manufacturer of your inverter. Currently supported:
 The prefix used for Home Assistant entities related to this inverter. For example, if your battery
 capacity sensor is `sensor.solax_battery_capacity`, the prefix would be `solax`.
 
+#### Option: `inverters[].control_entity_prefix`
+
+Optional prefix of the inverter's control entities (`select.*`, `number.*`, `button.*`, `switch.*`,
+`time.*`) when the integration names them differently from the sensors. For example, with sensors
+`sensor.solax_battery_capacity` and controls `select.solax_inverter_charger_use_mode`,
+`select.solax_inverter_lock_state` and `number.solax_inverter_export_control_user_limit`, set
+`entity_prefix: solax` and `control_entity_prefix: solax_inverter`. Sensors (`sensor.*`,
+`binary_sensor.*`) always use `entity_prefix`.
+
+Default: empty (control entities use the same prefix as before). The add-on log shows each
+inverter's `entity prefix` and `control prefix` at startup. Set in the add-on configuration, it also
+applies when the web UI has saved its own configuration.
+
 #### Option: `inverters[].topology`
 
 Defines the inverter's role in multi-inverter setups:
@@ -212,6 +225,22 @@ Fine-tune FluxION's control behavior.
 Maximum power (in watts) that can be exported to the grid.
 
 Default value: `10000`
+
+#### Option: `control.mode_control_enabled`
+
+When `false`, FluxION only curtails export: while the sell price is at or below
+`export_curtail_at_or_below_czk` (with `export_curtailment_enabled: true`) it sets the inverter's
+export limit to `export_limit_min_w` and restores the limit it read before once the price is above
+the threshold. It writes nothing else: no work mode, Back Up minimum SOC, HotStandBy, battery
+awaken or pre-wake, and no unlock on a lock event (the export limit write still unlocks a Locked
+inverter first when `auto_unlock_inverter` is on). Planning, prices, alerts and the dashboard keep
+running; the dashboard header shows "mode control off". The FluxION kill switch and the
+"Zakázat Automatizaci" lever still stop curtailment. Curtailment needs a known export limit above
+0 W to restore: set the inverter's export limit above 0 W first. Set in the add-on configuration,
+it also applies when the web UI has saved its own configuration. A change needs an add-on restart
+(saving the add-on configuration restarts it); the web UI cannot change it while FluxION runs.
+
+Default value: `true`
 
 #### Option: `control.update_interval_secs`
 

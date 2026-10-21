@@ -242,3 +242,81 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
         "Schedule should not be created for System config changes"
     );
 }
+
+/// Brief H37: a config update cannot change `control.mode_control_enabled` at runtime (the inverter
+/// adapter took it at startup); the rest of the update still applies
+#[test]
+fn test_config_update_keeps_running_mode_control() {
+    let mut app = App::new();
+    let mut config = SystemConfig {
+        inverters: vec![],
+        pricing_config: fluxion_core::PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_string(),
+            tomorrow_price_entity: None,
+            buy_price_entity: None,
+            use_spot_prices_to_buy: true,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_core::PriceSchedule::Flat(4.0),
+            fixed_sell_price_czk: fluxion_core::PriceSchedule::Flat(2.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        },
+        control_config: fluxion_core::ControlConfig {
+            max_battery_soc: 90.0,
+            mode_control_enabled: false,
+            ..Default::default()
+        },
+        system_config: fluxion_core::SystemSettingsConfig {
+            update_interval_secs: 60,
+            debug_mode: true,
+            display_currency: fluxion_core::Currency::CZK,
+            language: Language::English,
+            timezone: None,
+            display_timezone: None,
+        },
+        strategies_config: Default::default(),
+        history: Default::default(),
+        solar_forecast: Default::default(),
+        remote_access: Default::default(),
+        notifications: Default::default(),
+    };
+    let (config_sender, config_channel) = ConfigUpdateSender::new();
+    let plugin_manager =
+        create_plugin_manager(Some(&config.strategies_config), &config.control_config);
+    app.insert_resource(config.clone());
+    app.insert_resource(config_channel);
+    app.insert_resource(DebugModeConfig::default());
+    app.insert_resource(ConsumptionHistory::default());
+    app.insert_resource(PluginManagerResource(Arc::new(RwLock::new(plugin_manager))));
+
+    // Both ways: off stays off, and after a restart with it on, on stays on
+    for (running, requested) in [(false, true), (true, false)] {
+        app.world_mut()
+            .resource_mut::<SystemConfig>()
+            .control_config
+            .mode_control_enabled = running;
+        config.control_config.mode_control_enabled = requested;
+        config.control_config.max_battery_soc = if running { 95.0 } else { 100.0 };
+        let mut changed_sections = HashSet::new();
+        changed_sections.insert(ConfigSection::Control);
+        config_sender
+            .send_update(ConfigUpdateEvent::new(
+                serde_json::to_value(&config).unwrap(),
+                changed_sections,
+            ))
+            .unwrap();
+        app.world_mut()
+            .run_system_once(fluxion_core::async_systems::config_event_handler)
+            .unwrap();
+
+        let after = app.world().resource::<SystemConfig>();
+        assert_eq!(after.control_config.mode_control_enabled, running);
+        assert_eq!(
+            after.control_config.max_battery_soc,
+            config.control_config.max_battery_soc
+        );
+    }
+}

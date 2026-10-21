@@ -33,6 +33,10 @@ pub struct HaConfig {
     /// Optional prefix for inverter entities, e.g. "solax_inverter_1".
     /// The entity_id will be formatted as: `${prefix}_manual_mode_select`
     pub inverter_prefix: String,
+    /// Prefix of the control entities (`select.*`, `number.*`, ...) when it differs from
+    /// `inverter_prefix` (brief H36). Empty = `inverter_prefix`.
+    #[serde(default)]
+    pub control_prefix: String,
     /// Polling interval for reading entities
     pub polling_interval: Duration,
 }
@@ -43,8 +47,19 @@ impl Default for HaConfig {
             base_url: "http://homeassistant.local:8123".to_string(),
             token: None,
             inverter_prefix: "solax".to_string(),
+            control_prefix: String::new(),
             polling_interval: Duration::from_secs(5),
         }
+    }
+}
+
+impl HaConfig {
+    /// Prefix of the control entities: `control_prefix`, else `inverter_prefix` (brief H36)
+    #[must_use]
+    pub fn control_prefix(&self) -> &str {
+        Some(self.control_prefix.trim())
+            .filter(|p| !p.is_empty())
+            .unwrap_or(&self.inverter_prefix)
     }
 }
 
@@ -180,9 +195,10 @@ fn ha_poll_select_manual_mode_system(
     }
     ticker.0 = Some(now);
 
-    // Compute the list of prefixes to poll: per-entity if present, otherwise global cfg
+    // Compute the list of prefixes to poll: per-entity if present, otherwise the global control
+    // prefix (the manual mode select is a control entity, brief H36)
     let prefixes: Vec<String> = if q_prefixes.is_empty() {
-        vec![cfg.inverter_prefix.clone()]
+        vec![cfg.control_prefix().to_owned()]
     } else {
         q_prefixes.iter().map(|p| p.0.clone()).collect()
     };
@@ -352,7 +368,11 @@ fn spawn_backup_soc_fetcher(
         return;
     };
 
-    let entity_prefix = first_inverter.entity_prefix.clone();
+    // A number entity: the control prefix when one is set (brief H36)
+    let entity_prefix = first_inverter
+        .control_prefix_override()
+        .unwrap_or(&first_inverter.entity_prefix)
+        .to_owned();
     let client = client_res.0.clone();
     let sender = sender_res.sender.clone();
     let hardware_min_soc = system_config.control_config.hardware_min_battery_soc;
@@ -890,6 +910,18 @@ pub fn poll_hdo_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Brief H36: the lock and manual-mode polls use the control prefix, else the entity prefix
+    #[test]
+    fn ha_config_control_prefix_falls_back_to_the_entity_prefix() {
+        let mut cfg = HaConfig::default();
+        assert_eq!(cfg.control_prefix(), "solax");
+        cfg.control_prefix = " ".to_owned();
+        assert_eq!(cfg.control_prefix(), "solax");
+        cfg.control_prefix = "solax_inverter".to_owned();
+        assert_eq!(cfg.control_prefix(), "solax_inverter");
+        assert_eq!(cfg.inverter_prefix, "solax");
+    }
 
     /// Test parsing CEZ HDO sensor format with response_json.data.signals structure
     #[test]

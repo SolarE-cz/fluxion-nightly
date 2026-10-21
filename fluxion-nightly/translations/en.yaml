@@ -21,6 +21,12 @@ configuration:
     name: Entity Prefix
     description: >-
       The prefix used for Home Assistant entities related to this inverter.
+  control_entity_prefix:
+    name: Control Entity Prefix
+    description: >-
+      Prefix of this inverter's control entities (select, number, button, switch,
+      time) when it differs from the entity prefix, e.g. solax_inverter for
+      select.solax_inverter_charger_use_mode. Empty = the entity prefix.
   topology:
     name: Topology
     description: >-
@@ -92,6 +98,10 @@ configuration:
   maximum_export_power_w:
     name: Maximum Export Power (W)
     description: Maximum power (in watts) that can be exported to the grid.
+  mode_control_enabled:
+    name: Mode Control
+    description: >-
+      When off, FluxION only curtails export (export limit 0 W at or below the curtail price, restored afterwards) and never writes the work mode, Back Up minimum SOC, HotStandBy or battery awaken. Default on.
   update_interval_secs:
     name: Update Interval (seconds)
     description: >-

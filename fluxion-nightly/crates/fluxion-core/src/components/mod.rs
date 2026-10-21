@@ -175,7 +175,7 @@ pub struct PendingCommand {
 }
 
 /// Commands that can be sent to an inverter
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InverterCommand {
     /// Set operation mode
     SetMode(InverterOperationMode),

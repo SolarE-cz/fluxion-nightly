@@ -343,11 +343,18 @@ pub fn resolve_display_timezone(
     }
 }
 
+fn mode_control_default() -> bool {
+    true
+}
+
 /// Response containing ECS component data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebQueryResponse {
     pub timestamp: DateTime<Utc>,
     pub debug_mode: bool,
+    /// `control.mode_control_enabled` (brief H37); false = FluxION only curtails export
+    #[serde(default = "mode_control_default")]
+    pub mode_control_enabled: bool,
     pub inverters: Vec<InverterData>,
     pub schedule: Option<ScheduleData>,
     pub prices: Option<PriceData>,
@@ -1377,6 +1384,7 @@ fn build_dashboard_response(
     WebQueryResponse {
         timestamp: now,
         debug_mode: debug_config.is_enabled(),
+        mode_control_enabled: system_config.control_config.mode_control_enabled,
         inverters: inverter_data,
         schedule: schedule_data,
         prices: price_data_result,

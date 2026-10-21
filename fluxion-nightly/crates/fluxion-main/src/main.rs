@@ -147,7 +147,11 @@ fn pv_correction_site(
         .iter()
         .find(|inv| inv.topology != "slave")
         .or(config.inverters.first())?;
-    let mapper = fluxion_adapters::create_entity_mapper(master.inverter_type);
+    // The export limit is a number entity: control prefix when set (brief H36)
+    let mapper = fluxion_adapters::create_entity_mapper_with_control(
+        master.inverter_type,
+        config.control_prefixes(),
+    );
     let mut pv = vec![mapper.get_pv_power_entity(&master.id)];
     pv.extend(
         config::AppConfig::pv_extra_prefixes(master)
@@ -200,6 +204,18 @@ fn initialize_and_run() -> Result<()> {
             "     - {} ({}) - {} [{}]",
             inv.id, inv.inverter_type, inv.entity_prefix, inv.topology
         );
+        // Brief H36: sensors use the entity prefix, select/number/button/switch/time entities
+        // the control prefix (the inverter id where the control prefix is empty, as before)
+        info!(
+            "       {}: entity prefix {}, control prefix {}",
+            inv.id,
+            inv.entity_prefix,
+            inv.control_prefix_override().unwrap_or(&inv.id)
+        );
+    }
+    if !config.control.mode_control_enabled {
+        // Brief H37: only the export limit is written (curtail at or below the threshold)
+        info!("Mode control disabled: FluxION only curtails export");
     }
     info!("   Spot price entity: {}", config.pricing.spot_price_entity);
     info!(
@@ -263,7 +279,10 @@ fn initialize_and_run() -> Result<()> {
         .first()
         .map(|inv| inv.inverter_type)
         .expect("No inverters configured");
-    let mapper = fluxion_adapters::create_entity_mapper(inverter_type);
+    let mapper = fluxion_adapters::create_entity_mapper_with_control(
+        inverter_type,
+        config.control_prefixes(),
+    );
     info!(
         "📦 Using {} entity mapper",
         mapper.vendor_name().display_name()
@@ -272,6 +291,7 @@ fn initialize_and_run() -> Result<()> {
     // Create data sources
     let actuation_guard = fluxion_adapters::ha::actuation::ActuationGuardConfig {
         auto_unlock: config.control.auto_unlock_inverter,
+        mode_control_enabled: config.control.mode_control_enabled,
         ..Default::default()
     };
     // Read-only PV of parallel units, added to their inverter's PV (never written to)
@@ -541,9 +561,21 @@ fn initialize_and_run() -> Result<()> {
             .find(|inv| inv.topology != "slave")
             .or(config.inverters.first())
             .map_or_else(|| "solax".to_string(), |inv| inv.entity_prefix.clone()),
+        control_prefix: config
+            .inverters
+            .iter()
+            .find(|inv| inv.topology != "slave")
+            .or(config.inverters.first())
+            .and_then(|inv| inv.control_prefix_override())
+            .unwrap_or_default()
+            .to_owned(),
         ..Default::default()
     };
-    info!("   HA entity prefix: {}", ha_config.inverter_prefix);
+    info!(
+        "   HA entity prefix: {}, control prefix: {}",
+        ha_config.inverter_prefix,
+        ha_config.control_prefix()
+    );
 
     let mut app = App::new();
     app

@@ -47,12 +47,26 @@ pub struct InverterConfig {
     pub id: String,
     pub inverter_type: InverterType,
     pub entity_prefix: String,
+    /// Prefix of the control entities (`select.*`, `number.*`, `button.*`, `switch.*`, `time.*`)
+    /// when the integration names them differently from the sensors (brief H36), e.g. sensors
+    /// `sensor.solax_*` and controls `select.solax_inverter_*`. Empty = the same prefix as today.
+    #[serde(default)]
+    pub control_entity_prefix: String,
     pub topology: InverterTopology,
     /// Read-only entity prefixes of parallel units (e.g. a SolaX parallel slave) whose PV power
     /// and solar energy are added to this inverter's PV readings. Never written to, and not part
     /// of battery, house-load or control reads.
     #[serde(default)]
     pub pv_extra_prefixes: Vec<String>,
+}
+
+impl InverterConfig {
+    /// The configured control prefix, or `None` when it is empty (controls then keep the prefix
+    /// each call site used before brief H36)
+    #[must_use]
+    pub fn control_prefix_override(&self) -> Option<&str> {
+        Some(self.control_entity_prefix.trim()).filter(|p| !p.is_empty())
+    }
 }
 
 /// Inverter topology for multi-inverter setups
@@ -244,6 +258,12 @@ pub struct ControlConfig {
     /// Keep the HotStandBy setting on (checked at startup and every 5 minutes). Default: true
     #[serde(default = "default_true")]
     pub ensure_hot_standby: bool,
+
+    /// FluxION writes inverter modes (brief H37). When false it only curtails export: no work
+    /// mode, Back Up minimum SOC, HotStandBy, awaken or lock writes outside the export limit
+    /// write. Planning and the dashboard keep running. Default: true
+    #[serde(default = "default_true")]
+    pub mode_control_enabled: bool,
 }
 
 // Default value functions for serde
@@ -334,6 +354,7 @@ impl Default for ControlConfig {
             auto_unlock_inverter: true,
             hot_standby_entity: None,
             ensure_hot_standby: true,
+            mode_control_enabled: true,
         }
     }
 }

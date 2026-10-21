@@ -18,6 +18,7 @@ pub use entity_mapper::{SolaxEntityMapper, SolaxUltraEntityMapper};
 pub use modes::{SolaxChargerUseMode, SolaxManualMode};
 pub use variant::{detect_inverter_type, detect_variant};
 
+use crate::control_prefix::ControlPrefixes;
 use fluxion_core::{InverterType, VendorEntityMapper};
 use std::sync::Arc;
 
@@ -32,8 +33,19 @@ use std::sync::Arc;
 /// # Panics
 /// Panics if an unsupported inverter type is passed (should never happen with the enum)
 pub fn create_entity_mapper(inverter_type: InverterType) -> Arc<dyn VendorEntityMapper> {
+    create_entity_mapper_with_control(inverter_type, ControlPrefixes::new())
+}
+
+/// Entity mapper whose control entities use the per-inverter control prefixes (brief H36).
+/// With empty `control` it maps exactly like [`create_entity_mapper`].
+pub fn create_entity_mapper_with_control(
+    inverter_type: InverterType,
+    control: ControlPrefixes,
+) -> Arc<dyn VendorEntityMapper> {
     match inverter_type {
-        InverterType::Solax => Arc::new(SolaxEntityMapper::new()),
-        InverterType::SolaxUltra => Arc::new(SolaxUltraEntityMapper::new()),
+        InverterType::Solax => Arc::new(SolaxEntityMapper::with_control_prefixes(control)),
+        InverterType::SolaxUltra => {
+            Arc::new(SolaxUltraEntityMapper::with_control_prefixes(control))
+        }
     }
 }

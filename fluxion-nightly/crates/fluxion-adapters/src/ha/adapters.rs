@@ -144,12 +144,13 @@ impl HomeAssistantInverterAdapter {
         self.actuation.clone()
     }
 
-    /// Set `number.<inverter>_backup_discharge_min_soc` to `target` only when it differs (brief
-    /// H19). A failed read fails the write, so Back Up Mode never starts with an unknown minimum.
-    async fn sync_backup_min_soc(&self, inverter_id: &str, target: u8) -> Result<()> {
+    /// Set `number.<control prefix>_backup_discharge_min_soc` to `target` only when it differs
+    /// (brief H19). A failed read fails the write, so Back Up Mode never starts with an unknown
+    /// minimum.
+    async fn sync_backup_min_soc(&self, control_prefix: &str, target: u8) -> Result<()> {
         let entity_id = format!(
             "number.{}_backup_discharge_min_soc",
-            inverter_id.replace('.', "_")
+            control_prefix.replace('.', "_")
         );
         let state = self
             .client
@@ -180,11 +181,11 @@ impl HomeAssistantInverterAdapter {
 
     /// Read backup_discharge_min_soc sensor from HA
     /// Returns the minimum SOC for battery discharge configured in HA
-    /// Sensor: number.<prefix>_backup_discharge_min_soc
-    pub async fn read_backup_discharge_min_soc(&self, entity_prefix: &str) -> Result<f32> {
+    /// Entity: number.<control prefix of `inverter_id`>_backup_discharge_min_soc (brief H36)
+    pub async fn read_backup_discharge_min_soc(&self, inverter_id: &str) -> Result<f32> {
         let entity_id = format!(
             "number.{}_backup_discharge_min_soc",
-            entity_prefix.replace(".", "_")
+            self.mapper.control_prefix(inverter_id).replace('.', "_")
         );
         self.read_sensor_float(&entity_id).await
     }
@@ -477,6 +478,27 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
     }
 
     async fn write_command(&self, inverter_id: &str, command: &InverterCommand) -> Result<()> {
+        // Control entities (lock, Back Up minimum, awaken button) use the control prefix
+        // (brief H36); the mapper resolves its own mode and export limit entities the same way
+        let control_prefix = self.mapper.control_prefix(inverter_id);
+
+        // Mode control off (brief H37): only the export limit is written. Checked before the
+        // unlock, so a refused mode write never touches the lock either.
+        if !actuation::command_allowed(&self.guard, command) {
+            if self.actuation.first_mode_refusal() {
+                warn!(
+                    "Mode control disabled: refusing {:?} for {} (mode, Back Up minimum SOC and awaken writes are not sent; logged once)",
+                    command, inverter_id
+                );
+            } else {
+                debug!(
+                    "Mode control disabled: refusing {:?} for {}",
+                    command, inverter_id
+                );
+            }
+            anyhow::bail!("mode control disabled; {command:?} not written to {inverter_id}");
+        }
+
         info!(
             "📝 [ADAPTER] Writing command to {}: {:?}",
             inverter_id, command
@@ -484,13 +506,14 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
 
         // Pre-actuation guard (brief H11): the single choke point for every SolaX write.
         // Unlock before any write, including export limits; the write is skipped on error.
-        actuation::ensure_unlocked(&self.client, inverter_id, &self.guard).await?;
+        actuation::ensure_unlocked(&self.client, inverter_id, control_prefix, &self.guard).await?;
 
         // Back Up Mode: the minimum SOC is synced first, then the mode is written as SetMode
         let mode_command;
         let command = match command {
             InverterCommand::SetBackupMode { min_soc_pct } => {
-                self.sync_backup_min_soc(inverter_id, *min_soc_pct).await?;
+                self.sync_backup_min_soc(control_prefix, *min_soc_pct)
+                    .await?;
                 mode_command = InverterCommand::SetMode(InverterOperationMode::BackUpMode);
                 &mode_command
             }
@@ -500,7 +523,13 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
         match command {
             InverterCommand::SetMode(mode) => {
                 if *mode == InverterOperationMode::ForceCharge {
-                    actuation::ensure_awake(&self.client, inverter_id, &self.actuation).await;
+                    actuation::ensure_awake(
+                        &self.client,
+                        inverter_id,
+                        control_prefix,
+                        &self.actuation,
+                    )
+                    .await;
                 }
 
                 // Get all entity changes needed from vendor mapper
@@ -1430,6 +1459,7 @@ mod tests {
             charge_check_delay: Duration::from_secs(3600),
             run_mode_wait: Duration::from_secs(3600),
             run_mode_poll: Duration::from_millis(10),
+            mode_control_enabled: true,
         }
     }
 
@@ -2026,6 +2056,269 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec!["button", "write", "write"]);
         press.assert_async().await;
         write.assert_async().await;
+    }
+
+    // ---- Separate control prefix (brief H36) ----
+
+    /// Adapter for an install with sensors `sensor.solax_*` and controls `*.solax_inverter_*`
+    fn control_prefix_adapter(url: String) -> HomeAssistantInverterAdapter {
+        let client = Arc::new(HomeAssistantClient::new(url, "test_token").unwrap());
+        let control = crate::ControlPrefixes::new().with_inverter("solax", "solax_inverter");
+        HomeAssistantInverterAdapter::new(
+            client,
+            crate::solax::create_entity_mapper_with_control(
+                fluxion_core::InverterType::Solax,
+                control,
+            ),
+        )
+        .with_guard(guard(true))
+    }
+
+    #[tokio::test]
+    async fn control_prefix_reads_sensors_and_controls_from_their_prefixes() {
+        let mut server = Server::new_async().await;
+        for (entity, state) in [
+            ("sensor.solax_battery_capacity", "60"),
+            ("sensor.solax_grid_import", "0"),
+            ("sensor.solax_battery_power_charge", "839"),
+            ("sensor.solax_pv_power_total", "1335"),
+            ("sensor.solax_house_load", "447"),
+            ("select.solax_inverter_charger_use_mode", "Self Use Mode"),
+            ("number.solax_inverter_export_control_user_limit", "3900"),
+        ] {
+            mock_state(&mut server, entity, state).await;
+        }
+        let wrong = server
+            .mock(
+                "GET",
+                Matcher::Regex(
+                    r"^/api/states/(select|number|button|switch|time)\.solax_[a-hj-z]".to_owned(),
+                ),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let state = control_prefix_adapter(server.url())
+            .read_state("solax")
+            .await
+            .unwrap();
+
+        assert!((state.battery_soc - 60.0).abs() < 0.01);
+        assert_eq!(state.work_mode, InverterOperationMode::SelfUse);
+        assert_eq!(state.house_load_w, Some(447.0));
+        assert_eq!(state.export_limit_w, Some(3900));
+        wrong.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn control_prefix_writes_every_control_entity_with_it() {
+        let mut server = Server::new_async().await;
+        mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+        mock_state(&mut server, "sensor.solax_run_mode", "Idle").await;
+        mock_state(
+            &mut server,
+            "number.solax_inverter_backup_discharge_min_soc",
+            "20",
+        )
+        .await;
+        server
+            .mock(
+                "GET",
+                "/api/states/number.solax_inverter_export_control_user_limit",
+            )
+            .with_body(
+                r#"{"entity_id":"number.solax_inverter_export_control_user_limit","state":"0","attributes":{"max":10000},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let wrong_reads = server
+            .mock(
+                "GET",
+                Matcher::Regex(
+                    r"^/api/states/(select|number|button|switch|time)\.solax_[a-hj-z]".to_owned(),
+                ),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let wrong_writes = server
+            .mock("POST", Matcher::Regex(r"^/api/services/".to_owned()))
+            .match_body(Matcher::Regex(
+                r#""(select|number|button|switch|time)\.solax_[a-hj-z]"#.to_owned(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+        let mut expected = Vec::new();
+        for (service, entity) in [
+            ("button/press", "button.solax_inverter_battery_awaken"),
+            (
+                "select/select_option",
+                "select.solax_inverter_charger_use_mode",
+            ),
+            (
+                "select/select_option",
+                "select.solax_inverter_manual_mode_select",
+            ),
+            (
+                "number/set_value",
+                "number.solax_inverter_export_control_user_limit",
+            ),
+            (
+                "number/set_value",
+                "number.solax_inverter_backup_discharge_min_soc",
+            ),
+        ] {
+            expected.push(
+                server
+                    .mock("POST", format!("/api/services/{service}").as_str())
+                    .match_body(Matcher::PartialJson(json!({ "entity_id": entity })))
+                    .with_body_from_request(|_| b"[]".to_vec())
+                    .expect_at_least(1)
+                    .create_async()
+                    .await,
+            );
+        }
+        let adapter = control_prefix_adapter(server.url());
+
+        for command in [
+            InverterCommand::SetMode(InverterOperationMode::ForceCharge),
+            InverterCommand::SetExportLimit(5000),
+            InverterCommand::SetBackupMode { min_soc_pct: 30 },
+        ] {
+            adapter.write_command("solax", &command).await.unwrap();
+        }
+
+        for mock in expected {
+            mock.assert_async().await;
+        }
+        wrong_reads.assert_async().await;
+        wrong_writes.assert_async().await;
+    }
+
+    // ---- Mode control off (brief H37): only the export limit is written ----
+
+    #[tokio::test]
+    async fn mode_control_off_refuses_mode_writes_and_keeps_the_export_limit_write() {
+        let mut server = Server::new_async().await;
+        // Locked on the first read only: a mode command that reached the lock guard would use
+        // it up and the export limit write would then not need to unlock
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_count = reads.clone();
+        let lock_read = server
+            .mock("GET", "/api/states/select.solax_lock_state")
+            .with_body_from_request(move |_| {
+                let n = read_count.fetch_add(1, AtomicOrdering::SeqCst);
+                let state = if n == 0 { "Locked" } else { "Unlocked" };
+                state_body("select.solax_lock_state", state)
+            })
+            .expect(2)
+            .create_async()
+            .await;
+        mock_state(&mut server, "sensor.solax_run_mode", "Standby Mode").await;
+        mock_state(&mut server, "number.solax_backup_discharge_min_soc", "20").await;
+        server
+            .mock("GET", "/api/states/number.solax_export_control_user_limit")
+            .with_body(
+                r#"{"entity_id":"number.solax_export_control_user_limit","state":"8000","attributes":{"max":10000},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _notify = server
+            .mock("POST", "/api/services/persistent_notification/create")
+            .with_body_from_request(|_| b"[]".to_vec())
+            .create_async()
+            .await;
+        let unlock = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_body(Matcher::PartialJson(json!({
+                "entity_id": "select.solax_lock_state", "option": "Unlocked"
+            })))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+        let export_write = server
+            .mock("POST", "/api/services/number/set_value")
+            .match_body(Matcher::PartialJson(json!({
+                "entity_id": "number.solax_export_control_user_limit", "value": 0
+            })))
+            .with_body_from_request(|_| b"[]".to_vec())
+            .expect(1)
+            .create_async()
+            .await;
+        let mut refused = Vec::new();
+        for (service, entity) in [
+            ("select/select_option", "select.solax_charger_use_mode"),
+            ("select/select_option", "select.solax_manual_mode_select"),
+            ("number/set_value", "number.solax_backup_discharge_min_soc"),
+            ("button/press", "button.solax_battery_awaken"),
+        ] {
+            refused.push(
+                server
+                    .mock("POST", format!("/api/services/{service}").as_str())
+                    .match_body(Matcher::PartialJson(json!({ "entity_id": entity })))
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "test_token").unwrap());
+        let adapter = HomeAssistantInverterAdapter::new(
+            client,
+            Arc::new(crate::solax::SolaxEntityMapper::new()),
+        )
+        .with_guard(ActuationGuardConfig {
+            mode_control_enabled: false,
+            ..guard(true)
+        });
+
+        for _ in 0..2 {
+            for command in [
+                InverterCommand::SetMode(InverterOperationMode::ForceCharge),
+                InverterCommand::SetMode(InverterOperationMode::SelfUse),
+                InverterCommand::SetMode(InverterOperationMode::NoChargeNoDischarge),
+                InverterCommand::SetBackupMode { min_soc_pct: 30 },
+            ] {
+                assert!(adapter.write_command("solax", &command).await.is_err());
+            }
+        }
+        // The curtailment write keeps its unlock-if-needed step
+        adapter
+            .write_command("solax", &InverterCommand::SetExportLimit(0))
+            .await
+            .unwrap();
+
+        lock_read.assert_async().await;
+        unlock.assert_async().await;
+        export_write.assert_async().await;
+        for mock in refused {
+            mock.assert_async().await;
+        }
+    }
+
+    #[test]
+    fn only_the_export_limit_is_allowed_with_mode_control_off() {
+        let off = ActuationGuardConfig {
+            mode_control_enabled: false,
+            ..ActuationGuardConfig::default()
+        };
+        let on = ActuationGuardConfig::default();
+        assert!(on.mode_control_enabled);
+        for command in [
+            InverterCommand::SetMode(InverterOperationMode::ForceCharge),
+            InverterCommand::SetMode(InverterOperationMode::BackUpMode),
+            InverterCommand::SetBackupMode { min_soc_pct: 20 },
+        ] {
+            assert!(!actuation::command_allowed(&off, &command));
+            assert!(actuation::command_allowed(&on, &command));
+        }
+        assert!(actuation::command_allowed(
+            &off,
+            &InverterCommand::SetExportLimit(0)
+        ));
     }
 }
 

@@ -189,6 +189,8 @@ fn format_in_display_tz(ts: DateTime<Utc>, tz: Option<Tz>, fmt: &str) -> String 
 #[template(path = "index.html", escape = "none")]
 pub struct DashboardTemplate {
     pub debug_mode: bool,
+    /// False when FluxION only curtails export (brief H37); the header shows "mode control off"
+    pub mode_control_enabled: bool,
     pub inverters: Vec<InverterData>,
     pub schedule: Option<ScheduleData>,
     pub prices: Option<PriceDataWithChart>,
@@ -584,6 +586,7 @@ impl DashboardTemplate {
 
         Self {
             debug_mode: response.debug_mode,
+            mode_control_enabled: response.mode_control_enabled,
             inverters: response.inverters,
             schedule: response.schedule,
             prices,
@@ -876,6 +879,25 @@ mod tests {
         assert!(!is_time_in_low_tariff("12:00", &periods));
     }
 
+    /// Brief H37: the header says "mode control off" when FluxION only curtails export
+    #[test]
+    fn dashboard_header_marks_mode_control_off() {
+        for (enabled, shown) in [(false, true), (true, false)] {
+            let mut response =
+                response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+            response.mode_control_enabled = enabled;
+            let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+            let html = DashboardTemplate::from_query_response(response, i18n, String::new(), None)
+                .render()
+                .unwrap();
+            assert_eq!(
+                html.contains("mode control off"),
+                shown,
+                "enabled={enabled}"
+            );
+        }
+    }
+
     #[test]
     fn dashboard_shows_the_battery_cost_of_charge_once() {
         let inverter = |id: &str| -> InverterData {
@@ -912,6 +934,7 @@ mod tests {
         WebQueryResponse {
             timestamp: Utc::now(),
             debug_mode: false,
+            mode_control_enabled: true,
             inverters: vec![],
             schedule: None,
             prices: None,

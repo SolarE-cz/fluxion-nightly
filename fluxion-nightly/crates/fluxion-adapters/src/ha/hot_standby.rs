@@ -365,22 +365,38 @@ pub fn spawn_hot_standby_resolver(
         info!("HotStandBy guard disabled (control.ensure_hot_standby: false)");
         return;
     }
+    if !config.control_config.mode_control_enabled {
+        info!("Mode control disabled: HotStandBy guard inactive (no HotStandBy writes)");
+        return;
+    }
     let tx = channel.tx.clone();
     // The configured entity is one entity, so it applies to the first inverter only
     let configured = config.control_config.hot_standby_entity.clone();
-    let mut inverters: Vec<String> = config.inverters.iter().map(|inv| inv.id.clone()).collect();
+    // (inverter id, control prefix): the HotStandBy and lock entities are control entities
+    // (brief H36); results stay keyed by the inverter id
+    let mut inverters: Vec<(String, String)> = config
+        .inverters
+        .iter()
+        .map(|inv| {
+            let control = inv.control_prefix_override().unwrap_or(&inv.id).to_owned();
+            (inv.id.clone(), control)
+        })
+        .collect();
     if inverters.is_empty() {
-        inverters.push(ha_config.inverter_prefix.clone());
+        inverters.push((
+            ha_config.inverter_prefix.clone(),
+            ha_config.control_prefix().to_owned(),
+        ));
     }
     let client = client.0.clone();
     tokio::spawn(async move {
-        for (index, inverter) in inverters.into_iter().enumerate() {
+        for (index, (inverter, control_prefix)) in inverters.into_iter().enumerate() {
             let configured = if index == 0 {
                 configured.as_deref()
             } else {
                 None
             };
-            let target = resolve_hot_standby(&client, &inverter, configured).await;
+            let target = resolve_hot_standby(&client, &control_prefix, configured).await;
             match &target {
                 Some(t) => info!(
                     "HotStandBy entity resolved for {}: {}",
@@ -426,10 +442,10 @@ pub fn hot_standby_system(
     let Some(client) = ha_client else {
         return;
     };
-    if !system_config
-        .as_ref()
-        .is_some_and(|c| c.control_config.ensure_hot_standby)
-    {
+    // Mode control off (brief H37) stops the guard like `ensure_hot_standby: false`
+    if !system_config.as_ref().is_some_and(|c| {
+        c.control_config.ensure_hot_standby && c.control_config.mode_control_enabled
+    }) {
         return;
     }
     let now = Instant::now();

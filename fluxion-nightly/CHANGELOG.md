@@ -10,68 +10,163 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.67] - 2026-10-21
+
+### Added
+
+- Export-only mode (brief H37): add-on option `control.mode_control_enabled` (default true). When
+  false, FluxION writes only the export limit (curtailment at or below
+  `export_curtail_at_or_below_czk` and its restore, with the unlock-if-needed step): no work mode
+  from any path (schedule, initial sync, drift re-apply, Back Up default, fixed slots, VPR, kill
+  switch Self-Use), no Back Up minimum SOC, HotStandBy, battery awaken or pre-wake, and no unlock on
+  a lock event. The adapter refuses mode writes as a second line of defence. Planning, prices,
+  alerts and the dashboard keep running; the header shows "mode control off". The kill switch and
+  the automation lever still stop curtailment. Applied over a saved web UI config like the H33-H36
+  add-on-only options. Fixed for the add-on's run: a change needs an add-on restart, the config API
+  refuses a different value and the ECS config update keeps the running one.
+- Separate control entity prefix (brief H36): add-on option `inverters[].control_entity_prefix`
+  (default empty = unchanged). When set, every `select.*`, `number.*`, `button.*`, `switch.*` and
+  `time.*` entity FluxION reads or writes for that inverter (work mode, manual mode, export limit,
+  lock state, Back Up minimum SOC, battery awaken, HotStandBy) uses it, while sensors keep
+  `entity_prefix`; for SolaX Modbus installs with `sensor.solax_*` sensors and
+  `select.solax_inverter_*` controls. Applied over a saved web UI config too. The startup log shows
+  each inverter's entity and control prefix.
+
+### Changed
+
+- The "not curtailing" warning for an unknown or 0 W export limit now says to set the inverter's
+  export limit above 0 W (brief H37).
+- The add-on inverter "no match in the web UI config" warning is logged only when that add-on
+  inverter sets a non-empty `control_entity_prefix` (H36 review).
+
 ## [0.2.66] - 2026-10-19
 
 ### Added
-- Price feed check and OTE fallback: when the spot price entity lacks tomorrow's prices after 13:45 Europe/Prague (option `pricing.tomorrow_prices_check_time`), or prices for the rest of today, FluxION warns once per hour, shows a dashboard banner, keeps one HA notification (`fluxion_prices_missing`, option `pricing.price_alert_notification`, default on) and fills only the missing slots from the OTE day-ahead market (option `pricing.ote_fallback_enabled`, default on), after checking OTE against the entity's prices of today (on the second day of an outage, against the last check, used for its own day and the next only). With a separate buy price entity, slots are filled only when buy = a × spot + b fits exactly. Add-on options of H33/H34/H35 (`battery_wear_cost_czk_per_kwh`, `battery_efficiency`, `pv_forecast_correction_enabled`, `ote_fallback_enabled`, `price_alert_notification`, `tomorrow_prices_check_time`) now apply on installs with a web UI config (`/data/config.json`), which used to hide them. Filled blocks carry `price_source: "ote_fallback"` in the chart and export data.
+
+- Price feed check and OTE fallback: when the spot price entity lacks tomorrow's prices after 13:45
+  Europe/Prague (option `pricing.tomorrow_prices_check_time`), or prices for the rest of today,
+  FluxION warns once per hour, shows a dashboard banner, keeps one HA notification
+  (`fluxion_prices_missing`, option `pricing.price_alert_notification`, default on) and fills only
+  the missing slots from the OTE day-ahead market (option `pricing.ote_fallback_enabled`, default
+  on), after checking OTE against the entity's prices of today (on the second day of an outage,
+  against the last check, used for its own day and the next only). With a separate buy price entity,
+  slots are filled only when buy = a × spot + b fits exactly. Add-on options of H33/H34/H35
+  (`battery_wear_cost_czk_per_kwh`, `battery_efficiency`, `pv_forecast_correction_enabled`,
+  `ote_fallback_enabled`, `price_alert_notification`, `tomorrow_prices_check_time`) now apply on
+  installs with a web UI config (`/data/config.json`), which used to hide them. Filled blocks carry
+  `price_source: "ote_fallback"` in the chart and export data.
 
 ## [0.2.65] - 2026-10-19
 
 ### Added
-- Battery cost of charge: FluxION tracks what the energy in the battery cost — solar at the sale it replaced (0 when it could not have been sold), grid at the full buy price, both divided by the round-trip efficiency plus wear — as a weighted average over the usable energy, reset when the battery reaches its minimum. Shown on the dashboard battery card.
-- Self-correcting solar forecast: the Open-Meteo forecast is scaled by measured ÷ forecast PV over the last 7 days (curtailed and incomplete hours excluded, clamped 0.5–1.5, at least 3 valid days). The chart shows the raw and corrected forecast. Option `solar_forecast.pv_forecast_correction_enabled` (default on).
-- Add-on options `control.battery_wear_cost_czk_per_kwh` (default 0.1) and `control.battery_efficiency` (one-way, default 0.95).
+
+- Battery cost of charge: FluxION tracks what the energy in the battery cost — solar at the sale it
+  replaced (0 when it could not have been sold), grid at the full buy price, both divided by the
+  round-trip efficiency plus wear — as a weighted average over the usable energy, reset when the
+  battery reaches its minimum. Shown on the dashboard battery card.
+- Self-correcting solar forecast: the Open-Meteo forecast is scaled by measured ÷ forecast PV over
+  the last 7 days (curtailed and incomplete hours excluded, clamped 0.5–1.5, at least 3 valid days).
+  The chart shows the raw and corrected forecast. Option
+  `solar_forecast.pv_forecast_correction_enabled` (default on).
+- Add-on options `control.battery_wear_cost_czk_per_kwh` (default 0.1) and
+  `control.battery_efficiency` (one-way, default 0.95).
 
 ### Changed
-- The battery is planned as a buffer: while solar is still expected today, a grid charge stops short of full by the expected solar surplus; late in the day and at night it may fill to 100 % in the cheapest blocks.
-- Battery export (only with `force_discharge_enabled`) requires sell − cost of charge ≥ `min_arbitrage_profit_czk` (default now 2.0) and never goes below the night reserve. Energy left at the end of the plan is valued at the cost of charge, capped at the previous value.
+
+- The battery is planned as a buffer: while solar is still expected today, a grid charge stops short
+  of full by the expected solar surplus; late in the day and at night it may fill to 100 % in the
+  cheapest blocks.
+- Battery export (only with `force_discharge_enabled`) requires sell − cost of charge ≥
+  `min_arbitrage_profit_czk` (default now 2.0) and never goes below the night reserve. Energy left
+  at the end of the plan is valued at the cost of charge, capped at the previous value.
 
 ## [0.2.64] - 2026-10-19
 
 ### Fixed
-- Winter Reserve no longer plans tiny grid top-ups into an almost full battery (e.g. 98→100 %), which the SOC guard stopped within minutes and the next block repeated. A charge block must store at least one mode-change interval's worth of energy before the guard cutoff (max SOC − 1 %).
-- After a guard write inside a block, the next block's planned mode change is applied at the boundary instead of being held by the 5-minute debounce.
-- After a restart, the first plan waits (up to 90 s) for the house-load history, so it is no longer built on a flat default load.
-- Backtest: yesterday (still incomplete) is cached for 15 minutes, a request queued behind another day's load gives up after 120 s with a clear message, and a failed HDO sensor lookup prices the day at the high tariff instead of failing.
+
+- Winter Reserve no longer plans tiny grid top-ups into an almost full battery (e.g. 98→100 %),
+  which the SOC guard stopped within minutes and the next block repeated. A charge block must store
+  at least one mode-change interval's worth of energy before the guard cutoff (max SOC − 1 %).
+- After a guard write inside a block, the next block's planned mode change is applied at the
+  boundary instead of being held by the 5-minute debounce.
+- After a restart, the first plan waits (up to 90 s) for the house-load history, so it is no longer
+  built on a flat default load.
+- Backtest: yesterday (still incomplete) is cached for 15 minutes, a request queued behind another
+  day's load gives up after 120 s with a clear message, and a failed HDO sensor lookup prices the
+  day at the high tariff instead of failing.
 
 ## [0.2.63] - 2026-10-17
 
 ### Fixed
-- After a restart, the first plan waits (up to 30 s) for the HDO tariff schedule, so it is no longer priced at the high grid fee for every block.
+
+- After a restart, the first plan waits (up to 30 s) for the HDO tariff schedule, so it is no longer
+  priced at the high grid fee for every block.
 
 ### Changed
-- The backtest page (`/backtest`) works on the add-on again, on this site's own Home Assistant history: pick a past local day (as far back as the recorder keeps, ~10 days) and compare what actually happened, plain self-use and Winter Reserve with the live settings, block by block, with the live fees and HDO tariff. The old SQLite backtest (`FLUXION_BACKTEST_DB`) is retired.
+
+- The backtest page (`/backtest`) works on the add-on again, on this site's own Home Assistant
+  history: pick a past local day (as far back as the recorder keeps, ~10 days) and compare what
+  actually happened, plain self-use and Winter Reserve with the live settings, block by block, with
+  the live fees and HDO tariff. The old SQLite backtest (`FLUXION_BACKTEST_DB`) is retired.
 
 ## [0.2.62] - 2026-10-17
 
 ### Fixed
-- HDO grid fees are now add-on options (`pricing.hdo_low_tariff_czk`, `pricing.hdo_high_tariff_czk`). The runtime already used them, but the add-on schema had no such keys, so every site ran on the 0.5 / 1.8 defaults.
+
+- HDO grid fees are now add-on options (`pricing.hdo_low_tariff_czk`,
+  `pricing.hdo_high_tariff_czk`). The runtime already used them, but the add-on schema had no such
+  keys, so every site ran on the 0.5 / 1.8 defaults.
 
 ## [0.2.61] - 2026-10-17
 
 ### Fixed
-- Inverter mode changes now happen at 15-minute block boundaries. Inside a block the mode only changes for a user action (levers, VPR, kill switch, fixed slot, default mode, config change) or a safety stop; planner re-decisions wait for the next block. This ends the write at :00 being undone at :05 on every block.
-- The planner no longer keeps Hold forever once applied: Self-Use/Hold hysteresis now compares keeping the mode for the whole run the plan would switch for, and the projection of later blocks uses the same rule as the current block.
-- The `pricing.spot_buy_fee_czk` / `spot_sell_fee_czk` add-on options are now honoured (they were ignored and 0.5 was used).
+
+- Inverter mode changes now happen at 15-minute block boundaries. Inside a block the mode only
+  changes for a user action (levers, VPR, kill switch, fixed slot, default mode, config change) or a
+  safety stop; planner re-decisions wait for the next block. This ends the write at :00 being undone
+  at :05 on every block.
+- The planner no longer keeps Hold forever once applied: Self-Use/Hold hysteresis now compares
+  keeping the mode for the whole run the plan would switch for, and the projection of later blocks
+  uses the same rule as the current block.
+- The `pricing.spot_buy_fee_czk` / `spot_sell_fee_czk` add-on options are now honoured (they were
+  ignored and 0.5 was used).
 - Dashboard labels planner Hold blocks as "Hold" instead of "Self-Use".
-- The backtest page is opt-in (`FLUXION_BACKTEST_DB`); it no longer returns errors with developer file paths on the add-on.
+- The backtest page is opt-in (`FLUXION_BACKTEST_DB`); it no longer returns errors with developer
+  file paths on the add-on.
 
 ## [0.2.60] - 2026-10-16
 
 ### Fixed
+
 - Add-on start-up banner reports `system.debug_mode` (it always printed "Debug mode: true").
-- Dashboard in the Backup default mode: the predicted SOC line stops at the Back Up minimum (the planner's floor) instead of draining to the hardware minimum; PV still charges above it, Force Charge/Discharge blocks are unchanged. Chart bars, tooltip and Upcoming Schedule show the blocks the executor runs as Back Up Mode as "Back Up Mode (25%)" in the Back Up colour. The chart refresh now updates the predicted SOC line, and the chart and schedule refresh right after the default-mode switch.
-- `history.consumption_entity` and `history.solar_production_entity` are add-on options. When unset, the consumption entity is derived from the first inverter's prefix (`sensor.<prefix>_today_s_import_energy`), so sites whose prefix is not `solax` get daily summaries and the EMA.
+- Dashboard in the Backup default mode: the predicted SOC line stops at the Back Up minimum (the
+  planner's floor) instead of draining to the hardware minimum; PV still charges above it, Force
+  Charge/Discharge blocks are unchanged. Chart bars, tooltip and Upcoming Schedule show the blocks
+  the executor runs as Back Up Mode as "Back Up Mode (25%)" in the Back Up colour. The chart refresh
+  now updates the predicted SOC line, and the chart and schedule refresh right after the
+  default-mode switch.
+- `history.consumption_entity` and `history.solar_production_entity` are add-on options. When unset,
+  the consumption entity is derived from the first inverter's prefix
+  (`sensor.<prefix>_today_s_import_energy`), so sites whose prefix is not `solax` get daily
+  summaries and the EMA.
 
 ## [0.2.59] - 2026-10-16
 
 ### Fixed
-- Dashboard price chart: HDO tariff periods show as a strip when a block's grid fee is 0, and the chart's fee bars use the same pricing HDO fees the planner adds (they came from the WinterAdaptiveV3 settings).
-- Avg Consumption works when there are no daily import summaries, and is drawn at the right hours (the profile is per UTC hour).
-- PV history is averaged into 15-minute blocks, so the PV line fills in; new Solar Forecast line for the remaining blocks, on by default.
+
+- Dashboard price chart: HDO tariff periods show as a strip when a block's grid fee is 0, and the
+  chart's fee bars use the same pricing HDO fees the planner adds (they came from the
+  WinterAdaptiveV3 settings).
+- Avg Consumption works when there are no daily import summaries, and is drawn at the right hours
+  (the profile is per UTC hour).
+- PV history is averaged into 15-minute blocks, so the PV line fills in; new Solar Forecast line for
+  the remaining blocks, on by default.
 
 ### Added
-- `inverters[].pv_extra_prefixes`: read-only PV of parallel units (e.g. a SolaX Ultra slave) added to the inverter's PV power and solar energy for the dashboard and forecast accuracy. Nothing is ever written to these units, and their battery, grid, house-load and mode sensors are not read.
+
+- `inverters[].pv_extra_prefixes`: read-only PV of parallel units (e.g. a SolaX Ultra slave) added
+  to the inverter's PV power and solar energy for the dashboard and forecast accuracy. Nothing is
+  ever written to these units, and their battery, grid, house-load and mode sensors are not read.
 
 ## [0.2.58] - 2026-10-16
 
@@ -90,9 +185,9 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ### Fixed
 
-- The planner load comes from the 7-day house-load profile even when the consumption history
-  entity is missing. Before, such a site planned on the inverter's live house-load reading, which
-  on a parallel master includes the slave's charging (about 17 kW) and fed back into grid charging.
+- The planner load comes from the 7-day house-load profile even when the consumption history entity
+  is missing. Before, such a site planned on the inverter's live house-load reading, which on a
+  parallel master includes the slave's charging (about 17 kW) and fed back into grid charging.
 - Without load history the planner uses the configured average load, never the live reading.
 - Winter Reserve re-plans as soon as the load profile or the PV forecast changes.
 
@@ -100,9 +195,9 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ### Fixed
 
-- Winter Reserve plans and buys on the expected solar and load forecast. The conservative view
-  (PV x pv_confidence, load x safety margin) now only sizes the night reserve and the export guard,
-  so the planner no longer grid-charges energy the sun will deliver.
+- Winter Reserve plans and buys on the expected solar and load forecast. The conservative view (PV x
+  pv_confidence, load x safety margin) now only sizes the night reserve and the export guard, so the
+  planner no longer grid-charges energy the sun will deliver.
 - Winter Reserve recognises the coming morning when the plan starts in the last hours of the night
   (before 08:00 local). It used to need a 4 h night inside the plan, so from about 05:15 the whole
   battery became the night reserve.
@@ -151,15 +246,15 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ### Added
 
-- **Solar forecast accuracy check.** FluxION stores each morning's forecast for the day, compares
-  it with the actual PV production in the evening (`solar_forecast.actual_pv_power_entities`,
-  default each inverter's `pv_power_total`) and publishes `sensor.fluxion_solar_forecast_bias`.
-  When the 7-day bias exceeds 10 %, it posts a notification to fix the Open-Meteo setup.
+- **Solar forecast accuracy check.** FluxION stores each morning's forecast for the day, compares it
+  with the actual PV production in the evening (`solar_forecast.actual_pv_power_entities`, default
+  each inverter's `pv_power_total`) and publishes `sensor.fluxion_solar_forecast_bias`. When the
+  7-day bias exceeds 10 %, it posts a notification to fix the Open-Meteo setup.
 
 ### Fixed
 
-- The add-on image is built from `Cargo.lock`; 0.2.51 failed to build after an upstream crate
-  was yanked. 0.2.51's fix (keep Self-Use in solar blocks) ships in this version.
+- The add-on image is built from `Cargo.lock`; 0.2.51 failed to build after an upstream crate was
+  yanked. 0.2.51's fix (keep Self-Use in solar blocks) ships in this version.
 
 ## [0.2.51] - 2026-10-16
 
@@ -227,15 +322,16 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 ### Added
 
 - **SolaX readiness guards before every inverter write.**
-  - **Unlock:** if `select.<id>_lock_state` is "Locked", FluxION selects "Unlocked" and waits for the
-    read-back (up to 10 s) before writing. "Unlocked - Advanced" is left alone. If the inverter stays
-    locked, the write is skipped and retried. `control.auto_unlock_inverter` now defaults to true.
+  - **Unlock:** if `select.<id>_lock_state` is "Locked", FluxION selects "Unlocked" and waits for
+    the read-back (up to 10 s) before writing. "Unlocked - Advanced" is left alone. If the inverter
+    stays locked, the write is skipped and retried. `control.auto_unlock_inverter` now defaults to
+    true.
   - **HotStandBy:** found by name or in the HA entity registry (`control.hot_standby_entity`
     overrides). Checked every 5 minutes and switched back on if off (at most once an hour, with a
     notification). Set `control.ensure_hot_standby: false` to disable.
   - **Wake:** before a grid charge, if the inverter is not in Normal mode, FluxION presses
-    `button.<id>_battery_awaken`. If the battery is not charging 5 minutes after a charge starts, you
-    get a notification.
+    `button.<id>_battery_awaken`. If the battery is not charging 5 minutes after a charge starts,
+    you get a notification.
 
 ## [0.2.45] - 2026-10-14
 
@@ -243,31 +339,31 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 - **Node-RED dashboard entities.** FluxION publishes `sensor.fluxion_pv_work_mode_plan` (same
   attributes as Node-RED's `sensor.pv_work_mode_plan`: `date`, `blocks`, `prices`, `price_stats`),
-  `sensor.fluxion_aktivni_pracovni_rezim` and `sensor.fluxion_prum_nocni_vyuziti_baterie`.
-  Dashboard cards only need their entity ids changed. `prices` covers today.
-- **Inverter lock guard (SolaX).** When `select.<id>_lock_state` reads "Locked", FluxION creates
-  one persistent notification; with `control.auto_unlock_inverter: true` (default on) it selects
+  `sensor.fluxion_aktivni_pracovni_rezim` and `sensor.fluxion_prum_nocni_vyuziti_baterie`. Dashboard
+  cards only need their entity ids changed. `prices` covers today.
+- **Inverter lock guard (SolaX).** When `select.<id>_lock_state` reads "Locked", FluxION creates one
+  persistent notification; with `control.auto_unlock_inverter: true` (default on) it selects
   "Unlocked" once, never in debug mode.
 - **Daily plan notification** at 00:15 with `notifications.daily_plan: true` (default off).
-- **SolaX readiness guards.** Every inverter write first checks the lock (unlock and read-back,
-  or skip the write when `control.auto_unlock_inverter` is off; default on), wakes the inverter
-  with `button.<id>_battery_awaken` before ForceCharge when the run mode is not Normal (at most
-  every 10 min), and warns once if the battery is not charging 5 minutes after ForceCharge.
-  HotStandBy (`control.hot_standby_entity`, auto-detected, `control.ensure_hot_standby`, default
-  on) is checked at startup and every 5 minutes and turned on at most once an hour.
+- **SolaX readiness guards.** Every inverter write first checks the lock (unlock and read-back, or
+  skip the write when `control.auto_unlock_inverter` is off; default on), wakes the inverter with
+  `button.<id>_battery_awaken` before ForceCharge when the run mode is not Normal (at most every 10
+  min), and warns once if the battery is not charging 5 minutes after ForceCharge. HotStandBy
+  (`control.hot_standby_entity`, auto-detected, `control.ensure_hot_standby`, default on) is checked
+  at startup and every 5 minutes and turned on at most once an hour.
 
 ### Fixed
 
-- **House-load profile now actually loads.** The 7-day history request timed out after 10 s; it
-  now uses a minimal response with a 60 s timeout. A fallback to the import profile logs a warning
-  with the reason.
+- **House-load profile now actually loads.** The 7-day history request timed out after 10 s; it now
+  uses a minimal response with a 60 s timeout. A fallback to the import profile logs a warning with
+  the reason.
 - **Profile robustness.** Hours with no data take their neighbours' average instead of 0; the 75th
   percentile is capped at 1.5× the mean so a few EV-charging days don't make the planner hold all
   day.
 - A blocked Force Discharge fixed slot no longer resends Self Use every 5 minutes.
 - Enabling force discharge no longer blocks saving the configuration (it is a warning).
-- An export-limit restore is kept until confirmed, gives up after three rounds, and respects a
-  lower limit set by the owner.
+- An export-limit restore is kept until confirmed, gives up after three rounds, and respects a lower
+  limit set by the owner.
 - Lever migration after an HA restart no longer skips untouched helpers.
 
 ## [0.2.44] - 2026-10-14

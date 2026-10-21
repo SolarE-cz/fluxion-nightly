@@ -21,6 +21,12 @@ configuration:
     name: Prefix entity
     description: >-
       Prefix používaný pro Home Assistant entity související s tímto střídačem.
+  control_entity_prefix:
+    name: Prefix řídicích entit
+    description: >-
+      Prefix řídicích entit střídače (select, number, button, switch, time),
+      pokud se liší od prefixu entit, např. solax_inverter pro
+      select.solax_inverter_charger_use_mode. Prázdné = prefix entit.
   topology:
     name: Topologie
     description: >-
@@ -92,6 +98,10 @@ configuration:
   maximum_export_power_w:
     name: Maximální výkon exportu (W)
     description: Maximální výkon (ve wattech), který může být exportován do sítě.
+  mode_control_enabled:
+    name: Řízení režimu
+    description: >-
+      Vypnuto = FluxION jen omezuje export (limit exportu 0 W při ceně na prahu omezení nebo pod ním, poté obnoví) a nikdy nemění pracovní režim, minimální SOC Back Up, HotStandBy ani probuzení baterie. Výchozí zapnuto.
   update_interval_secs:
     name: Interval aktualizace (sekundy)
     description: >-

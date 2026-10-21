@@ -1357,6 +1357,12 @@
                         <span>Normal Mode</span>
                         {% endif %}
                     </button>
+                    {% if !mode_control_enabled %}
+                    <span id="mode-control-off" class="debug-mode-button debug-active" title="control.mode_control_enabled: false. FluxION plans and shows the schedule but writes only the export limit (curtailment).">
+                        <span>⛔</span>
+                        <span>mode control off</span>
+                    </span>
+                    {% endif %}
                     <button id="phone-connect-btn" class="phone-connect-button" onclick="openPairingModal()">
                         <span class="mdi mdi-cellphone-link"></span>
                         <span class="btn-text">Connect Phone</span>

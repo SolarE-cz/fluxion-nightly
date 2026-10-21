@@ -75,6 +75,9 @@ pub struct ActuationGuardConfig {
     pub run_mode_wait: Duration,
     /// Interval between run mode reads while waiting for Normal
     pub run_mode_poll: Duration,
+    /// `control.mode_control_enabled` (brief H37): when false only `SetExportLimit` is written;
+    /// mode and Back Up commands (with their awaken and minimum SOC writes) are refused
+    pub mode_control_enabled: bool,
 }
 
 impl Default for ActuationGuardConfig {
@@ -86,6 +89,7 @@ impl Default for ActuationGuardConfig {
             charge_check_delay: Duration::from_secs(5 * 60),
             run_mode_wait: Duration::from_secs(15 * 60),
             run_mode_poll: Duration::from_secs(5),
+            mode_control_enabled: true,
         }
     }
 }
@@ -96,6 +100,8 @@ pub struct ActuationState {
     last_wake: Mutex<Option<Instant>>,
     charge_run_active: Arc<AtomicBool>,
     charge_watch: Arc<Mutex<ChargeRunWatch>>,
+    /// A mode write refused with mode control off was logged (brief H37: once, not per tick)
+    mode_refusal_logged: AtomicBool,
 }
 
 /// Warns once per charge run when the battery is not charging
@@ -120,10 +126,16 @@ impl ChargeRunWatch {
     }
 }
 
-/// Entity of the SolaX lock state
+/// Entity of the SolaX lock state (a control entity: pass the control prefix, brief H36)
 #[must_use]
-pub fn lock_entity(inverter_id: &str) -> String {
-    format!("select.{inverter_id}_lock_state")
+pub fn lock_entity(control_prefix: &str) -> String {
+    format!("select.{control_prefix}_lock_state")
+}
+
+/// Entity of the SolaX battery awaken button (a control entity: pass the control prefix)
+#[must_use]
+pub fn awaken_button_entity(control_prefix: &str) -> String {
+    format!("button.{control_prefix}_battery_awaken")
 }
 
 /// Entity of the SolaX run mode
@@ -208,6 +220,8 @@ pub struct ActuationStateResource(pub Arc<ActuationState>);
 pub struct PreWakeState {
     last_check: Option<Instant>,
     done: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+    /// The "pre-wake off: mode control disabled" line was logged (brief H37)
+    mode_control_off_logged: bool,
 }
 
 impl ActuationState {
@@ -221,6 +235,22 @@ impl ActuationState {
         }
         *last = Some(now);
         true
+    }
+}
+
+/// Whether `command` may be written: with mode control off (brief H37) only the export limit.
+#[must_use]
+pub fn command_allowed(
+    cfg: &ActuationGuardConfig,
+    command: &fluxion_core::InverterCommand,
+) -> bool {
+    cfg.mode_control_enabled || matches!(command, fluxion_core::InverterCommand::SetExportLimit(_))
+}
+
+impl ActuationState {
+    /// True only the first time a write is refused because mode control is off
+    pub fn first_mode_refusal(&self) -> bool {
+        !self.mode_refusal_logged.swap(true, Ordering::SeqCst)
     }
 }
 
@@ -248,20 +278,37 @@ async fn notify(client: &HomeAssistantClient, title: &str, message: String, id: 
     }
 }
 
+/// A missing lock entity is a WARN when a separate control prefix is set (it may be mistyped),
+/// else DEBUG as before (brief H36)
+#[must_use]
+pub fn missing_lock_warns(inverter_id: &str, control_prefix: &str) -> bool {
+    inverter_id != control_prefix
+}
+
 /// Unlock guard. Reads the lock state; a "Locked" inverter is unlocked and read back.
 ///
-/// Returns `Ok` when the write may proceed. A missing lock entity proceeds (DEBUG log). A
-/// read error other than "not found" fails the write, so the usual retry applies.
+/// Returns `Ok` when the write may proceed. A missing lock entity proceeds (DEBUG log; WARN
+/// when a separate control prefix is set, as it may be wrong). A read error other than "not
+/// found" fails the write, so the usual retry applies. The lock entity uses `control_prefix`,
+/// the inverter's control prefix (brief H36).
 pub async fn ensure_unlocked(
     client: &HomeAssistantClient,
     inverter_id: &str,
+    control_prefix: &str,
     cfg: &ActuationGuardConfig,
 ) -> Result<()> {
-    let entity = lock_entity(inverter_id);
+    let entity = lock_entity(control_prefix);
     let state = match client.get_state(&entity).await {
         Ok(s) => s.state,
         Err(HaError::EntityNotFound(_)) => {
-            debug!("🔓 {} not found; proceeding without a lock check", entity);
+            if missing_lock_warns(inverter_id, control_prefix) {
+                warn!(
+                    "⚠️ {} not found (control prefix {} of {}); proceeding without a lock check",
+                    entity, control_prefix, inverter_id
+                );
+            } else {
+                debug!("🔓 {} not found; proceeding without a lock check", entity);
+            }
             return Ok(());
         }
         Err(e) => return Err(anyhow!("cannot read lock state {}: {}", entity, e)),
@@ -317,7 +364,13 @@ pub async fn ensure_unlocked(
 
 /// Wake guard, called before ForceCharge. Presses the awaken button when the run mode is not
 /// Normal, at most once per `WAKE_INTERVAL`. Failures are logged and do not block the write.
-pub async fn ensure_awake(client: &HomeAssistantClient, inverter_id: &str, state: &ActuationState) {
+/// The run mode sensor uses `inverter_id`, the button `control_prefix` (brief H36).
+pub async fn ensure_awake(
+    client: &HomeAssistantClient,
+    inverter_id: &str,
+    control_prefix: &str,
+    state: &ActuationState,
+) {
     let run_mode_entity = format!("sensor.{inverter_id}_run_mode");
     let run_mode = match client.get_state(&run_mode_entity).await {
         Ok(s) => s.state,
@@ -333,7 +386,7 @@ pub async fn ensure_awake(client: &HomeAssistantClient, inverter_id: &str, state
         debug!("run mode '{}' but awaken pressed within 10 min", run_mode);
         return;
     }
-    let button = format!("button.{inverter_id}_battery_awaken");
+    let button = awaken_button_entity(control_prefix);
     info!(
         "⏰ {} is '{}'; pressing {} before charging",
         run_mode_entity, run_mode, button
@@ -452,10 +505,12 @@ pub fn start_charge_check(
 ///
 /// Each charge run is keyed by its block start, so a run is pre-woken at most once. Across runs,
 /// presses are limited by the shared `WAKE_INTERVAL` (10 minutes). A read error, a blocked gate
-/// or a wake limit hit leaves the run open for the next check.
+/// or a wake limit hit leaves the run open for the next check. The run mode sensor uses
+/// `inverter_id`, the awaken button `control_prefix` (brief H36).
 pub async fn prewake_before_run(
     client: &HomeAssistantClient,
     inverter_id: &str,
+    control_prefix: &str,
     run_start: DateTime<Utc>,
     state: &ActuationState,
     done: &Mutex<HashMap<String, DateTime<Utc>>>,
@@ -491,7 +546,7 @@ pub async fn prewake_before_run(
         debug!("pre-wake: awaken pressed within 10 min; retried at the next check");
         return;
     }
-    let button = format!("button.{inverter_id}_battery_awaken");
+    let button = awaken_button_entity(control_prefix);
     info!(
         "⏰ Pre-wake: {} is '{}', charge run at {}; pressing {}",
         run_mode_entity, run_mode, run_start, button
@@ -508,7 +563,7 @@ pub async fn prewake_before_run(
 /// Update system: ten minutes before a scheduled ForceCharge, pre-wake the master or independent
 /// inverters whose run mode is not Normal. Checked every `PREWAKE_CHECK_INTERVAL`. Never in debug,
 /// and never while the executor would hold writes: user disabled, the kill-switch lever, an active
-/// VPR window, the lever startup wait, or SOC at the maximum.
+/// VPR window, the lever startup wait, or SOC at the maximum. Never with mode control off (H37).
 #[expect(clippy::too_many_arguments)]
 pub fn prewake_system(
     mut state: ResMut<PreWakeState>,
@@ -529,6 +584,15 @@ pub fn prewake_system(
     if !prewake_allowed(debug_mode.as_ref().map(|d| d.enabled)) {
         return;
     }
+    // Mode control off (brief H37): no awaken press ahead of a planned charge
+    if !config.control_config.mode_control_enabled {
+        if !state.mode_control_off_logged {
+            info!("Mode control disabled: no battery pre-wake (awaken) presses");
+            state.mode_control_off_logged = true;
+        }
+        return;
+    }
+    state.mode_control_off_logged = false;
     let now_instant = Instant::now();
     if state
         .last_check
@@ -580,8 +644,21 @@ pub fn prewake_system(
         let wake = wake.0.clone();
         let done = state.done.clone();
         let inverter_id = inverter.id.clone();
+        let control_prefix = inverter
+            .control_prefix_override()
+            .unwrap_or(&inverter.id)
+            .to_owned();
         tokio::spawn(async move {
-            prewake_before_run(&client, &inverter_id, run_start, &wake, &done, blocked).await;
+            prewake_before_run(
+                &client,
+                &inverter_id,
+                &control_prefix,
+                run_start,
+                &wake,
+                &done,
+                blocked,
+            )
+            .await;
         });
     }
 }
@@ -782,14 +859,80 @@ mod prewake_and_charge_tests {
         let done = Mutex::new(HashMap::new());
         let run: DateTime<Utc> = "2026-10-15T19:45:00Z".parse().unwrap();
 
-        prewake_before_run(&client, "solax", run, &state, &done, false).await;
+        prewake_before_run(&client, "solax", "solax", run, &state, &done, false).await;
         // The same charge run is not pre-woken twice
-        prewake_before_run(&client, "solax", run, &state, &done, false).await;
+        prewake_before_run(&client, "solax", "solax", run, &state, &done, false).await;
         // A later run within the wake limit is held back as well
         let later = run + chrono::Duration::minutes(15);
-        prewake_before_run(&client, "solax", later, &state, &done, false).await;
+        prewake_before_run(&client, "solax", "solax", later, &state, &done, false).await;
 
         press.assert_async().await;
+    }
+
+    /// Review nit 2: a missing lock entity is a WARN only with a separate control prefix
+    #[tokio::test]
+    async fn missing_lock_entity_proceeds_and_warns_only_with_a_control_prefix() {
+        assert!(!missing_lock_warns("solax", "solax"));
+        assert!(missing_lock_warns("solax", "solax_inverter"));
+
+        let mut server = Server::new_async().await;
+        let _missing = server
+            .mock("GET", "/api/states/select.solax_inverter_lock_state")
+            .with_status(404)
+            .create_async()
+            .await;
+        let client = HomeAssistantClient::new(server.url(), "t").unwrap();
+        ensure_unlocked(
+            &client,
+            "solax",
+            "solax_inverter",
+            &ActuationGuardConfig::default(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Brief H36: the run mode is a sensor (entity prefix), the awaken button a control
+    #[tokio::test]
+    async fn prewake_presses_the_button_of_the_control_prefix() {
+        let mut server = Server::new_async().await;
+        let _run_mode = server
+            .mock("GET", "/api/states/sensor.solax_run_mode")
+            .with_body(state_body("sensor.solax_run_mode", "Idle Mode"))
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let press = server
+            .mock("POST", "/api/services/button/press")
+            .match_body(Matcher::PartialJson(
+                json!({"entity_id": "button.solax_inverter_battery_awaken"}),
+            ))
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+        let client = HomeAssistantClient::new(server.url(), "t").unwrap();
+        let state = ActuationState::default();
+        let done = Mutex::new(HashMap::new());
+        let run: DateTime<Utc> = "2026-10-15T19:45:00Z".parse().unwrap();
+
+        prewake_before_run(
+            &client,
+            "solax",
+            "solax_inverter",
+            run,
+            &state,
+            &done,
+            false,
+        )
+        .await;
+
+        press.assert_async().await;
+        assert_eq!(awaken_button_entity("solax"), "button.solax_battery_awaken");
+        assert_eq!(
+            lock_entity("solax_inverter"),
+            "select.solax_inverter_lock_state"
+        );
     }
 
     #[tokio::test]
@@ -812,7 +955,7 @@ mod prewake_and_charge_tests {
         let done = Mutex::new(HashMap::new());
         let run: DateTime<Utc> = "2026-10-15T19:45:00Z".parse().unwrap();
 
-        prewake_before_run(&client, "solax", run, &state, &done, false).await;
+        prewake_before_run(&client, "solax", "solax", run, &state, &done, false).await;
 
         press.assert_async().await;
     }
@@ -1027,7 +1170,7 @@ mod prewake_and_charge_tests {
             let done = Mutex::new(HashMap::new());
             let blocked = prewake_blocked(gate, soc, 100.0);
             assert!(blocked, "case should be blocked: {gate:?} {soc:?}");
-            prewake_before_run(&client, "solax", run, &state, &done, blocked).await;
+            prewake_before_run(&client, "solax", "solax", run, &state, &done, blocked).await;
             // Not marked done either: the run is still open once the gate lifts
             assert!(done.lock().is_empty());
         }
@@ -1077,5 +1220,223 @@ mod prewake_and_charge_tests {
         handle.await.unwrap();
 
         notify.assert_async().await;
+    }
+}
+
+/// Brief H37: with `control.mode_control_enabled: false` the pre-wake, the HotStandBy guard and
+/// the lock watcher write nothing to the inverter
+#[cfg(test)]
+mod mode_control_off_tests {
+    use super::*;
+    use crate::ha::dashboard_entities::{
+        DashboardChannels, DashboardState, LockReading, lock_guard_system,
+    };
+    use crate::ha::hot_standby::{
+        HotStandbyChannel, HotStandbyKind, HotStandbyState, HotStandbyTarget, hot_standby_system,
+        spawn_hot_standby_resolver,
+    };
+    use crate::ha::plugin::HaConfig;
+    use bevy_ecs::schedule::Schedule;
+    use fluxion_types::config::{
+        Currency, InverterConfig, PriceSchedule, PricingConfig, SystemSettingsConfig,
+    };
+    use mockito::{Matcher, Server, ServerGuard};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Counter of the requests one mock served
+    fn counter() -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        (count.clone(), count)
+    }
+
+    fn system_config(mode_control_enabled: bool) -> SystemConfig {
+        SystemConfig {
+            inverters: vec![InverterConfig {
+                id: "solax".to_owned(),
+                inverter_type: fluxion_types::InverterType::Solax,
+                entity_prefix: "solax".to_owned(),
+                control_entity_prefix: String::new(),
+                topology: InverterTopology::Independent,
+                pv_extra_prefixes: Vec::new(),
+            }],
+            pricing_config: PricingConfig {
+                spot_price_entity: "sensor.spot_price".to_owned(),
+                tomorrow_price_entity: None,
+                buy_price_entity: None,
+                use_spot_prices_to_buy: true,
+                use_spot_prices_to_sell: true,
+                fixed_buy_price_czk: PriceSchedule::Flat(4.0),
+                fixed_sell_price_czk: PriceSchedule::Flat(2.0),
+                spot_buy_fee_czk: 0.5,
+                spot_sell_fee_czk: 0.5,
+                hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_owned(),
+                hdo_low_tariff_czk: 0.5,
+                hdo_high_tariff_czk: 1.8,
+            },
+            control_config: fluxion_types::ControlConfig {
+                maximum_export_power_w: 8000,
+                mode_control_enabled,
+                ..Default::default()
+            },
+            system_config: SystemSettingsConfig {
+                update_interval_secs: 60,
+                debug_mode: false,
+                display_currency: Currency::CZK,
+                language: Default::default(),
+                timezone: None,
+                display_timezone: None,
+            },
+            strategies_config: Default::default(),
+            history: Default::default(),
+            solar_forecast: Default::default(),
+            remote_access: Default::default(),
+            notifications: Default::default(),
+        }
+    }
+
+    /// World with the HA client of `server`, debug off and the given mode control
+    fn world(server: &ServerGuard, mode_control_enabled: bool) -> World {
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "test_token").unwrap());
+        let mut world = World::new();
+        world.insert_resource(HaClientResource(client));
+        world.insert_resource(system_config(mode_control_enabled));
+        world.insert_resource(DebugModeConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        world
+    }
+
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Pre-wake: a ForceCharge 5 minutes ahead and run mode Standby. With mode control on the run
+    /// mode is read and the button pressed; with it off nothing is read or pressed.
+    async fn prewake_requests(mode_control_enabled: bool) -> (usize, usize) {
+        let mut server = Server::new_async().await;
+        let (reads, read_count) = counter();
+        server
+            .mock("GET", "/api/states/sensor.solax_run_mode")
+            .with_body_from_request(move |_| {
+                read_count.fetch_add(1, Ordering::SeqCst);
+                br#"{"entity_id":"sensor.solax_run_mode","state":"Standby Mode","attributes":{},"last_changed":"2025-10-02T10:00:00Z","last_updated":"2025-10-02T10:00:00Z"}"#.to_vec()
+            })
+            .create_async()
+            .await;
+        let (presses, press_count) = counter();
+        server
+            .mock("POST", "/api/services/button/press")
+            .with_body_from_request(move |_| {
+                press_count.fetch_add(1, Ordering::SeqCst);
+                b"[]".to_vec()
+            })
+            .create_async()
+            .await;
+        let mut world = world(&server, mode_control_enabled);
+        world.insert_resource(PreWakeState::default());
+        world.insert_resource(ActuationStateResource(Arc::new(ActuationState::default())));
+        let now = Utc::now();
+        world.spawn(OperationSchedule {
+            scheduled_blocks: vec![ScheduledMode {
+                block_start: now + chrono::Duration::minutes(5),
+                duration_minutes: 15,
+                target_inverters: None,
+                mode: InverterOperationMode::ForceCharge,
+                reason: "schedule".to_owned(),
+                decision_uid: None,
+                debug_info: None,
+            }],
+            generated_at: now,
+            based_on_price_version: now,
+        });
+        let mut schedule = Schedule::default();
+        schedule.add_systems(prewake_system);
+        schedule.run(&mut world);
+        settle().await;
+        (reads.load(Ordering::SeqCst), presses.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn prewake_presses_nothing_with_mode_control_off() {
+        assert_eq!(prewake_requests(false).await, (0, 0));
+        // The same setup with mode control on does press, so the test can see a press
+        assert_eq!(prewake_requests(true).await, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn hot_standby_guard_writes_nothing_with_mode_control_off() {
+        let mut server = Server::new_async().await;
+        let any_read = server
+            .mock("GET", Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let any_write = server
+            .mock("POST", Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let mut world = world(&server, false);
+        world.insert_resource(HaConfig::default());
+        world.insert_resource(HotStandbyChannel::default());
+        world.insert_resource(HotStandbyState::default());
+        // A target that reads "off" would be switched on with mode control on
+        let tx = world.resource::<HotStandbyChannel>().tx.clone();
+        tx.send((
+            "solax".to_owned(),
+            Some(HotStandbyTarget {
+                entity_id: "switch.solax_hotstandby".to_owned(),
+                kind: HotStandbyKind::Switch,
+            }),
+        ))
+        .unwrap();
+        let mut schedule = Schedule::default();
+        schedule.add_systems((spawn_hot_standby_resolver, hot_standby_system).chain());
+        schedule.run(&mut world);
+        schedule.run(&mut world);
+        settle().await;
+        any_read.assert_async().await;
+        any_write.assert_async().await;
+    }
+
+    async fn lock_event_requests(mode_control_enabled: bool) -> usize {
+        let mut server = Server::new_async().await;
+        let _notify = server
+            .mock("POST", "/api/services/persistent_notification/create")
+            .with_body("[]")
+            .create_async()
+            .await;
+        let (unlocks, unlock_count) = counter();
+        server
+            .mock("POST", "/api/services/select/select_option")
+            .with_body_from_request(move |_| {
+                unlock_count.fetch_add(1, Ordering::SeqCst);
+                b"[]".to_vec()
+            })
+            .create_async()
+            .await;
+        let mut world = world(&server, mode_control_enabled);
+        world.insert_resource(DashboardState::default());
+        world.insert_resource(DashboardChannels::default());
+        world
+            .resource::<DashboardChannels>()
+            .lock_tx
+            .send(LockReading {
+                entity_id: "select.solax_lock_state".to_owned(),
+                state: "Locked".to_owned(),
+            })
+            .unwrap();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(lock_guard_system);
+        schedule.run(&mut world);
+        settle().await;
+        unlocks.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn lock_event_is_not_unlocked_with_mode_control_off() {
+        assert_eq!(lock_event_requests(false).await, 0);
+        assert_eq!(lock_event_requests(true).await, 1);
     }
 }

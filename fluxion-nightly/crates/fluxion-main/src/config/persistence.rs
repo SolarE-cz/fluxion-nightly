@@ -177,7 +177,7 @@ pub const HA_OPTIONS_PATH: &str = "/data/options.json";
 
 /// Add-on options that only the add-on UI sets (the web UI has no field for them). On an existing
 /// install `/data/config.json` wins over `options.json`, so without this overlay a change of
-/// these in the add-on UI would never apply (H33, H34, H35).
+/// these in the add-on UI would never apply (H33, H34, H35, H37).
 pub const ADDON_ONLY_OPTIONS: &[(&str, &str)] = &[
     ("control", "battery_wear_cost_czk_per_kwh"),
     ("control", "battery_efficiency"),
@@ -185,7 +185,12 @@ pub const ADDON_ONLY_OPTIONS: &[(&str, &str)] = &[
     ("pricing", "ote_fallback_enabled"),
     ("pricing", "price_alert_notification"),
     ("pricing", "tomorrow_prices_check_time"),
+    ("control", "mode_control_enabled"),
 ];
+
+/// Per-inverter add-on-only options (brief H36), applied to the inverter of `config.json` with
+/// the same `id` as the add-on option's inverter
+pub const ADDON_ONLY_INVERTER_OPTIONS: &[&str] = &["control_entity_prefix"];
 
 /// Apply the add-on-only options of `path` (HA `options.json`) over `config`; a missing or
 /// unreadable file changes nothing
@@ -229,6 +234,9 @@ pub fn overlay_addon_options(config: &mut AppConfig, options: &serde_json::Value
             changed.push(format!("{section}.{key}"));
         }
     }
+    for warning in overlay_inverter_options(&mut current, options, &mut changed) {
+        warn!("⚠️ {warning}");
+    }
     if changed.is_empty() {
         return changed;
     }
@@ -246,6 +254,69 @@ pub fn overlay_addon_options(config: &mut AppConfig, options: &serde_json::Value
             Vec::new()
         }
     }
+}
+
+/// Set each of [`ADDON_ONLY_INVERTER_OPTIONS`] of the add-on's inverters on the `config` inverter
+/// with the same `id`. A key missing from a matched add-on inverter resets to `""`: the
+/// Supervisor drops empty `str?` keys, so that is how clearing it in the add-on UI arrives.
+/// An add-on inverter without a match in `config.json` is left alone; when it sets a non-empty
+/// key, the returned warnings name it and the ids that `config.json` has.
+fn overlay_inverter_options(
+    current: &mut serde_json::Value,
+    options: &serde_json::Value,
+    changed: &mut Vec<String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(option_inverters) = options.get("inverters").and_then(|v| v.as_array()) else {
+        return warnings;
+    };
+    let Some(inverters) = current.get_mut("inverters").and_then(|v| v.as_array_mut()) else {
+        return warnings;
+    };
+    for option_inverter in option_inverters {
+        let Some(id) = option_inverter.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let config_ids: Vec<String> = inverters
+            .iter()
+            .filter_map(|inv| inv.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+            .collect();
+        let Some(inverter) = inverters
+            .iter_mut()
+            .find(|inv| inv.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|inv| inv.as_object_mut())
+        else {
+            // Only an add-on inverter that sets one of the keys (non-empty) has something that
+            // is not applied; one without them is the usual add-on default and stays quiet
+            let sets_a_key = ADDON_ONLY_INVERTER_OPTIONS.iter().any(|key| {
+                option_inverter
+                    .get(*key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|v| !v.trim().is_empty())
+            });
+            if !sets_a_key {
+                continue;
+            }
+            warnings.push(format!(
+                "Add-on inverter '{}' has no match in the web UI config (inverter ids there: {}); its {} not applied",
+                id,
+                config_ids.join(", "),
+                ADDON_ONLY_INVERTER_OPTIONS.join(", ")
+            ));
+            continue;
+        };
+        for key in ADDON_ONLY_INVERTER_OPTIONS {
+            let value = option_inverter
+                .get(*key)
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(String::new()));
+            if inverter.get(*key) != Some(&value) {
+                inverter.insert((*key).to_owned(), value);
+                changed.push(format!("inverters[{id}].{key}"));
+            }
+        }
+    }
+    warnings
 }
 
 #[cfg(test)]
@@ -322,6 +393,134 @@ mod tests {
         );
         assert!((config.control.min_battery_soc - saved.control.min_battery_soc).abs() < 1e-6);
         config.validate().unwrap();
+    }
+
+    /// H37: `control.mode_control_enabled` from the add-on UI applies over `config.json`, both
+    /// ways; options without the key keep the saved value
+    #[test]
+    fn addon_mode_control_enabled_overrides_the_web_ui_config() {
+        let (persistence, dir) = create_test_persistence();
+        let saved = AppConfig::default();
+        assert!(saved.control.mode_control_enabled);
+        persistence.save(&saved, "web_ui").unwrap();
+        let mut config = persistence.load().unwrap().config;
+
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({"control": {"mode_control_enabled": false}}).to_string(),
+        )
+        .unwrap();
+        overlay_addon_options_file(&mut config, &options);
+        assert!(!config.control.mode_control_enabled);
+        config.validate().unwrap();
+
+        let changed = overlay_addon_options(
+            &mut config,
+            &serde_json::json!({"control": {"mode_control_enabled": true}}),
+        );
+        assert_eq!(changed, vec!["control.mode_control_enabled".to_owned()]);
+        assert!(config.control.mode_control_enabled);
+
+        config.control.mode_control_enabled = false;
+        assert!(overlay_addon_options(&mut config, &serde_json::json!({"control": {}})).is_empty());
+        assert!(!config.control.mode_control_enabled);
+    }
+
+    /// H36: the add-on UI's `inverters[].control_entity_prefix` applies over `config.json`,
+    /// matched by inverter id; other inverter keys keep the precedence of `config.json`
+    #[test]
+    fn addon_control_entity_prefix_overrides_the_web_ui_config() {
+        let (persistence, dir) = create_test_persistence();
+        let saved = AppConfig::default();
+        persistence.save(&saved, "web_ui").unwrap();
+        let mut config = persistence.load().unwrap().config;
+        let id = config.inverters[0].id.clone();
+
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({
+                "inverters": [
+                    {"id": id, "vendor": "solax", "entity_prefix": "from_addon",
+                     "topology": "independent", "control_entity_prefix": "solax_inverter"},
+                    {"id": "not_configured", "control_entity_prefix": "other"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        overlay_addon_options_file(&mut config, &options);
+
+        assert_eq!(config.inverters.len(), 1);
+        assert_eq!(config.inverters[0].control_entity_prefix, "solax_inverter");
+        assert_eq!(
+            config.inverters[0].entity_prefix,
+            saved.inverters[0].entity_prefix
+        );
+        config.validate().unwrap();
+    }
+
+    /// Review nit 1: the Supervisor drops an empty `str?` key, so a matched add-on inverter
+    /// without `control_entity_prefix` clears the value a web UI save wrote into config.json
+    #[test]
+    fn addon_inverter_without_control_entity_prefix_clears_it() {
+        let mut config = AppConfig::default();
+        config.inverters[0].control_entity_prefix = "solax_inverter".to_owned();
+        let id = config.inverters[0].id.clone();
+
+        let changed = overlay_addon_options(
+            &mut config,
+            &serde_json::json!({"inverters": [
+                {"id": id, "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}
+            ]}),
+        );
+
+        assert_eq!(
+            changed,
+            vec![format!("inverters[{id}].control_entity_prefix")]
+        );
+        assert_eq!(config.inverters[0].control_entity_prefix, "");
+        assert_eq!(config.inverters[0].control_prefix_override(), None);
+    }
+
+    /// Review nit 2: an add-on inverter whose id is not in config.json changes nothing
+    #[test]
+    fn addon_inverter_without_a_match_changes_nothing() {
+        let mut config = AppConfig::default();
+        config.inverters[0].control_entity_prefix = "solax_inverter".to_owned();
+        let before = serde_json::to_value(&config).unwrap();
+
+        let options =
+            serde_json::json!({"inverters": [{"id": "renamed", "control_entity_prefix": "x"}]});
+        let mut current = before.clone();
+        let mut changed = Vec::new();
+        let warnings = overlay_inverter_options(&mut current, &options, &mut changed);
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Add-on inverter 'renamed' has no match in the web UI config (inverter ids there: {}); its control_entity_prefix not applied",
+                config.inverters[0].id
+            )]
+        );
+        assert!(changed.is_empty());
+        assert_eq!(current, before);
+
+        assert!(overlay_addon_options(&mut config, &options).is_empty());
+        assert_eq!(serde_json::to_value(&config).unwrap(), before);
+
+        // H36 review: an unmatched add-on inverter without the key, or with it empty, has
+        // nothing to apply and does not warn
+        for options in [
+            serde_json::json!({"inverters": [{"id": "renamed"}]}),
+            serde_json::json!({"inverters": [{"id": "renamed", "control_entity_prefix": " "}]}),
+        ] {
+            let mut current = before.clone();
+            let mut changed = Vec::new();
+            assert!(overlay_inverter_options(&mut current, &options, &mut changed).is_empty());
+            assert!(changed.is_empty());
+            assert_eq!(current, before);
+        }
     }
 
     #[test]

@@ -107,6 +107,16 @@ pub struct ConfigEventParams<'w, 's> {
     cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
 }
 
+/// Keep `control.mode_control_enabled` of the running config in `new` (brief H37): the inverter
+/// adapter takes it at startup, so the executor and the guards must not see a different value.
+/// Returns true when `new` asked for a change.
+pub fn keep_running_mode_control(running: &SystemConfig, new: &mut SystemConfig) -> bool {
+    let keep = running.control_config.mode_control_enabled;
+    let changed = new.control_config.mode_control_enabled != keep;
+    new.control_config.mode_control_enabled = keep;
+    changed
+}
+
 /// System that processes config update events from the web UI
 /// Updates SystemConfig and triggers schedule recalculation when needed
 pub fn config_event_handler(mut params: ConfigEventParams) {
@@ -154,6 +164,15 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 continue;
             }
         };
+
+        // Mode control stays as started (brief H37): the adapter took it at startup
+        let mut new_config = new_config;
+        if keep_running_mode_control(&params.system_config, &mut new_config) {
+            error!(
+                "control.mode_control_enabled cannot change at runtime; keeping {} until the add-on restarts",
+                params.system_config.control_config.mode_control_enabled
+            );
+        }
 
         // Store old config for comparison logging
         let old_config = params.system_config.clone();

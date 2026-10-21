@@ -252,6 +252,12 @@ pub trait VendorEntityMapper: Send + Sync {
     /// Get the inverter type
     fn vendor_name(&self) -> InverterType;
 
+    /// Prefix of the control entities (`select.*`, `number.*`, `button.*`, `switch.*`,
+    /// `time.*`) of the inverter whose sensors use `inverter_id` (brief H36). Default: the same.
+    fn control_prefix<'a>(&'a self, inverter_id: &'a str) -> &'a str {
+        inverter_id
+    }
+
     // ============= Mode Control (Required) =============
 
     /// Map generic operation mode to vendor-specific work mode value

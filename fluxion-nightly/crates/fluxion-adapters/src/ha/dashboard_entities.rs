@@ -962,7 +962,7 @@ pub fn night_usage_system(
     });
 }
 
-/// Update system: poll `select.<prefix>_lock_state` at the HA polling interval.
+/// Update system: poll `select.<control prefix>_lock_state` at the HA polling interval.
 pub fn poll_lock_state_system(
     mut state: ResMut<DashboardState>,
     channels: Res<DashboardChannels>,
@@ -982,12 +982,12 @@ pub fn poll_lock_state_system(
     state.lock_poll = Some(now);
 
     let prefixes: Vec<String> = if q_prefixes.is_empty() {
-        vec![ha_config.inverter_prefix.clone()]
+        vec![ha_config.control_prefix().to_owned()]
     } else {
         q_prefixes.iter().map(|p| p.0.clone()).collect()
     };
     for prefix in prefixes {
-        let entity_id = format!("select.{}_lock_state", prefix);
+        let entity_id = crate::ha::actuation::lock_entity(&prefix);
         let client = client.0.clone();
         let tx = channels.lock_tx.clone();
         tokio::spawn(async move {
@@ -1011,15 +1011,22 @@ pub fn lock_guard_system(
     ha_client: Option<Res<HaClientResource>>,
     debug_mode: Option<Res<DebugModeConfig>>,
     system_config: Option<Res<SystemConfig>>,
+    mut unlock_suppressed_logged: Local<bool>,
 ) {
     let Some(client) = ha_client else {
         return;
     };
     // Runtime debug state; without it, behave as debug and never unlock
     let debug = debug_mode.as_ref().is_none_or(|d| d.enabled);
-    let auto_unlock = system_config
+    // Mode control off (brief H37): no unlock on a lock event. The export limit write keeps its
+    // own unlock right before it writes (the adapter's pre-actuation guard).
+    let mode_control = system_config
         .as_ref()
-        .is_some_and(|c| c.control_config.auto_unlock_inverter);
+        .is_none_or(|c| c.control_config.mode_control_enabled);
+    let auto_unlock = mode_control
+        && system_config
+            .as_ref()
+            .is_some_and(|c| c.control_config.auto_unlock_inverter);
 
     while let Ok(reading) = channels.lock_rx.try_recv() {
         let entry = state
@@ -1034,6 +1041,19 @@ pub fn lock_guard_system(
             );
             continue;
         };
+        if decision.notify
+            && !mode_control
+            && !*unlock_suppressed_logged
+            && system_config
+                .as_ref()
+                .is_some_and(|c| c.control_config.auto_unlock_inverter)
+        {
+            info!(
+                "Mode control disabled: lock state {} not unlocked on the lock event (an export limit write still unlocks first)",
+                reading.entity_id
+            );
+            *unlock_suppressed_logged = true;
+        }
         if decision.notify {
             warn!(
                 "🔒 Inverter lock state {} is Locked; notifying",

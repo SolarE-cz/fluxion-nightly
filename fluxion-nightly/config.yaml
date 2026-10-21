@@ -37,6 +37,7 @@ options:
     max_battery_charge_rate_kw: 5.0
     max_battery_soc: 100
     min_battery_soc: 10
+    mode_control_enabled: true
     planner_load_margin: 1.1
   history:
     consumption_entity: ''
@@ -240,13 +241,15 @@ schema:
     max_battery_soc: float(0,100)?
     maximum_export_power_w: int(0,)
     min_battery_soc: float(0,100)?
+    mode_control_enabled: bool?
     planner_load_margin: float(1.0,1.5)?
   history:
     consumption_entity: str?
     house_load_power_entity: str?
     solar_production_entity: str?
   inverters:
-  - entity_prefix: str
+  - control_entity_prefix: str?
+    entity_prefix: str
     id: str
     master_id: str?
     pv_extra_prefixes:
@@ -479,4 +482,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.66
+version: 0.2.67

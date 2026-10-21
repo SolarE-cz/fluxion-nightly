@@ -101,6 +101,12 @@ pub struct InverterConfig {
     /// Entity prefix in HA (e.g., "solax", "solax_<ip>")
     pub entity_prefix: String,
 
+    /// Prefix of the control entities (`select.*`, `number.*`, `button.*`, `switch.*`, `time.*`)
+    /// when the integration names them differently from the sensors (brief H36), e.g. sensors
+    /// `sensor.solax_*` and controls `select.solax_inverter_*`. Empty = same as before.
+    #[serde(default)]
+    pub control_entity_prefix: String,
+
     /// Control topology: independent, master, slave
     pub topology: String,
 
@@ -119,6 +125,15 @@ pub struct InverterConfig {
     /// them, and battery, house-load and mode reads stay this inverter's own.
     #[serde(default)]
     pub pv_extra_prefixes: Vec<String>,
+}
+
+impl InverterConfig {
+    /// The configured control prefix, or `None` when it is empty (controls then keep the prefix
+    /// each call site used before brief H36)
+    #[must_use]
+    pub fn control_prefix_override(&self) -> Option<&str> {
+        Some(self.control_entity_prefix.trim()).filter(|p| !p.is_empty())
+    }
 }
 
 /// Pricing configuration
@@ -300,6 +315,12 @@ pub struct ControlConfig {
     /// Keep the HotStandBy setting on (startup and every 5 minutes). Default: true
     #[serde(default = "default_true")]
     pub ensure_hot_standby: bool,
+
+    /// FluxION writes inverter modes (brief H37). When false it only curtails export (no work
+    /// mode, Back Up minimum SOC, HotStandBy, awaken or lock writes besides the export limit
+    /// write); planning and the dashboard keep running. Default: true
+    #[serde(default = "default_true")]
+    pub mode_control_enabled: bool,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -1592,6 +1613,7 @@ impl Default for AppConfig {
                 id: "main_inverter".to_string(),
                 inverter_type: fluxion_core::InverterType::Solax,
                 entity_prefix: "solax".to_string(),
+                control_entity_prefix: String::new(),
                 topology: "independent".to_string(),
                 slaves: None,
                 master: None,
@@ -1638,6 +1660,7 @@ impl Default for AppConfig {
                 auto_unlock_inverter: true,
                 hot_standby_entity: None,
                 ensure_hot_standby: true,
+                mode_control_enabled: true,
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -1744,6 +1767,17 @@ impl AppConfig {
                     "PV extra prefix '{extra}' is the configured inverter '{}'; extras must be read-only parallel units",
                     inv.id
                 )
+            })
+    }
+
+    /// Control prefix per inverter id, for the entity mapper and adapter (brief H36).
+    /// Inverters with an empty `control_entity_prefix` are not listed.
+    #[must_use]
+    pub fn control_prefixes(&self) -> fluxion_adapters::ControlPrefixes {
+        self.inverters
+            .iter()
+            .fold(fluxion_adapters::ControlPrefixes::new(), |prefixes, inv| {
+                prefixes.with_inverter(&inv.id, &inv.control_entity_prefix)
             })
     }
 
@@ -2137,6 +2171,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     id: inv.id.clone(),
                     inverter_type: inv.inverter_type,
                     entity_prefix: inv.entity_prefix.clone(),
+                    control_entity_prefix: inv.control_entity_prefix.trim().to_owned(),
                     topology: match inv.topology.as_str() {
                         "master" => fluxion_core::InverterTopology::Master {
                             slave_ids: inv.slaves.clone().unwrap_or_default(),
@@ -2255,6 +2290,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     .clone()
                     .filter(|e| !e.trim().is_empty()),
                 ensure_hot_standby: app_config.control.ensure_hot_standby,
+                mode_control_enabled: app_config.control.mode_control_enabled,
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,
@@ -3035,6 +3071,7 @@ mod tests {
                     id: "master".to_string(),
                     inverter_type: fluxion_core::InverterType::Solax,
                     entity_prefix: "solax_1".to_string(),
+                    control_entity_prefix: String::new(),
                     topology: "master".to_string(),
                     slaves: Some(vec!["slave_1".to_string()]),
                     master: None,
@@ -3044,6 +3081,7 @@ mod tests {
                     id: "slave_1".to_string(),
                     inverter_type: fluxion_core::InverterType::Solax,
                     entity_prefix: "solax_2".to_string(),
+                    control_entity_prefix: String::new(),
                     topology: "slave".to_string(),
                     slaves: None,
                     master: Some("master".to_string()),
@@ -3547,6 +3585,122 @@ mod tests {
             system.inverters[0].topology,
             fluxion_core::InverterTopology::Independent
         );
+    }
+
+    /// Brief H37: `control.mode_control_enabled` from the add-on options (default true)
+    #[test]
+    fn test_ha_addon_mode_control_enabled() {
+        let options = |extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "solax", "vendor": "solax", "entity_prefix": "solax",
+                                "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                            "force_discharge_hours": 1, "min_battery_soc": 10,
+                            "max_battery_soc": 100 {extra}}},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+
+        let config: AppConfig =
+            serde_json::from_str(&options(r#", "mode_control_enabled": false"#)).expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(!config.control.mode_control_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(!system.control_config.mode_control_enabled);
+
+        // Missing (options saved before H37) or true: FluxION controls modes as before
+        for extra in ["", r#", "mode_control_enabled": true"#] {
+            let config: AppConfig = serde_json::from_str(&options(extra)).expect("parse");
+            assert!(config.control.mode_control_enabled);
+            let system: fluxion_core::SystemConfig = config.into();
+            assert!(system.control_config.mode_control_enabled);
+        }
+        assert!(AppConfig::default().control.mode_control_enabled);
+
+        // The add-on carries the option with default true and an optional bool in its schema
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    mode_control_enabled: true\n"));
+        assert!(addon.contains("    mode_control_enabled: bool?\n"));
+    }
+
+    /// Brief H36: `inverters[].control_entity_prefix` from the add-on options
+    #[test]
+    fn test_ha_addon_control_entity_prefix() {
+        let options = |extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "solax", "vendor": "solax", "entity_prefix": "solax",
+                                {extra} "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                            "force_discharge_hours": 1, "min_battery_soc": 10,
+                            "max_battery_soc": 100}},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+
+        let config: AppConfig =
+            serde_json::from_str(&options(r#""control_entity_prefix": " solax_inverter ","#))
+                .expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(config.validate_detailed().valid);
+        assert_eq!(
+            config.inverters[0].control_prefix_override(),
+            Some("solax_inverter")
+        );
+        let control = config.control_prefixes();
+        assert_eq!(control.resolve("solax"), "solax_inverter");
+        let mapper = fluxion_adapters::create_entity_mapper_with_control(
+            config.inverters[0].inverter_type,
+            control,
+        );
+        assert_eq!(
+            mapper.get_work_mode_entity("solax"),
+            "select.solax_inverter_charger_use_mode"
+        );
+        assert_eq!(
+            fluxion_adapters::ha::actuation::lock_entity(mapper.control_prefix("solax")),
+            "select.solax_inverter_lock_state"
+        );
+        assert_eq!(
+            mapper.get_export_limit_entity("solax"),
+            "number.solax_inverter_export_control_user_limit"
+        );
+        assert_eq!(
+            mapper.get_battery_soc_entity("solax"),
+            "sensor.solax_battery_capacity"
+        );
+        assert_eq!(
+            mapper.get_house_load_entity("solax").as_deref(),
+            Some("sensor.solax_house_load")
+        );
+        let system: fluxion_core::SystemConfig = config.into();
+        assert_eq!(system.inverters[0].control_entity_prefix, "solax_inverter");
+        assert_eq!(
+            system.inverters[0].control_prefix_override(),
+            Some("solax_inverter")
+        );
+
+        // Key missing (options saved before H36) or empty: no override, ids as before
+        for extra in ["", r#""control_entity_prefix": "","#] {
+            let config: AppConfig = serde_json::from_str(&options(extra)).expect("parse");
+            assert_eq!(config.inverters[0].control_prefix_override(), None);
+            assert!(config.control_prefixes().is_empty());
+            let system: fluxion_core::SystemConfig = config.into();
+            assert_eq!(system.inverters[0].control_prefix_override(), None);
+        }
+
+        // The add-on schema carries the optional key
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("      control_entity_prefix: str?\n"));
     }
 
     #[test]

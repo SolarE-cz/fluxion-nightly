@@ -1056,6 +1056,7 @@ mod tests {
         WebQueryResponse {
             timestamp: Utc::now(),
             debug_mode: false,
+            mode_control_enabled: true,
             inverters: vec![],
             schedule: None,
             prices: Some(PriceData {

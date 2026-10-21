@@ -157,6 +157,8 @@ fn soc_blocks_mode(mode: InverterOperationMode, soc: f32, control: &ControlConfi
 pub struct ScheduleWarnings {
     vpr_discharge: bool,
     fixed_slots: BTreeSet<String>,
+    /// The "mode writes suppressed" line was logged (brief H37)
+    mode_control_off: bool,
 }
 
 /// Defence in depth: ForceDischarge is never sent while `control.force_discharge_enabled` is false.
@@ -621,6 +623,22 @@ pub fn schedule_execution_system(
 ) {
     let now = Utc::now();
     let force_discharge_enabled = system_config.control_config.force_discharge_enabled;
+
+    // Mode control off (brief H37): no mode command from any path of the executor (schedule,
+    // initial sync, drift re-apply, Back Up default, fixed slots, VPR, kill switch Self-Use).
+    // The plan is still computed and shown. Cleared sync state makes a later re-enable compare
+    // against the hardware mode first.
+    if !system_config.control_config.mode_control_enabled {
+        if !warned.mode_control_off {
+            info!(
+                "Mode control disabled: no inverter mode writes (schedule, initial sync, drift re-apply, Back Up, force charge/discharge, VPR, kill switch)"
+            );
+            warned.mode_control_off = true;
+        }
+        sync_tracker.synced_inverters.clear();
+        return;
+    }
+    warned.mode_control_off = false;
 
     // Debug mode switched off at runtime: CurrentMode already equals the plan, so the
     // sync tracker is cleared to compare against the real hardware mode and send.
@@ -1332,7 +1350,7 @@ pub fn export_curtailment_system(
                     Some(limit_w) => {
                         if !watch.skip_warned {
                             warn!(
-                                "Export limit of {} is {} W, not above the curtail target {} W; not curtailing",
+                                "Export limit of {} is {} W, not above the curtail target {} W; not curtailing (set the inverter's export limit above 0 W so FluxION has a value to restore)",
                                 inverter.id, limit_w, control.export_limit_min_w
                             );
                             watch.skip_warned = true;
@@ -1342,7 +1360,7 @@ pub fn export_curtailment_system(
                     None => {
                         if !watch.skip_warned {
                             warn!(
-                                "Export limit of {} is unknown, not curtailing it (no restore value)",
+                                "Export limit of {} is unknown, not curtailing it (no restore value; set the inverter's export limit above 0 W)",
                                 inverter.id
                             );
                             watch.skip_warned = true;
@@ -1809,6 +1827,7 @@ mod levers_execution_tests {
                 id: "inv1".to_string(),
                 inverter_type: fluxion_types::InverterType::Solax,
                 entity_prefix: "solax".to_string(),
+                control_entity_prefix: String::new(),
                 topology: InverterTopology::Independent,
                 pv_extra_prefixes: Vec::new(),
             }],
@@ -4224,5 +4243,206 @@ mod levers_execution_tests {
         assert!(loaded.restore_limits_w.is_empty());
         assert_eq!(loaded.legacy_restore_limit_w, Some(8000));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- Mode control off: FluxION only curtails export (brief H37) ----
+
+    /// Executor and curtailment together: one inverter in SelfUse with an 8000 W export limit,
+    /// Back Up default mode, the given plan and sell price, and `mode_control_enabled` as given.
+    fn export_only_harness(
+        blocks: Vec<ScheduledMode>,
+        sell: Option<f32>,
+        mode_control_enabled: bool,
+    ) -> Harness {
+        let now = Utc::now();
+        let mut h = backup_harness(blocks);
+        {
+            let mut config = h.world.resource_mut::<SystemConfig>();
+            config.control_config.mode_control_enabled = mode_control_enabled;
+            config.control_config.export_curtailment_enabled = true;
+        }
+        {
+            let mut query = h.world.query::<&mut RawInverterState>();
+            for mut raw in query.iter_mut(&mut h.world) {
+                raw.state.export_limit_w = Some(8000);
+            }
+        }
+        h.world.insert_resource(ExportCurtailmentState::default());
+        h.world.spawn(sell_price_data(now, sell));
+        h.schedule.add_systems(export_curtailment_system);
+        h
+    }
+
+    fn set_sell_price(h: &mut Harness, sell: Option<f32>) {
+        let now = Utc::now();
+        let mut query = h.world.query::<&mut SpotPriceData>();
+        for mut data in query.iter_mut(&mut h.world) {
+            *data = sell_price_data(now, sell);
+        }
+    }
+
+    fn set_export_read_back(h: &mut Harness, read_back_w: Option<u32>, read_at: DateTime<Utc>) {
+        let mut query = h.world.query::<&mut RawInverterState>();
+        for mut raw in query.iter_mut(&mut h.world) {
+            raw.state.export_limit_w = read_back_w;
+            raw.last_updated = read_at;
+        }
+    }
+
+    #[test]
+    fn mode_control_is_on_by_default() {
+        assert!(fluxion_types::ControlConfig::default().mode_control_enabled);
+    }
+
+    #[tokio::test]
+    async fn mode_control_off_sends_only_the_export_limit_writes() {
+        let now = Utc::now();
+        // Startup: the hardware is in SelfUse and the plan wants ForceCharge (initial sync)
+        let mut h = export_only_harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            Some(-0.1),
+            false,
+        );
+        h.run();
+        h.run();
+        assert_eq!(
+            sent_commands(&h).await,
+            vec![InverterCommand::SetExportLimit(0)]
+        );
+        // The inverter takes the curtailment (read back 0 W), so it is not re-asserted
+        set_export_read_back(&mut h, Some(0), now - Duration::seconds(50));
+
+        // Planner SelfUse in the Back Up default (SetBackupMode with the minimum SOC), then Hold
+        for mode in [InverterOperationMode::SelfUse, HOLD] {
+            h.set_schedule(block(now - Duration::minutes(1), mode), now);
+            h.age_last_change();
+            h.run();
+            h.run();
+        }
+
+        // Drift: tracked and planned Hold, the hardware reads ForceCharge twice 40 s apart
+        h.mark_synced();
+        h.set_current(HOLD);
+        h.set_hardware(
+            InverterOperationMode::ForceCharge,
+            now - Duration::seconds(40),
+        );
+        h.run();
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.run();
+        h.run();
+
+        // Lever overrides: an active VPR charge window and a ForceCharge fixed slot
+        h.set_levers(UserLevers {
+            vpr: Some(vpr_all_day(VprMode::ChargeFromGrid)),
+            ..Default::default()
+        });
+        h.run();
+        h.set_levers(UserLevers::default());
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .fixed_time_slots
+            .push(fluxion_types::user_control::FixedTimeSlot::new(
+                now - Duration::minutes(5),
+                now + Duration::hours(1),
+                InverterOperationMode::ForceCharge,
+                None,
+            ));
+        h.run();
+        assert_eq!(
+            sent_commands(&h).await,
+            vec![InverterCommand::SetExportLimit(0)],
+            "no mode, Back Up or drift write with mode control off"
+        );
+
+        // Sell price above the threshold: the stored limit is restored, still no mode write
+        set_sell_price(&mut h, Some(1.0));
+        h.run();
+        h.run();
+        assert_eq!(
+            sent_commands(&h).await,
+            vec![
+                InverterCommand::SetExportLimit(0),
+                InverterCommand::SetExportLimit(8000)
+            ]
+        );
+        set_export_read_back(&mut h, Some(8000), Utc::now() + Duration::seconds(1));
+        h.run();
+        assert!(
+            h.world
+                .resource::<ExportCurtailmentState>()
+                .restore_limits_w
+                .is_empty()
+        );
+        assert_eq!(sent_commands(&h).await.len(), 2);
+        assert_eq!(h.current_mode().mode, HOLD, "CurrentMode untouched");
+    }
+
+    #[tokio::test]
+    async fn mode_control_off_kill_switch_still_stops_curtailment() {
+        let now = Utc::now();
+        let mut h = export_only_harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            Some(-0.1),
+            false,
+        );
+        h.run();
+        assert_eq!(
+            sent_commands(&h).await,
+            vec![InverterCommand::SetExportLimit(0)]
+        );
+
+        // Kill switch on: the curtailed limit is restored, no Self-Use is written
+        h.world.resource_mut::<UserControlResource>().state.enabled = false;
+        h.run();
+        h.run();
+        assert_eq!(
+            sent_commands(&h).await,
+            vec![
+                InverterCommand::SetExportLimit(0),
+                InverterCommand::SetExportLimit(8000)
+            ]
+        );
+
+        // The automation_disabled lever blocks a fresh curtailment the same way
+        let mut h = export_only_harness(
+            vec![block(now - Duration::minutes(1), HOLD)],
+            Some(-0.1),
+            false,
+        );
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        h.run();
+        h.run();
+        assert!(sent_commands(&h).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mode_control_on_sends_modes_and_export_limit() {
+        let now = Utc::now();
+        let mut h = export_only_harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            Some(-0.1),
+            true,
+        );
+        h.run();
+        let sent = sent_commands(&h).await;
+        assert!(sent.contains(&InverterCommand::SetMode(
+            InverterOperationMode::ForceCharge
+        )));
+        assert!(sent.contains(&InverterCommand::SetExportLimit(0)));
+        assert_eq!(sent.len(), 2);
     }
 }
