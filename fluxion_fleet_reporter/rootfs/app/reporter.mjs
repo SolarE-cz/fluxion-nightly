@@ -20139,8 +20139,9 @@ async function readSnapshot(reader, entityIds2) {
     const states = await reader.states(entityIds2);
     const version2 = await reader.version();
     return { reachable: true, version: version2, states };
-  } catch {
-    return { reachable: false, version: null, states: /* @__PURE__ */ new Map() };
+  } catch (error62) {
+    const reason = error62 instanceof Error ? error62.message : String(error62);
+    return { reachable: false, version: null, states: /* @__PURE__ */ new Map(), error: reason };
   }
 }
 
@@ -20585,7 +20586,7 @@ async function enrollStep(runtime, working, nowMs) {
   }
   return failure2;
 }
-function haHealth(runtime, working, reachable, nowMs, heartbeat) {
+function haHealth(runtime, working, reachable, nowMs, heartbeat, reason) {
   const log = working.haLog;
   if (log.startMs > 0 && nowMs - log.startMs >= HA_FLAP_WINDOW_MS) {
     if (log.suppressed > 0) {
@@ -20615,7 +20616,7 @@ function haHealth(runtime, working, reachable, nowMs, heartbeat) {
     log.phase = "down";
     return {
       key: `ha:down:${heartbeat.key}`,
-      message: `Home Assistant unreachable; ${heartbeat.message}`
+      message: `Home Assistant unreachable${reason === void 0 ? "" : ` (${reason})`}; ${heartbeat.message}`
     };
   }
   if (log.loggedUp) {
@@ -20648,7 +20649,7 @@ async function heartbeatStep(runtime, working, nowMs) {
       working.pendingWrite = writeError !== null;
     }
   }
-  return haHealth(runtime, working, snapshot.reachable, nowMs, heartbeatResult(outcome));
+  return haHealth(runtime, working, snapshot.reachable, nowMs, heartbeatResult(outcome), snapshot.error);
 }
 async function tick(runtime, state) {
   const nowMs = runtime.nowMs();
