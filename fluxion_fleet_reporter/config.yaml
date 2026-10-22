@@ -1,0 +1,36 @@
+name: FluxION Fleet Reporter
+slug: fluxion_fleet_reporter
+version: 0.1.0
+description: >-
+  Reads Home Assistant states and posts a signed legacy heartbeat to the
+  FluxION fleet register. It never writes to Home Assistant.
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+homeassistant_api: true
+backup_exclude:
+  - identity.json
+options:
+  claim_code: ""
+  interval_s: 300
+  netbird_fqdn: ""
+  pv_power_entity: ""
+  soc_entity: ""
+  import_today_entity: ""
+  export_today_entity: ""
+  plan_summary_entity: ""
+  fluxion_version_entity: update.fluxion_ecs_nightly_update
+schema:
+  ingest_url: url
+  claim_code: password?
+  interval_s: int(60,3600)?
+  netbird_fqdn: str?
+  pv_power_entity: str?
+  soc_entity: str?
+  import_today_entity: str?
+  export_today_entity: str?
+  plan_summary_entity: str?
+  fluxion_version_entity: str?
