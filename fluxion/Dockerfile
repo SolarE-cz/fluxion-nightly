@@ -34,11 +34,15 @@ WORKDIR /build
 # Note: rust-toolchain.toml is intentionally NOT copied - it requests dev components
 # (clippy, rust-analyzer, rustfmt) that trigger a rustup update which fails in Docker
 # overlay fs with "Cross-device link (os error 18)".
-COPY Cargo.toml ./
+# Cargo.lock pins every dependency. Without it the build resolves afresh and fails once an
+# upstream crate yanks the versions a dependency needs (zip 4.x, yanked 2026-10).
+# No --locked: the published workspace drops fluxion-integration-tests, so cargo prunes that
+# crate from the lock; every other version stays pinned.
+COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 
-# Build release binary
-RUN cargo build --release --bin fluxion
+# Build release binaries (fluxion and fluxion-upgrader)
+RUN cargo build --release --bin fluxion --bin fluxion-upgrader
 
 # Create final image stages
 FROM ghcr.io/home-assistant/amd64-base:3.18 AS final-amd64
@@ -52,8 +56,9 @@ RUN apk add --no-cache \
     libgcc \
     && rm -rf /var/cache/apk/*
 
-# Copy binary from builder
+# Copy binaries from builder (Phase 5.1: ships both binaries)
 COPY --from=builder /build/target/release/fluxion /usr/local/bin/fluxion-main
+COPY --from=builder /build/target/release/fluxion-upgrader /usr/local/bin/fluxion-upgrader
 
 # Copy run script (flat structure after publishing)
 COPY run.sh /
@@ -63,7 +68,7 @@ RUN chmod a+x /run.sh
 LABEL \
     io.hass.name="FluxION ECS" \
     io.hass.description="Home Assistant addon for PV plant automation with FluxION" \
-    io.hass.version="0.2.35" \
+    io.hass.version="0.2.67" \
     io.hass.type="addon" \
     io.hass.arch="amd64|aarch64"
 

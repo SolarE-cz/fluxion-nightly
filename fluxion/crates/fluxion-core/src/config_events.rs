@@ -45,8 +45,23 @@ pub enum UserControlChangeType {
     SlotRemoved,
     /// Fixed time slot modified
     SlotModified,
+    /// Default mode (Self-Use or Back Up) or its Back Up minimum SOC changed
+    DefaultModeChanged,
     /// Full state update
     FullUpdate,
+}
+
+/// True when a user control change must trigger a schedule recalculation
+#[must_use]
+pub fn user_control_change_recalcs_schedule(change: UserControlChangeType) -> bool {
+    matches!(
+        change,
+        UserControlChangeType::SlotAdded
+            | UserControlChangeType::SlotModified
+            | UserControlChangeType::SlotRemoved
+            | UserControlChangeType::RestrictionsChanged
+            | UserControlChangeType::DefaultModeChanged
+    )
 }
 
 impl UserControlUpdateEvent {
@@ -81,6 +96,11 @@ impl UserControlUpdateEvent {
     /// Create an event for slot modified
     pub fn slot_modified(new_state: UserControlState) -> Self {
         Self::new(new_state, UserControlChangeType::SlotModified)
+    }
+
+    /// Create an event for a default mode or Back Up minimum SOC change
+    pub fn default_mode_changed(new_state: UserControlState) -> Self {
+        Self::new(new_state, UserControlChangeType::DefaultModeChanged)
     }
 
     /// Create a full update event
@@ -131,5 +151,23 @@ impl ConfigUpdateEvent {
     /// Check if a specific section changed
     pub fn section_changed(&self, section: ConfigSection) -> bool {
         self.changed_sections.contains(&section)
+    }
+}
+
+#[cfg(test)]
+mod user_control_replan_tests {
+    use super::*;
+
+    #[test]
+    fn default_mode_change_triggers_schedule_recalc() {
+        assert!(user_control_change_recalcs_schedule(
+            UserControlChangeType::DefaultModeChanged
+        ));
+        assert!(user_control_change_recalcs_schedule(
+            UserControlChangeType::RestrictionsChanged
+        ));
+        assert!(!user_control_change_recalcs_schedule(
+            UserControlChangeType::EnabledChanged
+        ));
     }
 }

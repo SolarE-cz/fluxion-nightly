@@ -38,6 +38,11 @@ battery-energy-discharged = Energie vybito dnes
 battery-capacity = Kapacita baterie
 battery-input-today = Dnes nabito do baterie
 battery-output-today = Dnes vybito z baterie
+battery-cost-basis = Baterie
+battery-cost-usable-at = využitelné za
+battery-cost-unknown = cena zatím neznámá
+battery-cost-solar = solár
+battery-cost-grid = síť
 
 # Solární panely (FV)
 pv-power = Výkon FV
@@ -104,3 +109,9 @@ debug-strategy-mode = Režim
 debug-strategy-profit = Zisk
 debug-strategy-reason = Důvod
 debug-no-info = Ladicí informace nejsou k dispozici (nastavte log_level = "debug" v konfiguraci)
+default-mode-label = Výchozí režim
+default-mode-self-use = Self-Use
+default-mode-backup = Backup
+default-mode-help = Režim pro plánované bloky Self-Use
+backup-min-soc-label = Minimální SOC baterie (%)
+backup-min-soc-save = Uložit

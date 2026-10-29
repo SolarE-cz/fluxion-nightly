@@ -220,11 +220,57 @@ pub async fn validate_config_handler(
     Json(validation)
 }
 
+/// Brief H37: `control.mode_control_enabled` is fixed for the add-on's run (the inverter adapter
+/// takes it at startup). An update that sets a different value is refused with this issue.
+#[must_use]
+pub fn mode_control_change(
+    current: &serde_json::Value,
+    update: &serde_json::Value,
+) -> Option<ValidationIssue> {
+    let requested = update
+        .get("control")
+        .and_then(|c| c.get("mode_control_enabled"))?;
+    let running = current
+        .get("control")
+        .and_then(|c| c.get("mode_control_enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if requested.as_bool() == Some(running) {
+        return None;
+    }
+    Some(ValidationIssue {
+        field: "control.mode_control_enabled".to_owned(),
+        message: format!(
+            "control.mode_control_enabled cannot change at runtime (running with {running}); set it in the add-on configuration and restart the add-on"
+        ),
+        severity: "error".to_owned(),
+    })
+}
+
 /// POST /api/config/update - Update configuration
 pub async fn update_config_handler(
     State(state): State<ConfigApiState>,
     Json(request): Json<UpdateConfigRequest>,
 ) -> Result<Json<UpdateConfigResponse>, StatusCode> {
+    // Mode control is fixed until the add-on restarts (brief H37)
+    if let Some(issue) = mode_control_change(&state.config.read(), &request.config) {
+        info!("Config update refused: {}", issue.message);
+        let error = issue.message.clone();
+        return Ok(Json(UpdateConfigResponse {
+            success: false,
+            validation: ValidateResponse {
+                valid: false,
+                errors: vec![issue],
+                warnings: Vec::new(),
+                restart_required: true,
+            },
+            backup_id: None,
+            applied: false,
+            restart_required: true,
+            error: Some(error),
+        }));
+    }
+
     // Merge partial config with current config
     let mut config_to_validate = state.config.read().clone();
     validation::merge_json(&mut config_to_validate, request.config.clone());
@@ -374,4 +420,46 @@ pub async fn export_config_handler(State(state): State<ConfigApiState>) -> impl 
     );
 
     (headers, json_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Brief H37: the config API refuses to change `control.mode_control_enabled` at runtime
+    #[test]
+    fn mode_control_cannot_change_at_runtime() {
+        let off = json!({"control": {"mode_control_enabled": false, "max_battery_soc": 90.0}});
+        let on = json!({"control": {"mode_control_enabled": true}});
+        let issue = mode_control_change(&off, &json!({"control": {"mode_control_enabled": true}}))
+            .expect("refused");
+        assert_eq!(issue.field, "control.mode_control_enabled");
+        assert!(
+            issue.message.contains("restart the add-on"),
+            "{}",
+            issue.message
+        );
+        assert!(
+            mode_control_change(&on, &json!({"control": {"mode_control_enabled": false}}))
+                .is_some()
+        );
+        // A key missing from the running config counts as the default (on)
+        assert!(
+            mode_control_change(
+                &json!({}),
+                &json!({"control": {"mode_control_enabled": false}})
+            )
+            .is_some()
+        );
+        // The same value, or an update without the key, passes
+        assert!(
+            mode_control_change(&off, &json!({"control": {"mode_control_enabled": false}}))
+                .is_none()
+        );
+        assert!(
+            mode_control_change(&off, &json!({"control": {"max_battery_soc": 100.0}})).is_none()
+        );
+        assert!(mode_control_change(&off, &json!({"system": {"debug_mode": false}})).is_none());
+    }
 }

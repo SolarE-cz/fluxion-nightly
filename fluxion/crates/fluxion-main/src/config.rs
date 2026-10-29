@@ -48,6 +48,43 @@ pub struct AppConfig {
     /// Solar forecast configuration
     #[serde(default, rename = "solar_forecast")]
     pub solar_forecast: SolarForecastConfig,
+
+    /// Remote access configuration
+    #[serde(default, rename = "remote_access")]
+    pub remote_access: RemoteAccessConfig,
+
+    /// Server heartbeat configuration
+    #[serde(default, rename = "server_heartbeat")]
+    pub server_heartbeat: ServerHeartbeatConfig,
+
+    /// User levers (HA helpers) configuration
+    #[serde(default)]
+    pub levers: LeversConfig,
+
+    /// Persistent notifications configuration
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+/// Persistent notifications created by FluxION in Home Assistant
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Create a notification with today's plan at 00:15 local. Default: false
+    pub daily_plan: bool,
+}
+
+/// Legacy FluxION levers: FluxION creates and polls the FVE-Automatizace helpers
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LeversConfig {
+    pub enabled: bool,
+}
+
+impl Default for LeversConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Configuration for a single inverter
@@ -64,6 +101,12 @@ pub struct InverterConfig {
     /// Entity prefix in HA (e.g., "solax", "solax_<ip>")
     pub entity_prefix: String,
 
+    /// Prefix of the control entities (`select.*`, `number.*`, `button.*`, `switch.*`, `time.*`)
+    /// when the integration names them differently from the sensors (brief H36), e.g. sensors
+    /// `sensor.solax_*` and controls `select.solax_inverter_*`. Empty = same as before.
+    #[serde(default)]
+    pub control_entity_prefix: String,
+
     /// Control topology: independent, master, slave
     pub topology: String,
 
@@ -76,6 +119,21 @@ pub struct InverterConfig {
     /// Accepts both "master" (config.toml) and "master_id" (HA addon options.json)
     #[serde(alias = "master_id")]
     pub master: Option<String>,
+
+    /// Read-only entity prefixes of parallel units whose PV power and solar energy are added to
+    /// this inverter's PV (e.g. a SolaX parallel slave `solax_81`). Nothing is ever written to
+    /// them, and battery, house-load and mode reads stay this inverter's own.
+    #[serde(default)]
+    pub pv_extra_prefixes: Vec<String>,
+}
+
+impl InverterConfig {
+    /// The configured control prefix, or `None` when it is empty (controls then keep the prefix
+    /// each call site used before brief H36)
+    #[must_use]
+    pub fn control_prefix_override(&self) -> Option<&str> {
+        Some(self.control_entity_prefix.trim()).filter(|p| !p.is_empty())
+    }
 }
 
 /// Pricing configuration
@@ -87,6 +145,10 @@ pub struct PricingConfig {
     /// Optional separate sensor for tomorrow's prices
     #[serde(default)]
     pub tomorrow_price_entity: Option<String>,
+
+    /// Optional separate sensor for the buy price (incl. VAT); empty = buy at spot
+    #[serde(default)]
+    pub buy_price_entity: Option<String>,
 
     /// Use spot prices for buying decisions
     pub use_spot_prices_to_buy: bool,
@@ -102,12 +164,12 @@ pub struct PricingConfig {
     /// Can be 24 values (hourly) - will be expanded to 96 (15-min blocks)
     pub fixed_sell_prices: Vec<f32>,
 
-    /// Spot market buy fee (CZK/kWh)
-    #[serde(default = "default_spot_buy_fee")]
+    /// Spot market buy fee (CZK/kWh); HA addon option `spot_buy_fee_czk`
+    #[serde(default = "default_spot_buy_fee", alias = "spot_buy_fee_czk")]
     pub spot_buy_fee: f32,
 
-    /// Spot market sell fee (CZK/kWh)
-    #[serde(default = "default_spot_sell_fee")]
+    /// Spot market sell fee (CZK/kWh); HA addon option `spot_sell_fee_czk`
+    #[serde(default = "default_spot_sell_fee", alias = "spot_sell_fee_czk")]
     pub spot_sell_fee: f32,
 
     /// Home Assistant entity for HDO tariff schedule (e.g., "sensor.cez_hdo_raw_data")
@@ -121,6 +183,18 @@ pub struct PricingConfig {
     /// Grid fee during HDO high tariff periods (CZK/kWh)
     #[serde(default = "default_hdo_high_tariff_czk")]
     pub hdo_high_tariff_czk: f32,
+
+    /// Fill slots missing from the price entity with OTE day-ahead prices (brief H35)
+    #[serde(default = "default_true")]
+    pub ote_fallback_enabled: bool,
+
+    /// Keep an HA persistent notification up while prices are missing (brief H35)
+    #[serde(default = "default_true")]
+    pub price_alert_notification: bool,
+
+    /// Time of day (Europe/Prague, "HH:MM") after which tomorrow's prices are expected
+    #[serde(default = "default_tomorrow_prices_check_time")]
+    pub tomorrow_prices_check_time: String,
 }
 
 /// Control configuration
@@ -164,12 +238,12 @@ pub struct ControlConfig {
     /// This represents the cost of battery degradation
     /// Example: 23 kWh battery with 6000 cycles and 115,000 CZK cost
     /// = 115000 / (23 * 6000) = 0.833 CZK per full cycle = ~0.036 CZK/kWh per half-cycle
-    /// Conservative estimate: 0.125 CZK/kWh
+    /// Default: 0.1 CZK/kWh
     #[serde(default = "default_battery_wear_cost")]
     pub battery_wear_cost_czk_per_kwh: f32,
 
-    /// Battery round-trip efficiency (0.0 to 1.0)
-    /// Typical lithium-ion batteries: 0.90-0.95
+    /// Battery one-way efficiency (0.0 to 1.0, default 0.95). The cost of charge (brief H33)
+    /// uses its square as the round trip; the Winter Reserve planner applies it once, on charge.
     #[serde(default = "default_battery_efficiency")]
     pub battery_efficiency: f32,
 
@@ -185,6 +259,11 @@ pub struct ControlConfig {
     #[serde(default = "default_average_household_load")]
     pub average_household_load_kw: f32,
 
+    /// Multiplier on the house-load profile used by the Winter Reserve planner (1.0-1.5).
+    /// Applied to max(mean, p75) of the house-load profile. Default: 1.10
+    #[serde(default = "default_planner_load_margin")]
+    pub planner_load_margin: f32,
+
     /// Minimum number of consecutive 15-minute blocks required for force-charge/discharge operations
     /// Single-block force operations can cause excessive inverter EEPROM writes.
     /// Default: 2 blocks (30 minutes minimum duration)
@@ -194,11 +273,54 @@ pub struct ControlConfig {
     pub min_consecutive_force_blocks: usize,
 
     /// Default battery operation mode when not force charging/discharging
-    /// Options: "SelfUse" (default) or "BackUpMode" (Solax-specific)
+    /// Options: "SelfUse" (default), "BackUpMode", or "NoChargeNoDischarge"
     /// - SelfUse: Normal self-consumption, battery used to minimize grid import
-    /// - BackUpMode: Prioritize battery reserve for power outages (Solax only)
+    /// - BackUpMode: Battery reserved for power outages (Solax native backup mode)
+    /// - NoChargeNoDischarge: Hold battery charge, grid powers house directly
     #[serde(default = "default_battery_mode")]
     pub default_battery_mode: String,
+
+    /// Curtail export (SolaX export limit 0 W) in blocks whose sell price is at or below
+    /// `export_curtail_at_or_below_czk`. Options: true, false (default: false, opt-in per site)
+    #[serde(default = "default_export_curtailment_enabled")]
+    pub export_curtailment_enabled: bool,
+
+    /// Sell price (CZK/kWh) at or below which export is curtailed. Default: 0.0
+    #[serde(default = "default_export_curtail_at_or_below_czk")]
+    pub export_curtail_at_or_below_czk: f32,
+
+    /// Hard cap (W) on every export limit FluxION writes. Unset: no cap beyond
+    /// `maximum_export_power_w` and the inverter's own maximum.
+    #[serde(default)]
+    pub export_limit_hard_cap_w: Option<u32>,
+
+    /// Export limit (W) while curtailed. Default: 0
+    #[serde(default = "default_export_limit_min_w")]
+    pub export_limit_min_w: u32,
+
+    /// Allow battery Force Discharge (Manual Mode). Off until a discharge method capped to the
+    /// per-site export limit exists. Default: false
+    #[serde(default)]
+    pub force_discharge_enabled: bool,
+
+    /// SolaX only: unlock a "Locked" inverter before a write (never in debug mode).
+    /// Default: true (matches Node-RED); when false the write is skipped and only notifies.
+    #[serde(default = "default_true")]
+    pub auto_unlock_inverter: bool,
+
+    /// Entity that holds the SolaX HotStandBy setting. Empty or unset means auto-detect.
+    #[serde(default)]
+    pub hot_standby_entity: Option<String>,
+
+    /// Keep the HotStandBy setting on (startup and every 5 minutes). Default: true
+    #[serde(default = "default_true")]
+    pub ensure_hot_standby: bool,
+
+    /// FluxION writes inverter modes (brief H37). When false it only curtails export (no work
+    /// mode, Back Up minimum SOC, HotStandBy, awaken or lock writes besides the export limit
+    /// write); planning and the dashboard keep running. Default: true
+    #[serde(default = "default_true")]
+    pub mode_control_enabled: bool,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -206,11 +328,11 @@ fn default_battery_capacity() -> f32 {
 }
 
 fn default_battery_wear_cost() -> f32 {
-    0.125 // CZK per kWh cycled (conservative estimate)
+    0.1 // CZK per kWh cycled
 }
 
 fn default_battery_efficiency() -> f32 {
-    0.95 // 95% round-trip efficiency
+    0.95 // one-way; the round trip is its square (0.9025)
 }
 
 fn default_min_mode_change_interval() -> u64 {
@@ -219,6 +341,10 @@ fn default_min_mode_change_interval() -> u64 {
 
 fn default_average_household_load() -> f32 {
     0.5 // 500W typical household consumption
+}
+
+fn default_planner_load_margin() -> f32 {
+    1.10
 }
 
 fn default_hardware_min_soc() -> f32 {
@@ -235,6 +361,19 @@ fn default_min_consecutive_force_blocks() -> usize {
 
 fn default_battery_mode() -> String {
     "SelfUse".to_string() // Default to self-use mode for backward compatibility
+}
+
+fn default_export_curtailment_enabled() -> bool {
+    // Opt-in per site until an attended hardware test
+    false
+}
+
+fn default_export_curtail_at_or_below_czk() -> f32 {
+    0.0
+}
+
+fn default_export_limit_min_w() -> u32 {
+    0
 }
 
 fn default_spot_buy_fee() -> f32 {
@@ -255,6 +394,10 @@ fn default_hdo_low_tariff_czk() -> f32 {
 
 fn default_hdo_high_tariff_czk() -> f32 {
     1.80
+}
+
+fn default_tomorrow_prices_check_time() -> String {
+    fluxion_adapters::price_fallback::DEFAULT_CHECK_TIME.to_string()
 }
 
 /// System configuration
@@ -286,6 +429,10 @@ pub struct SystemConfig {
     /// Home Assistant timezone (fetched from HA at runtime)
     #[serde(skip)]
     pub timezone: Option<String>,
+
+    /// User-selected display timezone (IANA name), used when HA timezone is unknown
+    #[serde(default)]
+    pub display_timezone: Option<String>,
 }
 
 /// Strategies configuration root
@@ -308,6 +455,12 @@ pub struct StrategiesConfig {
     #[serde(default)]
     pub winter_adaptive_v9: WinterAdaptiveV9Config,
     #[serde(default)]
+    pub winter_reserve: WinterReserveConfig,
+    #[serde(default)]
+    pub winter_adaptive_v10: WinterAdaptiveV10Config,
+    #[serde(default)]
+    pub winter_adaptive_v20: WinterAdaptiveV20Config,
+    #[serde(default)]
     pub winter_peak_discharge: WinterPeakDischargeConfig,
     #[serde(default)]
     pub solar_aware_charging: SolarAwareChargingConfig,
@@ -325,6 +478,8 @@ pub struct StrategiesConfig {
     pub self_use: StrategyEnabledConfig,
     #[serde(default)]
     pub seasonal: SeasonalConfig,
+    #[serde(default)]
+    pub fixed_price_arbitrage: FixedPriceArbitrageConfig,
 }
 
 fn default_strategy_priority() -> u8 {
@@ -930,6 +1085,243 @@ impl Default for WinterAdaptiveV9Config {
     }
 }
 
+/// Winter Reserve - keeps the night reserve, buys cheap and exports only real profit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterReserveConfig {
+    pub enabled: bool,
+    pub priority: u8,
+    pub min_arbitrage_profit_czk: f32,
+    pub insane_price_multiplier: f32,
+    pub cheap_percentile: f32,
+    pub load_safety_factor: f32,
+    pub pv_confidence: f32,
+    pub min_mode_benefit_czk: f32,
+    pub mode_switch_min_benefit_czk: f32,
+    pub soc_resolution_pct: f32,
+}
+
+impl Default for WinterReserveConfig {
+    fn default() -> Self {
+        let core = fluxion_core::WinterReserveConfigCore::default();
+        Self {
+            enabled: core.enabled,
+            priority: core.priority,
+            min_arbitrage_profit_czk: core.min_arbitrage_profit_czk,
+            insane_price_multiplier: core.insane_price_multiplier,
+            cheap_percentile: core.cheap_percentile,
+            load_safety_factor: core.load_safety_factor,
+            pv_confidence: core.pv_confidence,
+            min_mode_benefit_czk: core.min_mode_benefit_czk,
+            mode_switch_min_benefit_czk: core.mode_switch_min_benefit_czk,
+            soc_resolution_pct: core.soc_resolution_pct,
+        }
+    }
+}
+
+/// Winter Adaptive V10 Configuration - Dynamic Battery Budget Allocation
+/// V10 uses unified budget allocation instead of mode-based planning
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterAdaptiveV10Config {
+    pub enabled: bool,
+    #[serde(default = "default_v10_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v10_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_v10_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    #[serde(default = "default_v10_battery_round_trip_efficiency")]
+    pub battery_round_trip_efficiency: f32,
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    #[serde(default = "default_v10_opportunistic_charge_threshold_czk")]
+    pub opportunistic_charge_threshold_czk: f32,
+    #[serde(default = "default_v10_min_export_spread_czk")]
+    pub min_export_spread_czk: f32,
+    #[serde(default = "default_v10_min_soc_after_export")]
+    pub min_soc_after_export: f32,
+    #[serde(default = "default_v10_solar_threshold_kwh")]
+    pub solar_threshold_kwh: f32,
+    #[serde(default = "default_v10_solar_confidence_factor")]
+    pub solar_confidence_factor: f32,
+    #[serde(default = "default_v10_min_savings_threshold_czk")]
+    pub min_savings_threshold_czk: f32,
+}
+
+fn default_v10_priority() -> u8 {
+    100
+}
+fn default_v10_target_battery_soc() -> f32 {
+    95.0
+}
+fn default_v10_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v10_battery_round_trip_efficiency() -> f32 {
+    0.90
+}
+fn default_v10_opportunistic_charge_threshold_czk() -> f32 {
+    1.5
+}
+fn default_v10_min_export_spread_czk() -> f32 {
+    5.0
+}
+fn default_v10_min_soc_after_export() -> f32 {
+    35.0
+}
+fn default_v10_solar_threshold_kwh() -> f32 {
+    5.0
+}
+fn default_v10_solar_confidence_factor() -> f32 {
+    0.7
+}
+fn default_v10_min_savings_threshold_czk() -> f32 {
+    0.5
+}
+
+impl Default for WinterAdaptiveV10Config {
+    fn default() -> Self {
+        Self {
+            enabled: false, // V9 remains the default
+            priority: 100,
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            battery_round_trip_efficiency: 0.90,
+            negative_price_handling_enabled: true,
+            opportunistic_charge_threshold_czk: 1.5,
+            min_export_spread_czk: 5.0,
+            min_soc_after_export: 35.0,
+            solar_threshold_kwh: 5.0,
+            solar_confidence_factor: 0.7,
+            min_savings_threshold_czk: 0.5,
+        }
+    }
+}
+
+/// Winter Adaptive V20 Configuration - Adaptive Budget Allocation
+/// V20 = V10 algorithm + DayMetrics-driven parameter resolution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WinterAdaptiveV20Config {
+    pub enabled: bool,
+    #[serde(default = "default_v20_priority")]
+    pub priority: u8,
+    #[serde(default = "default_v20_target_battery_soc")]
+    pub target_battery_soc: f32,
+    #[serde(default = "default_v20_min_discharge_soc")]
+    pub min_discharge_soc: f32,
+    #[serde(default = "default_v20_battery_round_trip_efficiency")]
+    pub battery_round_trip_efficiency: f32,
+    #[serde(default = "default_true")]
+    pub negative_price_handling_enabled: bool,
+    #[serde(default = "default_v20_opportunistic_charge_threshold_czk")]
+    pub opportunistic_charge_threshold_czk: f32,
+    #[serde(default = "default_v20_min_export_spread_czk")]
+    pub min_export_spread_czk: f32,
+    #[serde(default = "default_v20_min_soc_after_export")]
+    pub min_soc_after_export: f32,
+    #[serde(default = "default_v20_solar_threshold_kwh")]
+    pub solar_threshold_kwh: f32,
+    #[serde(default = "default_v20_solar_confidence_factor")]
+    pub solar_confidence_factor: f32,
+    #[serde(default = "default_v20_min_savings_threshold_czk")]
+    pub min_savings_threshold_czk: f32,
+    // DayMetrics thresholds
+    #[serde(default = "default_v20_volatile_cv_threshold")]
+    pub volatile_cv_threshold: f32,
+    #[serde(default = "default_v20_expensive_level_threshold")]
+    pub expensive_level_threshold: f32,
+    #[serde(default = "default_v20_high_solar_ratio_threshold")]
+    pub high_solar_ratio_threshold: f32,
+    #[serde(default = "default_v20_low_solar_ratio_threshold")]
+    pub low_solar_ratio_threshold: f32,
+    #[serde(default = "default_v20_tomorrow_expensive_ratio")]
+    pub tomorrow_expensive_ratio: f32,
+    #[serde(default = "default_v20_tomorrow_cheap_ratio")]
+    pub tomorrow_cheap_ratio: f32,
+    #[serde(default = "default_v20_negative_price_fraction_threshold")]
+    pub negative_price_fraction_threshold: f32,
+}
+
+fn default_v20_priority() -> u8 {
+    100
+}
+fn default_v20_target_battery_soc() -> f32 {
+    95.0
+}
+fn default_v20_min_discharge_soc() -> f32 {
+    10.0
+}
+fn default_v20_battery_round_trip_efficiency() -> f32 {
+    0.90
+}
+fn default_v20_opportunistic_charge_threshold_czk() -> f32 {
+    1.5
+}
+fn default_v20_min_export_spread_czk() -> f32 {
+    3.0
+}
+fn default_v20_min_soc_after_export() -> f32 {
+    25.0
+}
+fn default_v20_solar_threshold_kwh() -> f32 {
+    5.0
+}
+fn default_v20_solar_confidence_factor() -> f32 {
+    0.7
+}
+fn default_v20_min_savings_threshold_czk() -> f32 {
+    0.5
+}
+fn default_v20_volatile_cv_threshold() -> f32 {
+    0.35
+}
+fn default_v20_expensive_level_threshold() -> f32 {
+    0.3
+}
+fn default_v20_high_solar_ratio_threshold() -> f32 {
+    1.1
+}
+fn default_v20_low_solar_ratio_threshold() -> f32 {
+    0.9
+}
+fn default_v20_tomorrow_expensive_ratio() -> f32 {
+    1.3
+}
+fn default_v20_tomorrow_cheap_ratio() -> f32 {
+    0.7
+}
+fn default_v20_negative_price_fraction_threshold() -> f32 {
+    0.0
+}
+
+impl Default for WinterAdaptiveV20Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            priority: 100,
+            target_battery_soc: 95.0,
+            min_discharge_soc: 10.0,
+            battery_round_trip_efficiency: 0.90,
+            negative_price_handling_enabled: true,
+            opportunistic_charge_threshold_czk: 1.5,
+            min_export_spread_czk: 5.0,
+            min_soc_after_export: 35.0,
+            solar_threshold_kwh: 5.0,
+            solar_confidence_factor: 0.7,
+            min_savings_threshold_czk: 0.5,
+            volatile_cv_threshold: 0.35,
+            expensive_level_threshold: 0.5,
+            high_solar_ratio_threshold: 1.1,
+            low_solar_ratio_threshold: 0.9,
+            tomorrow_expensive_ratio: 1.3,
+            tomorrow_cheap_ratio: 0.7,
+            negative_price_fraction_threshold: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WinterPeakDischargeConfig {
     pub enabled: bool,
@@ -1008,13 +1400,21 @@ impl Default for StrategyEnabledConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumptionHistoryConfig {
-    /// Home Assistant entity ID for daily consumption (e.g., "sensor.solax_today_s_import_energy")
-    #[serde(default = "default_consumption_entity")]
+    /// Home Assistant entity ID for daily consumption (grid import today, kWh). Empty or unset:
+    /// derived from the first inverter's entity prefix, `sensor.<prefix>_today_s_import_energy`
+    /// (e.g. "sensor.solax_today_s_import_energy").
+    #[serde(default)]
     pub consumption_entity: String,
 
-    /// Home Assistant entity ID for daily solar production (e.g., "sensor.energy_production_today")
-    #[serde(default = "default_solar_production_entity")]
+    /// Home Assistant entity ID for daily solar production. Empty or unset:
+    /// "sensor.energy_production_today".
+    #[serde(default)]
     pub solar_production_entity: String,
+
+    /// Home Assistant entity ID for house load power in W. Empty or unset: derived from the
+    /// inverter entity mapper (e.g., "sensor.solax_house_load" on SolaX).
+    #[serde(default)]
+    pub house_load_power_entity: Option<String>,
 
     /// Number of days to track for EMA calculation
     #[serde(default = "default_ema_days")]
@@ -1028,20 +1428,46 @@ pub struct ConsumptionHistoryConfig {
 impl Default for ConsumptionHistoryConfig {
     fn default() -> Self {
         Self {
-            consumption_entity: default_consumption_entity(),
-            solar_production_entity: default_solar_production_entity(),
+            consumption_entity: String::new(),
+            solar_production_entity: String::new(),
+            house_load_power_entity: None,
             ema_days: default_ema_days(),
             seasonal_detection_days: default_seasonal_detection_days(),
         }
     }
 }
 
-fn default_consumption_entity() -> String {
-    "sensor.solax_today_s_import_energy".to_string()
+/// Daily consumption entity used when none is configured and there is no inverter to derive it
+const FALLBACK_CONSUMPTION_ENTITY: &str = "sensor.solax_today_s_import_energy";
+/// Daily solar production entity used when none is configured
+const DEFAULT_SOLAR_PRODUCTION_ENTITY: &str = "sensor.energy_production_today";
+
+impl ConsumptionHistoryConfig {
+    /// Daily consumption entity in effect: the configured one, else the first inverter's
+    /// grid-import-today sensor from its entity prefix (`sensor.<prefix>_today_s_import_energy`
+    /// on SolaX), so a site whose prefix is not `solax` reads its own sensor.
+    pub fn effective_consumption_entity(&self, inverters: &[InverterConfig]) -> String {
+        non_empty(&self.consumption_entity)
+            .or_else(|| {
+                inverters.first().and_then(|inv| {
+                    fluxion_adapters::solax::create_entity_mapper(inv.inverter_type)
+                        .get_grid_import_today_entity(&inv.entity_prefix)
+                })
+            })
+            .unwrap_or_else(|| FALLBACK_CONSUMPTION_ENTITY.to_string())
+    }
+
+    /// Daily solar production entity in effect: the configured one, else
+    /// "sensor.energy_production_today"
+    pub fn effective_solar_production_entity(&self) -> String {
+        non_empty(&self.solar_production_entity)
+            .unwrap_or_else(|| DEFAULT_SOLAR_PRODUCTION_ENTITY.to_string())
+    }
 }
 
-fn default_solar_production_entity() -> String {
-    "sensor.energy_production_today".to_string()
+fn non_empty(entity: &str) -> Option<String> {
+    let entity = entity.trim();
+    (!entity.is_empty()).then(|| entity.to_string())
 }
 
 fn default_ema_days() -> usize {
@@ -1057,8 +1483,40 @@ pub struct SeasonalConfig {
     pub force_season: Option<String>,
 }
 
+// ============================================================================
+// Fixed Price Arbitrage Strategy Configuration
+// ============================================================================
+
+/// Fixed Price Arbitrage - charges at fixed price, sells at high spot price
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FixedPriceArbitrageConfig {
+    pub enabled: bool,
+    #[serde(default = "default_fixed_price_arbitrage_priority")]
+    pub priority: u8,
+    #[serde(default = "default_fpa_min_profit_threshold")]
+    pub min_profit_threshold_czk: f32,
+}
+
+fn default_fixed_price_arbitrage_priority() -> u8 {
+    85
+}
+fn default_fpa_min_profit_threshold() -> f32 {
+    3.0
+}
+
+impl Default for FixedPriceArbitrageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            priority: default_fixed_price_arbitrage_priority(),
+            min_profit_threshold_czk: default_fpa_min_profit_threshold(),
+        }
+    }
+}
+
 /// Solar forecast configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolarForecastConfig {
     /// Enable solar forecast fetching
     #[serde(default)]
@@ -1079,6 +1537,72 @@ pub struct SolarForecastConfig {
     /// Fetch interval in seconds
     #[serde(default)]
     pub fetch_interval_seconds: u64,
+
+    /// Forecast provider (registry platform); empty = pattern match only
+    #[serde(default = "default_solar_provider")]
+    pub provider: String,
+
+    /// Power sensors compared with the forecast; empty = `sensor.<prefix>_pv_power_total`
+    #[serde(default)]
+    pub actual_pv_power_entities: Vec<String>,
+
+    /// Scale the planner's PV forecast by the 7-day measured/forecast ratio (brief H34)
+    #[serde(default = "default_pv_forecast_correction_enabled")]
+    pub pv_forecast_correction_enabled: bool,
+}
+
+fn default_pv_forecast_correction_enabled() -> bool {
+    true
+}
+
+fn default_solar_provider() -> String {
+    "open_meteo_solar_forecast".to_string()
+}
+
+impl Default for SolarForecastConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sensor_total_today_pattern: String::new(),
+            sensor_remaining_today_pattern: String::new(),
+            sensor_tomorrow_pattern: String::new(),
+            fetch_interval_seconds: 0,
+            provider: default_solar_provider(),
+            actual_pv_power_entities: Vec::new(),
+            pv_forecast_correction_enabled: default_pv_forecast_correction_enabled(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct RemoteAccessConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerHeartbeatConfig {
+    pub enabled: bool,
+    pub server_url: String,
+    pub instance_id: String,
+    pub shared_secret: String,
+    pub friendly_name: Option<String>,
+    pub interval_seconds: u64,
+}
+
+impl Default for ServerHeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: String::new(),
+            instance_id: String::new(),
+            shared_secret: String::new(),
+            friendly_name: None,
+            interval_seconds: 300,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -1089,13 +1613,16 @@ impl Default for AppConfig {
                 id: "main_inverter".to_string(),
                 inverter_type: fluxion_core::InverterType::Solax,
                 entity_prefix: "solax".to_string(),
+                control_entity_prefix: String::new(),
                 topology: "independent".to_string(),
                 slaves: None,
                 master: None,
+                pv_extra_prefixes: Vec::new(),
             }],
             pricing: PricingConfig {
                 spot_price_entity: "sensor.current_spot_electricity_price_15min".to_string(),
                 tomorrow_price_entity: None,
+                buy_price_entity: None,
                 use_spot_prices_to_buy: true,
                 use_spot_prices_to_sell: true,
                 fixed_buy_prices: vec![0.05; 24], // 24 hourly values
@@ -1105,6 +1632,9 @@ impl Default for AppConfig {
                 hdo_sensor_entity: default_hdo_sensor_entity(),
                 hdo_low_tariff_czk: default_hdo_low_tariff_czk(),
                 hdo_high_tariff_czk: default_hdo_high_tariff_czk(),
+                ote_fallback_enabled: true,
+                price_alert_notification: true,
+                tomorrow_prices_check_time: default_tomorrow_prices_check_time(),
             },
             control: ControlConfig {
                 maximum_export_power_w: 5000,
@@ -1118,9 +1648,19 @@ impl Default for AppConfig {
                 battery_efficiency: default_battery_efficiency(),
                 min_mode_change_interval_secs: default_min_mode_change_interval(),
                 average_household_load_kw: default_average_household_load(),
+                planner_load_margin: default_planner_load_margin(),
                 hardware_min_battery_soc: default_hardware_min_soc(),
                 min_consecutive_force_blocks: default_min_consecutive_force_blocks(),
                 default_battery_mode: default_battery_mode(),
+                export_curtailment_enabled: default_export_curtailment_enabled(),
+                export_curtail_at_or_below_czk: default_export_curtail_at_or_below_czk(),
+                export_limit_hard_cap_w: None,
+                export_limit_min_w: default_export_limit_min_w(),
+                force_discharge_enabled: false,
+                auto_unlock_inverter: true,
+                hot_standby_entity: None,
+                ensure_hot_standby: true,
+                mode_control_enabled: true,
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -1131,10 +1671,15 @@ impl Default for AppConfig {
                 display_currency: "EUR".to_string(),
                 language: Language::English,
                 timezone: None, // Will be fetched from HA at runtime
+                display_timezone: None,
             },
             strategies: StrategiesConfig::default(),
             history: ConsumptionHistoryConfig::default(),
             solar_forecast: SolarForecastConfig::default(),
+            remote_access: RemoteAccessConfig::default(),
+            server_heartbeat: ServerHeartbeatConfig::default(),
+            levers: LeversConfig::default(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -1211,6 +1756,41 @@ impl AppConfig {
     }
 
     /// Validate configuration with detailed error reporting
+    /// Why a `pv_extra_prefixes` entry is not allowed, if it is not: it must not name a
+    /// configured inverter (those are controlled; extras are read-only).
+    fn pv_extra_prefix_error(&self, extra: &str) -> Option<String> {
+        self.inverters
+            .iter()
+            .find(|inv| inv.id == extra || inv.entity_prefix == extra)
+            .map(|inv| {
+                format!(
+                    "PV extra prefix '{extra}' is the configured inverter '{}'; extras must be read-only parallel units",
+                    inv.id
+                )
+            })
+    }
+
+    /// Control prefix per inverter id, for the entity mapper and adapter (brief H36).
+    /// Inverters with an empty `control_entity_prefix` are not listed.
+    #[must_use]
+    pub fn control_prefixes(&self) -> fluxion_adapters::ControlPrefixes {
+        self.inverters
+            .iter()
+            .fold(fluxion_adapters::ControlPrefixes::new(), |prefixes, inv| {
+                prefixes.with_inverter(&inv.id, &inv.control_entity_prefix)
+            })
+    }
+
+    /// Non-empty, trimmed `pv_extra_prefixes` of an inverter
+    pub fn pv_extra_prefixes(inverter: &InverterConfig) -> Vec<String> {
+        inverter
+            .pv_extra_prefixes
+            .iter()
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
     pub fn validate_detailed(&self) -> ValidationResult {
         let mut result = ValidationResult::success();
 
@@ -1234,6 +1814,11 @@ impl AppConfig {
                     format!("{prefix}.entity_prefix"),
                     "Entity prefix cannot be empty",
                 );
+            }
+            for extra in Self::pv_extra_prefixes(inverter) {
+                if let Some(error) = self.pv_extra_prefix_error(&extra) {
+                    result.add_error(format!("{prefix}.pv_extra_prefixes"), error);
+                }
             }
 
             // Validate topology relationships
@@ -1272,6 +1857,20 @@ impl AppConfig {
             result.add_error(
                 "pricing.spot_price_entity",
                 "Spot price entity cannot be empty",
+            );
+        }
+
+        if fluxion_adapters::price_fallback::parse_check_time(
+            &self.pricing.tomorrow_prices_check_time,
+        )
+        .is_none()
+        {
+            result.add_error(
+                "pricing.tomorrow_prices_check_time",
+                format!(
+                    "Must be HH:MM, got '{}'",
+                    self.pricing.tomorrow_prices_check_time
+                ),
             );
         }
 
@@ -1399,6 +1998,11 @@ impl AppConfig {
             }
             if inverter.entity_prefix.is_empty() {
                 anyhow::bail!("Inverter '{}' has empty entity_prefix", inverter.id);
+            }
+            for extra in Self::pv_extra_prefixes(inverter) {
+                if let Some(error) = self.pv_extra_prefix_error(&extra) {
+                    anyhow::bail!("Inverter '{}': {}", inverter.id, error);
+                }
             }
 
             // Validate topology relationships
@@ -1567,6 +2171,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     id: inv.id.clone(),
                     inverter_type: inv.inverter_type,
                     entity_prefix: inv.entity_prefix.clone(),
+                    control_entity_prefix: inv.control_entity_prefix.trim().to_owned(),
                     topology: match inv.topology.as_str() {
                         "master" => fluxion_core::InverterTopology::Master {
                             slave_ids: inv.slaves.clone().unwrap_or_default(),
@@ -1576,11 +2181,16 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         },
                         _ => fluxion_core::InverterTopology::Independent,
                     },
+                    pv_extra_prefixes: AppConfig::pv_extra_prefixes(inv),
                 })
                 .collect(),
             pricing_config: fluxion_core::PricingConfig {
                 spot_price_entity: app_config.pricing.spot_price_entity,
                 tomorrow_price_entity: app_config.pricing.tomorrow_price_entity,
+                buy_price_entity: app_config
+                    .pricing
+                    .buy_price_entity
+                    .filter(|entity| !entity.trim().is_empty()),
                 use_spot_prices_to_buy: app_config.pricing.use_spot_prices_to_buy,
                 use_spot_prices_to_sell: app_config.pricing.use_spot_prices_to_sell,
                 fixed_buy_price_czk: if app_config.pricing.fixed_buy_prices.len() == 1 {
@@ -1644,6 +2254,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 battery_efficiency: app_config.control.battery_efficiency,
                 min_mode_change_interval_secs: app_config.control.min_mode_change_interval_secs,
                 average_household_load_kw: app_config.control.average_household_load_kw,
+                planner_load_margin: app_config.control.planner_load_margin,
                 hardware_min_battery_soc: app_config.control.hardware_min_battery_soc,
                 grid_export_fee_czk_per_kwh: 0.5, // Fixed export fee (TODO: make configurable)
                 max_battery_charge_rate_kw: app_config.control.max_battery_charge_rate_kw,
@@ -1662,8 +2273,24 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     "BACKUPMODE" | "BACKUP" | "BACK_UP_MODE" => {
                         fluxion_core::InverterOperationMode::BackUpMode
                     }
+                    "NOCHARGENODISCHARGE" | "NO_CHARGE_NO_DISCHARGE" => {
+                        fluxion_core::InverterOperationMode::NoChargeNoDischarge
+                    }
                     _ => fluxion_core::InverterOperationMode::SelfUse, // Default or "SELFUSE"
                 },
+                export_curtailment_enabled: app_config.control.export_curtailment_enabled,
+                export_curtail_at_or_below_czk: app_config.control.export_curtail_at_or_below_czk,
+                export_limit_hard_cap_w: app_config.control.export_limit_hard_cap_w,
+                export_limit_min_w: app_config.control.export_limit_min_w,
+                force_discharge_enabled: app_config.control.force_discharge_enabled,
+                auto_unlock_inverter: app_config.control.auto_unlock_inverter,
+                hot_standby_entity: app_config
+                    .control
+                    .hot_standby_entity
+                    .clone()
+                    .filter(|e| !e.trim().is_empty()),
+                ensure_hot_standby: app_config.control.ensure_hot_standby,
+                mode_control_enabled: app_config.control.mode_control_enabled,
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,
@@ -1671,6 +2298,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 display_currency,
                 language: app_config.system.language,
                 timezone: app_config.system.timezone,
+                display_timezone: app_config.system.display_timezone,
             },
             strategies_config: fluxion_core::StrategiesConfigCore {
                 winter_adaptive: fluxion_core::WinterAdaptiveConfigCore {
@@ -1806,7 +2434,6 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .min_discharge_spread_czk,
                     safety_margin_pct: app_config.strategies.winter_adaptive_v5.safety_margin_pct,
                 },
-                winter_adaptive_v6: fluxion_core::WinterAdaptiveV6ConfigCore::default(),
                 winter_adaptive_v7: fluxion_core::WinterAdaptiveV7ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v7.enabled,
                     priority: app_config.strategies.winter_adaptive_v7.priority,
@@ -1982,6 +2609,137 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .winter_adaptive_v9
                         .opportunistic_charge_threshold_czk,
                 },
+                winter_reserve: fluxion_core::WinterReserveConfigCore {
+                    enabled: app_config.strategies.winter_reserve.enabled,
+                    priority: app_config.strategies.winter_reserve.priority,
+                    min_arbitrage_profit_czk: app_config
+                        .strategies
+                        .winter_reserve
+                        .min_arbitrage_profit_czk,
+                    insane_price_multiplier: app_config
+                        .strategies
+                        .winter_reserve
+                        .insane_price_multiplier,
+                    cheap_percentile: app_config.strategies.winter_reserve.cheap_percentile,
+                    load_safety_factor: app_config.strategies.winter_reserve.load_safety_factor,
+                    pv_confidence: app_config.strategies.winter_reserve.pv_confidence,
+                    min_mode_benefit_czk: app_config.strategies.winter_reserve.min_mode_benefit_czk,
+                    mode_switch_min_benefit_czk: app_config
+                        .strategies
+                        .winter_reserve
+                        .mode_switch_min_benefit_czk,
+                    soc_resolution_pct: app_config.strategies.winter_reserve.soc_resolution_pct,
+                },
+                winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v10.enabled,
+                    priority: app_config.strategies.winter_adaptive_v10.priority,
+                    target_battery_soc: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .target_battery_soc,
+                    min_discharge_soc: app_config.strategies.winter_adaptive_v10.min_discharge_soc,
+                    battery_round_trip_efficiency: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .battery_round_trip_efficiency,
+                    negative_price_handling_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .negative_price_handling_enabled,
+                    opportunistic_charge_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .opportunistic_charge_threshold_czk,
+                    min_export_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .min_export_spread_czk,
+                    min_soc_after_export: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .min_soc_after_export,
+                    solar_threshold_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .solar_threshold_kwh,
+                    solar_confidence_factor: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .solar_confidence_factor,
+                    min_savings_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v10
+                        .min_savings_threshold_czk,
+                },
+                winter_adaptive_v20: fluxion_core::WinterAdaptiveV20ConfigCore {
+                    enabled: app_config.strategies.winter_adaptive_v20.enabled,
+                    priority: app_config.strategies.winter_adaptive_v20.priority,
+                    target_battery_soc: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .target_battery_soc,
+                    min_discharge_soc: app_config.strategies.winter_adaptive_v20.min_discharge_soc,
+                    battery_round_trip_efficiency: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .battery_round_trip_efficiency,
+                    negative_price_handling_enabled: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .negative_price_handling_enabled,
+                    opportunistic_charge_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .opportunistic_charge_threshold_czk,
+                    min_export_spread_czk: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .min_export_spread_czk,
+                    min_soc_after_export: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .min_soc_after_export,
+                    solar_threshold_kwh: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .solar_threshold_kwh,
+                    solar_confidence_factor: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .solar_confidence_factor,
+                    min_savings_threshold_czk: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .min_savings_threshold_czk,
+                    volatile_cv_threshold: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .volatile_cv_threshold,
+                    expensive_level_threshold: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .expensive_level_threshold,
+                    high_solar_ratio_threshold: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .high_solar_ratio_threshold,
+                    low_solar_ratio_threshold: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .low_solar_ratio_threshold,
+                    tomorrow_expensive_ratio: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .tomorrow_expensive_ratio,
+                    tomorrow_cheap_ratio: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .tomorrow_cheap_ratio,
+                    negative_price_fraction_threshold: app_config
+                        .strategies
+                        .winter_adaptive_v20
+                        .negative_price_fraction_threshold,
+                },
                 winter_peak_discharge: fluxion_core::WinterPeakDischargeConfigCore {
                     enabled: app_config.strategies.winter_peak_discharge.enabled,
                     priority: app_config.strategies.winter_peak_discharge.priority,
@@ -2042,10 +2800,30 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     enabled: app_config.strategies.self_use.enabled,
                     priority: app_config.strategies.self_use.priority,
                 },
+                fixed_price_arbitrage: fluxion_core::FixedPriceArbitrageConfigCore {
+                    enabled: app_config.strategies.fixed_price_arbitrage.enabled,
+                    priority: app_config.strategies.fixed_price_arbitrage.priority,
+                    min_profit_threshold_czk: app_config
+                        .strategies
+                        .fixed_price_arbitrage
+                        .min_profit_threshold_czk,
+                },
             },
             history: fluxion_core::ConsumptionHistoryConfig {
-                consumption_entity: app_config.history.consumption_entity,
-                solar_production_entity: app_config.history.solar_production_entity,
+                consumption_entity: app_config
+                    .history
+                    .effective_consumption_entity(&app_config.inverters),
+                solar_production_entity: app_config.history.effective_solar_production_entity(),
+                house_load_power_entity: app_config
+                    .history
+                    .house_load_power_entity
+                    .filter(|entity| !entity.trim().is_empty())
+                    .or_else(|| {
+                        app_config.inverters.first().and_then(|inv| {
+                            fluxion_adapters::solax::create_entity_mapper(inv.inverter_type)
+                                .get_house_load_entity(&inv.id)
+                        })
+                    }),
                 ema_days: app_config.history.ema_days,
                 seasonal_detection_days: app_config.history.seasonal_detection_days,
             },
@@ -2083,6 +2861,17 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 } else {
                     app_config.solar_forecast.fetch_interval_seconds
                 },
+                provider: app_config.solar_forecast.provider,
+                actual_pv_power_entities: app_config.solar_forecast.actual_pv_power_entities,
+                pv_forecast_correction_enabled: app_config
+                    .solar_forecast
+                    .pv_forecast_correction_enabled,
+            },
+            remote_access: fluxion_core::RemoteAccessConfigCore {
+                enabled: app_config.remote_access.enabled,
+            },
+            notifications: fluxion_core::NotificationsConfigCore {
+                daily_plan: app_config.notifications.daily_plan,
             },
         }
     }
@@ -2282,17 +3071,21 @@ mod tests {
                     id: "master".to_string(),
                     inverter_type: fluxion_core::InverterType::Solax,
                     entity_prefix: "solax_1".to_string(),
+                    control_entity_prefix: String::new(),
                     topology: "master".to_string(),
                     slaves: Some(vec!["slave_1".to_string()]),
                     master: None,
+                    pv_extra_prefixes: Vec::new(),
                 },
                 InverterConfig {
                     id: "slave_1".to_string(),
                     inverter_type: fluxion_core::InverterType::Solax,
                     entity_prefix: "solax_2".to_string(),
+                    control_entity_prefix: String::new(),
                     topology: "slave".to_string(),
                     slaves: None,
                     master: Some("master".to_string()),
+                    pv_extra_prefixes: Vec::new(),
                 },
             ],
             ..AppConfig::default()
@@ -2414,6 +3207,273 @@ mod tests {
         );
     }
 
+    /// The HA addon option names `pricing.spot_buy_fee_czk` / `spot_sell_fee_czk` must reach
+    /// the runtime fields, not fall back to the 0.5 default.
+    #[test]
+    fn test_ha_addon_spot_fee_options_are_honoured() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "solax",
+                    "vendor": "solax",
+                    "entity_prefix": "solax",
+                    "topology": "independent"
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": [],
+                "spot_buy_fee_czk": 0.35,
+                "spot_sell_fee_czk": 0.35
+            },
+            "control": {
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            },
+            "strategies": {}
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(ha_addon_json).unwrap();
+        assert_eq!(config.pricing.spot_buy_fee, 0.35);
+        assert_eq!(config.pricing.spot_sell_fee, 0.35);
+    }
+
+    #[test]
+    fn test_ha_addon_hdo_fee_options_are_honoured() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": [],
+                "hdo_low_tariff_czk": 0.36,
+                "hdo_high_tariff_czk": 1.0
+            },
+            "control": {
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            },
+            "system": {"debug_mode": true, "log_level": "info", "update_interval_secs": 60},
+            "strategies": {}
+        }"#;
+
+        let config: AppConfig = serde_json::from_str(ha_addon_json).unwrap();
+        assert_eq!(config.pricing.hdo_low_tariff_czk, 0.36);
+        assert_eq!(config.pricing.hdo_high_tariff_czk, 1.0);
+    }
+
+    /// H34: `solar_forecast.pv_forecast_correction_enabled` loads from the add-on options,
+    /// defaults to true when missing, and reaches the runtime config
+    #[test]
+    fn test_ha_addon_pv_forecast_correction_option() {
+        let options = |solar: &str| {
+            format!(
+                r#"{{
+            "inverters": [
+                {{"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}}
+            ],
+            "pricing": {{
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            }},
+            "control": {{
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                "average_household_load_kw": 0.5
+            }},
+            "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}},
+            {solar}
+            "strategies": {{}}
+        }}"#
+            )
+        };
+
+        // Off in the options: off at runtime
+        let config: AppConfig = serde_json::from_str(&options(
+            r#""solar_forecast": {"provider": "open_meteo_solar_forecast", "actual_pv_power_entities": [], "pv_forecast_correction_enabled": false},"#,
+        ))
+        .unwrap();
+        assert!(!config.solar_forecast.pv_forecast_correction_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(!system.solar_forecast.pv_forecast_correction_enabled);
+
+        // Key missing (options saved before H34), or the section missing: on
+        let config: AppConfig = serde_json::from_str(&options(
+            r#""solar_forecast": {"provider": "open_meteo_solar_forecast", "actual_pv_power_entities": []},"#,
+        ))
+        .unwrap();
+        assert!(config.solar_forecast.pv_forecast_correction_enabled);
+        let config: AppConfig = serde_json::from_str(&options("")).unwrap();
+        assert!(config.solar_forecast.pv_forecast_correction_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(system.solar_forecast.pv_forecast_correction_enabled);
+
+        // The add-on defaults and schema carry the key
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    pv_forecast_correction_enabled: true\n"));
+        assert!(addon.contains("    pv_forecast_correction_enabled: bool?\n"));
+    }
+
+    /// Add-on options JSON with the given extra `control` keys (brief H33).
+    fn ha_addon_control_json(extra_control: &str) -> String {
+        format!(
+            r#"{{
+            "inverters": [
+                {{"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}}
+            ],
+            "pricing": {{
+                "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            }},
+            "control": {{
+                "maximum_export_power_w": 10000,
+                "force_charge_hours": 4,
+                "force_discharge_hours": 2,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 23.0,
+                "max_battery_charge_rate_kw": 5.0,
+                {extra_control}
+                "average_household_load_kw": 0.5
+            }},
+            "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}},
+            "strategies": {{}}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn test_ha_addon_wear_and_efficiency_options_are_honoured() {
+        let json = ha_addon_control_json(
+            r#""battery_wear_cost_czk_per_kwh": 0.25, "battery_efficiency": 0.97,"#,
+        );
+        let config: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.25);
+        assert_eq!(config.control.battery_efficiency, 0.97);
+        let core = fluxion_core::SystemConfig::from(config);
+        assert_eq!(core.control_config.battery_wear_cost_czk_per_kwh, 0.25);
+        assert_eq!(core.control_config.battery_efficiency, 0.97);
+    }
+
+    #[test]
+    fn test_ha_addon_wear_and_efficiency_default_when_missing() {
+        let config: AppConfig = serde_json::from_str(&ha_addon_control_json("")).unwrap();
+        assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.1);
+        assert_eq!(config.control.battery_efficiency, 0.95);
+    }
+
+    #[test]
+    fn test_ha_addon_price_fallback_options_are_honoured() {
+        let addon_json = |pricing_extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [
+                    {{"id": "solax", "vendor": "solax", "entity_prefix": "solax", "topology": "independent"}}
+                ],
+                "pricing": {{
+                    "spot_price_entity": "sensor.current_spot_electricity_price_15min",
+                    "use_spot_prices_to_buy": true,
+                    "use_spot_prices_to_sell": true,
+                    "fixed_buy_prices": [],
+                    "fixed_sell_prices": []{pricing_extra}
+                }},
+                "control": {{
+                    "maximum_export_power_w": 10000,
+                    "force_charge_hours": 4,
+                    "force_discharge_hours": 2,
+                    "min_battery_soc": 10,
+                    "max_battery_soc": 100,
+                    "battery_capacity_kwh": 23.0,
+                    "max_battery_charge_rate_kw": 5.0,
+                    "average_household_load_kw": 0.5
+                }},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}},
+                "strategies": {{}}
+            }}"#
+            )
+        };
+
+        // Options set in the add-on are honoured
+        let config: AppConfig = serde_json::from_str(&addon_json(
+            r#", "ote_fallback_enabled": false, "price_alert_notification": false, "tomorrow_prices_check_time": "14:30""#,
+        ))
+        .unwrap();
+        assert!(!config.pricing.ote_fallback_enabled);
+        assert!(!config.pricing.price_alert_notification);
+        assert_eq!(config.pricing.tomorrow_prices_check_time, "14:30");
+
+        // Options missing (options.json of an older add-on version): defaults on, 13:45
+        let config: AppConfig = serde_json::from_str(&addon_json("")).unwrap();
+        assert!(config.pricing.ote_fallback_enabled);
+        assert!(config.pricing.price_alert_notification);
+        assert_eq!(config.pricing.tomorrow_prices_check_time, "13:45");
+
+        // The add-on's config.yaml declares them with the same defaults
+        let addon_yaml = include_str!("../../../fluxion/config.yaml");
+        for line in [
+            "    ote_fallback_enabled: true",
+            "    price_alert_notification: true",
+            "    tomorrow_prices_check_time: \"13:45\"",
+            "    ote_fallback_enabled: bool?",
+            "    price_alert_notification: bool?",
+        ] {
+            assert!(addon_yaml.contains(line), "config.yaml lacks `{line}`");
+        }
+    }
+
+    /// Configs written under the runtime field names (config.toml, persisted JSON) still load.
+    #[test]
+    fn test_spot_fee_runtime_field_names_still_load() {
+        let json = r#"{
+            "spot_price_entity": "sensor.price",
+            "use_spot_prices_to_buy": true,
+            "use_spot_prices_to_sell": true,
+            "fixed_buy_prices": [],
+            "fixed_sell_prices": [],
+            "spot_buy_fee": 0.2,
+            "spot_sell_fee": 0.3
+        }"#;
+
+        let pricing: PricingConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(pricing.spot_buy_fee, 0.2);
+        assert_eq!(pricing.spot_sell_fee, 0.3);
+    }
+
     /// Test that master/slave topology works with HA addon field names (master_id, slave_ids)
     #[test]
     fn test_ha_addon_master_slave_topology() {
@@ -2479,5 +3539,463 @@ mod tests {
             config.validate().is_ok(),
             "HA addon master/slave config should be valid"
         );
+    }
+
+    #[test]
+    fn test_ha_addon_pv_extra_prefixes() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "solax_80",
+                    "vendor": "solax-ultra",
+                    "entity_prefix": "solax_80",
+                    "topology": "independent",
+                    "pv_extra_prefixes": ["solax_81", " ", ""]
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.price",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            },
+            "control": {
+                "maximum_export_power_w": 5000,
+                "force_charge_hours": 2,
+                "force_discharge_hours": 1,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(ha_addon_json).expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(config.validate_detailed().valid);
+
+        let system: fluxion_core::SystemConfig = config.into();
+        // Read-only extras only; the parallel unit is not a configured (controlled) inverter
+        assert_eq!(system.inverters.len(), 1);
+        assert_eq!(system.inverters[0].pv_extra_prefixes, vec!["solax_81"]);
+        assert_eq!(
+            system.inverters[0].topology,
+            fluxion_core::InverterTopology::Independent
+        );
+    }
+
+    /// Brief H37: `control.mode_control_enabled` from the add-on options (default true)
+    #[test]
+    fn test_ha_addon_mode_control_enabled() {
+        let options = |extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "solax", "vendor": "solax", "entity_prefix": "solax",
+                                "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                            "force_discharge_hours": 1, "min_battery_soc": 10,
+                            "max_battery_soc": 100 {extra}}},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+
+        let config: AppConfig =
+            serde_json::from_str(&options(r#", "mode_control_enabled": false"#)).expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(!config.control.mode_control_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(!system.control_config.mode_control_enabled);
+
+        // Missing (options saved before H37) or true: FluxION controls modes as before
+        for extra in ["", r#", "mode_control_enabled": true"#] {
+            let config: AppConfig = serde_json::from_str(&options(extra)).expect("parse");
+            assert!(config.control.mode_control_enabled);
+            let system: fluxion_core::SystemConfig = config.into();
+            assert!(system.control_config.mode_control_enabled);
+        }
+        assert!(AppConfig::default().control.mode_control_enabled);
+
+        // The add-on carries the option with default true and an optional bool in its schema
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    mode_control_enabled: true\n"));
+        assert!(addon.contains("    mode_control_enabled: bool?\n"));
+    }
+
+    /// Brief H36: `inverters[].control_entity_prefix` from the add-on options
+    #[test]
+    fn test_ha_addon_control_entity_prefix() {
+        let options = |extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "solax", "vendor": "solax", "entity_prefix": "solax",
+                                {extra} "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                            "force_discharge_hours": 1, "min_battery_soc": 10,
+                            "max_battery_soc": 100}},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+
+        let config: AppConfig =
+            serde_json::from_str(&options(r#""control_entity_prefix": " solax_inverter ","#))
+                .expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(config.validate_detailed().valid);
+        assert_eq!(
+            config.inverters[0].control_prefix_override(),
+            Some("solax_inverter")
+        );
+        let control = config.control_prefixes();
+        assert_eq!(control.resolve("solax"), "solax_inverter");
+        let mapper = fluxion_adapters::create_entity_mapper_with_control(
+            config.inverters[0].inverter_type,
+            control,
+        );
+        assert_eq!(
+            mapper.get_work_mode_entity("solax"),
+            "select.solax_inverter_charger_use_mode"
+        );
+        assert_eq!(
+            fluxion_adapters::ha::actuation::lock_entity(mapper.control_prefix("solax")),
+            "select.solax_inverter_lock_state"
+        );
+        assert_eq!(
+            mapper.get_export_limit_entity("solax"),
+            "number.solax_inverter_export_control_user_limit"
+        );
+        assert_eq!(
+            mapper.get_battery_soc_entity("solax"),
+            "sensor.solax_battery_capacity"
+        );
+        assert_eq!(
+            mapper.get_house_load_entity("solax").as_deref(),
+            Some("sensor.solax_house_load")
+        );
+        let system: fluxion_core::SystemConfig = config.into();
+        assert_eq!(system.inverters[0].control_entity_prefix, "solax_inverter");
+        assert_eq!(
+            system.inverters[0].control_prefix_override(),
+            Some("solax_inverter")
+        );
+
+        // Key missing (options saved before H36) or empty: no override, ids as before
+        for extra in ["", r#""control_entity_prefix": "","#] {
+            let config: AppConfig = serde_json::from_str(&options(extra)).expect("parse");
+            assert_eq!(config.inverters[0].control_prefix_override(), None);
+            assert!(config.control_prefixes().is_empty());
+            let system: fluxion_core::SystemConfig = config.into();
+            assert_eq!(system.inverters[0].control_prefix_override(), None);
+        }
+
+        // The add-on schema carries the optional key
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("      control_entity_prefix: str?\n"));
+    }
+
+    #[test]
+    fn consumption_entity_derives_from_first_inverter_prefix_when_unset() {
+        let options = |prefix: &str, history: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "{prefix}", "vendor": "solax-ultra",
+                                "entity_prefix": "{prefix}", "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                             "force_discharge_hours": 1, "min_battery_soc": 10,
+                             "max_battery_soc": 100}},
+                "history": {history},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+        let history_of = |json: String| -> fluxion_core::ConsumptionHistoryConfig {
+            let config: AppConfig = serde_json::from_str(&json).expect("parse");
+            let system: fluxion_core::SystemConfig = config.into();
+            system.history
+        };
+
+        // Owner site: prefix "solax" keeps the long-standing sensor
+        let h = history_of(options("solax", r#"{"house_load_power_entity": ""}"#));
+        assert_eq!(h.consumption_entity, "sensor.solax_today_s_import_energy");
+        assert_eq!(h.solar_production_entity, "sensor.energy_production_today");
+
+        // Other prefix, key missing or empty: that site's own sensor
+        for history in ["{}", r#"{"consumption_entity": "  "}"#] {
+            let h = history_of(options("solax_80_jakub", history));
+            assert_eq!(
+                h.consumption_entity,
+                "sensor.solax_80_jakub_today_s_import_energy"
+            );
+        }
+
+        // Configured values win
+        let h = history_of(options(
+            "solax_80_jakub",
+            r#"{"consumption_entity": "sensor.grid_import_today",
+                "solar_production_entity": "sensor.pv_today"}"#,
+        ));
+        assert_eq!(h.consumption_entity, "sensor.grid_import_today");
+        assert_eq!(h.solar_production_entity, "sensor.pv_today");
+
+        // Built-in default config (prefix "solax")
+        let system: fluxion_core::SystemConfig = AppConfig::default().into();
+        assert_eq!(
+            system.history.consumption_entity,
+            "sensor.solax_today_s_import_energy"
+        );
+    }
+
+    #[test]
+    fn test_pv_extra_prefixes_default_empty() {
+        let config = AppConfig::default();
+        assert!(config.inverters[0].pv_extra_prefixes.is_empty());
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(system.inverters[0].pv_extra_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_pv_extra_prefix_may_not_name_a_configured_inverter() {
+        let mut config = AppConfig::default();
+        let own_prefix = config.inverters[0].entity_prefix.clone();
+        config.inverters[0].pv_extra_prefixes = vec![own_prefix];
+        assert!(config.validate().is_err());
+        assert!(!config.validate_detailed().valid);
+    }
+}
+
+#[cfg(test)]
+mod winter_reserve_config_tests {
+    use super::*;
+
+    #[test]
+    fn test_winter_reserve_defaults_when_section_missing() {
+        // Saved add-on options from before Winter Reserve have no winter_reserve key
+        let strategies: StrategiesConfig = serde_json::from_str("{}").unwrap();
+        let wr = &strategies.winter_reserve;
+
+        assert!(wr.enabled);
+        assert_eq!(wr.priority, 120);
+        assert!((wr.min_arbitrage_profit_czk - 2.0).abs() < 1e-6);
+        assert!((wr.insane_price_multiplier - 3.0).abs() < 1e-6);
+        assert!((wr.cheap_percentile - 0.20).abs() < 1e-6);
+        assert!((wr.load_safety_factor - 1.10).abs() < 1e-6);
+        assert!((wr.pv_confidence - 0.70).abs() < 1e-6);
+        assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
+        assert!((wr.mode_switch_min_benefit_czk - 1.0).abs() < 1e-6);
+        assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_winter_reserve_custom_values_honoured() {
+        let json = r#"{
+            "winter_reserve": {
+                "enabled": false,
+                "priority": 90,
+                "min_arbitrage_profit_czk": 4.5,
+                "insane_price_multiplier": 3.0,
+                "cheap_percentile": 0.30,
+                "load_safety_factor": 1.2,
+                "pv_confidence": 0.5,
+                "min_mode_benefit_czk": 0.25,
+                "mode_switch_min_benefit_czk": 2.5,
+                "soc_resolution_pct": 1.0
+            }
+        }"#;
+        let strategies: StrategiesConfig = serde_json::from_str(json).unwrap();
+        let wr = &strategies.winter_reserve;
+
+        assert!(!wr.enabled);
+        assert_eq!(wr.priority, 90);
+        assert!((wr.min_arbitrage_profit_czk - 4.5).abs() < 1e-6);
+        assert!((wr.insane_price_multiplier - 3.0).abs() < 1e-6);
+        assert!((wr.cheap_percentile - 0.30).abs() < 1e-6);
+        assert!((wr.load_safety_factor - 1.2).abs() < 1e-6);
+        assert!((wr.pv_confidence - 0.5).abs() < 1e-6);
+        assert!((wr.min_mode_benefit_czk - 0.25).abs() < 1e-6);
+        assert!((wr.mode_switch_min_benefit_czk - 2.5).abs() < 1e-6);
+        assert!((wr.soc_resolution_pct - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn system_display_timezone_survives_config_update() {
+        // Config save path: the web UI posts the full config JSON with system.display_timezone set
+        let mut json = serde_json::to_value(AppConfig::default()).unwrap();
+        json["system"]["display_timezone"] = serde_json::json!("Europe/Prague");
+
+        let config: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            config.system.display_timezone.as_deref(),
+            Some("Europe/Prague")
+        );
+    }
+}
+
+#[cfg(test)]
+mod addon_schema_tests {
+    use std::collections::HashMap;
+
+    /// Minimal reader for the indentation-based YAML in fluxion/config.yaml.
+    /// Returns each `key: value` mapping line as (dotted path, unquoted value).
+    /// List items and keys without a value are skipped.
+    fn read_scalars(text: &str) -> HashMap<String, String> {
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut out = HashMap::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("- ") {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let Some((key, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let key = key.trim().to_string();
+            let value = value.trim();
+            while stack.last().is_some_and(|(i, _)| *i >= indent) {
+                stack.pop();
+            }
+            if value.is_empty() {
+                stack.push((indent, key));
+                continue;
+            }
+            let path: Vec<&str> = stack
+                .iter()
+                .map(|(_, k)| k.as_str())
+                .chain(std::iter::once(key.as_str()))
+                .collect();
+            out.insert(path.join("."), value.trim_matches('"').to_string());
+        }
+        out
+    }
+
+    /// Parses `int(a,b)?` or `float(a,b)?` into optional (min, max) bounds.
+    /// Returns None for any other schema type.
+    fn parse_numeric_range(schema: &str) -> Option<(Option<f64>, Option<f64>)> {
+        let s = schema.strip_suffix('?').unwrap_or(schema);
+        let inner = s
+            .strip_prefix("int(")
+            .or_else(|| s.strip_prefix("float("))?
+            .strip_suffix(')')?;
+        let (lo, hi) = inner.split_once(',')?;
+        let bound = |b: &str| {
+            let b = b.trim();
+            (!b.is_empty()).then(|| b.parse::<f64>().expect("numeric schema bound"))
+        };
+        Some((bound(lo), bound(hi)))
+    }
+
+    #[test]
+    fn test_addon_option_defaults_within_schema_ranges() {
+        let entries = read_scalars(include_str!("../../../fluxion/config.yaml"));
+
+        let mut checked = 0;
+        let mut winter_reserve_checked = 0;
+        for (path, default) in entries
+            .iter()
+            .filter(|(p, v)| p.starts_with("options.") && !v.starts_with('['))
+        {
+            let rest = &path["options.".len()..];
+            let schema = entries
+                .get(&format!("schema.{rest}"))
+                .unwrap_or_else(|| panic!("option {path} has no schema entry"));
+            let Some((lo, hi)) = parse_numeric_range(schema) else {
+                continue;
+            };
+            let value: f64 = default
+                .parse()
+                .unwrap_or_else(|_| panic!("{path} default {default} is not numeric for {schema}"));
+            if let Some(lo) = lo {
+                assert!(
+                    value >= lo,
+                    "{path}: default {value} is below schema {schema}"
+                );
+            }
+            if let Some(hi) = hi {
+                assert!(
+                    value <= hi,
+                    "{path}: default {value} is above schema {schema}"
+                );
+            }
+            checked += 1;
+            if rest.starts_with("strategies.winter_reserve.") {
+                winter_reserve_checked += 1;
+            }
+        }
+
+        assert!(checked > 0, "no numeric options were checked");
+        // priority, insane_price_multiplier, cheap_percentile, load_safety_factor,
+        // pv_confidence, soc_resolution_pct
+        assert!(
+            winter_reserve_checked >= 6,
+            "winter_reserve numeric options were not all checked"
+        );
+    }
+
+    #[test]
+    fn test_addon_schema_has_no_single_value_list_enum() {
+        // In the add-on schema `list(a|b)` is an enum, not a list. `list(str)?` only accepts the
+        // literal "str", so Supervisor rejects every options save. A list is a `- str?` sequence.
+        let schema = include_str!("../../../fluxion/config.yaml")
+            .split_once("\nschema:")
+            .expect("config.yaml has a schema section")
+            .1;
+        for line in schema.lines() {
+            if let Some(start) = line.find("list(") {
+                let inner = &line[start + "list(".len()..];
+                let inner = &inner[..inner.find(')').unwrap_or(inner.len())];
+                assert!(
+                    inner.contains('|'),
+                    "schema line `{}` is a single-value enum; use a `- str?` sequence for a list",
+                    line.trim()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod solar_forecast_config_tests {
+    use super::*;
+
+    #[test]
+    fn solar_provider_defaults_to_open_meteo_when_missing() {
+        // Section missing entirely, and section present without the key
+        assert_eq!(
+            SolarForecastConfig::default().provider,
+            "open_meteo_solar_forecast"
+        );
+        let section: SolarForecastConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(section.provider, "open_meteo_solar_forecast");
+        assert!(section.actual_pv_power_entities.is_empty());
+    }
+
+    #[test]
+    fn solar_provider_override_and_empty_round_trip() {
+        let json = r#"{
+            "provider": "forecast_solar",
+            "actual_pv_power_entities": ["sensor.solax_pv_power_total"]
+        }"#;
+        let section: SolarForecastConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(section.provider, "forecast_solar");
+        assert_eq!(
+            section.actual_pv_power_entities,
+            vec!["sensor.solax_pv_power_total".to_string()]
+        );
+        // Empty provider means pattern match only (old behaviour)
+        let empty: SolarForecastConfig = serde_json::from_str(r#"{"provider": ""}"#).unwrap();
+        assert_eq!(empty.provider, "");
     }
 }

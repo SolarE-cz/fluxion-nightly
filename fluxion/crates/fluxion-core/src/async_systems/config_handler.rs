@@ -16,21 +16,22 @@ use tracing::{error, info, trace};
 use crate::{
     PluginManagerResource,
     components::*,
-    config_events::{ConfigSection, UserControlChangeType},
+    config_events::ConfigSection,
     debug::DebugModeConfig,
     pricing::analyze_prices,
-    resources::{SystemConfig, UserControlResource},
-    scheduling::{ScheduleConfig, generate_schedule_with_optimizer},
+    resources::{SystemConfig, UserControlResource, UserLeversResource},
+    scheduling::{ScheduleConfig, active_user_levers, generate_schedule_with_optimizer},
     web_bridge::{ConfigUpdateChannel, UserControlUpdateChannel},
 };
 
 use super::BackupDischargeMinSoc;
 
 /// Generates consumption forecast for scheduling using priority-based data sources
-/// Priority: 1) Historical data (EMA), 2) Current consumption, 3) Configured fallback
+/// Priority: 1) Historical data (EMA), 2) Configured fallback. The instantaneous house load is
+/// not used: on a parallel master it includes the slave's battery and PV flows (17 kW while the
+/// slave charges, negative while it exports), and a flat plan load from it fed back into grid charging.
 fn generate_consumption_forecast(
     consumption_history: &ConsumptionHistory,
-    current_inverter_raw_state: Option<&RawInverterState>,
     control_config: &fluxion_types::config::ControlConfig,
     num_blocks: usize,
 ) -> Option<Vec<f32>> {
@@ -45,22 +46,8 @@ fn generate_consumption_forecast(
         } else {
             control_config.average_household_load_kw * 24.0
         }
-    } else if let Some(raw_state) = current_inverter_raw_state {
-        // Priority 2: Use current consumption data (extrapolated)
-        if let Some(current_load_w) = raw_state.state.house_load_w {
-            let current_load_kw = current_load_w / 1000.0;
-            // Apply dampening factor since instantaneous readings can be high
-            let estimated_daily = current_load_kw * 24.0 * 0.9;
-            trace!(
-                "📊 Using current consumption: {:.0}W → {:.2} kWh/day",
-                current_load_w, estimated_daily
-            );
-            estimated_daily
-        } else {
-            control_config.average_household_load_kw * 24.0
-        }
     } else {
-        // Priority 3: Use configured fallback
+        // Priority 2: Use configured fallback
         trace!(
             "📊 Using fallback consumption: {:.2} kWh/day",
             control_config.average_household_load_kw * 24.0
@@ -114,6 +101,20 @@ pub struct ConfigEventParams<'w, 's> {
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
     plugin_manager_res: Res<'w, PluginManagerResource>,
     user_control: Option<Res<'w, crate::resources::UserControlResource>>,
+    solar_forecast: Option<Res<'w, super::SolarForecastData>>,
+    timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
+    user_levers: Option<Res<'w, UserLeversResource>>,
+    cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
+}
+
+/// Keep `control.mode_control_enabled` of the running config in `new` (brief H37): the inverter
+/// adapter takes it at startup, so the executor and the guards must not see a different value.
+/// Returns true when `new` asked for a change.
+pub fn keep_running_mode_control(running: &SystemConfig, new: &mut SystemConfig) -> bool {
+    let keep = running.control_config.mode_control_enabled;
+    let changed = new.control_config.mode_control_enabled != keep;
+    new.control_config.mode_control_enabled = keep;
+    changed
 }
 
 /// System that processes config update events from the web UI
@@ -163,6 +164,15 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                 continue;
             }
         };
+
+        // Mode control stays as started (brief H37): the adapter took it at startup
+        let mut new_config = new_config;
+        if keep_running_mode_control(&params.system_config, &mut new_config) {
+            error!(
+                "control.mode_control_enabled cannot change at runtime; keeping {} until the add-on restarts",
+                params.system_config.control_config.mode_control_enabled
+            );
+        }
 
         // Store old config for comparison logging
         let old_config = params.system_config.clone();
@@ -252,7 +262,6 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
             // Generate consumption forecast from available data
             let consumption_forecast = generate_consumption_forecast(
                 &params.consumption_history,
-                params.inverter_raw_state_query.iter().next(),
                 &params.system_config.control_config,
                 price_data.time_block_prices.len(),
             );
@@ -282,22 +291,46 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
             let plugin_manager = params.plugin_manager_res.0.read();
             let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
             let user_control_state = params.user_control.as_ref().map(|uc| &uc.state);
+            let block_starts: Vec<_> = price_data
+                .time_block_prices
+                .iter()
+                .map(|b| b.block_start)
+                .collect();
+            // Corrected by the PV forecast correction factor (brief H34) when in force
+            let solar =
+                super::planner_solar_inputs(params.solar_forecast.as_deref(), &block_starts);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
                 current_soc,
-                None,                            // Future: Solar forecast
+                solar.per_block_kwh.as_deref(), // PV forecast per block
                 consumption_forecast.as_deref(), // Enhanced consumption forecast
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
                 hdo_raw_data,
-                0.0, // TODO: Wire up solar_forecast_total_today_kwh from SolarForecastData resource
-                0.0, // TODO: Wire up solar_forecast_remaining_today_kwh from SolarForecastData resource
-                0.0, // TODO: Wire up solar_forecast_tomorrow_kwh from SolarForecastData resource
+                solar.total_today_kwh,
+                solar.remaining_today_kwh,
+                solar.tomorrow_kwh,
                 user_control_state,
-                params.consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
+                params
+                    .consumption_history
+                    .hourly_profile()
+                    .map(|p| &p.hourly_avg_kwh),
+                params
+                    .consumption_history
+                    .hourly_profile()
+                    .and_then(|p| p.hourly_p75_kwh.as_ref()),
+                params
+                    .timezone_config
+                    .as_ref()
+                    .and_then(|tz| tz.timezone.as_deref()),
+                active_user_levers(params.user_levers.as_deref()),
+                params
+                    .cost_basis
+                    .as_ref()
+                    .and_then(|t| t.cost_czk_per_kwh()),
             );
 
             // Update schedule
@@ -355,6 +388,10 @@ pub struct UserControlEventParams<'w, 's> {
     consumption_history: Res<'w, crate::components::ConsumptionHistory>,
     inverter_raw_state_query: Query<'w, 's, &'static RawInverterState>,
     plugin_manager_res: Res<'w, PluginManagerResource>,
+    solar_forecast: Option<Res<'w, super::SolarForecastData>>,
+    timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
+    user_levers: Option<Res<'w, UserLeversResource>>,
+    cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
 }
 
 /// System that processes user control update events from the web UI
@@ -376,13 +413,8 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
         );
 
         // Determine if schedule recalculation is needed
-        let needs_schedule_recalc = matches!(
-            event.change_type,
-            UserControlChangeType::SlotAdded
-                | UserControlChangeType::SlotModified
-                | UserControlChangeType::SlotRemoved
-                | UserControlChangeType::RestrictionsChanged
-        );
+        let needs_schedule_recalc =
+            crate::config_events::user_control_change_recalcs_schedule(event.change_type);
 
         if needs_schedule_recalc {
             info!("🔄 Triggering schedule recalculation due to user control changes");
@@ -426,7 +458,6 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
             // Generate consumption forecast
             let consumption_forecast = generate_consumption_forecast(
                 &params.consumption_history,
-                params.inverter_raw_state_query.iter().next(),
                 &params.system_config.control_config,
                 price_data.time_block_prices.len(),
             );
@@ -441,22 +472,46 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
             // Generate new schedule with updated user control
             let plugin_manager = params.plugin_manager_res.0.read();
             let hdo_raw_data = params.hdo_data.as_ref().and_then(|h| h.raw_data.clone());
+            let block_starts: Vec<_> = price_data
+                .time_block_prices
+                .iter()
+                .map(|b| b.block_start)
+                .collect();
+            // Corrected by the PV forecast correction factor (brief H34) when in force
+            let solar =
+                super::planner_solar_inputs(params.solar_forecast.as_deref(), &block_starts);
             let new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
                 current_soc,
-                None,
+                solar.per_block_kwh.as_deref(),
                 consumption_forecast.as_deref(),
                 backup_discharge_min_soc,
                 grid_import_today_kwh,
                 &plugin_manager,
                 hdo_raw_data,
-                0.0,
-                0.0,
-                0.0,
+                solar.total_today_kwh,
+                solar.remaining_today_kwh,
+                solar.tomorrow_kwh,
                 Some(&params.user_control.state),
-                params.consumption_history.hourly_profile().map(|p| &p.hourly_avg_kwh),
+                params
+                    .consumption_history
+                    .hourly_profile()
+                    .map(|p| &p.hourly_avg_kwh),
+                params
+                    .consumption_history
+                    .hourly_profile()
+                    .and_then(|p| p.hourly_p75_kwh.as_ref()),
+                params
+                    .timezone_config
+                    .as_ref()
+                    .and_then(|tz| tz.timezone.as_deref()),
+                active_user_levers(params.user_levers.as_deref()),
+                params
+                    .cost_basis
+                    .as_ref()
+                    .and_then(|t| t.cost_czk_per_kwh()),
             );
 
             // Update schedule

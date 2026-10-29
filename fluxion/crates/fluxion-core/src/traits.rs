@@ -62,8 +62,23 @@ pub struct GenericInverterState {
     /// PV generation power (total)
     pub pv_power_w: f32,
 
+    /// Battery power (W, positive = charge) of the read-only parallel units
+    /// (`pv_extra_prefixes`) that report one, summed; `None` when none does. Each unit reports
+    /// only its own battery's share (brief H33).
+    pub extra_battery_power_w: Option<f32>,
+
     /// Is inverter reachable?
     pub online: bool,
+
+    /// Live export limit (W) from the inverter's export control number, when readable
+    pub export_limit_w: Option<u32>,
+
+    /// Maximum the inverter accepts for the export limit (the entity's `max` attribute)
+    pub export_limit_max_w: Option<u32>,
+
+    /// True when `work_mode` is ForceCharge but the vendor's manual sub-mode could not be read,
+    /// so the real mode may be any Manual mode (Force Charge, Force Discharge or Hold)
+    pub work_mode_ambiguous: bool,
 
     // ============= Load & Grid Detailed (Optional) =============
     /// House/load consumption (W)
@@ -237,6 +252,12 @@ pub trait VendorEntityMapper: Send + Sync {
     /// Get the inverter type
     fn vendor_name(&self) -> InverterType;
 
+    /// Prefix of the control entities (`select.*`, `number.*`, `button.*`, `switch.*`,
+    /// `time.*`) of the inverter whose sensors use `inverter_id` (brief H36). Default: the same.
+    fn control_prefix<'a>(&'a self, inverter_id: &'a str) -> &'a str {
+        inverter_id
+    }
+
     // ============= Mode Control (Required) =============
 
     /// Map generic operation mode to vendor-specific work mode value
@@ -245,6 +266,17 @@ pub trait VendorEntityMapper: Send + Sync {
 
     /// Map vendor-specific work mode value to generic operation mode
     fn map_mode_from_vendor(&self, vendor_mode: i32) -> Option<InverterOperationMode>;
+
+    /// Entity holding the vendor's manual sub-mode (e.g. Solax manual_mode_select), if any.
+    /// Needed when the work mode value alone cannot tell Force Charge, Force Discharge and Hold.
+    fn get_manual_mode_entity(&self, _inverter_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Map the state of the manual sub-mode entity to the generic mode.
+    fn map_manual_sub_mode(&self, _option: &str) -> Option<InverterOperationMode> {
+        None
+    }
 
     /// Get the entity ID for work mode control (Required)
     /// Example: "select.{inverter_id}_charger_use_mode"
@@ -589,6 +621,18 @@ pub trait ConsumptionHistoryDataSource: Send + Sync {
         start_time: chrono::DateTime<chrono::Utc>,
         end_time: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<HistoryDataPoint>>;
+
+    /// Fetch history, with `minimal` requesting responses without attributes. Sources that
+    /// cannot reduce the response fall back to `get_history`.
+    async fn get_history_with(
+        &self,
+        entity_id: &str,
+        start_time: chrono::DateTime<chrono::Utc>,
+        end_time: Option<chrono::DateTime<chrono::Utc>>,
+        _minimal: bool,
+    ) -> Result<Vec<HistoryDataPoint>> {
+        self.get_history(entity_id, start_time, end_time).await
+    }
 
     /// Check if data source is available
     async fn health_check(&self) -> Result<bool>;

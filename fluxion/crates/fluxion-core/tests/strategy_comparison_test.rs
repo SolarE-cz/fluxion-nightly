@@ -26,6 +26,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
             effective_price_czk_per_kwh: 1.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -36,6 +38,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -46,6 +50,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 4.5,
             effective_price_czk_per_kwh: 4.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -56,6 +62,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -66,6 +74,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 3.5,
             effective_price_czk_per_kwh: 3.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -76,6 +86,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
             effective_price_czk_per_kwh: 5.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -86,6 +98,8 @@ fn create_czech_price_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
             effective_price_czk_per_kwh: 2.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -149,7 +163,12 @@ fn compare_v1_v2_on_czech_pattern() {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         let v1_eval = v1_strategy.evaluate(&context);
@@ -315,6 +334,8 @@ fn test_v2_spike_detection() {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -325,6 +346,8 @@ fn test_v2_spike_detection() {
             duration_minutes: 15,
             price_czk_per_kwh: 9.5, // Above 8.0 threshold
             effective_price_czk_per_kwh: 9.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -335,6 +358,8 @@ fn test_v2_spike_detection() {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -396,7 +421,12 @@ fn compare_cost_overnight_charging() {
         solar_forecast_remaining_today_kwh: 0.0,
         solar_forecast_tomorrow_kwh: 0.0,
         battery_avg_charge_price_czk_per_kwh: 0.0,
+        battery_charge_cost_czk_per_kwh: None,
         hourly_consumption_profile: None,
+        hourly_consumption_p75: None,
+        block_forecasts: None,
+        timezone: None,
+        user_levers: None,
     };
 
     let v1_overnight = v1_strategy.evaluate(&context_overnight);
@@ -448,7 +478,12 @@ fn compare_peak_discharge_behavior() {
         solar_forecast_remaining_today_kwh: 0.0,
         solar_forecast_tomorrow_kwh: 0.0,
         battery_avg_charge_price_czk_per_kwh: 0.0,
+        battery_charge_cost_czk_per_kwh: None,
         hourly_consumption_profile: None,
+        hourly_consumption_p75: None,
+        block_forecasts: None,
+        timezone: None,
+        user_levers: None,
     };
 
     let v1_peak = v1_strategy.evaluate(&context_peak);
@@ -569,6 +604,8 @@ fn load_scenario_from_export(path: &str, name: &str) -> Option<TestScenario> {
             duration_minutes: 15,
             price_czk_per_kwh: b.p,
             effective_price_czk_per_kwh: b.p,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         })
         .collect();
 
@@ -646,7 +683,12 @@ fn simulate_strategy<S: EconomicStrategy>(
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         // Get strategy decision
@@ -665,7 +707,10 @@ fn simulate_strategy<S: EconomicStrategy>(
                 let soc_gain = (actual_charge / scenario.battery_capacity_kwh) * 100.0;
                 (grid_import, cost, soc_gain, actual_charge, 0.0)
             }
-            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+            InverterOperationMode::SelfUse
+            | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
+            | InverterOperationMode::NoChargeNoDischarge => {
                 // Try to cover consumption from battery
                 let available_battery = ((soc - control_config.min_battery_soc).max(0.0) / 100.0)
                     * scenario.battery_capacity_kwh;

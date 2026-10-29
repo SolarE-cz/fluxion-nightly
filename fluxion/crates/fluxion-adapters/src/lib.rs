@@ -10,7 +10,9 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+pub mod control_prefix;
 pub mod ha;
+pub mod price_fallback;
 pub mod solax;
 
 // Re-export commonly used types for convenience
@@ -20,7 +22,11 @@ pub use ha::{
     HomeAssistantClient, HomeAssistantInverterAdapter, PriceAdapterTimezoneHandle,
 };
 
+pub use control_prefix::ControlPrefixes;
+
+pub use price_fallback::{PriceFallback, PriceFallbackConfig};
+
 pub use solax::{
     SolaxChargerUseMode, SolaxEntityMapper, SolaxManualMode, SolaxUltraEntityMapper,
-    create_entity_mapper,
+    create_entity_mapper, create_entity_mapper_with_control,
 };

@@ -34,6 +34,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -44,6 +46,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
             effective_price_czk_per_kwh: 1.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -54,6 +58,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 1.0,
             effective_price_czk_per_kwh: 1.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -64,6 +70,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
             effective_price_czk_per_kwh: 3.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -74,6 +82,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
             effective_price_czk_per_kwh: 5.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -84,6 +94,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
             effective_price_czk_per_kwh: 2.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -94,6 +106,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 6.0,
             effective_price_czk_per_kwh: 6.0,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -104,6 +118,8 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
             effective_price_czk_per_kwh: 2.5,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         });
     }
 
@@ -151,7 +167,12 @@ fn test_v2_waits_for_cheapest_blocks() {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         let eval = v1_strategy.evaluate(&context);
@@ -187,7 +208,12 @@ fn test_v2_waits_for_cheapest_blocks() {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

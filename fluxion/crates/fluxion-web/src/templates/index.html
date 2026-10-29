@@ -409,6 +409,16 @@
         color: var(--text-secondary);
     }
 
+    .backup-min-soc {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .backup-min-soc input {
+        width: 70px;
+    }
+
     .user-control-slots {
         display: flex;
         justify-content: space-between;
@@ -680,6 +690,655 @@
         background: #6c757d;
         cursor: not-allowed;
     }
+
+    /* ============== Phone Pairing Modal Styles ============== */
+
+    /* Phone Connect Button */
+    .phone-connect-button {
+        background: linear-gradient(135deg, #9c27b0 0%, #7b1fa2 100%);
+        color: #fff;
+        padding: 10px 20px;
+        border: none;
+        border-radius: 6px;
+        font-weight: 600;
+        font-size: 0.9em;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        transition: all 0.2s ease;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+
+    .phone-connect-button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+
+    .phone-connect-button:active {
+        transform: translateY(0);
+    }
+
+    /* Modal Overlay */
+    .pairing-modal-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.75);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 2000;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s ease;
+    }
+
+    .pairing-modal-overlay.show {
+        opacity: 1;
+        pointer-events: all;
+    }
+
+    /* Modal Dialog */
+    .pairing-modal {
+        background: var(--bg-secondary);
+        border-radius: 16px;
+        max-width: 480px;
+        width: 90%;
+        max-height: 90vh;
+        overflow-y: auto;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        transform: scale(0.9);
+        transition: transform 0.3s ease;
+    }
+
+    .pairing-modal-overlay.show .pairing-modal {
+        transform: scale(1);
+    }
+
+    .pairing-modal-header {
+        padding: 24px 24px 16px;
+        border-bottom: 1px solid var(--border-color);
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+    }
+
+    .pairing-modal-header h2 {
+        font-size: 1.4em;
+        font-weight: 600;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .pairing-modal-subtitle {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+        margin-top: 8px;
+        line-height: 1.5;
+    }
+
+    .pairing-modal-close {
+        background: none;
+        border: none;
+        color: var(--text-secondary);
+        font-size: 1.5em;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 4px;
+        transition: background 0.2s, color 0.2s;
+    }
+
+    .pairing-modal-close:hover {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+
+    .pairing-modal-body {
+        padding: 24px;
+    }
+
+    .pairing-modal-footer {
+        padding: 16px 24px 24px;
+        border-top: 1px solid var(--border-color);
+        text-align: center;
+    }
+
+    /* Step Indicator */
+    .step-indicator {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0;
+        margin-bottom: 24px;
+        padding: 0 24px;
+    }
+
+    .step-dot {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 600;
+        font-size: 0.9em;
+        background: var(--bg-tertiary);
+        color: var(--text-secondary);
+        transition: all 0.3s ease;
+    }
+
+    .step-dot.active {
+        background: var(--info);
+        color: #fff;
+    }
+
+    .step-dot.completed {
+        background: var(--success);
+        color: #fff;
+    }
+
+    .step-line {
+        width: 40px;
+        height: 2px;
+        background: var(--border-color);
+        transition: background 0.3s ease;
+    }
+
+    .step-line.completed {
+        background: var(--success);
+    }
+
+    /* Step Content */
+    .step-content {
+        animation: fade-slide-in 0.3s ease-out;
+    }
+
+    .step-content.reverse {
+        animation: fade-slide-in-reverse 0.3s ease-out;
+    }
+
+    /* Form Styles */
+    .pairing-form-group {
+        margin-bottom: 20px;
+    }
+
+    .pairing-form-label {
+        display: block;
+        font-size: 0.9em;
+        font-weight: 500;
+        color: var(--text-primary);
+        margin-bottom: 8px;
+    }
+
+    .pairing-form-input {
+        width: 100%;
+        padding: 12px 14px;
+        background: var(--bg-tertiary);
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        color: var(--text-primary);
+        font-size: 1em;
+        transition: border-color 0.2s, box-shadow 0.2s;
+        box-sizing: border-box;
+    }
+
+    .pairing-form-input:focus {
+        outline: none;
+        border-color: var(--info);
+        box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.2);
+    }
+
+    .pairing-form-input::placeholder {
+        color: var(--text-secondary);
+    }
+
+    /* Access Mode Selector */
+    .access-mode-selector {
+        display: flex;
+        gap: 12px;
+        margin-top: 8px;
+    }
+
+    .access-mode-option {
+        flex: 1;
+        position: relative;
+    }
+
+    .access-mode-option input[type="radio"] {
+        position: absolute;
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+
+    .access-mode-card {
+        display: block;
+        padding: 16px;
+        background: var(--bg-tertiary);
+        border: 2px solid var(--border-color);
+        border-radius: 10px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+    }
+
+    .access-mode-option input:checked + .access-mode-card {
+        border-color: var(--info);
+        background: rgba(33, 150, 243, 0.1);
+    }
+
+    .access-mode-option input:focus + .access-mode-card {
+        box-shadow: 0 0 0 3px rgba(33, 150, 243, 0.2);
+    }
+
+    .access-mode-card:hover {
+        border-color: var(--text-secondary);
+    }
+
+    .access-mode-title {
+        font-weight: 600;
+        font-size: 0.95em;
+        margin-bottom: 4px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .access-mode-description {
+        font-size: 0.8em;
+        color: var(--text-secondary);
+        line-height: 1.4;
+    }
+
+    .access-mode-icon {
+        font-size: 1.3em;
+    }
+
+    .access-mode-icon.full { color: var(--success); }
+    .access-mode-icon.readonly { color: var(--warning); }
+
+    /* QR Code Display */
+    .qr-code-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 20px;
+    }
+
+    .qr-code-wrapper {
+        background: #ffffff;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+        animation: qr-appear 0.4s ease-out;
+    }
+
+    .qr-code-wrapper svg {
+        display: block;
+        width: 240px;
+        height: 240px;
+    }
+
+    .qr-instruction-title {
+        font-size: 1.1em;
+        font-weight: 600;
+        color: var(--text-primary);
+        margin-bottom: 8px;
+        text-align: center;
+    }
+
+    .qr-instructions {
+        color: var(--text-secondary);
+        font-size: 0.85em;
+        line-height: 1.6;
+        text-align: left;
+        max-width: 280px;
+    }
+
+    .qr-instructions ol {
+        margin: 0;
+        padding-left: 20px;
+    }
+
+    .qr-instructions li {
+        margin: 6px 0;
+    }
+
+    .qr-security-note {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 16px;
+        padding: 12px;
+        background: rgba(76, 175, 80, 0.1);
+        border-radius: 8px;
+        font-size: 0.8em;
+        color: var(--success);
+    }
+
+    .qr-security-note .mdi {
+        font-size: 1.2em;
+    }
+
+    /* Success State */
+    .success-icon-container {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        background: rgba(76, 175, 80, 0.15);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 20px;
+    }
+
+    .success-checkmark {
+        font-size: 48px;
+        color: var(--success);
+        animation: pop-in 0.4s ease-out;
+    }
+
+    .success-title {
+        font-size: 1.3em;
+        font-weight: 600;
+        margin-bottom: 8px;
+        color: var(--text-primary);
+        text-align: center;
+    }
+
+    .success-subtitle {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+        text-align: center;
+    }
+
+    .success-device-summary {
+        margin-top: 20px;
+        padding: 16px;
+        background: var(--bg-tertiary);
+        border-radius: 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+
+    .success-device-name {
+        font-weight: 600;
+    }
+
+    .success-device-badge {
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 0.8em;
+        font-weight: 600;
+    }
+
+    .success-device-badge.full {
+        background: var(--success);
+        color: #000;
+    }
+
+    .success-device-badge.readonly {
+        background: var(--warning);
+        color: #000;
+    }
+
+    /* Loading State */
+    .pairing-loading {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        padding: 40px;
+    }
+
+    .pairing-spinner {
+        width: 48px;
+        height: 48px;
+        border: 3px solid var(--border-color);
+        border-top-color: var(--info);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+
+    .pairing-loading-text {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+    }
+
+    /* Error State */
+    .pairing-error {
+        padding: 16px;
+        background: rgba(244, 67, 54, 0.1);
+        border: 1px solid rgba(244, 67, 54, 0.3);
+        border-radius: 8px;
+        margin-bottom: 16px;
+    }
+
+    .pairing-error-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+        color: var(--error);
+        margin-bottom: 4px;
+    }
+
+    .pairing-error-message {
+        color: var(--text-secondary);
+        font-size: 0.9em;
+    }
+
+    /* Manage Devices Link */
+    .manage-devices-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--text-secondary);
+        text-decoration: none;
+        font-size: 0.9em;
+        transition: color 0.2s;
+    }
+
+    .manage-devices-link:hover {
+        color: var(--text-primary);
+        text-decoration: underline;
+    }
+
+    .manage-devices-link .mdi {
+        font-size: 1.1em;
+    }
+
+    /* Pairing Buttons */
+    .pairing-btn {
+        padding: 12px 24px;
+        border-radius: 8px;
+        font-weight: 600;
+        font-size: 0.95em;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        border: none;
+    }
+
+    .pairing-btn-primary {
+        background: var(--info);
+        color: #fff;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+
+    .pairing-btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+
+    .pairing-btn-primary:active {
+        transform: translateY(0);
+    }
+
+    .pairing-btn-primary:disabled {
+        background: #555;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+    }
+
+    .pairing-btn-secondary {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+    }
+
+    .pairing-btn-secondary:hover {
+        background: #3a3a3a;
+    }
+
+    .pairing-btn-success {
+        background: var(--success);
+        color: #fff;
+    }
+
+    .pairing-btn-success:hover {
+        background: #45a049;
+    }
+
+    .pairing-button-group {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        margin-top: 24px;
+    }
+
+    /* Screen Reader Only */
+    .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    /* Animations */
+    @keyframes fade-slide-in {
+        from {
+            opacity: 0;
+            transform: translateX(20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+
+    @keyframes fade-slide-in-reverse {
+        from {
+            opacity: 0;
+            transform: translateX(-20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    }
+
+    @keyframes pop-in {
+        0% {
+            transform: scale(0);
+            opacity: 0;
+        }
+        50% {
+            transform: scale(1.2);
+        }
+        100% {
+            transform: scale(1);
+            opacity: 1;
+        }
+    }
+
+    @keyframes qr-appear {
+        from {
+            opacity: 0;
+            transform: scale(0.8);
+        }
+        to {
+            opacity: 1;
+            transform: scale(1);
+        }
+    }
+
+    /* Responsive for Pairing Modal */
+    @media (max-width: 768px) {
+        .phone-connect-button span.btn-text {
+            display: none;
+        }
+        .phone-connect-button {
+            padding: 10px 14px;
+        }
+
+        .pairing-modal {
+            width: 95%;
+            max-width: none;
+            max-height: 85vh;
+            margin: auto 2.5%;
+        }
+
+        .pairing-modal-header {
+            padding: 20px 16px 14px;
+        }
+
+        .pairing-modal-body {
+            padding: 16px;
+        }
+
+        .pairing-modal-footer {
+            padding: 14px 16px 20px;
+        }
+
+        .access-mode-selector {
+            flex-direction: column;
+        }
+
+        .qr-code-wrapper svg {
+            width: 200px;
+            height: 200px;
+        }
+
+        .step-dot {
+            width: 28px;
+            height: 28px;
+            font-size: 0.8em;
+        }
+
+        .step-line {
+            width: 30px;
+        }
+
+        .step-indicator {
+            padding: 0 16px;
+        }
+    }
+
+    @media (max-width: 360px) {
+        .qr-code-wrapper {
+            padding: 16px;
+        }
+
+        .qr-code-wrapper svg {
+            width: 180px;
+            height: 180px;
+        }
+
+        .pairing-form-input {
+            padding: 10px 12px;
+        }
+    }
 </style>
 
 <div class="dashboard-wrapper" id="dashboard-wrapper">
@@ -697,6 +1356,16 @@
                         <span>✓</span>
                         <span>Normal Mode</span>
                         {% endif %}
+                    </button>
+                    {% if !mode_control_enabled %}
+                    <span id="mode-control-off" class="debug-mode-button debug-active" title="control.mode_control_enabled: false. FluxION plans and shows the schedule but writes only the export limit (curtailment).">
+                        <span>⛔</span>
+                        <span>mode control off</span>
+                    </span>
+                    {% endif %}
+                    <button id="phone-connect-btn" class="phone-connect-button" onclick="openPairingModal()">
+                        <span class="mdi mdi-cellphone-link"></span>
+                        <span class="btn-text">Connect Phone</span>
                     </button>
                     <button id="config-toggle" class="config-button" onclick="toggleConfigSidebar()">
                         <span>⚙️</span>
@@ -752,6 +1421,21 @@
                     <span class="label-help">Prevents ForceDischarge mode</span>
                 </label>
             </div>
+            <div class="restriction-toggle">
+                <label class="config-toggle-switch">
+                    <input type="checkbox" class="config-toggle-input" id="default-mode-toggle" {% if uc.default_mode.as_str() == "backup" %}checked{% endif %} onchange="updateDefaultMode()">
+                    <span class="config-toggle-slider"></span>
+                </label>
+                <label for="default-mode-toggle">
+                    <span class="label-text">{{ self.t("default-mode-label") }}: <span id="default-mode-name" data-self-use="{{ self.t("default-mode-self-use") }}" data-backup="{{ self.t("default-mode-backup") }}">{% if uc.default_mode.as_str() == "backup" %}{{ self.t("default-mode-backup") }}{% else %}{{ self.t("default-mode-self-use") }}{% endif %}</span></span>
+                    <span class="label-help">{{ self.t("default-mode-help") }}</span>
+                </label>
+            </div>
+            <div class="backup-min-soc" id="backup-min-soc-row" {% if uc.default_mode.as_str() != "backup" %}style="display: none;"{% endif %}>
+                <label for="backup-min-soc-input">{{ self.t("backup-min-soc-label") }}</label>
+                <input type="number" id="backup-min-soc-input" min="15" max="100" step="1" value="{{ uc.backup_min_soc_pct }}">
+                <button type="button" onclick="updateBackupMinSoc()">{{ self.t("backup-min-soc-save") }}</button>
+            </div>
         </div>
 
         <div class="user-control-slots">
@@ -769,22 +1453,39 @@
     {% endif %}
 
     <!-- Price Chart (Outside SSE update area - updates once per minute) -->
+    {% if let Some(banner) = price_feed_banner %}
+    <div class="price-feed-banner" role="alert" style="padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; border: 1px solid var(--warning); background: var(--bg-tertiary); color: var(--text-primary);">
+        ⚠️ {{ banner|e }}
+    </div>
+    {% endif %}
+    {% if timezone_unknown %}
+    <div class="timezone-banner" role="alert" style="padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary);">
+        Timezone unknown, times shown in UTC — <a href="#" onclick="openDisplayTimezoneSelector(event)">choose your timezone</a>
+    </div>
+    {% endif %}
     {% if let Some(prices) = prices %}
     <div class="card" id="chart-container">
         <h2>💰 Price Chart (48h)</h2>
         <div class="price-chart-container">
-            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h)</h3>
+            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h) <span class="tz-label" style="font-size: 0.7em; color: var(--text-secondary);">{{ display_tz_label }}</span></h3>
             <div class="price-legend">
                 <span><div class="legend-box charge"></div> Force Charge</span>
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
                 <span><div class="legend-box backup"></div> Back Up Mode</span>
+                <span><div class="legend-box no-charge-discharge"></div> Hold</span>
                 <span><div class="legend-box self-use"></div> Self-Use</span>
+                <span><div class="legend-box feedin-priority"></div> Feed-in Priority</span>
                 <span><div class="legend-box hdo-low"></div> HDO Low Tariff</span>
                 <span><div class="legend-box hdo-high"></div> HDO High Tariff</span>
                 {% if let Some(inv) = inverters.first() %}
                 <span><div class="legend-box battery-soc"></div> Battery SOC ({{ inv.battery_soc }}%)</span>
                 <span><div class="legend-box pv-generation"></div> PV Generation ({{ inv.pv_power_w }} W)</span>
                 {% endif %}
+                <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px;">
+                    <input type="checkbox" id="toggleSolarForecast" style="cursor: pointer;" checked>
+                    <div class="legend-box" style="background: transparent; border: 2px dashed rgba(255, 213, 79, 0.95);"></div>
+                    Solar Forecast <span id="solarForecastCorrection" style="opacity: 0.8;"></span>
+                </label>
                 <label style="cursor: pointer; display: inline-flex; align-items: center; gap: 4px;">
                     <input type="checkbox" id="toggleConsumptionProfile" style="cursor: pointer;">
                     <div class="legend-box" style="background: rgba(0, 188, 212, 0.15); border: 2px solid rgba(0, 188, 212, 0.7);"></div>
@@ -797,8 +1498,347 @@
         </div>
     </div>
     <script>
+        // Shared chart series logic: used on first render and by every chart refresh.
+        window.FluxionChartSeries = (function() {
+            const LABELS = {
+                hdoStrip: 'HDO Tariff',
+                pv: 'PV Generation (kW)',
+                forecast: 'Solar Forecast (kW)',
+                forecastRaw: 'Solar Forecast raw (kW)',
+                consumption: 'Avg Consumption (kW)'
+            };
+            const PREFS = {
+                forecast: { key: 'fluxion-chart-show-solar-forecast', fallback: true },
+                consumption: { key: 'fluxion-chart-show-consumption', fallback: false }
+            };
+            // Strip height as a fraction of the chart height (hidden 0..1 axis)
+            const HDO_STRIP_HEIGHT = 0.035;
+
+            function readPref(name) {
+                const pref = PREFS[name];
+                try {
+                    const v = window.localStorage.getItem(pref.key);
+                    if (v === 'true') return true;
+                    if (v === 'false') return false;
+                } catch (e) { /* storage unavailable */ }
+                return pref.fallback;
+            }
+
+            function writePref(name, value) {
+                try {
+                    window.localStorage.setItem(PREFS[name].key, value ? 'true' : 'false');
+                } catch (e) { /* storage unavailable */ }
+            }
+
+            function hasValues(arr) {
+                return Array.isArray(arr) && arr.some(v => v !== null && v !== undefined);
+            }
+
+            function tariffColor(type, isHistorical, alpha) {
+                const opacity = alpha !== undefined ? alpha : (isHistorical ? 0.4 : 0.8);
+                return type === 'low'
+                    ? `rgba(255, 235, 59, ${opacity})`   // Yellow for low tariff
+                    : `rgba(244, 67, 54, ${opacity})`;   // Red for high tariff
+            }
+
+            // Profile is indexed by UTC hour; map each block by its UTC start, not its local label
+            function consumptionData(d) {
+                const profile = d.hourly_consumption_profile;
+                if (!Array.isArray(profile) || profile.length !== 24 || !Array.isArray(d.block_starts_utc)) return null;
+                const data = d.block_starts_utc.map(s => {
+                    const t = Date.parse(s);
+                    return isNaN(t) ? null : profile[new Date(t).getUTCHours()];
+                });
+                return hasValues(data) ? data : null;
+            }
+
+            function pvData(d) {
+                return hasValues(d.pv_actual_kw) ? d.pv_actual_kw : null;
+            }
+
+            function forecastData(d) {
+                return hasValues(d.solar_forecast_kw) ? d.solar_forecast_kw : null;
+            }
+
+            // A correction scales the forecast only when it rests on at least 3 valid days
+            const MIN_CORRECTION_DAYS = 3;
+            function correctionApplied(d) {
+                const c = d && d.pv_forecast_correction;
+                return !!c && typeof c.factor === 'number' && c.days_used >= MIN_CORRECTION_DAYS;
+            }
+
+            // Forecast before the PV forecast correction; only while a correction applies
+            function forecastRawData(d) {
+                return correctionApplied(d) && hasValues(d.solar_forecast_raw_kw) ? d.solar_forecast_raw_kw : null;
+            }
+
+            // Legend text of the correction: factor and the days it rests on
+            function correctionText(d) {
+                const c = d && d.pv_forecast_correction;
+                if (!c || typeof c.factor !== 'number') return '';
+                const days = c.days_used === 1 ? '1 day' : `${c.days_used} days`;
+                if (!correctionApplied(d)) return `(no correction yet, ${days})`;
+                return `(×${c.factor.toFixed(2)}, ${days})`;
+            }
+
+            function syncCorrectionLabel(d) {
+                const el = document.getElementById('solarForecastCorrection');
+                if (!el) return;
+                const c = d && d.pv_forecast_correction;
+                el.textContent = correctionText(d);
+                el.title = correctionApplied(d)
+                    ? `Forecast scaled by measured/forecast PV over ${c.days_used} valid days (${c.measured_kwh.toFixed(1)} / ${c.forecast_kwh.toFixed(1)} kWh); dotted line = raw forecast`
+                    : '';
+            }
+
+            // Floating bars along the bottom for blocks whose tariff is known but whose
+            // grid fee is 0 (a fee > 0 is already drawn as the stacked Grid Fee bar)
+            function hdoStripData(d) {
+                if (!d.tariff_known || !Array.isArray(d.tariff_types)) return null;
+                const fees = d.grid_fees || [];
+                const data = d.tariff_types.map((t, i) => (fees[i] > 0 ? null : [0, HDO_STRIP_HEIGHT]));
+                return hasValues(data) ? data : null;
+            }
+
+            function hdoStripColors(d) {
+                return (d.tariff_types || []).map((t, i) => tariffColor(t, d.is_historical && d.is_historical[i]));
+            }
+
+            function buildDataset(name, d, data) {
+                if (name === 'hdoStrip') {
+                    return {
+                        label: LABELS.hdoStrip,
+                        data: data,
+                        type: 'bar',
+                        backgroundColor: hdoStripColors(d),
+                        borderWidth: 0,
+                        barPercentage: 1.0,
+                        categoryPercentage: 1.0,
+                        yAxisID: 'yHdo',
+                        // Same bar group as the price bars (no side-by-side split); stacking is
+                        // per value axis, so it does not stack onto the prices
+                        stack: 'price',
+                        order: 0
+                    };
+                }
+                if (name === 'pv') {
+                    return {
+                        label: LABELS.pv,
+                        data: data,
+                        type: 'line',
+                        borderColor: 'rgba(255, 193, 7, 0.8)',
+                        backgroundColor: 'rgba(255, 193, 7, 0.15)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        pointHoverRadius: 5,
+                        pointBackgroundColor: 'rgba(255, 193, 7, 1)',
+                        pointBorderColor: '#fff',
+                        pointBorderWidth: 1,
+                        fill: 'origin',
+                        tension: 0.4,
+                        yAxisID: 'y2',
+                        order: 3,
+                        spanGaps: true // bridge a block the 15-min sampler skipped
+                    };
+                }
+                if (name === 'forecast') {
+                    return {
+                        label: LABELS.forecast,
+                        data: data,
+                        type: 'line',
+                        borderColor: 'rgba(255, 213, 79, 0.95)',
+                        backgroundColor: 'rgba(255, 213, 79, 0.0)',
+                        borderWidth: 2,
+                        borderDash: [6, 4],
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
+                        fill: false,
+                        tension: 0.3,
+                        yAxisID: 'y2',
+                        order: 1,
+                        spanGaps: false,
+                        hidden: !readPref('forecast')
+                    };
+                }
+                if (name === 'forecastRaw') {
+                    return {
+                        label: LABELS.forecastRaw,
+                        data: data,
+                        type: 'line',
+                        borderColor: 'rgba(255, 213, 79, 0.5)',
+                        backgroundColor: 'rgba(255, 213, 79, 0.0)',
+                        borderWidth: 1,
+                        borderDash: [2, 3],
+                        pointRadius: 0,
+                        pointHoverRadius: 3,
+                        fill: false,
+                        tension: 0.3,
+                        yAxisID: 'y2',
+                        order: 2,
+                        spanGaps: false,
+                        hidden: !readPref('forecast')
+                    };
+                }
+                // consumption
+                return {
+                    label: LABELS.consumption,
+                    data: data,
+                    type: 'line',
+                    borderColor: 'rgba(0, 188, 212, 0.7)',
+                    backgroundColor: 'rgba(0, 188, 212, 0.1)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    fill: 'origin',
+                    stepped: 'before',
+                    yAxisID: 'y2',
+                    order: 4,
+                    hidden: !readPref('consumption')
+                };
+            }
+
+            function seriesData(name, d) {
+                if (name === 'hdoStrip') return hdoStripData(d);
+                if (name === 'pv') return pvData(d);
+                if (name === 'forecast') return forecastData(d);
+                if (name === 'forecastRaw') return forecastRawData(d);
+                return consumptionData(d);
+            }
+
+            const NAMES = ['hdoStrip', 'pv', 'forecast', 'forecastRaw', 'consumption'];
+
+            // Datasets for the first render
+            function datasets(d) {
+                syncCorrectionLabel(d);
+                const out = [];
+                NAMES.forEach(name => {
+                    const data = seriesData(name, d);
+                    if (data) out.push(buildDataset(name, d, data));
+                });
+                return out;
+            }
+
+            function y2Visible(chart) {
+                return chart.data.datasets.some((ds, i) =>
+                    ds.yAxisID === 'y2' && chart.isDatasetVisible(i) && hasValues(ds.data));
+            }
+
+            function y2VisibleFor(d) {
+                return !!(pvData(d)
+                    || ((forecastData(d) || forecastRawData(d)) && readPref('forecast'))
+                    || (consumptionData(d) && readPref('consumption')));
+            }
+
+            // Bring the series of an existing chart in line with fresh chart data:
+            // update, add (when missing at first render) or remove each one.
+            function sync(chart, d) {
+                syncCorrectionLabel(d);
+                NAMES.forEach(name => {
+                    const data = seriesData(name, d);
+                    const idx = chart.data.datasets.findIndex(ds => ds.label === LABELS[name]);
+                    if (!data) {
+                        if (idx >= 0) chart.data.datasets.splice(idx, 1);
+                        return;
+                    }
+                    if (idx >= 0) {
+                        const ds = chart.data.datasets[idx];
+                        ds.data = data;
+                        if (name === 'hdoStrip') ds.backgroundColor = hdoStripColors(d);
+                    } else {
+                        chart.data.datasets.push(buildDataset(name, d, data));
+                    }
+                });
+                if (chart.options.scales && chart.options.scales.y2) {
+                    chart.options.scales.y2.display = y2Visible(chart);
+                }
+                // Series added after first render need the top legend too
+                const legend = chart.options.plugins && chart.options.plugins.legend;
+                if (legend && chart.data.datasets.some(ds => ds.yAxisID === 'y2')) {
+                    legend.display = true;
+                }
+                syncCheckboxes(chart);
+            }
+
+            function setVisible(chart, name, visible) {
+                writePref(name, visible);
+                if (!chart) return;
+                // The raw forecast follows the Solar Forecast checkbox
+                const labels = name === 'forecast' ? [LABELS.forecast, LABELS.forecastRaw] : [LABELS[name]];
+                labels.forEach(label => {
+                    const idx = chart.data.datasets.findIndex(x => x.label === label);
+                    if (idx >= 0) {
+                        chart.data.datasets[idx].hidden = !visible;
+                        chart.setDatasetVisibility(idx, visible);
+                    }
+                });
+                if (chart.options.scales && chart.options.scales.y2) {
+                    chart.options.scales.y2.display = y2Visible(chart);
+                }
+                chart.update('none');
+            }
+
+            const CHECKBOXES = { forecast: 'toggleSolarForecast', consumption: 'toggleConsumptionProfile' };
+
+            function syncCheckboxes(chart) {
+                Object.keys(CHECKBOXES).forEach(name => {
+                    const box = document.getElementById(CHECKBOXES[name]);
+                    if (!box) return;
+                    box.checked = readPref(name);
+                    const present = chart && chart.data.datasets.some(ds => ds.label === LABELS[name]);
+                    const label = box.closest('label');
+                    if (label) label.style.opacity = present ? '1' : '0.5';
+                    box.title = present ? '' : 'No data yet';
+                });
+            }
+
+            function wireCheckboxes() {
+                Object.keys(CHECKBOXES).forEach(name => {
+                    const box = document.getElementById(CHECKBOXES[name]);
+                    if (!box || box.dataset.wired) return;
+                    box.dataset.wired = '1';
+                    box.addEventListener('change', function() {
+                        setVisible(window.priceChartInstance, name, this.checked);
+                    });
+                });
+                syncCheckboxes(window.priceChartInstance);
+            }
+
+            // Chart legend click on a series: remember it like the checkbox does and refit y2
+            function legendToggled(chart, datasetIndex) {
+                const ds = chart.data.datasets[datasetIndex];
+                if (!ds) return;
+                const visible = chart.isDatasetVisible(datasetIndex);
+                Object.keys(CHECKBOXES).forEach(name => {
+                    if (ds.label === LABELS[name]) {
+                        ds.hidden = !visible;
+                        writePref(name, visible);
+                    }
+                });
+                if (chart.options.scales && chart.options.scales.y2) {
+                    chart.options.scales.y2.display = y2Visible(chart);
+                }
+                syncCheckboxes(chart);
+                chart.update('none');
+            }
+
+            // Tooltip line naming the tariff of a block (used when the fee is 0)
+            function tariffLabel(type) {
+                return type === 'low' ? '🟡 Low' : '🔴 High';
+            }
+
+            return {
+                LABELS, HDO_STRIP_HEIGHT, datasets, sync, y2VisibleFor, wireCheckboxes, legendToggled,
+                consumptionData, pvData, forecastData, forecastRawData, correctionText, hdoStripData,
+                tariffColor, tariffLabel,
+                readPref, writePref
+            };
+        })();
+    </script>
+    <script>
         (function() {
             const chartData = {{ chart_data_json|safe }};
+            window.priceChartData = chartData;
+            const initialChartData = chartData;
             {% if let Some(inv) = inverters.first() %}
             const currentBatterySoc = {{ inv.battery_soc }};
             {% else %}
@@ -814,7 +1854,8 @@
                     const opacity = isHistorical ? 0.4 : 0.8; // Dimmed for past blocks
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
 
@@ -823,7 +1864,8 @@
                     const opacity = isHistorical ? 0.5 : 1.0;
                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`; // Purple
+                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`; // Grey
                     return `rgba(33, 150, 243, ${opacity})`; // Blue for Self-Use
                 });
 
@@ -973,74 +2015,11 @@
                     });
                 }
 
-                // Add PV generation history as area chart if available
-                console.log('☀️ [CHART] PV generation history:', chartData.pv_generation_history);
-                console.log('☀️ [CHART] PV generation history length:', chartData.pv_generation_history ? chartData.pv_generation_history.length : 0);
-
-                if (chartData.pv_generation_history && chartData.pv_generation_history.length > 0) {
-                    console.log('☀️ [CHART] Processing', chartData.pv_generation_history.length, 'PV history points');
-                    console.log('☀️ [CHART] First PV point:', chartData.pv_generation_history[0]);
-                    console.log('☀️ [CHART] Last PV point:', chartData.pv_generation_history[chartData.pv_generation_history.length - 1]);
-
-                    // Create a mapping from label to PV power
-                    const pvMap = new Map();
-                    chartData.pv_generation_history.forEach(point => {
-                        pvMap.set(point.label, point.power_w);
-                    });
-
-                    console.log('☀️ [CHART] PV map has', pvMap.size, 'entries');
-
-                    // Map PV history to chart labels (fill nulls where no data)
-                    const pvData = chartData.labels.map(label => pvMap.get(label) || null);
-                    const nonNullPvCount = pvData.filter(v => v !== null).length;
-                    console.log('☀️ [CHART] Mapped PV data: ', nonNullPvCount, 'non-null values out of', pvData.length);
-
-                    // Convert watts to kilowatts for better display scale
-                    const pvDataKw = pvData.map(v => v !== null ? v / 1000 : null);
-
-                    datasets.push({
-                        label: 'PV Generation (kW)',
-                        data: pvDataKw,
-                        type: 'line',
-                        borderColor: 'rgba(255, 193, 7, 0.8)',
-                        backgroundColor: 'rgba(255, 193, 7, 0.15)',
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        pointHoverRadius: 5,
-                        pointBackgroundColor: 'rgba(255, 193, 7, 1)',
-                        pointBorderColor: '#fff',
-                        pointBorderWidth: 1,
-                        fill: 'origin', // Fill area under the line
-                        tension: 0.4, // Smooth curves
-                        yAxisID: 'y2',
-                        order: 3, // Behind the price bars
-                        spanGaps: true
-                    });
-                }
-
-                // Add hourly consumption profile if available (hidden by default, toggled by checkbox)
-                if (chartData.hourly_consumption_profile && chartData.hourly_consumption_profile.length === 24) {
-                    const profileData = chartData.labels.map(label => {
-                        const match = label.match(/(\d{2}):(\d{2})$/);
-                        if (match) return chartData.hourly_consumption_profile[parseInt(match[1], 10)];
-                        return null;
-                    });
-                    datasets.push({
-                        label: 'Avg Consumption (kW)',
-                        data: profileData,
-                        type: 'line',
-                        borderColor: 'rgba(0, 188, 212, 0.7)',
-                        backgroundColor: 'rgba(0, 188, 212, 0.1)',
-                        borderWidth: 2,
-                        pointRadius: 0,
-                        pointHoverRadius: 4,
-                        fill: 'origin',
-                        stepped: 'before',
-                        yAxisID: 'y2',
-                        order: 4,
-                        hidden: true
-                    });
-                }
+                // PV history (bucketed per block by UTC instant), solar forecast, average
+                // consumption (UTC-hour profile) and the HDO tariff strip for zero-fee blocks
+                const seriesDatasets = window.FluxionChartSeries.datasets(chartData);
+                datasets.push(...seriesDatasets);
+                const hasPowerSeries = seriesDatasets.some(ds => ds.yAxisID === 'y2');
 
                 window.priceChartInstance = new Chart(ctx, {
                     type: 'bar',
@@ -1057,14 +2036,18 @@
                         },
                         plugins: {
                             legend: {
-                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || (chartData.pv_generation_history && chartData.pv_generation_history.length > 0),
+                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || hasPowerSeries,
                                 position: 'top',
                                 labels: {
                                     color: '#999',
                                     filter: function(item) {
                                         // Show battery, PV, and consumption related legends
-                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV') || item.text.includes('Consumption');
+                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV') || item.text.includes('Consumption') || item.text.includes('Forecast');
                                     }
+                                },
+                                onClick: function(e, item, legend) {
+                                    Chart.defaults.plugins.legend.onClick.call(this, e, item, legend);
+                                    window.FluxionChartSeries.legendToggled(legend.chart, item.datasetIndex);
                                 }
                             },
                             tooltip: {
@@ -1078,9 +2061,18 @@
                                 callbacks: {
                                     title: (items) => items[0].label,
                                     label: (context) => {
-                                        // Skip HDO grid fee dataset in tooltip (shown in main price tooltip)
-                                        if (context.dataset.label === 'Grid Fee (HDO)') {
+                                        // Latest data (refreshes merge into it), first render as fallback
+                                        const chartData = window.priceChartData || initialChartData;
+                                        // Skip HDO grid fee dataset and tariff strip in tooltip (shown in main price tooltip)
+                                        if (context.dataset.label === 'Grid Fee (HDO)' || context.dataset.label === window.FluxionChartSeries.LABELS.hdoStrip) {
                                             return null; // Will be shown in the main price tooltip
+                                        }
+                                        if (context.dataset.type === 'line' && (context.parsed.y === null || context.parsed.y === undefined || isNaN(context.parsed.y))) {
+                                            return null;
+                                        }
+                                        if (context.dataset.label === window.FluxionChartSeries.LABELS.forecast
+                                            || context.dataset.label === window.FluxionChartSeries.LABELS.forecastRaw) {
+                                            return `${context.dataset.label}: ${context.parsed.y.toFixed(2)} kW`;
                                         }
                                         if (context.dataset.label.includes('Battery') || context.dataset.label.includes('SOC') || context.dataset.label.includes('Predicted')) {
                                             return `${context.dataset.label}: ${context.parsed.y.toFixed(1)}%`;
@@ -1095,7 +2087,6 @@
                                         const mode = chartData.modes[idx];
                                         const targetSoc = chartData.target_socs[idx];
                                         const strategy = chartData.strategies[idx];
-                                        const profit = chartData.profits[idx];
                                         const debugInfo = chartData.debug_info ? chartData.debug_info[idx] : null;
                                         const isHistorical = chartData.is_historical && chartData.is_historical[idx];
 
@@ -1119,8 +2110,10 @@
                                             lines.push('═══ Price Breakdown ═══');
                                             lines.push(`  Spot Price: ${spotPrice.toFixed(3)} Kč`);
                                             if (gridFee > 0) {
-                                                const tariffLabel = tariffType === 'low' ? '🟡 Low' : '🔴 High';
+                                                const tariffLabel = window.FluxionChartSeries.tariffLabel(tariffType);
                                                 lines.push(`  Grid Fee: ${gridFee.toFixed(2)} Kč (${tariffLabel})`);
+                                            } else if (chartData.tariff_known && chartData.tariff_types) {
+                                                lines.push(`  HDO Tariff: ${window.FluxionChartSeries.tariffLabel(tariffType)}`);
                                             }
                                             if (buyFee > 0) {
                                                 lines.push(`  Buy/Dist: ${buyFee.toFixed(2)} Kč`);
@@ -1136,11 +2129,6 @@
 
                                         if (strategy) {
                                             lines.push(`Strategy: ${strategy}`);
-                                        }
-
-                                        if (profit !== null && profit !== undefined) {
-                                            const profitColor = profit >= 0 ? '✓' : '✗';
-                                            lines.push(`${profitColor} Expected Profit: ${profit.toFixed(2)} CZK`);
                                         }
 
                                         if (targetSoc !== null && targetSoc !== undefined) {
@@ -1250,20 +2238,26 @@
                                 },
                                 position: 'right'
                             },
+                            yHdo: {
+                                // Hidden 0..1 axis for the HDO tariff strip along the bottom
+                                display: false,
+                                stacked: false,
+                                min: 0,
+                                max: 1
+                            },
                             y2: {
-                                display: (chartData.pv_generation_history && chartData.pv_generation_history.length > 0),
+                                display: window.FluxionChartSeries.y2VisibleFor(chartData),
                                 beginAtZero: true,
                                 title: {
                                     display: true,
-                                    text: 'PV Power (kW)',
+                                    text: 'Power (kW)',
                                     color: 'rgba(255, 193, 7, 0.9)'
                                 },
                                 ticks: { color: 'rgba(255, 193, 7, 0.8)' },
                                 grid: {
                                     display: false // Don't show grid lines to avoid clutter
                                 },
-                                position: 'right',
-                                offset: true
+                                position: 'right'
                             },
                             x: {
                                 stacked: true,  // Enable stacking for price breakdown
@@ -1286,21 +2280,8 @@
                 });
             }
 
-            // Wire checkbox to toggle consumption profile visibility
-            const toggleCheckbox = document.getElementById('toggleConsumptionProfile');
-            if (toggleCheckbox && window.priceChartInstance) {
-                toggleCheckbox.addEventListener('change', function() {
-                    const chart = window.priceChartInstance;
-                    const dsIndex = chart.data.datasets.findIndex(d => d.label === 'Avg Consumption (kW)');
-                    if (dsIndex >= 0) {
-                        chart.data.datasets[dsIndex].hidden = !this.checked;
-                        const pvDs = chart.data.datasets.find(d => d.label === 'PV Generation (kW)');
-                        const pvVisible = pvDs && !pvDs.hidden;
-                        chart.options.scales.y2.display = this.checked || pvVisible;
-                        chart.update('none');
-                    }
-                });
-            }
+            // Wire the Solar Forecast / Avg Consumption checkboxes (state kept in localStorage)
+            window.FluxionChartSeries.wireCheckboxes();
         })();
     </script>
     {% else %}
@@ -1314,8 +2295,18 @@
     <script>
         // Refresh chart data every 10 seconds (independent of SSE)
         const ingressPath = "{{ ingress_path }}";
-        setInterval(function() {
-            fetch(ingressPath + '/chart-data')
+
+        // Predicted SOC line from chart data (it follows the default-mode switch, brief H19)
+        function applySocPrediction(chart, data) {
+            const dataset = chart.data.datasets.find(d => d.label === 'Predicted SOC (%)');
+            if (!dataset || !data || !data.labels || !data.battery_soc_prediction) return;
+            const predictionMap = new Map();
+            data.battery_soc_prediction.forEach(point => predictionMap.set(point.label, point.soc));
+            dataset.data = data.labels.map(label => predictionMap.has(label) ? predictionMap.get(label) : null);
+        }
+
+        function refreshPriceChart() {
+            return fetch(ingressPath + '/chart-data')
                 .then(response => response.json())
                 .then(data => {
                     if (window.priceChartInstance && data) {
@@ -1338,7 +2329,8 @@
                                     const opacity = isHistorical ? 0.4 : 0.8;
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                             }
@@ -1366,15 +2358,13 @@
                             currentSocDataset.data = data.labels.map(() => data.current_battery_soc);
                         }
 
-                        // Update consumption profile dataset if present
-                        const consumptionDataset = findDataset('Avg Consumption (kW)');
-                        if (consumptionDataset && data.hourly_consumption_profile && data.hourly_consumption_profile.length === 24) {
-                            consumptionDataset.data = data.labels.map(label => {
-                                const match = label.match(/(\d{2}):(\d{2})$/);
-                                if (match) return data.hourly_consumption_profile[parseInt(match[1], 10)];
-                                return null;
-                            });
+                        // PV history, solar forecast, avg consumption and HDO tariff strip
+                        // (added here too when they were missing at first render)
+                        window.priceChartData = Object.assign({}, window.priceChartData, data);
+                        if (window.FluxionChartSeries) {
+                            window.FluxionChartSeries.sync(window.priceChartInstance, data);
                         }
+                        applySocPrediction(window.priceChartInstance, data);
 
                         // Update NOW line
                         if (data.current_time_label) {
@@ -1386,7 +2376,8 @@
                     }
                 })
                 .catch(err => console.error('Failed to update chart:', err));
-        }, 10000); // 10 seconds
+        }
+        setInterval(refreshPriceChart, 10000); // 10 seconds
     </script>
 
     <!-- Upcoming Schedule (Outside SSE update area - updates every 15 minutes) -->
@@ -1404,7 +2395,6 @@
                         <th style="padding: 8px; text-align: left;"><i class="mdi mdi-cash"></i> Price</th>
                         <th style="padding: 8px; text-align: left;"><i class="mdi mdi-cog"></i> Mode</th>
                         <th style="padding: 8px; text-align: left;"><i class="mdi mdi-strategy"></i> Strategy</th>
-                        <th style="padding: 8px; text-align: right;"><i class="mdi mdi-trending-up"></i> Profit</th>
                         <th class="verbose-col" style="padding: 8px; text-align: left; display: none;"><i class="mdi mdi-identifier"></i> UID</th>
                         <th class="verbose-col" style="padding: 8px; text-align: left; display: none;"><i class="mdi mdi-comment-text-outline"></i> Reason</th>
                     </tr>
@@ -1435,6 +2425,7 @@
                     const dataHash = JSON.stringify({
                         labels: chartData.labels ? chartData.labels.slice(0, 24) : [],
                         strategies: chartData.strategies ? chartData.strategies.slice(0, 24) : [],
+                        modes: chartData.modes ? chartData.modes.slice(0, 96) : [],
                         profits: chartData.profits ? chartData.profits.slice(0, 24) : []
                     });
 
@@ -1451,10 +2442,37 @@
 
         // Initial load
         fetchAndUpdateSchedule();
+        // Called after the default-mode switch so Self-Use/Back Up labels follow at once
+        window.refreshUpcomingSchedule = fetchAndUpdateSchedule;
 
         // Update every 15 minutes
         setInterval(fetchAndUpdateSchedule, FETCH_INTERVAL_MS);
     })();
+
+    // Approximate sunrise/sunset hours for ~50°N latitude (Central Europe)
+    function getSunHours(month, day) {
+        const daysInMonth = [0,31,28,31,30,31,30,31,31,30,31,30];
+        let doy = day;
+        for (let m = 1; m < month; m++) doy += daysInMonth[m];
+        const decl = 23.45 * Math.sin(2 * Math.PI * (284 + doy) / 365);
+        const lat = 50.0;
+        const latRad = lat * Math.PI / 180;
+        const declRad = decl * Math.PI / 180;
+        const cosHA = -Math.tan(latRad) * Math.tan(declRad);
+        const ha = Math.acos(Math.max(-1, Math.min(1, cosHA)));
+        const sunriseHour = 12 - (ha * 180 / Math.PI) / 15;
+        const sunsetHour = 12 + (ha * 180 / Math.PI) / 15;
+        return { sunrise: sunriseHour, sunset: sunsetHour };
+    }
+
+    // Sine-weighted solar production for a 15-min block
+    function getSolarWeight(blockMinuteOfDay, sunriseMinute, sunsetMinute) {
+        const blockCenter = blockMinuteOfDay + 7.5;
+        if (blockCenter <= sunriseMinute || blockCenter >= sunsetMinute) return 0;
+        const dayLength = sunsetMinute - sunriseMinute;
+        const progress = (blockCenter - sunriseMinute) / dayLength;
+        return Math.sin(progress * Math.PI);
+    }
 
     function populateUpcomingBlocks(tbody, chartData) {
         if (!tbody || !chartData) return;
@@ -1520,7 +2538,6 @@
                 prices: [chartData.prices[i]],
                 mode: mode,
                 strategies: [chartData.strategies[i]],
-                profits: [chartData.profits[i]],
                 reasons: [chartData.reasons ? chartData.reasons[i] : null],
                 decision_uids: [chartData.decision_uids ? chartData.decision_uids[i] : null],
                 blockCount: 1
@@ -1532,7 +2549,6 @@
                 group.endLabel = chartData.labels[i];
                 group.prices.push(chartData.prices[i]);
                 group.strategies.push(chartData.strategies[i]);
-                group.profits.push(chartData.profits[i]);
                 group.reasons.push(chartData.reasons ? chartData.reasons[i] : null);
                 group.decision_uids.push(chartData.decision_uids ? chartData.decision_uids[i] : null);
                 group.blockCount++;
@@ -1576,7 +2592,8 @@
             const tdMode = document.createElement('td');
             tdMode.style.padding = '8px';
             const modeBadge = document.createElement('span');
-            modeBadge.className = 'mode-badge mode-' + group.mode.toLowerCase().replace(/ /g, '-');
+            // "Back Up Mode (25%)" uses the Back Up Mode badge style
+            modeBadge.className = 'mode-badge mode-' + group.mode.replace(/\s*\(.*\)$/, '').toLowerCase().replace(/ /g, '-');
             modeBadge.style.fontSize = '0.8em';
             modeBadge.style.padding = '2px 6px';
             modeBadge.textContent = group.mode;
@@ -1601,29 +2618,6 @@
                 tdStrategy.appendChild(dash);
             }
             row.appendChild(tdStrategy);
-
-            // Profit (sum for grouped blocks)
-            const tdProfit = document.createElement('td');
-            tdProfit.style.padding = '8px';
-            tdProfit.style.textAlign = 'right';
-            tdProfit.style.fontWeight = 'bold';
-            const validProfits = group.profits.filter(p => p !== null && p !== undefined);
-            if (validProfits.length > 0) {
-                const totalProfit = validProfits.reduce((sum, p) => sum + p, 0);
-                const profitSpan = document.createElement('span');
-                profitSpan.style.color = totalProfit >= 0 ? '#4caf50' : '#f44336';
-                profitSpan.textContent = totalProfit.toFixed(2) + ' CZK';
-                if (group.blockCount > 1) {
-                    profitSpan.title = `Total for ${group.blockCount} blocks`;
-                }
-                tdProfit.appendChild(profitSpan);
-            } else {
-                const dash = document.createElement('span');
-                dash.style.color = '#666';
-                dash.textContent = '—';
-                tdProfit.appendChild(dash);
-            }
-            row.appendChild(tdProfit);
 
             // UID (verbose)
             const tdUid = document.createElement('td');
@@ -1651,50 +2645,6 @@
             tbody.appendChild(row);
         }
 
-        // Summary row with total profit
-        const allProfits = groups.flatMap(g => g.profits.filter(p => p !== null && p !== undefined));
-        if (allProfits.length > 0) {
-            const grandTotal = allProfits.reduce((sum, p) => sum + p, 0);
-            const summaryRow = document.createElement('tr');
-            summaryRow.style.borderTop = '2px solid rgba(255,255,255,0.15)';
-            summaryRow.style.background = 'rgba(255,255,255,0.03)';
-
-            // Empty cells for Time, Price, Mode, Strategy
-            for (let c = 0; c < 4; c++) {
-                const td = document.createElement('td');
-                td.style.padding = '8px';
-                if (c === 0) {
-                    td.style.fontWeight = '600';
-                    td.style.color = 'var(--text-secondary)';
-                    td.textContent = 'Total';
-                }
-                summaryRow.appendChild(td);
-            }
-
-            // Total profit cell
-            const tdTotal = document.createElement('td');
-            tdTotal.style.padding = '8px';
-            tdTotal.style.textAlign = 'right';
-            tdTotal.style.fontWeight = 'bold';
-            tdTotal.style.fontSize = '1.05em';
-            const totalSpan = document.createElement('span');
-            totalSpan.style.color = grandTotal >= 0 ? '#4caf50' : '#f44336';
-            totalSpan.textContent = grandTotal.toFixed(2) + ' CZK';
-            tdTotal.appendChild(totalSpan);
-            summaryRow.appendChild(tdTotal);
-
-            // Empty verbose cells
-            const verboseDisplay = document.getElementById('verbose-schedule')?.checked ? '' : 'none';
-            for (let c = 0; c < 2; c++) {
-                const td = document.createElement('td');
-                td.className = 'verbose-col';
-                td.style.display = verboseDisplay;
-                td.style.padding = '8px';
-                summaryRow.appendChild(td);
-            }
-
-            tbody.appendChild(summaryRow);
-        }
     }
 
     // Verbose checkbox toggle
@@ -1756,7 +2706,7 @@
             {% endfor %}
         </div>
         {% endif %}
-        <div class="timestamp">Last update: {{ last_update_formatted }}</div>
+        <div class="timestamp">Last update: {{ last_update_formatted }} {{ display_tz_label }}</div>
     </div>
 
     <!-- Inverters Grid -->
@@ -1899,6 +2849,12 @@
                 <span class="stat-value">{{ output }} {{ self.t("unit-kilowatt-hour") }}</span>
             </div>
             {% endif %}
+            {% if loop.first %}{% if let Some(basis) = battery_cost_basis %}
+            <div class="stat">
+                <span class="stat-label">{{ self.t("battery-cost-basis") }}</span>
+                <span class="stat-value">{{ basis.usable_text() }} {{ self.t("unit-kilowatt-hour") }} {{ self.t("battery-cost-usable-at") }} {% if let Some(cost) = basis.cost_text() %}{{ cost }} CZK/kWh{% else %}{{ self.t("battery-cost-unknown") }}{% endif %}{% if let Some((solar, grid)) = basis.shares_text() %} ({{ self.t("battery-cost-solar") }} {{ solar }} % / {{ self.t("battery-cost-grid") }} {{ grid }} %){% endif %}</span>
+            </div>
+            {% endif %}{% endif %}
         </div>
         {% endfor %}
     </div>
@@ -2071,7 +3027,12 @@
         <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
         <div class="stat">
             <span class="stat-label">Predicted Today</span>
-            <span class="stat-value">{{ format!("{:.1}", forecast.total_today_kwh) }} kWh</span>
+            <span class="stat-value">
+                {{ format!("{:.1}", forecast.total_today_kwh) }} kWh
+                {% if let Some(corrected) = forecast.corrected_total_today_kwh() %}
+                <span style="font-size: 0.85em; color: var(--text-secondary);" title="Forecast the planner uses (corrected)">→ {{ format!("{:.1}", corrected) }} kWh</span>
+                {% endif %}
+            </span>
         </div>
         {% if let Some(actual) = forecast.actual_today_kwh %}
         <div class="stat">
@@ -2094,6 +3055,20 @@
             <span class="stat-label">Tomorrow</span>
             <span class="stat-value">{{ format!("{:.1}", forecast.tomorrow_kwh) }} kWh</span>
         </div>
+        {% if let Some(correction) = forecast.correction %}
+        <div class="stat">
+            <span class="stat-label">Forecast Correction</span>
+            {% if correction.is_applied() %}
+            <span class="stat-value" title="Measured / forecast PV over the valid hours of the last 7 days: {{ format!("{:.1}", correction.measured_kwh) }} / {{ format!("{:.1}", correction.forecast_kwh) }} kWh. Predicted Today shows the raw forecast, then the corrected one.">
+                ×{{ format!("{:.2}", correction.factor) }}
+                <span style="font-size: 0.85em; color: var(--text-secondary);">({{ correction.days_used }} days)</span>
+            {% else %}
+            <span class="stat-value" style="color: var(--text-secondary);" title="Needs at least 3 valid days of measured vs forecast PV">
+                no correction yet ({{ correction.days_used }} days)
+            {% endif %}
+            </span>
+        </div>
+        {% endif %}
         {% else %}
         <h3 style="margin-top: 15px; margin-bottom: 8px; font-size: 1.0em;">☀️ Solar Forecast</h3>
         <p style="color: var(--text-secondary); font-size: 0.9em;">No solar forecast data available.</p>
@@ -2246,6 +3221,22 @@
                     </div>
                 </div>
 
+                <!-- Display Timezone Section -->
+                <div class="config-section" id="display-timezone-section">
+                    <div class="config-section-header" onclick="toggleConfigSection(this)">
+                        <h3 class="config-section-title">Display Timezone</h3>
+                    </div>
+                    <div class="config-section-content">
+                        <div class="config-form-group">
+                            <label class="config-form-label" for="display_timezone">Timezone</label>
+                            <select id="display_timezone" class="config-form-input">
+                                <option value="">{% if let Some(ha) = ha_timezone %}Home Assistant ({{ ha }}){% else %}Not set{% endif %}</option>
+                            </select>
+                            <span class="config-form-help">Times are stored in UTC and shown in this timezone</span>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Pricing Section -->
                 <div class="config-section">
                     <div class="config-section-header" onclick="toggleConfigSection(this)">
@@ -2293,6 +3284,60 @@ function toggleConfigSection(header) {
     section.classList.toggle('expanded');
 }
 
+// Fallback timezone list when Intl.supportedValuesOf is unavailable
+const FALLBACK_TIMEZONES = [
+    'UTC', 'Europe/Amsterdam', 'Europe/Athens', 'Europe/Belgrade', 'Europe/Berlin', 'Europe/Bratislava',
+    'Europe/Brussels', 'Europe/Bucharest', 'Europe/Budapest', 'Europe/Copenhagen', 'Europe/Dublin',
+    'Europe/Helsinki', 'Europe/Istanbul', 'Europe/Lisbon', 'Europe/London', 'Europe/Madrid', 'Europe/Moscow',
+    'Europe/Oslo', 'Europe/Paris', 'Europe/Prague', 'Europe/Riga', 'Europe/Rome', 'Europe/Sofia',
+    'Europe/Stockholm', 'Europe/Tallinn', 'Europe/Vienna', 'Europe/Vilnius', 'Europe/Warsaw', 'Europe/Zagreb',
+    'Europe/Zurich',
+];
+
+// Set when the user arrives via the "choose your timezone" banner
+let preselectBrowserTimezone = false;
+
+// Fill the display timezone selector; `configured` is the saved system.display_timezone
+function populateDisplayTimezoneSelect(configured) {
+    const select = document.getElementById('display_timezone');
+    if (!select) return;
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const zones = typeof Intl.supportedValuesOf === 'function'
+        ? Intl.supportedValuesOf('timeZone')
+        : FALLBACK_TIMEZONES;
+
+    // Keep the first option (HA or "Not set"), rebuild the IANA list
+    select.length = 1;
+    const addZone = (zone) => {
+        if (![...select.options].some(o => o.value === zone)) {
+            select.add(new Option(zone, zone));
+        }
+    };
+    zones.forEach(addZone);
+    if (configured) addZone(configured);
+
+    let selected = configured;
+    if (!selected && preselectBrowserTimezone) {
+        addZone(browserTz);
+        selected = browserTz;
+    }
+    select.value = selected || '';
+    preselectBrowserTimezone = false;
+}
+
+// Open the sidebar on the display timezone selector, preselecting the browser timezone
+function openDisplayTimezoneSelector(event) {
+    if (event) event.preventDefault();
+    preselectBrowserTimezone = true;
+    const sidebar = document.getElementById('config-sidebar');
+    if (sidebar.classList.contains('show')) {
+        loadConfigToSidebar();
+    } else {
+        toggleConfigSidebar();
+    }
+    document.getElementById('display-timezone-section')?.scrollIntoView({ behavior: 'smooth' });
+}
+
 // Load config into sidebar
 async function loadConfigToSidebar() {
     try {
@@ -2321,6 +3366,8 @@ async function loadConfigToSidebar() {
             document.getElementById('pricing_buy_fee').value = data.config.pricing.spot_buy_fee_czk || 0;
             document.getElementById('pricing_sell_fee').value = data.config.pricing.spot_sell_fee_czk || 0;
         }
+
+        populateDisplayTimezoneSelect(data.config.system?.display_timezone || '');
     } catch (error) {
         console.error('Failed to load config:', error);
         showConfigNotification('Failed to load config: ' + error.message, 'error');
@@ -2371,6 +3418,9 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
         data.config.pricing.spot_buy_fee_czk = parseFloat(document.getElementById('pricing_buy_fee').value);
         data.config.pricing.spot_sell_fee_czk = parseFloat(document.getElementById('pricing_sell_fee').value);
 
+        // Empty selection means "not set" (HA timezone is used when available)
+        data.config.system.display_timezone = document.getElementById('display_timezone').value || null;
+
         // Update config
         const updateResponse = await fetch('{{ ingress_path }}/api/config/update', {
             method: 'POST',
@@ -2416,7 +3466,8 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     const opacity = isHistorical ? 0.4 : 0.8;
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                                 spotDataset.borderColor = chartData.modes.map((mode, idx) => {
@@ -2424,7 +3475,8 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                                     const opacity = isHistorical ? 0.5 : 1.0;
                                     if (mode === 'Force Charge') return `rgba(255, 152, 0, ${opacity})`;
                                     if (mode === 'Force Discharge') return `rgba(76, 175, 80, ${opacity})`;
-                                    if (mode === 'Back Up Mode') return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode.startsWith('Back Up Mode')) return `rgba(156, 39, 176, ${opacity})`;
+                                    if (mode === 'Hold') return `rgba(158, 158, 158, ${opacity})`;
                                     return `rgba(33, 150, 243, ${opacity})`;
                                 });
                             }
@@ -2450,6 +3502,15 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                         const currentSocDataset = findDataset('Current SOC (%)');
                         if (currentSocDataset && chartData.current_battery_soc) {
                             currentSocDataset.data = chartData.labels.map(() => chartData.current_battery_soc);
+                        }
+
+                        // PV history, solar forecast, avg consumption and HDO tariff strip
+                        window.priceChartData = Object.assign({}, window.priceChartData, chartData);
+                        if (window.FluxionChartSeries) {
+                            window.FluxionChartSeries.sync(window.priceChartInstance, chartData);
+                        }
+                        if (typeof applySocPrediction === 'function') {
+                            applySocPrediction(window.priceChartInstance, chartData);
                         }
 
                         // Update NOW line
@@ -2567,6 +3628,68 @@ async function updateRestrictions() {
     } catch (error) {
         console.error('Error updating restrictions:', error);
         alert('Failed to update restrictions: ' + error.message);
+    }
+}
+
+// Update the default mode (Self-Use or Backup). The minimum SOC is sent with it in Backup.
+async function sendDefaultMode(defaultMode, minSoc) {
+    const body = { default_mode: defaultMode };
+    if (minSoc !== undefined) {
+        body.backup_min_soc_pct = minSoc;
+    }
+    try {
+        const response = await fetch(`${USER_CONTROL_API}/default-mode`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+            alert('Failed to update default mode');
+            return false;
+        }
+        return true;
+    } catch (error) {
+        console.error('Error updating default mode:', error);
+        alert('Failed to update default mode: ' + error.message);
+        return false;
+    }
+}
+
+// The backend applies the new default mode on its next tick; then refresh the chart's mode
+// colours, the predicted SOC line and the Upcoming Schedule
+function refreshAfterDefaultModeChange() {
+    setTimeout(() => {
+        if (typeof refreshPriceChart === 'function') refreshPriceChart();
+        if (window.refreshUpcomingSchedule) window.refreshUpcomingSchedule();
+    }, 1500);
+}
+
+async function updateDefaultMode() {
+    const backup = document.getElementById('default-mode-toggle').checked;
+    const name = document.getElementById('default-mode-name');
+    document.getElementById('backup-min-soc-row').style.display = backup ? '' : 'none';
+    if (!backup) {
+        if (await sendDefaultMode('self_use')) {
+            name.textContent = name.dataset.selfUse;
+            refreshAfterDefaultModeChange();
+        }
+        return;
+    }
+    const minSoc = parseInt(document.getElementById('backup-min-soc-input').value, 10);
+    if (await sendDefaultMode('backup', minSoc)) {
+        name.textContent = name.dataset.backup;
+        refreshAfterDefaultModeChange();
+    }
+}
+
+async function updateBackupMinSoc() {
+    const minSoc = parseInt(document.getElementById('backup-min-soc-input').value, 10);
+    if (!Number.isInteger(minSoc) || minSoc < 15 || minSoc > 100) {
+        alert('Minimum SOC must be between 15 and 100');
+        return;
+    }
+    if (await sendDefaultMode('backup', minSoc)) {
+        refreshAfterDefaultModeChange();
     }
 }
 
@@ -2810,6 +3933,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         <option value="ForceCharge">Force Charge</option>
                         <option value="ForceDischarge">Force Discharge</option>
                         <option value="BackUpMode">Back Up Mode</option>
+                        <option value="NoChargeNoDischarge">No Charge/Discharge</option>
                     </select>
                 </div>
 
@@ -2826,5 +3950,513 @@ document.addEventListener('DOMContentLoaded', function() {
         </div>
     </div>
 </div>
+
+<!-- Phone Pairing Modal -->
+<div id="pairing-modal-overlay" class="pairing-modal-overlay" onclick="if(event.target === this) closePairingModal()">
+    <div class="pairing-modal" role="dialog" aria-modal="true" aria-labelledby="pairing-modal-title">
+
+        <!-- Header -->
+        <div class="pairing-modal-header">
+            <div>
+                <h2 id="pairing-modal-title">
+                    <span class="mdi mdi-cellphone-link"></span> Connect via Phone
+                </h2>
+                <p class="pairing-modal-subtitle">
+                    Pair your mobile device to monitor and control your solar plant from anywhere.
+                </p>
+            </div>
+            <button class="pairing-modal-close" onclick="closePairingModal()" aria-label="Close">&times;</button>
+        </div>
+
+        <!-- Step Indicator -->
+        <div class="step-indicator" role="navigation" aria-label="Pairing steps">
+            <span class="step-dot active" id="step-dot-1" aria-current="step">1</span>
+            <span class="step-line" id="step-line-1"></span>
+            <span class="step-dot" id="step-dot-2">2</span>
+            <span class="step-line" id="step-line-2"></span>
+            <span class="step-dot" id="step-dot-3">3</span>
+        </div>
+
+        <!-- Body -->
+        <div class="pairing-modal-body">
+            <!-- Step 1: Configure Device -->
+            <div id="pairing-step-1" class="step-content">
+                <div class="pairing-form-group">
+                    <label class="pairing-form-label" for="pairing-device-name">Device Name</label>
+                    <input type="text" id="pairing-device-name" class="pairing-form-input"
+                           placeholder="My Phone" maxlength="50" autocomplete="off">
+                </div>
+
+                <div class="pairing-form-group">
+                    <label class="pairing-form-label">Access Mode</label>
+                    <div class="access-mode-selector">
+                        <label class="access-mode-option">
+                            <input type="radio" name="access-mode" value="full" checked>
+                            <div class="access-mode-card">
+                                <div class="access-mode-title">
+                                    <span class="mdi mdi-shield-check access-mode-icon full"></span>
+                                    Full Access
+                                </div>
+                                <div class="access-mode-description">Monitor and control your solar plant</div>
+                            </div>
+                        </label>
+                        <label class="access-mode-option">
+                            <input type="radio" name="access-mode" value="read_only">
+                            <div class="access-mode-card">
+                                <div class="access-mode-title">
+                                    <span class="mdi mdi-eye access-mode-icon readonly"></span>
+                                    Read Only
+                                </div>
+                                <div class="access-mode-description">View status without control</div>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="pairing-step1-error" class="pairing-error" style="display: none;">
+                    <div class="pairing-error-title">
+                        <span class="mdi mdi-alert-circle"></span>
+                        <span id="pairing-step1-error-title">Error</span>
+                    </div>
+                    <div class="pairing-error-message" id="pairing-step1-error-message"></div>
+                </div>
+
+                <div class="pairing-button-group">
+                    <button class="pairing-btn pairing-btn-primary" onclick="handleStep1Submit()" id="pairing-continue-btn">
+                        Continue
+                    </button>
+                </div>
+            </div>
+
+            <!-- Step 2: Display QR Code -->
+            <div id="pairing-step-2" class="step-content" style="display:none">
+                <!-- Loading State -->
+                <div id="pairing-step2-loading" class="pairing-loading">
+                    <div class="pairing-spinner"></div>
+                    <div class="pairing-loading-text">Generating secure connection...</div>
+                </div>
+
+                <!-- QR Code Container (hidden while loading) -->
+                <div id="pairing-step2-content" style="display: none;">
+                    <div class="qr-code-container">
+                        <div class="qr-instruction-title">Scan with FluxION Mobile App</div>
+                        <div class="qr-code-wrapper" id="pairing-qr-wrapper" role="img" aria-label="QR code for pairing device">
+                            <!-- QR SVG inserted here by JavaScript -->
+                        </div>
+                        <div class="qr-instructions">
+                            <ol>
+                                <li>Open FluxION app on your phone</li>
+                                <li>Tap "Add Connection" or scan icon</li>
+                                <li>Point camera at QR code</li>
+                            </ol>
+                        </div>
+                        <div class="qr-security-note">
+                            <span class="mdi mdi-shield-lock"></span>
+                            The connection is secured with end-to-end encryption via Tor.
+                        </div>
+                    </div>
+
+                    <div class="pairing-button-group">
+                        <button class="pairing-btn pairing-btn-secondary" onclick="goToStep(1, true)">
+                            Back
+                        </button>
+                        <button class="pairing-btn pairing-btn-primary" onclick="handleStep2Confirm()">
+                            I've Scanned It
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 3: Success -->
+            <div id="pairing-step-3" class="step-content" style="display:none">
+                <div class="success-icon-container">
+                    <span class="mdi mdi-check success-checkmark"></span>
+                </div>
+                <div class="success-title">Device Paired Successfully!</div>
+                <div class="success-subtitle">Your phone is now connected to FluxION.</div>
+
+                <div class="success-device-summary">
+                    <span class="success-device-name" id="pairing-success-device-name"></span>
+                    <span class="success-device-badge" id="pairing-success-device-badge"></span>
+                </div>
+
+                <div class="pairing-button-group">
+                    <button class="pairing-btn pairing-btn-secondary" onclick="handlePairAnother()">
+                        Pair Another
+                    </button>
+                    <button class="pairing-btn pairing-btn-success" onclick="closePairingModal()">
+                        Done
+                    </button>
+                </div>
+            </div>
+
+            <!-- Error State -->
+            <div id="pairing-error-state" class="step-content" style="display:none">
+                <div class="pairing-error">
+                    <div class="pairing-error-title">
+                        <span class="mdi mdi-alert-circle"></span>
+                        <span id="pairing-error-state-title">Connection Error</span>
+                    </div>
+                    <div class="pairing-error-message" id="pairing-error-state-message">
+                        Something went wrong. Please try again.
+                    </div>
+                </div>
+
+                <div class="pairing-button-group">
+                    <button class="pairing-btn pairing-btn-secondary" onclick="closePairingModal()">
+                        Cancel
+                    </button>
+                    <button class="pairing-btn pairing-btn-primary" onclick="handleRetry()">
+                        Try Again
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="pairing-modal-footer">
+            <a href="{{ ingress_path }}/remote-access" class="manage-devices-link">
+                <span class="mdi mdi-cog"></span> Manage All Devices
+            </a>
+        </div>
+
+    </div>
+</div>
+
+<!-- Screen reader live region for pairing -->
+<div class="sr-only" aria-live="polite" id="pairing-status"></div>
+
+<script>
+// ============== Phone Pairing Modal Functions ==============
+
+const PAIRING_API = '{{ ingress_path }}/api/remote/pair';
+
+// State management for pairing modal
+const pairingState = {
+    currentStep: 1,
+    deviceName: '',
+    accessMode: 'full',
+    qrSvg: '',
+    deviceId: '',
+    error: null
+};
+
+// Reference to previously focused element (for focus restoration)
+let pairingPreviousFocus = null;
+
+// Open the pairing modal
+function openPairingModal() {
+    // Store current focus for restoration
+    pairingPreviousFocus = document.activeElement;
+
+    // Reset state
+    pairingState.currentStep = 1;
+    pairingState.deviceName = '';
+    pairingState.accessMode = 'full';
+    pairingState.qrSvg = '';
+    pairingState.deviceId = '';
+    pairingState.error = null;
+
+    // Reset form
+    document.getElementById('pairing-device-name').value = '';
+    document.querySelector('input[name="access-mode"][value="full"]').checked = true;
+
+    // Hide error
+    document.getElementById('pairing-step1-error').style.display = 'none';
+
+    // Reset to step 1
+    showStep(1);
+
+    // Show modal
+    const overlay = document.getElementById('pairing-modal-overlay');
+    overlay.classList.add('show');
+
+    // Prevent body scroll
+    document.body.style.overflow = 'hidden';
+
+    // Focus the device name input
+    setTimeout(() => {
+        document.getElementById('pairing-device-name').focus();
+    }, 100);
+
+    // Announce to screen readers
+    announceToScreenReader('Pairing dialog opened. Step 1 of 3: Configure device.');
+}
+
+// Close the pairing modal
+function closePairingModal() {
+    const overlay = document.getElementById('pairing-modal-overlay');
+    overlay.classList.remove('show');
+
+    // Restore body scroll
+    document.body.style.overflow = '';
+
+    // Return focus to trigger button
+    if (pairingPreviousFocus) {
+        pairingPreviousFocus.focus();
+        pairingPreviousFocus = null;
+    }
+
+    // Announce to screen readers
+    announceToScreenReader('Pairing dialog closed.');
+}
+
+// Show a specific step
+function showStep(stepNumber) {
+    // Hide all steps
+    document.getElementById('pairing-step-1').style.display = 'none';
+    document.getElementById('pairing-step-2').style.display = 'none';
+    document.getElementById('pairing-step-3').style.display = 'none';
+    document.getElementById('pairing-error-state').style.display = 'none';
+
+    // Show the target step
+    document.getElementById(`pairing-step-${stepNumber}`).style.display = 'block';
+
+    // Update step indicators
+    for (let i = 1; i <= 3; i++) {
+        const dot = document.getElementById(`step-dot-${i}`);
+        const line = i < 3 ? document.getElementById(`step-line-${i}`) : null;
+
+        dot.classList.remove('active', 'completed');
+        dot.removeAttribute('aria-current');
+
+        if (i < stepNumber) {
+            dot.classList.add('completed');
+            if (line) line.classList.add('completed');
+        } else if (i === stepNumber) {
+            dot.classList.add('active');
+            dot.setAttribute('aria-current', 'step');
+        }
+
+        if (line && i >= stepNumber) {
+            line.classList.remove('completed');
+        }
+    }
+
+    pairingState.currentStep = stepNumber;
+}
+
+// Navigate to a step with animation direction
+function goToStep(stepNumber, isBack = false) {
+    const targetStep = document.getElementById(`pairing-step-${stepNumber}`);
+    if (targetStep) {
+        targetStep.classList.remove('reverse');
+        if (isBack) {
+            targetStep.classList.add('reverse');
+        }
+    }
+
+    showStep(stepNumber);
+
+    // Announce to screen readers
+    const stepNames = ['', 'Configure device', 'Scan QR code', 'Complete'];
+    announceToScreenReader(`Step ${stepNumber} of 3: ${stepNames[stepNumber]}`);
+
+    // Focus management
+    if (stepNumber === 1) {
+        document.getElementById('pairing-device-name').focus();
+    }
+}
+
+// Handle Step 1 form submission
+async function handleStep1Submit() {
+    const nameInput = document.getElementById('pairing-device-name');
+    const name = nameInput.value.trim();
+
+    // Validate name
+    if (!name) {
+        showStep1Error('Please enter a device name');
+        nameInput.focus();
+        return;
+    }
+
+    // Get access mode
+    const modeInput = document.querySelector('input[name="access-mode"]:checked');
+    const mode = modeInput ? modeInput.value : 'full';
+
+    // Store in state
+    pairingState.deviceName = name;
+    pairingState.accessMode = mode;
+
+    // Hide any previous error
+    document.getElementById('pairing-step1-error').style.display = 'none';
+
+    // Move to step 2 and call API
+    goToStep(2);
+
+    // Show loading state
+    document.getElementById('pairing-step2-loading').style.display = 'flex';
+    document.getElementById('pairing-step2-content').style.display = 'none';
+
+    // Call the pairing API
+    try {
+        const result = await callPairApi(name, mode);
+
+        if (result.error) {
+            // Show error in step 1
+            goToStep(1, true);
+            showStep1Error(result.error);
+            return;
+        }
+
+        // Store result
+        pairingState.qrSvg = result.qr_svg;
+        pairingState.deviceId = result.device_id;
+
+        // Display QR code
+        document.getElementById('pairing-qr-wrapper').innerHTML = result.qr_svg;
+
+        // Update aria-label with device name
+        document.getElementById('pairing-qr-wrapper').setAttribute(
+            'aria-label',
+            `QR code for pairing device: ${name}`
+        );
+
+        // Hide loading, show content
+        document.getElementById('pairing-step2-loading').style.display = 'none';
+        document.getElementById('pairing-step2-content').style.display = 'block';
+
+    } catch (error) {
+        console.error('Pairing API error:', error);
+        goToStep(1, true);
+        showStep1Error('Failed to connect. Please try again.');
+    }
+}
+
+// Show error in step 1
+function showStep1Error(message) {
+    const errorEl = document.getElementById('pairing-step1-error');
+    document.getElementById('pairing-step1-error-message').textContent = message;
+    errorEl.style.display = 'block';
+    announceToScreenReader('Error: ' + message);
+}
+
+// Call the pairing API
+async function callPairApi(name, mode) {
+    const response = await fetch(PAIRING_API, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            name: name,
+            mode: mode
+        })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        return { error: data.error || 'Failed to create pairing' };
+    }
+
+    return data;
+}
+
+// Handle Step 2 confirmation (user scanned the QR code)
+function handleStep2Confirm() {
+    // Move to success step
+    goToStep(3);
+
+    // Populate success summary
+    document.getElementById('pairing-success-device-name').textContent = pairingState.deviceName;
+
+    const badge = document.getElementById('pairing-success-device-badge');
+    if (pairingState.accessMode === 'full') {
+        badge.textContent = 'Full Access';
+        badge.className = 'success-device-badge full';
+    } else {
+        badge.textContent = 'Read Only';
+        badge.className = 'success-device-badge readonly';
+    }
+
+    announceToScreenReader(`Device ${pairingState.deviceName} paired successfully with ${pairingState.accessMode === 'full' ? 'full access' : 'read only'} mode.`);
+}
+
+// Handle "Pair Another" button
+function handlePairAnother() {
+    pairingState.deviceName = '';
+    pairingState.accessMode = 'full';
+    pairingState.qrSvg = '';
+    pairingState.deviceId = '';
+    pairingState.error = null;
+
+    document.getElementById('pairing-device-name').value = '';
+    document.querySelector('input[name="access-mode"][value="full"]').checked = true;
+    document.getElementById('pairing-step1-error').style.display = 'none';
+
+    goToStep(1, true);
+}
+
+// Handle retry from error state
+function handleRetry() {
+    goToStep(1, true);
+}
+
+// Announce to screen readers
+function announceToScreenReader(message) {
+    const statusEl = document.getElementById('pairing-status');
+    if (statusEl) {
+        statusEl.textContent = message;
+    }
+}
+
+// Keyboard event handler for pairing modal
+document.addEventListener('keydown', function(e) {
+    const overlay = document.getElementById('pairing-modal-overlay');
+    if (!overlay.classList.contains('show')) return;
+
+    // Escape closes modal
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        closePairingModal();
+        return;
+    }
+
+    // Tab focus trap
+    if (e.key === 'Tab') {
+        const modal = overlay.querySelector('.pairing-modal');
+        const focusableElements = modal.querySelectorAll(
+            'button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"]), a[href]'
+        );
+
+        if (focusableElements.length === 0) return;
+
+        const firstFocusable = focusableElements[0];
+        const lastFocusable = focusableElements[focusableElements.length - 1];
+
+        if (e.shiftKey) {
+            if (document.activeElement === firstFocusable) {
+                e.preventDefault();
+                lastFocusable.focus();
+            }
+        } else {
+            if (document.activeElement === lastFocusable) {
+                e.preventDefault();
+                firstFocusable.focus();
+            }
+        }
+    }
+
+    // Enter submits form in step 1
+    if (e.key === 'Enter' && pairingState.currentStep === 1) {
+        const activeElement = document.activeElement;
+        if (activeElement && activeElement.id === 'pairing-device-name') {
+            e.preventDefault();
+            handleStep1Submit();
+        }
+    }
+});
+
+// Clear step 1 error when user starts typing
+document.addEventListener('DOMContentLoaded', function() {
+    const nameInput = document.getElementById('pairing-device-name');
+    if (nameInput) {
+        nameInput.addEventListener('input', function() {
+            document.getElementById('pairing-step1-error').style.display = 'none';
+        });
+    }
+});
+</script>
 
 {% endblock %}

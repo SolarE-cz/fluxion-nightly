@@ -105,6 +105,19 @@ The manufacturer of your inverter. Currently supported:
 The prefix used for Home Assistant entities related to this inverter. For example, if your battery
 capacity sensor is `sensor.solax_battery_capacity`, the prefix would be `solax`.
 
+#### Option: `inverters[].control_entity_prefix`
+
+Optional prefix of the inverter's control entities (`select.*`, `number.*`, `button.*`, `switch.*`,
+`time.*`) when the integration names them differently from the sensors. For example, with sensors
+`sensor.solax_battery_capacity` and controls `select.solax_inverter_charger_use_mode`,
+`select.solax_inverter_lock_state` and `number.solax_inverter_export_control_user_limit`, set
+`entity_prefix: solax` and `control_entity_prefix: solax_inverter`. Sensors (`sensor.*`,
+`binary_sensor.*`) always use `entity_prefix`.
+
+Default: empty (control entities use the same prefix as before). The add-on log shows each
+inverter's `entity prefix` and `control prefix` at startup. Set in the add-on configuration, it also
+applies when the web UI has saved its own configuration.
+
 #### Option: `inverters[].topology`
 
 Defines the inverter's role in multi-inverter setups:
@@ -171,6 +184,38 @@ Optional list of fixed electricity buy prices if not using spot prices.
 
 Optional list of fixed electricity sell prices if not using spot prices.
 
+#### Option: `pricing.tomorrow_prices_check_time`
+
+Time of day (Europe/Prague, `HH:MM`) after which tomorrow's 15-minute prices are expected in the
+spot price entity. If they are missing after this time (or prices for the rest of today are
+missing), FluxION logs a warning once per hour and shows a banner on the dashboard.
+
+Default value: `"13:45"`
+
+#### Option: `pricing.ote_fallback_enabled`
+
+When the spot price entity lacks prices, fetch the OTE day-ahead prices directly (converted to
+CZK/kWh with the CNB EUR rate, like the Czech Energy Spot Prices integration) and fill only the
+missing slots. The OTE prices are used only if they match the entity on at least 90 % of today's
+slots (within 0.5 % or 0.01 CZK/kWh). With a separate buy price entity, the buy price of filled
+slots is derived as `a × spot + b` from today's prices; when that fit is not exact (within
+0.01 CZK/kWh) nothing is filled. The last successful check is kept in `/data`: when the entity has
+no prices of today at all (second day of an outage), a check at most 48 hours old is used instead
+and the banner says "validated <date>" (a check of one day covers that day and the next only).
+The add-on options `ote_fallback_enabled`, `price_alert_notification`,
+`tomorrow_prices_check_time`, `battery_wear_cost_czk_per_kwh`, `battery_efficiency` and
+`pv_forecast_correction_enabled` always apply from the add-on configuration, also on installs
+whose settings were saved in the web UI. The entity's prices always win once it has them again.
+
+Default value: `true`
+
+#### Option: `pricing.price_alert_notification`
+
+Show one Home Assistant notification (`fluxion_prices_missing`) while prices are missing, and
+dismiss it when they are complete again.
+
+Default value: `true`
+
 ### Option Group: `control`
 
 Fine-tune FluxION's control behavior.
@@ -180,6 +225,22 @@ Fine-tune FluxION's control behavior.
 Maximum power (in watts) that can be exported to the grid.
 
 Default value: `10000`
+
+#### Option: `control.mode_control_enabled`
+
+When `false`, FluxION only curtails export: while the sell price is at or below
+`export_curtail_at_or_below_czk` (with `export_curtailment_enabled: true`) it sets the inverter's
+export limit to `export_limit_min_w` and restores the limit it read before once the price is above
+the threshold. It writes nothing else: no work mode, Back Up minimum SOC, HotStandBy, battery
+awaken or pre-wake, and no unlock on a lock event (the export limit write still unlocks a Locked
+inverter first when `auto_unlock_inverter` is on). Planning, prices, alerts and the dashboard keep
+running; the dashboard header shows "mode control off". The FluxION kill switch and the
+"Zakázat Automatizaci" lever still stop curtailment. Curtailment needs a known export limit above
+0 W to restore: set the inverter's export limit above 0 W first. Set in the add-on configuration,
+it also applies when the web UI has saved its own configuration. A change needs an add-on restart
+(saving the add-on configuration restarts it); the web UI cannot change it while FluxION runs.
+
+Default value: `true`
 
 #### Option: `control.update_interval_secs`
 

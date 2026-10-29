@@ -508,7 +508,7 @@ impl EconomicStrategy for WinterAdaptiveV3Strategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: context.control_config.battery_wear_cost_czk_per_kwh,
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -548,7 +548,10 @@ impl EconomicStrategy for WinterAdaptiveV3Strategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+            InverterOperationMode::SelfUse
+            | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
+            | InverterOperationMode::NoChargeNoDischarge => {
                 let usable_battery_kwh = ((context.current_battery_soc
                     - context.control_config.hardware_min_battery_soc)
                     .max(0.0)

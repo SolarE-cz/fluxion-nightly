@@ -21,8 +21,9 @@ use crate::{
     components::*,
     config_events::{ConfigUpdateEvent, UserControlUpdateEvent},
     debug::DebugModeConfig,
-    resources::{SystemConfig, TimezoneConfig},
+    resources::{SystemConfig, TimezoneConfig, UserControlResource},
 };
+use fluxion_types::user_control::{DefaultMode, UserControlState};
 
 /// Channel for web query requests
 #[derive(Resource)]
@@ -196,7 +197,7 @@ pub struct ConsumptionStats {
     pub today_import_kwh: Option<f32>,
     /// Total grid import yesterday (kWh), if available
     pub yesterday_import_kwh: Option<f32>,
-    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = UTC hour of day)
     /// Averaged over last 7 days of historical data
     pub hourly_consumption_profile: Option<Vec<f32>>,
 }
@@ -223,6 +224,54 @@ pub struct PricingFees {
     pub sell_fee_czk: f32,
 }
 
+/// Cost of charge of the battery energy for the dashboard (brief H33)
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BatteryCostBasisInfo {
+    /// Usable energy (kWh above the current minimum SOC)
+    pub usable_kwh: f32,
+    /// Cost per kWh delivered (CZK/kWh, losses and wear included); `None` = unknown
+    pub cost_czk_per_kwh: Option<f32>,
+    /// Share of the usable energy from solar / from the grid (%); `None` when empty
+    pub solar_pct: Option<f32>,
+    pub grid_pct: Option<f32>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl BatteryCostBasisInfo {
+    #[must_use]
+    pub fn from_basis(basis: &crate::battery_cost_basis::BatteryCostBasis) -> Self {
+        let solar = basis.solar_share();
+        Self {
+            usable_kwh: basis.usable_kwh,
+            cost_czk_per_kwh: basis.cost_czk_per_kwh,
+            solar_pct: solar.map(|s| s * 100.0),
+            grid_pct: solar.map(|s| (1.0 - s) * 100.0),
+            updated_at: basis.updated_at,
+        }
+    }
+
+    /// Usable energy, rounded for display
+    #[must_use]
+    pub fn usable_text(&self) -> String {
+        format!("{:.1}", self.usable_kwh)
+    }
+
+    /// Cost of charge for display, `None` when unknown
+    #[must_use]
+    pub fn cost_text(&self) -> Option<String> {
+        self.cost_czk_per_kwh.map(|c| format!("{c:.2}"))
+    }
+
+    /// Solar and grid shares (whole percent), `None` when empty
+    #[must_use]
+    pub fn shares_text(&self) -> Option<(String, String)> {
+        Some((
+            format!("{:.0}", self.solar_pct?),
+            format!("{:.0}", self.grid_pct?),
+        ))
+    }
+}
+
 /// Solar forecast data for dashboard display
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SolarForecastInfo {
@@ -239,6 +288,63 @@ pub struct SolarForecastInfo {
     pub accuracy_percent: Option<f32>,
     /// Whether data is available (sensors discovered)
     pub available: bool,
+    /// PV forecast correction in force (brief H34); `None` when off or not computed yet. The
+    /// totals above are the provider's raw values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<crate::pv_correction::CorrectionResult>,
+}
+
+impl SolarForecastInfo {
+    /// The correction that scales the planner's forecast, when it rests on enough days
+    #[must_use]
+    pub fn applied_correction(&self) -> Option<&crate::pv_correction::CorrectionResult> {
+        self.correction.as_ref().filter(|c| c.is_applied())
+    }
+
+    /// Total-today forecast as the planner uses it, when a correction applies
+    #[must_use]
+    pub fn corrected_total_today_kwh(&self) -> Option<f32> {
+        self.applied_correction()
+            .map(|c| self.total_today_kwh * c.factor)
+    }
+}
+
+/// Where the display timezone of a response came from
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimezoneSource {
+    /// Timezone reported by Home Assistant
+    HomeAssistant,
+    /// Timezone the user selected in Fluxion settings
+    Configured,
+    /// No timezone known; times are shown in UTC
+    #[default]
+    Unknown,
+}
+
+/// Resolve the display timezone: Home Assistant first, then the configured `display_timezone`
+pub fn resolve_display_timezone(
+    ha_timezone: Option<&str>,
+    configured: Option<&str>,
+) -> (Option<String>, TimezoneSource) {
+    // Only a name that parses as an IANA zone counts, so an invalid HA value
+    // falls through to the user's configured zone.
+    let non_empty = |tz: Option<&str>| {
+        tz.map(str::trim)
+            .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok())
+            .map(str::to_owned)
+    };
+    if let Some(tz) = non_empty(ha_timezone) {
+        (Some(tz), TimezoneSource::HomeAssistant)
+    } else if let Some(tz) = non_empty(configured) {
+        (Some(tz), TimezoneSource::Configured)
+    } else {
+        (None, TimezoneSource::Unknown)
+    }
+}
+
+fn mode_control_default() -> bool {
+    true
 }
 
 /// Response containing ECS component data
@@ -246,11 +352,17 @@ pub struct SolarForecastInfo {
 pub struct WebQueryResponse {
     pub timestamp: DateTime<Utc>,
     pub debug_mode: bool,
+    /// `control.mode_control_enabled` (brief H37); false = FluxION only curtails export
+    #[serde(default = "mode_control_default")]
+    pub mode_control_enabled: bool,
     pub inverters: Vec<InverterData>,
     pub schedule: Option<ScheduleData>,
     pub prices: Option<PriceData>,
     pub health: SystemHealthData,
     pub timezone: Option<String>,
+    /// Where `timezone` came from (Home Assistant, configured, or unknown)
+    #[serde(default)]
+    pub timezone_source: TimezoneSource,
     pub battery_soc_history: Option<Vec<BatterySocHistoryPoint>>,
     pub battery_soc_prediction: Option<Vec<BatterySocPredictionPoint>>,
     pub pv_generation_history: Option<Vec<PvGenerationHistoryPoint>>,
@@ -262,6 +374,12 @@ pub struct WebQueryResponse {
     pub pricing_fees: Option<PricingFees>,
     /// Solar forecast data
     pub solar_forecast: Option<SolarForecastInfo>,
+    /// Cost of charge of the battery energy (brief H33)
+    #[serde(default)]
+    pub battery_cost_basis: Option<BatteryCostBasisInfo>,
+    /// Health of the spot price feed and the OTE fallback (brief H35)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_feed: Option<crate::price_feed::PriceFeedStatus>,
 }
 
 /// Inverter component data bundle
@@ -368,6 +486,9 @@ pub struct PriceData {
 pub struct PriceBlockData {
     pub timestamp: DateTime<Utc>,
     pub price: f32,
+    /// Buy price the planner used (energy + HDO fee + operator fee; fixed price when not on spot)
+    #[serde(default)]
+    pub effective_buy_price: Option<f32>,
     pub block_type: String,           // "charge", "discharge", "self-use"
     pub target_soc: Option<f32>,      // Target SOC for charge/discharge blocks
     pub strategy: Option<String>,     // Strategy that chose this mode
@@ -378,6 +499,21 @@ pub struct PriceBlockData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_info: Option<crate::strategy::BlockDebugInfo>, // Debug info (only when log_level=debug)
     pub is_historical: bool, // True if block is in the past (shows regenerated schedule, not actual history)
+    /// Forecast PV power (kW, mean over the block) for blocks that have not ended yet,
+    /// `None` for past blocks and where no forecast covers the block
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solar_forecast_kw: Option<f32>,
+    /// The same forecast before the PV forecast correction (brief H34); `None` like
+    /// `solar_forecast_kw`, and when no correction is in force
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solar_forecast_raw_kw: Option<f32>,
+    /// Minimum SOC (%) Back Up Mode keeps, for blocks that run as Back Up Mode in the Back Up
+    /// default mode (brief H19); `None` otherwise
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_min_soc_pct: Option<u8>,
+    /// Where the price came from when not the HA price entity: `"ote_fallback"` (brief H35)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_source: Option<String>,
 }
 
 /// System health data
@@ -456,6 +592,7 @@ fn extract_strategy_info(reason: &str) -> (Option<String>, Option<f32>) {
 
 /// ECS system that processes web query requests
 #[allow(clippy::too_many_arguments)]
+#[expect(clippy::type_complexity)]
 pub fn web_query_system(
     debug_config: Res<DebugModeConfig>,
     system_config: Res<SystemConfig>,
@@ -471,6 +608,11 @@ pub fn web_query_system(
     consumption_history_config: Option<Res<ConsumptionHistoryConfig>>,
     hdo_data: Option<Res<crate::async_systems::HdoScheduleData>>,
     solar_forecast: Option<Res<crate::async_systems::SolarForecastData>>,
+    (user_control, cost_basis, price_feed): (
+        Option<Res<UserControlResource>>,
+        Option<Res<crate::battery_cost_basis::BatteryCostTracker>>,
+        Option<Res<crate::price_feed::PriceFeedStatusResource>>,
+    ),
 ) {
     // Process all pending queries
     while let Ok(request) = channel.receiver.try_recv() {
@@ -480,25 +622,124 @@ pub fn web_query_system(
         );
 
         let response = match request.query_type {
-            QueryType::Dashboard => build_dashboard_response(
-                &debug_config,
-                &system_config,
-                timezone_config.as_deref(),
-                &inverters,
-                &schedule,
-                &price_data,
-                &price_analysis,
-                &battery_history,
-                &pv_history,
-                consumption_history.as_deref(),
-                consumption_history_config.as_deref(),
-                hdo_data.as_deref(),
-                solar_forecast.as_deref(),
-            ),
+            QueryType::Dashboard => WebQueryResponse {
+                battery_cost_basis: cost_basis
+                    .as_deref()
+                    .map(|t| BatteryCostBasisInfo::from_basis(&t.basis)),
+                price_feed: price_feed.as_deref().map(|p| p.snapshot()),
+                ..build_dashboard_response(
+                    &debug_config,
+                    &system_config,
+                    timezone_config.as_deref(),
+                    &inverters,
+                    &schedule,
+                    &price_data,
+                    &price_analysis,
+                    &battery_history,
+                    &pv_history,
+                    consumption_history.as_deref(),
+                    consumption_history_config.as_deref(),
+                    hdo_data.as_deref(),
+                    solar_forecast.as_deref(),
+                    user_control.as_deref().map(|uc| &uc.state),
+                )
+            },
         };
 
         // Send response (ignore if receiver dropped)
         let _ = request.response_tx.send(response);
+    }
+}
+
+/// Consumption statistics for the dashboard: EMA, today's and yesterday's import, hourly profile.
+/// `None` only when none of them is known. The hourly profile alone is enough: a site whose
+/// history has no daily summaries yet still gets its profile on the chart.
+fn compute_consumption_stats(
+    consumption_history: Option<&ConsumptionHistory>,
+    consumption_history_config: Option<&ConsumptionHistoryConfig>,
+    now: DateTime<Utc>,
+) -> Option<ConsumptionStats> {
+    // Determine EMA window (days) from config if available, otherwise default to 7
+    let ema_days = consumption_history_config
+        .map(|cfg| cfg.ema_days)
+        .unwrap_or(7);
+
+    let mut ema_kwh: Option<f32> = None;
+    let mut today_import_kwh: Option<f32> = None;
+    let mut yesterday_import_kwh: Option<f32> = None;
+
+    if let Some(history) = consumption_history {
+        // EMA based on historical daily consumption values
+        let values = history.consumption_values();
+        if history.has_sufficient_data(ema_days) {
+            ema_kwh = calculate_ema(&values, ema_days);
+        }
+
+        // Today and yesterday imports from history summaries (newest first)
+        let today_date = now.date_naive();
+        let yesterday_date = today_date.pred_opt().unwrap_or(today_date);
+
+        for summary in history.summaries().iter() {
+            let date = summary.date.date_naive();
+            if date == today_date && today_import_kwh.is_none() {
+                today_import_kwh = Some(summary.grid_import_kwh);
+            } else if date == yesterday_date && yesterday_import_kwh.is_none() {
+                yesterday_import_kwh = Some(summary.grid_import_kwh);
+            }
+
+            if today_import_kwh.is_some() && yesterday_import_kwh.is_some() {
+                break;
+            }
+        }
+    }
+
+    // Hourly profile, indexed by UTC hour
+    let hourly_consumption_profile = consumption_history
+        .and_then(|h| h.hourly_profile())
+        .map(|p| p.hourly_avg_kwh.to_vec());
+
+    if ema_kwh.is_none()
+        && today_import_kwh.is_none()
+        && yesterday_import_kwh.is_none()
+        && hourly_consumption_profile.is_none()
+    {
+        return None;
+    }
+    Some(ConsumptionStats {
+        ema_kwh,
+        ema_days,
+        today_import_kwh,
+        yesterday_import_kwh,
+        hourly_consumption_profile,
+    })
+}
+
+/// HDO schedule for the chart. The grid fees come from the pricing config, the same values
+/// `calculate_effective_prices` adds to the planner's buy price, so the chart and the plan agree.
+fn hdo_schedule_info(
+    hdo: &crate::async_systems::HdoScheduleData,
+    pricing_config: &fluxion_types::config::PricingConfig,
+) -> HdoScheduleInfo {
+    let low_tariff_czk = pricing_config.hdo_low_tariff_czk;
+    let high_tariff_czk = pricing_config.hdo_high_tariff_czk;
+    if hdo.low_tariff_periods.is_empty() {
+        warn!(
+            "⚠️ HDO schedule has 0 low tariff periods! last_updated: {:?}",
+            hdo.last_updated
+        );
+    } else {
+        debug!(
+            "📊 HDO schedule for web: {} periods, low={:.2} CZK, high={:.2} CZK",
+            hdo.low_tariff_periods.len(),
+            low_tariff_czk,
+            high_tariff_czk
+        );
+    }
+    HdoScheduleInfo {
+        low_tariff_periods: hdo.low_tariff_periods.clone(),
+        low_tariff_czk,
+        high_tariff_czk,
+        last_updated: hdo.last_updated.map(|t| t.to_rfc3339()),
     }
 }
 
@@ -518,63 +759,24 @@ fn build_dashboard_response(
     consumption_history_config: Option<&ConsumptionHistoryConfig>,
     hdo_data: Option<&crate::async_systems::HdoScheduleData>,
     solar_forecast_data: Option<&crate::async_systems::SolarForecastData>,
+    user_control: Option<&UserControlState>,
 ) -> WebQueryResponse {
     let now = Utc::now();
 
-    // Compute consumption statistics (EMA and imports) early for use in inverter data
-    let consumption_stats = {
-        // Determine EMA window (days) from config if available, otherwise default to 7
-        let ema_days = consumption_history_config
-            .map(|cfg| cfg.ema_days)
-            .unwrap_or(7);
+    // The schedule as the executor runs it: planner Self-Use is Back Up Mode in the Back Up
+    // default mode. Display only; the planner's schedule stays unchanged.
+    let display_schedule = schedule
+        .single()
+        .ok()
+        .map(|sched| effective_display_schedule(sched, user_control));
+    // Back Up minimum shown next to blocks that run as Back Up Mode in the Back Up default mode
+    let backup_display_min_soc = user_control
+        .filter(|uc| uc.default_mode == DefaultMode::Backup)
+        .map(|uc| uc.backup_min_soc_pct);
 
-        let mut ema_kwh: Option<f32> = None;
-        let mut today_import_kwh: Option<f32> = None;
-        let mut yesterday_import_kwh: Option<f32> = None;
-
-        if let Some(history) = consumption_history {
-            // EMA based on historical daily consumption values
-            let values = history.consumption_values();
-            if history.has_sufficient_data(ema_days) {
-                ema_kwh = calculate_ema(&values, ema_days);
-            }
-
-            // Today and yesterday imports from history summaries (newest first)
-            let today_date = now.date_naive();
-            let yesterday_date = today_date.pred_opt().unwrap_or(today_date);
-
-            for summary in history.summaries().iter() {
-                let date = summary.date.date_naive();
-                if date == today_date && today_import_kwh.is_none() {
-                    today_import_kwh = Some(summary.grid_import_kwh);
-                } else if date == yesterday_date && yesterday_import_kwh.is_none() {
-                    yesterday_import_kwh = Some(summary.grid_import_kwh);
-                }
-
-                if today_import_kwh.is_some() && yesterday_import_kwh.is_some() {
-                    break;
-                }
-            }
-        }
-
-        // Extract hourly profile if available
-        let hourly_consumption_profile = consumption_history
-            .and_then(|h| h.hourly_profile())
-            .map(|p| p.hourly_avg_kwh.to_vec());
-
-        // Only include stats if we have at least some meaningful data
-        if ema_kwh.is_some() || today_import_kwh.is_some() || yesterday_import_kwh.is_some() {
-            Some(ConsumptionStats {
-                ema_kwh,
-                ema_days,
-                today_import_kwh,
-                yesterday_import_kwh,
-                hourly_consumption_profile,
-            })
-        } else {
-            None
-        }
-    };
+    // Compute consumption statistics (EMA, imports, hourly profile) early for use in inverter data
+    let consumption_stats =
+        compute_consumption_stats(consumption_history, consumption_history_config, now);
 
     // Extract EMA for use in inverter data
     let grid_import_ema = consumption_stats.as_ref().and_then(|stats| stats.ema_kwh);
@@ -648,7 +850,7 @@ fn build_dashboard_response(
         .collect();
 
     // Query schedule data
-    let schedule_data = schedule.single().ok().and_then(|sched| {
+    let schedule_data = display_schedule.as_ref().and_then(|sched| {
         sched.get_current_mode(now).map(|current| {
             // Find next change
             let next_change = sched
@@ -698,8 +900,28 @@ fn build_dashboard_response(
             .ok()
             .zip(price_analysis.single().ok())
             .map(|(prices, analysis)| {
-                // Get schedule for matching blocks with strategy info
-                let sched = schedule.single().ok();
+                // Get schedule for matching blocks with strategy info (effective modes)
+                let sched = display_schedule.as_ref();
+
+                // Per-block PV forecast aligned with the price blocks
+                let price_block_starts: Vec<DateTime<Utc>> = prices
+                    .time_block_prices
+                    .iter()
+                    .map(|b| b.block_start)
+                    .collect();
+                let solar_forecast_kwh = crate::async_systems::solar_block_forecast_covered(
+                    solar_forecast_data,
+                    &price_block_starts,
+                );
+                // Raw forecast only when a correction changes it
+                let solar_forecast_raw_kwh = solar_forecast_data
+                    .filter(|sf| sf.correction.is_some_and(|c| c.is_applied()))
+                    .and_then(|sf| {
+                        crate::async_systems::solar_block_forecast_raw_covered(
+                            Some(sf),
+                            &price_block_starts,
+                        )
+                    });
 
                 // Build price blocks with classification
                 let blocks: Vec<PriceBlockData> = prices
@@ -731,7 +953,11 @@ fn build_dashboard_response(
                                     InverterOperationMode::ForceCharge => "charge",
                                     InverterOperationMode::ForceDischarge => "discharge",
                                     InverterOperationMode::SelfUse => "self-use",
+                                    InverterOperationMode::FeedinPriority => "feedin-priority",
                                     InverterOperationMode::BackUpMode => "backup",
+                                    InverterOperationMode::NoChargeNoDischarge => {
+                                        "no-charge-discharge"
+                                    }
                                 };
                                 let target_soc = match sb.mode {
                                     InverterOperationMode::ForceCharge => {
@@ -741,7 +967,9 @@ fn build_dashboard_response(
                                         Some(system_config.control_config.min_battery_soc)
                                     }
                                     InverterOperationMode::SelfUse
-                                    | InverterOperationMode::BackUpMode => None,
+                                    | InverterOperationMode::BackUpMode
+                                    | InverterOperationMode::FeedinPriority
+                                    | InverterOperationMode::NoChargeNoDischarge => None,
                                 };
                                 (
                                     block_type_str.to_string(),
@@ -764,7 +992,7 @@ fn build_dashboard_response(
                                         None,
                                         Some(format!(
                                             "Time-Aware Charge - Cheapest block ({:.3} CZK/kWh)",
-                                            block.price_czk_per_kwh
+                                            block.buy_energy_price_czk_per_kwh()
                                         )),
                                         None,
                                         None,
@@ -799,9 +1027,25 @@ fn build_dashboard_response(
                                 }
                             });
 
+                        let block_type_is_backup = block_type == "backup";
+                        let block_end = block.block_start
+                            + chrono::Duration::minutes(i64::from(block.duration_minutes));
+                        let solar_forecast_kw = solar_forecast_kwh
+                            .as_ref()
+                            .and_then(|f| f.get(idx).copied().flatten())
+                            .filter(|_| block_end > now)
+                            // Forecast values are kWh per 15-min block
+                            .map(|kwh| kwh * 4.0);
+                        let solar_forecast_raw_kw = solar_forecast_raw_kwh
+                            .as_ref()
+                            .and_then(|f| f.get(idx).copied().flatten())
+                            .filter(|_| block_end > now)
+                            .map(|kwh| kwh * 4.0);
+
                         PriceBlockData {
                             timestamp: block.block_start,
                             price: block.price_czk_per_kwh,
+                            effective_buy_price: Some(block.effective_price_czk_per_kwh),
                             block_type,
                             target_soc,
                             strategy,
@@ -810,6 +1054,13 @@ fn build_dashboard_response(
                             decision_uid,
                             debug_info,
                             is_historical: block.block_start < now, // Mark past blocks as historical (regenerated, not actual)
+                            solar_forecast_kw,
+                            solar_forecast_raw_kw,
+                            backup_min_soc_pct: backup_display_min_soc
+                                .filter(|_| block_type_is_backup),
+                            price_source: prices
+                                .is_fallback_block(block.block_start)
+                                .then(|| crate::price_feed::PRICE_SOURCE_OTE_FALLBACK.to_owned()),
                         }
                     })
                     .collect();
@@ -983,27 +1234,69 @@ fn build_dashboard_response(
         pv_generation_history.is_some()
     );
 
+    let (display_timezone, timezone_source) = resolve_display_timezone(
+        timezone_config
+            .and_then(|tz| tz.timezone.as_deref())
+            .or(system_config.system_config.timezone.as_deref()),
+        system_config.system_config.display_timezone.as_deref(),
+    );
+    // Night detection and yesterday's PV use local time; UTC when no timezone is known
+    let prediction_timezone = display_timezone
+        .as_deref()
+        .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok())
+        .unwrap_or(chrono_tz::UTC);
+
     // Calculate battery SOC predictions based on schedule
-    let battery_soc_prediction = schedule.single().ok().and_then(|sched| {
+    let battery_soc_prediction = display_schedule.as_ref().and_then(|sched| {
         // Get current battery SOC from first inverter
         let current_soc = inverter_data
             .first()
             .map(|inv| inv.battery_soc)
             .unwrap_or(50.0);
 
-        // Get current house load and PV power for accurate self-use predictions
+        // Get current house load and PV power (fallback only, near-term blocks)
         let house_load_w = inverter_data.first().and_then(|inv| inv.house_load_w);
         let pv_power_w = inverter_data.first().map(|inv| inv.pv_power_w);
 
+        // Per-block inputs: 7-day load profile, PV forecast and yesterday's PV history
+        let block_starts: Vec<DateTime<Utc>> = sched
+            .scheduled_blocks
+            .iter()
+            .map(|b| b.block_start)
+            .collect();
+        let solar_block_kwh =
+            crate::async_systems::solar_block_forecast(solar_forecast_data, &block_starts);
+        let pv_history_w: Vec<(DateTime<Utc>, f32)> = pv_generation_history
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|p| (p.timestamp, p.power_w))
+            .collect();
+        let hourly_load_profile_kwh = consumption_stats
+            .as_ref()
+            .and_then(|stats| stats.hourly_consumption_profile.as_deref());
+        let prediction_sources = crate::components::battery_predictor::PredictionSources {
+            now,
+            timezone: prediction_timezone,
+            hourly_load_profile_kwh,
+            solar_block_kwh: solar_block_kwh.as_deref(),
+            pv_history_w: &pv_history_w,
+            current_house_load_w: house_load_w,
+            current_pv_power_w: pv_power_w,
+            average_household_load_kw: system_config.control_config.average_household_load_kw,
+        };
+        let inputs = crate::components::battery_predictor::build_prediction_inputs(
+            sched,
+            &prediction_sources,
+        );
+
         // Generate prediction using configured charge/discharge rates
-        let prediction = crate::components::predict_battery_soc(
+        let prediction = predict_display_soc(
             sched,
             &system_config.control_config,
             current_soc,
-            Some(system_config.control_config.max_battery_charge_rate_kw), // Use configured charge rate
-            Some(system_config.control_config.max_battery_charge_rate_kw), // Use same for discharge
-            house_load_w,
-            pv_power_w,
+            &inputs,
+            user_control,
         );
 
         if prediction.is_empty() {
@@ -1031,32 +1324,15 @@ fn build_dashboard_response(
     });
 
     // Build HDO schedule info for chart display
-    let hdo_schedule = hdo_data.map(|hdo| {
-        // Log HDO data being sent to web
-        if hdo.low_tariff_periods.is_empty() {
-            warn!(
-                "⚠️ HDO schedule has 0 low tariff periods! last_updated: {:?}",
-                hdo.last_updated
-            );
-        } else {
-            debug!(
-                "📊 HDO schedule for web: {} periods, low={:.2} CZK, high={:.2} CZK",
-                hdo.low_tariff_periods.len(),
-                hdo.low_tariff_czk,
-                hdo.high_tariff_czk
-            );
-        }
-        HdoScheduleInfo {
-            low_tariff_periods: hdo.low_tariff_periods.clone(),
-            low_tariff_czk: hdo.low_tariff_czk,
-            high_tariff_czk: hdo.high_tariff_czk,
-            last_updated: hdo.last_updated.map(|t| t.to_rfc3339()),
-        }
-    });
+    let hdo_schedule = hdo_data.map(|hdo| hdo_schedule_info(hdo, &system_config.pricing_config));
 
     // Build pricing fees from config
     let pricing_fees = Some(PricingFees {
-        buy_fee_czk: system_config.pricing_config.spot_buy_fee_czk,
+        buy_fee_czk: if system_config.pricing_config.use_spot_prices_to_buy {
+            system_config.pricing_config.spot_buy_fee_czk
+        } else {
+            0.0
+        },
         sell_fee_czk: system_config.pricing_config.spot_sell_fee_czk,
     });
 
@@ -1097,6 +1373,7 @@ fn build_dashboard_response(
             actual_today_kwh: actual_solar_today,
             accuracy_percent,
             available: has_data,
+            correction: sf.correction,
         }
     });
 
@@ -1107,13 +1384,13 @@ fn build_dashboard_response(
     WebQueryResponse {
         timestamp: now,
         debug_mode: debug_config.is_enabled(),
+        mode_control_enabled: system_config.control_config.mode_control_enabled,
         inverters: inverter_data,
         schedule: schedule_data,
         prices: price_data_result,
         health,
-        timezone: timezone_config
-            .and_then(|tz| tz.timezone.clone())
-            .or_else(|| system_config.system_config.timezone.clone()),
+        timezone: display_timezone,
+        timezone_source,
         battery_soc_history,
         battery_soc_prediction,
         pv_generation_history,
@@ -1121,6 +1398,8 @@ fn build_dashboard_response(
         hdo_schedule,
         pricing_fees,
         solar_forecast,
+        battery_cost_basis: None,
+        price_feed: None,
     }
 }
 
@@ -1153,5 +1432,275 @@ fn get_topology_string(inverter_id: &str, config: &SystemConfig) -> String {
         }
     } else {
         "Unknown".to_string()
+    }
+}
+
+/// Predicted SOC for the dashboard over `display_schedule` (effective modes, see
+/// [`effective_display_schedule`]), at the configured charge rate both ways. Back Up Mode
+/// blocks hold the Back Up floor, the same floor the planner uses
+/// (`scheduling::backup_planner_floor`), so it follows the default-mode switch on the next query.
+pub fn predict_display_soc(
+    display_schedule: &OperationSchedule,
+    control_config: &crate::resources::ControlConfig,
+    current_soc: f32,
+    inputs: &crate::components::battery_predictor::PredictionInputs,
+    user_control: Option<&UserControlState>,
+) -> crate::components::battery_predictor::BatteryPrediction {
+    crate::components::battery_predictor::predict_battery_soc_with_inputs(
+        display_schedule,
+        control_config,
+        current_soc,
+        Some(control_config.max_battery_charge_rate_kw),
+        Some(control_config.max_battery_charge_rate_kw),
+        inputs,
+        crate::scheduling::backup_planner_floor(
+            user_control,
+            control_config.min_battery_soc,
+            control_config.max_battery_soc,
+        ),
+    )
+}
+
+/// Copy of the planner schedule with each block's mode replaced by the mode the executor runs
+/// ([`UserControlState::effective_mode_at`]): planner Self-Use is Back Up Mode in the Back Up
+/// default mode unless a fixed slot covers the block. Used for display and the SOC prediction.
+pub fn effective_display_schedule(
+    schedule: &OperationSchedule,
+    user_control: Option<&UserControlState>,
+) -> OperationSchedule {
+    let mut display = schedule.clone();
+    if let Some(uc) = user_control {
+        for block in &mut display.scheduled_blocks {
+            block.mode = uc.effective_mode_at(block.mode, block.block_start);
+        }
+    }
+    display
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn self_use_schedule(start: DateTime<Utc>, count: usize) -> OperationSchedule {
+        OperationSchedule {
+            scheduled_blocks: (0..count)
+                .map(|i| ScheduledMode {
+                    block_start: start + chrono::Duration::minutes(15 * i as i64),
+                    duration_minutes: 15,
+                    target_inverters: None,
+                    mode: if i == 0 {
+                        InverterOperationMode::ForceCharge
+                    } else {
+                        InverterOperationMode::SelfUse
+                    },
+                    reason: "Self-Use - test".to_string(),
+                    decision_uid: None,
+                    debug_info: None,
+                })
+                .collect(),
+            generated_at: start,
+            based_on_price_version: start,
+        }
+    }
+
+    fn backup_state(min_soc: u8) -> UserControlState {
+        UserControlState {
+            default_mode: DefaultMode::Backup,
+            backup_min_soc_pct: min_soc,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn display_schedule_shows_back_up_for_self_use_blocks_in_backup_default() {
+        let start = Utc::now();
+        let planned = self_use_schedule(start, 4);
+
+        let display = effective_display_schedule(&planned, Some(&backup_state(25)));
+        let modes: Vec<_> = display.scheduled_blocks.iter().map(|b| b.mode).collect();
+        assert_eq!(
+            modes,
+            vec![
+                InverterOperationMode::ForceCharge,
+                InverterOperationMode::BackUpMode,
+                InverterOperationMode::BackUpMode,
+                InverterOperationMode::BackUpMode,
+            ]
+        );
+        // Reasons and the planner's own schedule stay unchanged
+        assert_eq!(display.scheduled_blocks[1].reason, "Self-Use - test");
+        assert_eq!(
+            planned.scheduled_blocks[1].mode,
+            InverterOperationMode::SelfUse
+        );
+
+        // Self-Use default or no user control: as planned
+        let self_use = UserControlState::default();
+        for uc in [Some(&self_use), None] {
+            let display = effective_display_schedule(&planned, uc);
+            assert_eq!(
+                display.scheduled_blocks[1].mode,
+                InverterOperationMode::SelfUse
+            );
+        }
+    }
+
+    #[test]
+    fn predicted_soc_floors_at_backup_min_and_follows_the_switch() {
+        let start = Utc::now();
+        let mut planned = self_use_schedule(start, 12);
+        planned.scheduled_blocks[0].mode = InverterOperationMode::SelfUse;
+        let config = crate::resources::ControlConfig {
+            min_battery_soc: 10.0,
+            hardware_min_battery_soc: 10.0,
+            max_battery_soc: 100.0,
+            battery_capacity_kwh: 23.0,
+            max_battery_charge_rate_kw: 10.0,
+            ..Default::default()
+        };
+        // 2.3 kWh deficit per block = 10 % of the battery
+        let inputs = crate::components::battery_predictor::PredictionInputs {
+            load_kwh_per_block: vec![2.3; 12],
+            pv_kwh_per_block: vec![0.0; 12],
+        };
+        let last = |uc: Option<&UserControlState>| {
+            let display = effective_display_schedule(&planned, uc);
+            let p = predict_display_soc(&display, &config, 60.0, &inputs, uc);
+            let socs: Vec<f32> = p.points().iter().map(|pt| pt.soc_percent).collect();
+            (socs.iter().copied().fold(f32::MAX, f32::min), socs[11])
+        };
+
+        let mut state = backup_state(25);
+        let (min, end) = last(Some(&state));
+        assert!((min - 25.0).abs() < 1e-3 && (end - 25.0).abs() < 1e-3);
+
+        // Flip to Self-Use: the next query drains to the hardware minimum
+        state.default_mode = DefaultMode::SelfUse;
+        let (_, end) = last(Some(&state));
+        assert!((end - 10.0).abs() < 1e-3, "{end}");
+
+        // Back to Backup with a new minimum
+        state.default_mode = DefaultMode::Backup;
+        state.backup_min_soc_pct = 40;
+        let (min, _) = last(Some(&state));
+        assert!((min - 40.0).abs() < 1e-3, "{min}");
+    }
+
+    fn profile(hourly_avg_kwh: [f32; 24]) -> HourlyConsumptionProfile {
+        HourlyConsumptionProfile {
+            hourly_avg_kwh,
+            days_averaged: 3,
+            hourly_p75_kwh: None,
+        }
+    }
+
+    #[test]
+    fn consumption_stats_keep_profile_without_daily_summaries() {
+        let mut hourly = [0.5; 24];
+        hourly[17] = 2.0;
+        let mut history = ConsumptionHistory::new(7);
+        history.set_hourly_profile(profile(hourly));
+        assert!(history.summaries().is_empty());
+
+        let stats = compute_consumption_stats(Some(&history), None, Utc::now())
+            .expect("profile alone is enough for stats");
+        assert_eq!(stats.ema_kwh, None);
+        assert_eq!(stats.today_import_kwh, None);
+        assert_eq!(stats.yesterday_import_kwh, None);
+        assert_eq!(stats.ema_days, 7);
+        assert_eq!(stats.hourly_consumption_profile, Some(hourly.to_vec()));
+    }
+
+    #[test]
+    fn consumption_stats_none_without_any_data() {
+        let history = ConsumptionHistory::new(7);
+        assert!(compute_consumption_stats(Some(&history), None, Utc::now()).is_none());
+        assert!(compute_consumption_stats(None, None, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn consumption_stats_with_summaries_and_profile() {
+        let now = Utc::now();
+        let mut history = ConsumptionHistory::new(7);
+        history.add_summary(DailyEnergySummary {
+            date: now,
+            consumption_kwh: 10.0,
+            solar_production_kwh: 2.0,
+            grid_import_kwh: 8.0,
+        });
+        history.set_hourly_profile(profile([1.0; 24]));
+        let stats = compute_consumption_stats(Some(&history), None, now).unwrap();
+        assert_eq!(stats.today_import_kwh, Some(8.0));
+        assert_eq!(stats.hourly_consumption_profile, Some(vec![1.0; 24]));
+    }
+
+    #[test]
+    fn hdo_schedule_fees_come_from_pricing_config() {
+        // The resource may still carry the strategy's (zero) HDO fees
+        let hdo = crate::async_systems::HdoScheduleData {
+            low_tariff_periods: vec![("00:00".to_owned(), "06:00".to_owned())],
+            high_tariff_czk: 0.0,
+            low_tariff_czk: 0.0,
+            ..Default::default()
+        };
+        let pricing = fluxion_types::config::PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_owned(),
+            tomorrow_price_entity: None,
+            buy_price_entity: Some("sensor.buy_price".to_owned()),
+            use_spot_prices_to_buy: true,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.0,
+            spot_sell_fee_czk: 0.0,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_owned(),
+            hdo_low_tariff_czk: 0.5,
+            hdo_high_tariff_czk: 1.8,
+        };
+
+        let info = hdo_schedule_info(&hdo, &pricing);
+
+        assert!((info.low_tariff_czk - 0.5).abs() < f32::EPSILON);
+        assert!((info.high_tariff_czk - 1.8).abs() < f32::EPSILON);
+        assert_eq!(info.low_tariff_periods, hdo.low_tariff_periods);
+    }
+
+    #[test]
+    fn display_timezone_prefers_home_assistant() {
+        assert_eq!(
+            resolve_display_timezone(Some("Europe/Prague"), Some("Europe/Berlin")),
+            (
+                Some("Europe/Prague".to_owned()),
+                TimezoneSource::HomeAssistant
+            )
+        );
+    }
+
+    #[test]
+    fn display_timezone_falls_back_to_configured() {
+        assert_eq!(
+            resolve_display_timezone(None, Some("Europe/Berlin")),
+            (Some("Europe/Berlin".to_owned()), TimezoneSource::Configured)
+        );
+        assert_eq!(
+            resolve_display_timezone(Some("  "), Some("Europe/Berlin")),
+            (Some("Europe/Berlin".to_owned()), TimezoneSource::Configured)
+        );
+    }
+
+    #[test]
+    fn display_timezone_unknown_when_both_unset() {
+        assert_eq!(
+            resolve_display_timezone(Some("Mars/Olympus"), Some("Europe/Berlin")),
+            (Some("Europe/Berlin".to_owned()), TimezoneSource::Configured)
+        );
+        assert_eq!(
+            resolve_display_timezone(None, None),
+            (None, TimezoneSource::Unknown)
+        );
+        assert_eq!(
+            resolve_display_timezone(None, Some("")),
+            (None, TimezoneSource::Unknown)
+        );
     }
 }

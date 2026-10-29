@@ -10,17 +10,26 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+pub mod actuation;
 pub mod adapters;
+pub mod backtest_history;
 pub mod client;
+pub mod dashboard_entities;
 pub mod errors;
+pub mod hot_standby;
+pub mod levers;
 pub mod plugin;
+pub mod pv_forecast_correction;
+pub mod solar_forecast_accuracy;
 pub mod solar_forecast_fetcher;
 pub mod types;
+pub mod ws;
 
 pub use adapters::{
     ConfigurablePriceDataSource, CzSpotPriceAdapter, HaConsumptionHistoryAdapter,
     HomeAssistantInverterAdapter,
 };
+pub use backtest_history::HaBacktestHistory;
 pub use client::HomeAssistantClient;
 pub use errors::{HaError, HaResult};
 pub use plugin::{HaClientResource, HaPlugin, PriceAdapterTimezoneHandle};

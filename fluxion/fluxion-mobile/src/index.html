@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+  <title>FluxION</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0a0a0a;
+      --fg: #e0e0e0;
+      --accent: #4fc3f7;
+      --dim: #666;
+      --error: #ef5350;
+    }
+    body {
+      font-family: -apple-system, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    }
+    #loading-screen {
+      text-align: center;
+    }
+    #loading-screen h1, #pin-screen h1 {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 16px;
+    }
+    #loading-screen .status {
+      color: var(--dim);
+      font-size: 14px;
+      margin-top: 8px;
+    }
+    .spinner {
+      width: 40px;
+      height: 40px;
+      border: 3px solid var(--dim);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin: 16px auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* PIN lock screen */
+    #pin-screen {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      gap: 16px;
+    }
+    #pin-screen .pin-icon {
+      font-size: 48px;
+      margin-bottom: 8px;
+      opacity: 0.6;
+    }
+    #pin-input {
+      width: 160px;
+      padding: 12px 16px;
+      font-size: 24px;
+      text-align: center;
+      letter-spacing: 8px;
+      background: #1a1a1a;
+      border: 2px solid #333;
+      border-radius: 8px;
+      color: var(--fg);
+      -webkit-text-security: disc;
+      outline: none;
+    }
+    #pin-input:focus {
+      border-color: var(--accent);
+    }
+    #pin-submit {
+      padding: 10px 32px;
+      font-size: 16px;
+      background: var(--accent);
+      color: #000;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    #pin-submit:active {
+      opacity: 0.8;
+    }
+    #pin-error {
+      color: var(--error);
+      font-size: 14px;
+      min-height: 20px;
+    }
+
+    /* Hidden initially — main content injected by Tauri IPC */
+    #app { display: none; width: 100%; }
+  </style>
+</head>
+<body>
+  <div id="loading-screen">
+    <h1>FluxION</h1>
+    <div class="spinner"></div>
+    <div class="status" id="status-text">Loading...</div>
+  </div>
+
+  <div id="pin-screen">
+    <div class="pin-icon">&#128274;</div>
+    <h1>FluxION</h1>
+    <input id="pin-input" type="tel" maxlength="8" inputmode="numeric" pattern="[0-9]*" placeholder="PIN">
+    <button id="pin-submit">Unlock</button>
+    <div id="pin-error"></div>
+  </div>
+
+  <div id="app"></div>
+
+  <script src="main.js"></script>
+</body>
+</html>

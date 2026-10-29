@@ -28,6 +28,10 @@ pub struct PriceBlock {
     /// Effective import price per kWh in CZK (spot price + grid fees from HDO tariff)
     /// This is the final price strategies should use for buy decisions
     pub effective_price_czk_per_kwh: f32,
+    /// Spot sell price (CZK/kWh) = spot_price - spot_sell_fee, when available.
+    /// Only populated when use_spot_prices_to_sell is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_sell_price_czk_per_kwh: Option<f32>,
 }
 
 /// Battery state information
@@ -60,6 +64,16 @@ pub struct ForecastData {
     pub grid_export_price_czk_per_kwh: f32,
 }
 
+/// Raw per-block forecast (no safety/confidence factors applied).
+/// Aligned index-for-index with `EvaluationRequest::all_blocks`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BlockForecast {
+    /// Expected solar generation in this block (kWh)
+    pub solar_kwh: f32,
+    /// Expected household consumption in this block (kWh)
+    pub consumption_kwh: f32,
+}
+
 /// Historical data for strategy analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoricalData {
@@ -67,10 +81,13 @@ pub struct HistoricalData {
     pub grid_import_today_kwh: Option<f32>,
     /// Total household consumption today (kWh)
     pub consumption_today_kwh: Option<f32>,
-    /// Average hourly consumption profile (kWh per hour, 24 entries, index = hour of day)
+    /// Average hourly consumption profile (kWh per hour, 24 entries, index = UTC hour of day)
     /// Averaged over last 7 days of historical data
     #[serde(default)]
     pub hourly_consumption_profile: Option<Vec<f32>>,
+    /// Per-hour 75th percentile of house load (kWh per hour, 24 entries), when available
+    #[serde(default)]
+    pub hourly_consumption_p75: Option<Vec<f32>>,
 }
 
 /// Complete evaluation request sent to strategy plugins
@@ -109,6 +126,27 @@ pub struct EvaluationRequest {
     /// Used to calculate arbitrage profit during discharge
     #[serde(default)]
     pub battery_avg_charge_price_czk_per_kwh: f32,
+
+    /// Measured cost of charge of the energy in the battery, per kWh delivered (CZK/kWh, losses
+    /// and wear included). `None` = unknown.
+    #[serde(default)]
+    pub battery_charge_cost_czk_per_kwh: Option<f32>,
+
+    /// Per-block forecasts aligned with `all_blocks` (empty = unknown)
+    #[serde(default)]
+    pub block_forecasts: Vec<BlockForecast>,
+
+    /// IANA timezone of the site, e.g. "Europe/Prague"
+    #[serde(default)]
+    pub timezone: Option<String>,
+
+    /// User levers from Home Assistant; `None` until the first successful sync
+    #[serde(default)]
+    pub user_levers: Option<fluxion_types::UserLevers>,
+
+    /// Planner minimum SOC (%) when the default mode is Back Up; `None` keeps the control minimum
+    #[serde(default)]
+    pub planner_min_soc_pct: Option<f32>,
 }
 
 /// Operation mode decision
@@ -123,6 +161,8 @@ pub enum OperationMode {
     ForceDischarge,
     /// Backup mode - battery ready for backup
     BackUpMode,
+    /// No charge/no discharge - battery idle, grid powers house
+    NoChargeNoDischarge,
 }
 
 impl From<fluxion_types::inverter::InverterOperationMode> for OperationMode {
@@ -132,6 +172,14 @@ impl From<fluxion_types::inverter::InverterOperationMode> for OperationMode {
             fluxion_types::inverter::InverterOperationMode::ForceCharge => Self::ForceCharge,
             fluxion_types::inverter::InverterOperationMode::ForceDischarge => Self::ForceDischarge,
             fluxion_types::inverter::InverterOperationMode::BackUpMode => Self::BackUpMode,
+            fluxion_types::inverter::InverterOperationMode::NoChargeNoDischarge => {
+                Self::NoChargeNoDischarge
+            }
+            // The plugin protocol has no feed-in priority mode: fall back to Self-Use.
+            fluxion_types::inverter::InverterOperationMode::FeedinPriority => {
+                tracing::warn!("Plugin protocol cannot express Feed-in Priority, using Self-Use");
+                Self::SelfUse
+            }
         }
     }
 }
@@ -143,6 +191,7 @@ impl From<OperationMode> for fluxion_types::inverter::InverterOperationMode {
             OperationMode::ForceCharge => Self::ForceCharge,
             OperationMode::ForceDischarge => Self::ForceDischarge,
             OperationMode::BackUpMode => Self::BackUpMode,
+            OperationMode::NoChargeNoDischarge => Self::NoChargeNoDischarge,
         }
     }
 }

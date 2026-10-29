@@ -15,13 +15,16 @@ use bevy_ecs::prelude::*;
 use futures_timer::Delay;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     async_tasks::*,
     components::*,
     resources::{ConsumptionHistoryConfig, ConsumptionHistoryDataSourceResource},
 };
+
+/// Days of house-load power history used for the hourly load profile
+const HOUSE_LOAD_HISTORY_DAYS: i64 = 7;
 
 /// Spawns the consumption history fetcher worker task
 pub fn spawn_history_fetcher_worker(
@@ -100,14 +103,25 @@ pub fn poll_consumption_history_channel(
 
     // NON-BLOCKING: try to receive from channel
     while let Ok(update) = channel.receiver.try_recv() {
-        if update.daily_summaries.is_empty() {
+        // Any result, even an empty one, ends the first schedule's wait for the load profile
+        if !consumption_history.fetch_received() {
+            consumption_history.mark_fetch_received();
+        }
+        // The hourly profile comes from house-load power and stands on its own: a site whose
+        // consumption entity is missing has no daily summaries but still has a profile.
+        if update.daily_summaries.is_empty() && update.hourly_profile.is_none() {
             debug!("⚠️ Received empty consumption history");
             continue;
         }
 
         info!(
-            "📊 Updating consumption history: {} daily summaries",
-            update.daily_summaries.len()
+            "📊 Updating consumption history: {} daily summaries, hourly profile: {}",
+            update.daily_summaries.len(),
+            if update.hourly_profile.is_some() {
+                "yes"
+            } else {
+                "no"
+            }
         );
 
         // Add all summaries to the history
@@ -178,15 +192,63 @@ async fn fetch_consumption_history(
     let summaries =
         crate::components::aggregate_daily_consumption(&consumption_history, &solar_history);
 
-    // Compute hourly consumption profile
+    // Compute hourly consumption profile: house-load power when configured and it has enough days
+    let consumption_profile = crate::components::aggregate_hourly_consumption(&consumption_history);
+    let house_load_profile = match &config.house_load_power_entity {
+        Some(entity) => {
+            info!("   Fetching house load from: {}", entity);
+            match source
+                .get_history_with(
+                    entity,
+                    now - chrono::Duration::days(HOUSE_LOAD_HISTORY_DAYS),
+                    Some(now),
+                    true,
+                )
+                .await
+            {
+                Ok(power_history) => {
+                    let profile = crate::components::aggregate_hourly_house_load(&power_history);
+                    if profile.as_ref().is_none_or(|p| {
+                        p.days_averaged
+                            < crate::components::consumption_history::MIN_HOUSE_LOAD_DAYS
+                    }) {
+                        warn!(
+                            "House load history for {} has too little data for a profile ({} points), using the import profile instead",
+                            entity,
+                            power_history.len()
+                        );
+                    }
+                    profile
+                }
+                Err(e) => {
+                    warn!(
+                        "House load history for {} could not be fetched, using the import profile instead: {e}",
+                        entity
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let hourly_profile =
-        crate::components::aggregate_hourly_consumption(&consumption_history);
+        crate::components::pick_hourly_profile(house_load_profile, consumption_profile);
 
     info!(
         "✅ Aggregated {} daily summaries, hourly profile: {}",
         summaries.len(),
-        if hourly_profile.is_some() { "computed" } else { "none" }
+        if hourly_profile.is_some() {
+            "computed"
+        } else {
+            "none"
+        }
     );
+    if let Some(profile) = &hourly_profile {
+        info!(
+            "📊 Hourly load profile ({} days) mean kWh/h {:?} p75 {:?}",
+            profile.days_averaged, profile.hourly_avg_kwh, profile.hourly_p75_kwh
+        );
+    }
 
     // Send to channel
     let update = ConsumptionHistoryUpdate {
@@ -198,4 +260,53 @@ async fn fetch_consumption_history(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use bevy_ecs::system::RunSystemOnce;
+
+    fn profile() -> HourlyConsumptionProfile {
+        HourlyConsumptionProfile {
+            hourly_avg_kwh: [2.0; 24],
+            days_averaged: 8,
+            hourly_p75_kwh: None,
+        }
+    }
+
+    fn poll(update: ConsumptionHistoryUpdate) -> ConsumptionHistory {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(update).unwrap();
+        let mut world = World::new();
+        world.insert_resource(ConsumptionHistory::new(7));
+        world.spawn(ConsumptionHistoryChannel { receiver: rx });
+        world
+            .run_system_once(poll_consumption_history_channel)
+            .unwrap();
+        world.remove_resource::<ConsumptionHistory>().unwrap()
+    }
+
+    #[test]
+    fn profile_is_kept_without_daily_summaries() {
+        // A site whose consumption entity is missing has no daily summaries; its house-load profile
+        // must still reach the planner.
+        let history = poll(ConsumptionHistoryUpdate {
+            daily_summaries: Vec::new(),
+            hourly_profile: Some(profile()),
+        });
+        assert!(history.summaries().is_empty());
+        assert_eq!(history.hourly_profile().unwrap().hourly_avg_kwh[3], 2.0);
+    }
+
+    #[test]
+    fn empty_update_changes_nothing() {
+        let history = poll(ConsumptionHistoryUpdate {
+            daily_summaries: Vec::new(),
+            hourly_profile: None,
+        });
+        assert!(history.hourly_profile().is_none());
+        // ...except that a fetch result arrived: the first schedule stops waiting (H31)
+        assert!(history.fetch_received());
+    }
 }

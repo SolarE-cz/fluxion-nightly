@@ -364,6 +364,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pricing_config = PricingConfig {
         spot_price_entity: "sensor.spot_price".to_string(),
         tomorrow_price_entity: None,
+        buy_price_entity: None,
         use_spot_prices_to_buy: true,
         use_spot_prices_to_sell: true,
         fixed_buy_price_czk: PriceSchedule::Flat(0.0),
@@ -388,6 +389,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 duration_minutes: 15,
                 price_czk_per_kwh: spot_price + buy_fee_czk, // Import price = Spot + Buy Fee
                 effective_price_czk_per_kwh: spot_price + buy_fee_czk,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             }
         })
         .collect();
@@ -418,7 +421,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 solar_forecast_remaining_today_kwh: 0.0,
                 solar_forecast_tomorrow_kwh: 0.0,
                 battery_avg_charge_price_czk_per_kwh: 0.0,
+                battery_charge_cost_czk_per_kwh: None,
                 hourly_consumption_profile: None,
+                hourly_consumption_p75: None,
+                block_forecasts: None,
+                timezone: None,
+                user_levers: None,
             };
 
             let evaluation = state.strategy.evaluate(&context);

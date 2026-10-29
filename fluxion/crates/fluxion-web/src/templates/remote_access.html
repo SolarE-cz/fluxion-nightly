@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+
+{% block title %}FluxION — Remote Access{% endblock %}
+
+{% block content %}
+<div class="container">
+  <div class="header">
+    <div>
+      <h1>Remote Access</h1>
+      <p class="text-secondary">Manage Tor hidden service and paired mobile devices</p>
+    </div>
+    <a href="{{ ingress_path }}/" class="btn btn-secondary">Back to Dashboard</a>
+  </div>
+
+  <!-- Status Card -->
+  <div class="card" id="status-card">
+    <h2><span class="mdi mdi-tor"></span> Tor Hidden Service</h2>
+    <div id="status-content">
+      <p class="text-secondary">Loading...</p>
+    </div>
+  </div>
+
+  <!-- Pair Device Card -->
+  <div class="card" style="margin-top: 16px;">
+    <h2><span class="mdi mdi-cellphone-link"></span> Pair New Device</h2>
+    <form id="pair-form">
+      <div style="display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+        <div>
+          <label for="device-name" class="text-secondary" style="display: block; margin-bottom: 4px; font-size: 0.85em;">Device Name</label>
+          <input type="text" id="device-name" placeholder="My Phone" required
+                 style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 8px 12px; border-radius: 6px;">
+        </div>
+        <div>
+          <label for="access-mode" class="text-secondary" style="display: block; margin-bottom: 4px; font-size: 0.85em;">Access Mode</label>
+          <select id="access-mode"
+                  style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 8px 12px; border-radius: 6px;">
+            <option value="full">Full Access</option>
+            <option value="readonly">Read Only</option>
+          </select>
+        </div>
+        <button type="submit" class="btn btn-primary">Generate QR Code</button>
+      </div>
+    </form>
+
+    <!-- QR Code Modal -->
+    <div id="qr-modal" style="display: none; margin-top: 16px; padding: 20px; background: var(--bg-tertiary); border-radius: 8px; text-align: center;">
+      <h3 id="qr-device-name" style="margin-bottom: 12px;"></h3>
+      <div id="qr-svg" style="display: inline-block; background: white; padding: 16px; border-radius: 8px;"></div>
+      <p class="text-secondary" style="margin-top: 12px; font-size: 0.85em;">
+        Scan this QR code with the FluxION mobile app to pair this device.
+        <br>The private key is shown only once.
+      </p>
+      <button onclick="document.getElementById('qr-modal').style.display='none'" class="btn btn-secondary" style="margin-top: 12px;">Done</button>
+    </div>
+  </div>
+
+  <!-- Devices List Card -->
+  <div class="card" style="margin-top: 16px;">
+    <h2><span class="mdi mdi-devices"></span> Paired Devices</h2>
+    <div id="devices-list">
+      <p class="text-secondary">Loading...</p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .btn {
+    display: inline-block;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: none;
+    cursor: pointer;
+    font-size: 0.9em;
+    text-decoration: none;
+    color: var(--text-primary);
+  }
+  .btn-primary { background: var(--info); }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-secondary { background: var(--bg-tertiary); border: 1px solid var(--border-color); }
+  .btn-danger { background: var(--error); }
+  .btn-danger:hover { opacity: 0.9; }
+  .card { background: var(--bg-secondary); padding: 20px; border-radius: var(--card-radius); }
+  .text-secondary { color: var(--text-secondary); }
+  .device-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border-color);
+  }
+  .device-row:last-child { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.8em;
+  }
+  .badge-full { background: var(--success); color: #000; }
+  .badge-readonly { background: var(--warning); color: #000; }
+  .status-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 8px;
+  }
+  .status-running { background: var(--success); }
+  .status-stopped { background: var(--error); }
+</style>
+
+<script>
+const BASE = '{{ ingress_path }}';
+
+async function loadStatus() {
+  try {
+    const res = await fetch(BASE + '/api/remote/status');
+    const data = await res.json();
+    const el = document.getElementById('status-content');
+    el.innerHTML = `
+      <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
+        <span class="status-dot ${data.tor_running ? 'status-running' : 'status-stopped'}"></span>
+        <span>${data.tor_running ? 'Running' : 'Stopped'}</span>
+      </div>
+      ${data.onion_address ? `<p style="font-family: monospace; font-size: 0.85em; word-break: break-all; color: var(--text-secondary);">${data.onion_address}</p>` : ''}
+      <p class="text-secondary" style="margin-top: 8px;">${data.device_count} device(s) paired</p>
+    `;
+  } catch (e) {
+    document.getElementById('status-content').innerHTML = '<p style="color: var(--error);">Failed to load status</p>';
+  }
+}
+
+async function loadDevices() {
+  try {
+    const res = await fetch(BASE + '/api/remote/devices');
+    const devices = await res.json();
+    const el = document.getElementById('devices-list');
+    if (devices.length === 0) {
+      el.innerHTML = '<p class="text-secondary">No devices paired yet.</p>';
+      return;
+    }
+    el.innerHTML = devices.map(d => `
+      <div class="device-row">
+        <div>
+          <strong>${escapeHtml(d.name)}</strong>
+          <span class="badge ${d.access_mode === 'full' ? 'badge-full' : 'badge-readonly'}">${d.access_mode}</span>
+          <br>
+          <span class="text-secondary" style="font-size: 0.8em;">Added: ${new Date(d.created_at).toLocaleDateString()}</span>
+          ${d.last_seen ? `<span class="text-secondary" style="font-size: 0.8em; margin-left: 12px;">Last seen: ${new Date(d.last_seen).toLocaleString()}</span>` : ''}
+        </div>
+        <button class="btn btn-danger" onclick="revokeDevice('${d.id}', '${escapeHtml(d.name)}')">Revoke</button>
+      </div>
+    `).join('');
+  } catch (e) {
+    document.getElementById('devices-list').innerHTML = '<p style="color: var(--error);">Failed to load devices</p>';
+  }
+}
+
+document.getElementById('pair-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = document.getElementById('device-name').value.trim();
+  const mode = document.getElementById('access-mode').value;
+  if (!name) return;
+
+  try {
+    const res = await fetch(BASE + '/api/remote/pair', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, mode }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Pairing failed');
+      return;
+    }
+
+    document.getElementById('qr-device-name').textContent = `Scan to pair: ${name}`;
+    document.getElementById('qr-svg').innerHTML = data.qr_svg;
+    document.getElementById('qr-modal').style.display = 'block';
+    document.getElementById('device-name').value = '';
+
+    loadStatus();
+    loadDevices();
+  } catch (e) {
+    alert('Pairing failed: ' + e.message);
+  }
+});
+
+async function revokeDevice(id, name) {
+  if (!confirm(`Revoke access for "${name}"? The device will no longer be able to connect.`)) return;
+  try {
+    await fetch(BASE + '/api/remote/devices/' + id, { method: 'DELETE' });
+    loadStatus();
+    loadDevices();
+  } catch (e) {
+    alert('Revoke failed: ' + e.message);
+  }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+loadStatus();
+loadDevices();
+</script>
+{% endblock %}

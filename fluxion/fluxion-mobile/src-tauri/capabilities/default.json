@@ -1,0 +1,15 @@
+{
+  "identifier": "default",
+  "description": "FluxION mobile app capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "barcode-scanner:allow-scan",
+    "barcode-scanner:allow-cancel",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-delete",
+    "store:allow-has",
+    "store:allow-keys"
+  ]
+}

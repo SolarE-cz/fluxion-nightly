@@ -22,14 +22,21 @@ pub struct HaEntityState {
     pub last_updated: String,
 }
 
-/// Historical state point from HA history API
+/// Historical state point from HA history API.
+///
+/// With `minimal_response` HA sends full objects only for the first and last state; the others
+/// carry just `state` and `last_changed`, so `entity_id`, `last_updated` and `attributes` are
+/// optional.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HaHistoryState {
-    pub entity_id: String,
+    #[serde(default)]
+    pub entity_id: Option<String>,
     pub state: String,
+    #[serde(default)]
     pub attributes: Option<serde_json::Value>,
     pub last_changed: String,
-    pub last_updated: String,
+    #[serde(default)]
+    pub last_updated: Option<String>,
 }
 
 /// Parsed history data point with numeric value and timestamp

@@ -10,19 +10,22 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+use crate::resources::UserLeversResource;
 use crate::strategy::BlockEvaluation;
-use chrono::Utc;
+use crate::strategy::winter_reserve::WinterReserveStrategy;
+use chrono::{DateTime, Timelike, Utc};
 use fluent::fluent_args;
 use fluxion_i18n::I18n;
 use fluxion_plugins::{
-    BatteryState, BlockDecision, EvaluationRequest, ForecastData, HistoricalData, OperationMode,
-    PluginManager, PriceBlock,
+    BatteryState, BlockDecision, BlockForecast, EvaluationRequest, ForecastData, HistoricalData,
+    OperationMode, PluginManager, PriceBlock,
 };
-use fluxion_types::UserControlState;
 use fluxion_types::config::{ControlConfig, Currency, PricingConfig};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
+use fluxion_types::{UserControlState, UserLevers};
+use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
 /// Check if debug logging is enabled based on log level
@@ -93,7 +96,8 @@ fn calculate_initial_battery_price(time_block_prices: &[TimeBlockPrice]) -> f32 
 /// * `pricing_config` - Pricing configuration with grid fee amounts
 ///
 /// # Note
-/// If HDO cache is not available or returns None, falls back to spot_buy_fee_czk
+/// If HDO cache is not available or returns None for a given block, defaults to
+/// hdo_high_tariff_czk (conservative: avoids underpricing unknown periods)
 pub fn calculate_effective_prices(
     time_block_prices: &mut [TimeBlockPrice],
     hdo_cache: Option<&crate::resources::GlobalHdoCache>,
@@ -112,21 +116,39 @@ pub fn calculate_effective_prices(
                     pricing_config.hdo_high_tariff_czk
                 }
                 None => {
-                    // HDO data not available for this time, use fallback
+                    // HDO data not available for this time — default to high tariff
+                    // (conservative: avoids charging during unknown periods that may be expensive)
                     warn!(
-                        "HDO tariff data not available for {}, using fallback spot_buy_fee",
+                        "HDO tariff data not available for {}, defaulting to high tariff",
                         block.block_start
                     );
-                    pricing_config.spot_buy_fee_czk
+                    pricing_config.hdo_high_tariff_czk
                 }
             }
         } else {
-            // No HDO cache available, use fallback
-            pricing_config.spot_buy_fee_czk
+            // No HDO cache available, default to high tariff (conservative)
+            pricing_config.hdo_high_tariff_czk
         };
 
-        // Calculate effective price = spot price + grid fee
-        block.effective_price_czk_per_kwh = block.price_czk_per_kwh + grid_fee;
+        // Buy price = energy price + HDO grid fee (+ operator buy fee on spot).
+        // Spot buy: the buy sensor's price when the block has one, else spot.
+        // Fixed buy: the configured price at the block's local time replaces spot.
+        let (energy_price, buy_fee) = if pricing_config.use_spot_prices_to_buy {
+            (
+                block.buy_energy_price_czk_per_kwh(),
+                pricing_config.spot_buy_fee_czk,
+            )
+        } else {
+            let tz = hdo_cache.map_or(chrono_tz::UTC, |cache| cache.timezone());
+            let local = block.block_start.with_timezone(&tz);
+            (
+                pricing_config
+                    .fixed_buy_price_czk
+                    .get_price_at(local.hour(), local.minute()),
+                0.0,
+            )
+        };
+        block.effective_price_czk_per_kwh = energy_price + grid_fee + buy_fee;
     }
 
     debug!(
@@ -166,6 +188,30 @@ impl Default for ScheduleConfig {
     }
 }
 
+/// Force discharge stays off until a capped discharge method exists (`control.force_discharge_enabled`):
+/// ForceDischarge blocks become Self-Use. Returns how many blocks were converted.
+pub fn gate_force_discharge(blocks: &mut [ScheduledMode], enabled: bool) -> usize {
+    if enabled {
+        return 0;
+    }
+    let mut converted = 0;
+    for block in blocks
+        .iter_mut()
+        .filter(|b| b.mode == InverterOperationMode::ForceDischarge)
+    {
+        block.mode = InverterOperationMode::SelfUse;
+        block.reason = format!("{} (force discharge disabled)", block.reason);
+        converted += 1;
+    }
+    if converted > 0 {
+        info!(
+            "Force discharge disabled (control.force_discharge_enabled): {} discharge block(s) converted to Self-Use",
+            converted
+        );
+    }
+    converted
+}
+
 /// Generate an operation schedule using the economic optimizer
 ///
 /// This function uses the economic optimization architecture where multiple strategies
@@ -186,8 +232,35 @@ impl Default for ScheduleConfig {
 /// * `solar_forecast_remaining_today_kwh` - Remaining solar forecast for today (kWh)
 /// * `solar_forecast_tomorrow_kwh` - Solar forecast for tomorrow (kWh)
 /// * `user_control` - Optional user control state for overrides and restrictions
+/// * `timezone` - Optional IANA timezone of the site (e.g. "Europe/Prague"), passed to strategies
+/// * `battery_charge_cost_czk_per_kwh` - Measured cost of charge of the battery energy (brief H33)
 ///
 /// # Returns
+/// Planner minimum SOC (%) in Back Up default mode: the higher of the control and Back Up
+/// minimums. `None` in Self-Use, so the planner keeps the control minimum (brief H19).
+#[must_use]
+pub fn backup_planner_floor(
+    user_control: Option<&UserControlState>,
+    min_battery_soc: f32,
+    max_battery_soc: f32,
+) -> Option<f32> {
+    let uc = user_control
+        .filter(|uc| uc.default_mode == fluxion_types::user_control::DefaultMode::Backup)?;
+    if f32::from(uc.backup_min_soc_pct)
+        > fluxion_types::user_control::backup_min_soc_limit(max_battery_soc)
+    {
+        static CAP_WARNED: std::sync::Once = std::sync::Once::new();
+        CAP_WARNED.call_once(|| {
+            warn!(
+                "Back Up minimum SOC {}% is above max_battery_soc - 5 ({}%), planning with the cap",
+                uc.backup_min_soc_pct,
+                fluxion_types::user_control::backup_min_soc_limit(max_battery_soc)
+            );
+        });
+    }
+    Some(uc.planner_min_soc_pct(min_battery_soc, max_battery_soc))
+}
+
 /// Complete `OperationSchedule` with economically optimized mode assignments
 #[expect(clippy::too_many_arguments)]
 pub fn generate_schedule_with_optimizer(
@@ -206,13 +279,24 @@ pub fn generate_schedule_with_optimizer(
     solar_forecast_tomorrow_kwh: f32,
     user_control: Option<&UserControlState>,
     hourly_consumption_profile: Option<&[f32; 24]>,
+    hourly_consumption_p75: Option<&[f32; 24]>,
+    timezone: Option<&str>,
+    user_levers: Option<&UserLevers>,
+    battery_charge_cost_czk_per_kwh: Option<f32>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
         return OperationSchedule::default();
     }
     let mut scheduled_blocks = Vec::new();
+    // Block starts decided by Winter-Reserve; its short force runs are kept
+    let mut winter_reserve_blocks: HashSet<DateTime<Utc>> = HashSet::new();
     let mut total_profit = 0.0;
+    let planner_min_soc_pct = backup_planner_floor(
+        user_control,
+        control_config.min_battery_soc,
+        control_config.max_battery_soc,
+    );
 
     // Track predicted SOC throughout schedule for realistic future evaluations
     let now = Utc::now();
@@ -272,7 +356,10 @@ pub fn generate_schedule_with_optimizer(
         let consumption_kwh = consumption_forecast
             .and_then(|f| f.get(*original_idx).copied())
             .unwrap_or(0.25);
-        let export_price = control_config.grid_export_fee_czk_per_kwh;
+        // Use per-block spot sell price when available, otherwise fall back to fixed export fee
+        let export_price = price_block
+            .spot_sell_price_czk_per_kwh
+            .unwrap_or(control_config.grid_export_fee_czk_per_kwh);
 
         let remaining_blocks: Vec<TimeBlockPrice> = relevant_blocks
             .iter()
@@ -303,6 +390,16 @@ pub fn generate_schedule_with_optimizer(
             solar_forecast_tomorrow_kwh,
             avg_charge_price,
             hourly_consumption_profile,
+            hourly_consumption_p75,
+            remaining_block_forecasts(
+                relevant_blocks.iter().skip(local_idx).map(|(i, _)| *i),
+                solar_forecast,
+                consumption_forecast,
+            ),
+            timezone,
+            user_levers,
+            planner_min_soc_pct,
+            battery_charge_cost_czk_per_kwh,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -351,7 +448,10 @@ pub fn generate_schedule_with_optimizer(
             .and_then(|f| f.get(*original_idx).copied())
             .unwrap_or(0.25); // Default: ~1 kWh/hour
 
-        let export_price = control_config.grid_export_fee_czk_per_kwh;
+        // Use per-block spot sell price when available, otherwise fall back to fixed export fee
+        let export_price = price_block
+            .spot_sell_price_czk_per_kwh
+            .unwrap_or(control_config.grid_export_fee_czk_per_kwh);
 
         // For filtered blocks, all are current or future, so we use predicted SOC
         // (starting with current SOC for the first block)
@@ -438,6 +538,16 @@ pub fn generate_schedule_with_optimizer(
             solar_forecast_tomorrow_kwh,
             avg_charge_price,
             hourly_consumption_profile,
+            hourly_consumption_p75,
+            remaining_block_forecasts(
+                relevant_blocks.iter().skip(local_idx).map(|(i, _)| *i),
+                solar_forecast,
+                consumption_forecast,
+            ),
+            timezone,
+            user_levers,
+            planner_min_soc_pct,
+            battery_charge_cost_czk_per_kwh,
         );
 
         // Get decision from plugin manager
@@ -480,7 +590,9 @@ pub fn generate_schedule_with_optimizer(
                 battery_energy_kwh += charge_kwh * control_config.battery_efficiency;
                 battery_total_cost_czk += charge_cost;
             }
-            InverterOperationMode::ForceDischarge | InverterOperationMode::SelfUse => {
+            InverterOperationMode::ForceDischarge
+            | InverterOperationMode::SelfUse
+            | InverterOperationMode::FeedinPriority => {
                 // Estimate discharge based on mode
                 let discharge_kwh = if evaluation.mode == InverterOperationMode::ForceDischarge {
                     // Force discharge at export rate
@@ -506,6 +618,9 @@ pub fn generate_schedule_with_optimizer(
                     battery_energy_kwh = (battery_energy_kwh - discharge_kwh).max(0.0);
                 }
             }
+            InverterOperationMode::NoChargeNoDischarge => {
+                // Battery idle - no charge or discharge, no cost change
+            }
         }
 
         // Update predicted SOC for next block
@@ -529,6 +644,10 @@ pub fn generate_schedule_with_optimizer(
 
         total_profit += evaluation.net_profit_czk;
 
+        if evaluation.strategy_name == WinterReserveStrategy::NAME {
+            winter_reserve_blocks.insert(evaluation.block_start);
+        }
+
         scheduled_blocks.push(ScheduledMode {
             block_start: evaluation.block_start,
             duration_minutes: evaluation.duration_minutes,
@@ -546,6 +665,11 @@ pub fn generate_schedule_with_optimizer(
             debug_info: evaluation.debug_info,
         });
     }
+
+    gate_force_discharge(
+        &mut scheduled_blocks,
+        control_config.force_discharge_enabled,
+    );
 
     let mut schedule = OperationSchedule {
         scheduled_blocks,
@@ -581,7 +705,7 @@ pub fn generate_schedule_with_optimizer(
 
     // Post-process to ensure minimum consecutive charge blocks
     // Simply remove any force-charge sequences shorter than the minimum required
-    remove_short_force_sequences(&mut schedule, control_config);
+    remove_short_force_sequences(&mut schedule, control_config, &winter_reserve_blocks);
 
     schedule
 }
@@ -623,20 +747,22 @@ pub fn generate_schedule(
                     .format(
                         "reason-cheapest-block",
                         Some(&fluent_args![
-                            "price" => price_block.price_czk_per_kwh,
+                            "price" => price_block.buy_energy_price_czk_per_kwh(),
                             "currency" => currency_symbol
                         ]),
                     )
                     .unwrap_or_else(|_| {
                         format!(
                             "Cheapest block ({}{:.3}/kWh)",
-                            currency_symbol, price_block.price_czk_per_kwh
+                            currency_symbol,
+                            price_block.buy_energy_price_czk_per_kwh()
                         )
                     })
             } else {
                 format!(
                     "Cheapest block ({}{:.3}/kWh)",
-                    currency_symbol, price_block.price_czk_per_kwh
+                    currency_symbol,
+                    price_block.buy_energy_price_czk_per_kwh()
                 )
             };
             (InverterOperationMode::ForceCharge, reason)
@@ -754,8 +880,11 @@ pub fn check_soc_constraints(
                 return false;
             }
         }
-        InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
-            // Self-use and Backup Mode are always allowed
+        InverterOperationMode::SelfUse
+        | InverterOperationMode::BackUpMode
+        | InverterOperationMode::FeedinPriority
+        | InverterOperationMode::NoChargeNoDischarge => {
+            // Self-use, Backup Mode, and NoChargeNoDischarge are always allowed
         }
     }
 
@@ -769,7 +898,12 @@ pub fn check_soc_constraints(
 /// # Arguments
 /// * `schedule` - Mutable schedule to process
 /// * `config` - Control configuration (includes min_consecutive_force_blocks)
-fn remove_short_force_sequences(schedule: &mut OperationSchedule, config: &ControlConfig) {
+/// * `winter_reserve_blocks` - Block starts decided by Winter-Reserve; left unchanged
+fn remove_short_force_sequences(
+    schedule: &mut OperationSchedule,
+    config: &ControlConfig,
+    winter_reserve_blocks: &HashSet<DateTime<Utc>>,
+) {
     if schedule.scheduled_blocks.is_empty() {
         return;
     }
@@ -805,14 +939,21 @@ fn remove_short_force_sequences(schedule: &mut OperationSchedule, config: &Contr
                 "Force-Discharge"
             };
 
+            let mut converted = 0;
             for j in 0..consecutive {
-                schedule.scheduled_blocks[i + j].mode = config.default_battery_mode;
-                schedule.scheduled_blocks[i + j].reason = format!(
+                let block = &mut schedule.scheduled_blocks[i + j];
+                // Winter-Reserve's plan already handles anti-churn; overriding it would make plan and reality drift
+                if winter_reserve_blocks.contains(&block.block_start) {
+                    continue;
+                }
+                block.mode = config.default_battery_mode;
+                block.reason = format!(
                     "Converted from {} to Self-Use ({}-block sequence < {} min required)",
                     mode_name, consecutive, min_consecutive
                 );
+                converted += 1;
             }
-            changes += consecutive;
+            changes += converted;
         }
 
         i += consecutive;
@@ -872,7 +1013,9 @@ fn update_soc_prediction(
                 crate::components::calculate_soc_change(energy_kwh, battery_capacity);
             new_soc -= soc_decrease;
         }
-        InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+        InverterOperationMode::SelfUse
+        | InverterOperationMode::BackUpMode
+        | InverterOperationMode::FeedinPriority => {
             // Calculate net load (already in kWh for the block)
             let net_load = consumption_kwh - solar_kwh;
 
@@ -889,10 +1032,35 @@ fn update_soc_prediction(
                 new_soc += soc_increase;
             }
         }
+        InverterOperationMode::NoChargeNoDischarge => {
+            // Battery idle - SOC stays constant
+        }
     }
 
     // Clamp SOC to hardware limits
     new_soc.clamp(config.hardware_min_battery_soc, 100.0)
+}
+
+/// Raw per-block forecasts for the remaining blocks, aligned with `all_blocks`.
+/// Empty when neither forecast is known.
+fn remaining_block_forecasts(
+    original_indices: impl Iterator<Item = usize>,
+    solar_forecast: Option<&[f32]>,
+    consumption_forecast: Option<&[f32]>,
+) -> Vec<BlockForecast> {
+    if solar_forecast.is_none() && consumption_forecast.is_none() {
+        return Vec::new();
+    }
+    original_indices
+        .map(|idx| BlockForecast {
+            solar_kwh: solar_forecast
+                .and_then(|f| f.get(idx).copied())
+                .unwrap_or(0.0),
+            consumption_kwh: consumption_forecast
+                .and_then(|f| f.get(idx).copied())
+                .unwrap_or(0.25),
+        })
+        .collect()
 }
 
 /// Create an evaluation request for the plugin manager
@@ -913,6 +1081,12 @@ fn create_evaluation_request(
     solar_forecast_tomorrow_kwh: f32,
     battery_avg_charge_price_czk_per_kwh: f32,
     hourly_consumption_profile: Option<&[f32; 24]>,
+    hourly_consumption_p75: Option<&[f32; 24]>,
+    block_forecasts: Vec<BlockForecast>,
+    timezone: Option<&str>,
+    user_levers: Option<&UserLevers>,
+    planner_min_soc_pct: Option<f32>,
+    battery_charge_cost_czk_per_kwh: Option<f32>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -920,6 +1094,7 @@ fn create_evaluation_request(
             duration_minutes: price_block.duration_minutes,
             price_czk_per_kwh: price_block.price_czk_per_kwh,
             effective_price_czk_per_kwh: price_block.effective_price_czk_per_kwh,
+            spot_sell_price_czk_per_kwh: price_block.spot_sell_price_czk_per_kwh,
         },
         battery: BatteryState {
             current_soc_percent: current_soc,
@@ -942,12 +1117,14 @@ fn create_evaluation_request(
                 duration_minutes: b.duration_minutes,
                 price_czk_per_kwh: b.price_czk_per_kwh,
                 effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
+                spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
             })
             .collect(),
         historical: HistoricalData {
             grid_import_today_kwh,
             consumption_today_kwh: None, // TODO: Track actual consumption
             hourly_consumption_profile: hourly_consumption_profile.map(|p| p.to_vec()),
+            hourly_consumption_p75: hourly_consumption_p75.map(|p| p.to_vec()),
         },
         backup_discharge_min_soc,
         hdo_raw_data,
@@ -955,7 +1132,17 @@ fn create_evaluation_request(
         solar_forecast_remaining_today_kwh,
         solar_forecast_tomorrow_kwh,
         battery_avg_charge_price_czk_per_kwh,
+        battery_charge_cost_czk_per_kwh,
+        block_forecasts,
+        timezone: timezone.map(str::to_owned),
+        user_levers: user_levers.copied(),
+        planner_min_soc_pct,
     }
+}
+
+/// The levers the planner may use: `None` until the first successful HA sync.
+pub fn active_user_levers(res: Option<&UserLeversResource>) -> Option<&UserLevers> {
+    res.filter(|r| r.available).map(|r| &r.levers)
 }
 
 /// Convert a plugin decision back to a BlockEvaluation for compatibility
@@ -971,6 +1158,7 @@ fn convert_decision_to_evaluation(
         OperationMode::ForceCharge => InverterOperationMode::ForceCharge,
         OperationMode::ForceDischarge => InverterOperationMode::ForceDischarge,
         OperationMode::BackUpMode => InverterOperationMode::BackUpMode,
+        OperationMode::NoChargeNoDischarge => InverterOperationMode::NoChargeNoDischarge,
     };
 
     let net_profit = decision.expected_profit_czk.unwrap_or(0.0);
@@ -1018,6 +1206,461 @@ fn convert_decision_to_evaluation(
         } else {
             None
         },
-        arbitrage_profit_czk: 0.0, // Calculated by strategy if discharge occurs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resources::GlobalHdoCache;
+    use crate::strategy::pricing::{HdoDaySchedule, HdoTimeRange};
+    use chrono::Duration as ChronoDuration;
+    use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone};
+    use fluxion_plugins::Plugin;
+    use fluxion_types::config::PricingConfig;
+    use std::sync::{Arc, Mutex};
+
+    /// Strategy plugin that records every request it receives
+    struct RecordingPlugin {
+        requests: Mutex<Vec<EvaluationRequest>>,
+    }
+
+    impl Plugin for RecordingPlugin {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        fn priority(&self) -> u8 {
+            100
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(BlockDecision {
+                block_start: request.block.block_start,
+                duration_minutes: request.block.duration_minutes,
+                mode: OperationMode::SelfUse,
+                reason: "recording".to_string(),
+                priority: 100,
+                strategy_name: None,
+                confidence: None,
+                expected_profit_czk: None,
+                decision_uid: None,
+            })
+        }
+    }
+
+    #[test]
+    fn test_schedule_request_carries_block_forecasts_and_timezone() {
+        let now = Utc::now();
+        let blocks: Vec<TimeBlockPrice> = (0..4)
+            .map(|i| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
+                block_start: now + ChronoDuration::minutes(15 * i),
+                duration_minutes: 15,
+                price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.5,
+                spot_sell_price_czk_per_kwh: Some(2.0),
+            })
+            .collect();
+        let solar = [0.0, 0.5, 1.0, 1.5];
+        let consumption = [0.3, 0.3, 0.4, 0.4];
+
+        let plugin = Arc::new(RecordingPlugin {
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut manager = PluginManager::new();
+        manager.register(plugin.clone());
+
+        generate_schedule_with_optimizer(
+            &blocks,
+            &ControlConfig::default(),
+            &ScheduleConfig::default(),
+            50.0,
+            Some(&solar[..]),
+            Some(&consumption[..]),
+            10.0,
+            None,
+            &manager,
+            None,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            Some("Europe/Prague"),
+            None,
+            None,
+        );
+
+        let requests = plugin.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        for request in requests.iter() {
+            assert_eq!(request.block_forecasts.len(), request.all_blocks.len());
+            assert_eq!(request.timezone.as_deref(), Some("Europe/Prague"));
+
+            // Forecast entries must line up with the request's first block in the horizon
+            let first_idx = blocks
+                .iter()
+                .position(|b| b.block_start == request.all_blocks[0].block_start)
+                .unwrap();
+            for (j, forecast) in request.block_forecasts.iter().enumerate() {
+                assert_eq!(forecast.solar_kwh, solar[first_idx + j]);
+                assert_eq!(forecast.consumption_kwh, consumption[first_idx + j]);
+            }
+        }
+    }
+
+    fn spot_block(block_start: DateTime<Utc>, spot: f32) -> TimeBlockPrice {
+        TimeBlockPrice {
+            block_start,
+            duration_minutes: 15,
+            price_czk_per_kwh: spot,
+            effective_price_czk_per_kwh: spot,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
+        }
+    }
+
+    fn buy_sensor_pricing(use_spot_prices_to_buy: bool) -> PricingConfig {
+        PricingConfig {
+            spot_price_entity: "sensor.current_spot_electricity_price_15min".to_string(),
+            tomorrow_price_entity: None,
+            buy_price_entity: Some("sensor.current_buy_electricity_price_15min".to_string()),
+            use_spot_prices_to_buy,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        }
+    }
+
+    #[test]
+    fn test_effective_buy_uses_buy_sensor_price_and_keeps_sell() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut block = spot_block(start, 2.0);
+        block.buy_price_czk_per_kwh = Some(2.42);
+        block.spot_sell_price_czk_per_kwh = Some(1.5);
+        let mut blocks = vec![block];
+
+        // No HDO cache: high tariff fee; the operator buy fee still applies on top
+        calculate_effective_prices(&mut blocks, None, &buy_sensor_pricing(true));
+
+        assert!((blocks[0].effective_price_czk_per_kwh - (2.42 + 1.80 + 0.5)).abs() < 0.001);
+        assert_eq!(blocks[0].price_czk_per_kwh, 2.0);
+        assert_eq!(blocks[0].spot_sell_price_czk_per_kwh, Some(1.5));
+    }
+
+    #[test]
+    fn test_effective_buy_without_buy_value_falls_back_to_spot() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut blocks = vec![spot_block(start, 2.0)];
+
+        calculate_effective_prices(&mut blocks, None, &buy_sensor_pricing(true));
+
+        assert!((blocks[0].effective_price_czk_per_kwh - (2.0 + 1.80 + 0.5)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_effective_buy_unset_is_spot_plus_fees_exactly() {
+        // Without a buy sensor the formula is unchanged from before H13: spot + HDO fee + buy fee
+        let mut pricing = buy_sensor_pricing(true);
+        pricing.buy_price_entity = None;
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut blocks = vec![spot_block(start, 2.0), spot_block(start, 3.25)];
+
+        calculate_effective_prices(&mut blocks, None, &pricing);
+
+        assert_eq!(blocks[0].effective_price_czk_per_kwh, 2.0_f32 + 1.80 + 0.5);
+        assert_eq!(blocks[1].effective_price_czk_per_kwh, 3.25_f32 + 1.80 + 0.5);
+    }
+
+    #[test]
+    fn test_effective_buy_fixed_buy_ignores_buy_sensor() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap();
+        let mut block = spot_block(start, 2.0);
+        block.buy_price_czk_per_kwh = Some(2.42);
+        let mut blocks = vec![block];
+
+        // Fixed buy price (0.0 here) replaces the buy side; no buy fee on fixed prices
+        calculate_effective_prices(&mut blocks, None, &buy_sensor_pricing(false));
+
+        assert!((blocks[0].effective_price_czk_per_kwh - 1.80).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_effective_price_low_and_high_tariff_blocks() {
+        let cache = GlobalHdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
+            low_tariff_ranges: vec![HdoTimeRange {
+                start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            }],
+        }]);
+
+        let pricing = PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_string(),
+            tomorrow_price_entity: None,
+            buy_price_entity: None,
+            use_spot_prices_to_buy: true,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        };
+
+        // 02:00 UTC is 03:00 Prague (low tariff); 07:00 UTC is 08:00 Prague (high tariff)
+        let mut blocks = vec![
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 2, 0, 0).unwrap(), 2.0),
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap(), 2.0),
+        ];
+        calculate_effective_prices(&mut blocks, Some(&cache), &pricing);
+
+        // buy = spot + HDO fee + operator buy fee (0.5)
+        assert!((blocks[0].effective_price_czk_per_kwh - 3.00).abs() < 0.001);
+        assert!((blocks[1].effective_price_czk_per_kwh - 4.30).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_effective_price_fixed_buy_uses_local_time_schedule() {
+        let cache = GlobalHdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
+            low_tariff_ranges: vec![HdoTimeRange {
+                start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            }],
+        }]);
+        // Hourly fixed price in local time: 3.0 CZK at 03:00, 6.0 CZK at 08:00
+        let mut hourly = vec![4.0; 24];
+        hourly[3] = 3.0;
+        hourly[8] = 6.0;
+        let pricing = PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_string(),
+            tomorrow_price_entity: None,
+            buy_price_entity: None,
+            use_spot_prices_to_buy: false,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Hourly(hourly),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        };
+
+        // 02:00 UTC = 03:00 Prague (low tariff), 07:00 UTC = 08:00 Prague (high tariff).
+        // Spot (-5.0 / 20.0) must not leak into the buy price.
+        let mut blocks = vec![
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 2, 0, 0).unwrap(), -5.0),
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap(), 20.0),
+        ];
+        calculate_effective_prices(&mut blocks, Some(&cache), &pricing);
+
+        // buy = fixed price at local hour + HDO fee, no operator spot fee
+        assert!((blocks[0].effective_price_czk_per_kwh - 3.50).abs() < 0.001);
+        assert!((blocks[1].effective_price_czk_per_kwh - 7.80).abs() < 0.001);
+    }
+
+    fn short_run_block(start: DateTime<Utc>, mode: InverterOperationMode) -> ScheduledMode {
+        ScheduledMode {
+            block_start: start,
+            duration_minutes: 15,
+            target_inverters: None,
+            mode,
+            reason: "test".to_string(),
+            decision_uid: None,
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn test_short_force_removal_keeps_winter_reserve_blocks() {
+        let control = ControlConfig {
+            min_consecutive_force_blocks: 2,
+            ..ControlConfig::default()
+        };
+        let start = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let at = |i: i64| start + ChronoDuration::minutes(15 * i);
+
+        // Single Winter-Reserve ForceDischarge, then SelfUse, then single ForceCharge from another strategy
+        let mut schedule = OperationSchedule {
+            scheduled_blocks: vec![
+                short_run_block(at(0), InverterOperationMode::ForceDischarge),
+                short_run_block(at(1), InverterOperationMode::SelfUse),
+                short_run_block(at(2), InverterOperationMode::ForceCharge),
+            ],
+            generated_at: Utc::now(),
+            based_on_price_version: Utc::now(),
+        };
+        let winter_reserve_blocks: HashSet<DateTime<Utc>> = [at(0)].into_iter().collect();
+
+        remove_short_force_sequences(&mut schedule, &control, &winter_reserve_blocks);
+
+        assert_eq!(
+            schedule.scheduled_blocks[0].mode,
+            InverterOperationMode::ForceDischarge
+        );
+        assert_eq!(
+            schedule.scheduled_blocks[2].mode,
+            control.default_battery_mode
+        );
+    }
+
+    #[test]
+    fn test_schedule_request_carries_user_levers_only_when_available() {
+        let now = Utc::now();
+        let blocks: Vec<TimeBlockPrice> = (0..2)
+            .map(|i| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
+                block_start: now + ChronoDuration::minutes(15 * i),
+                duration_minutes: 15,
+                price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.5,
+                spot_sell_price_czk_per_kwh: Some(2.0),
+            })
+            .collect();
+        let levers = UserLevers {
+            force_charge_at_or_below_czk: Some(1.0),
+            ..UserLevers::default()
+        };
+        let synced = UserLeversResource {
+            levers,
+            available: true,
+            sync_expected: true,
+        };
+        let not_synced = UserLeversResource {
+            levers,
+            available: false,
+            sync_expected: true,
+        };
+
+        let run = |res: Option<&UserLeversResource>| {
+            let plugin = Arc::new(RecordingPlugin {
+                requests: Mutex::new(Vec::new()),
+            });
+            let mut manager = PluginManager::new();
+            manager.register(plugin.clone());
+            generate_schedule_with_optimizer(
+                &blocks,
+                &ControlConfig::default(),
+                &ScheduleConfig::default(),
+                50.0,
+                None,
+                None,
+                10.0,
+                None,
+                &manager,
+                None,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+                None,
+                None,
+                active_user_levers(res),
+                None,
+            );
+            plugin
+        };
+
+        let requests = run(Some(&synced)).requests.lock().unwrap().clone();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|r| r.user_levers == Some(levers)));
+
+        let requests = run(Some(&not_synced)).requests.lock().unwrap().clone();
+        assert!(requests.iter().all(|r| r.user_levers.is_none()));
+        let requests = run(None).requests.lock().unwrap().clone();
+        assert!(requests.iter().all(|r| r.user_levers.is_none()));
+    }
+}
+
+#[cfg(test)]
+mod force_discharge_gate_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn block(mode: InverterOperationMode) -> ScheduledMode {
+        ScheduledMode {
+            block_start: Utc::now(),
+            duration_minutes: 15,
+            target_inverters: None,
+            mode,
+            reason: "plan".to_string(),
+            decision_uid: None,
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn gate_converts_force_discharge_blocks_when_disabled() {
+        let mut blocks = vec![
+            block(InverterOperationMode::ForceDischarge),
+            block(InverterOperationMode::ForceCharge),
+        ];
+
+        assert_eq!(gate_force_discharge(&mut blocks, false), 1);
+
+        assert_eq!(blocks[0].mode, InverterOperationMode::SelfUse);
+        assert!(blocks[0].reason.contains("force discharge disabled"));
+        assert_eq!(blocks[1].mode, InverterOperationMode::ForceCharge);
+    }
+
+    #[test]
+    fn gate_keeps_force_discharge_blocks_when_enabled() {
+        let mut blocks = vec![block(InverterOperationMode::ForceDischarge)];
+
+        assert_eq!(gate_force_discharge(&mut blocks, true), 0);
+        assert_eq!(blocks[0].mode, InverterOperationMode::ForceDischarge);
+    }
+}
+
+#[cfg(test)]
+mod backup_floor_tests {
+    use super::*;
+    use fluxion_types::user_control::DefaultMode;
+
+    #[test]
+    fn floor_is_none_in_self_use_and_without_user_control() {
+        let state = UserControlState::default();
+        assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), None);
+        assert_eq!(backup_planner_floor(None, 10.0, 100.0), None);
+    }
+
+    #[test]
+    fn floor_is_max_of_control_and_backup_minimum_in_backup() {
+        let state = UserControlState {
+            default_mode: DefaultMode::Backup,
+            backup_min_soc_pct: 40,
+            ..Default::default()
+        };
+        assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), Some(40.0));
+        assert_eq!(backup_planner_floor(Some(&state), 55.0, 100.0), Some(55.0));
+    }
+
+    #[test]
+    fn floor_is_capped_below_battery_maximum() {
+        let state = UserControlState {
+            default_mode: DefaultMode::Backup,
+            backup_min_soc_pct: 100,
+            ..Default::default()
+        };
+        assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), Some(95.0));
     }
 }

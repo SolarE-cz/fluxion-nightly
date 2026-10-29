@@ -13,6 +13,7 @@
 mod backtest;
 mod config_api;
 mod plugin_api;
+pub mod remote_access;
 mod routes;
 mod simulator;
 mod user_control_api;
@@ -21,7 +22,10 @@ mod validation;
 pub use backtest::BacktestState;
 pub use config_api::ConfigApiState;
 pub use plugin_api::PluginApiState;
-use routes::{DashboardTemplate, LiveDataTemplate};
+pub use remote_access::{
+    MobileApiState, RemoteAccessApiState, mobile_api_routes, remote_access_routes,
+};
+use routes::{DashboardTemplate, LiveDataTemplate, display_timezone};
 pub use simulator::SimulatorState;
 pub use user_control_api::{UserControlApiState, UserControlUpdateSender};
 
@@ -35,7 +39,7 @@ use axum::{
     },
     routing::get,
 };
-use chrono::{Local, NaiveTime};
+use chrono::{Local, NaiveTime, Offset};
 use fluxion_core::{ConfigUpdateSender, WebQueryResponse, WebQuerySender};
 use fluxion_i18n::I18n;
 use fluxion_types::UserControlState;
@@ -226,7 +230,8 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 /// * `port` - Port to listen on (8099 for HA Ingress)
 /// * `config_json` - Current configuration as JSON
 /// * `config_update_sender` - Optional channel for config updates
-/// * `backtest_db_path` - Optional path to backtest database
+/// * `backtest_state` - Backtest on Home Assistant history; `None` serves the routes with a
+///   "not available" error
 /// * `plugin_api_state` - Optional plugin API state for plugin management
 /// * `scheduled_export_config` - Optional config for daily scheduled exports (for debugging)
 /// * `user_control_api_state` - Optional user control API state for user override features
@@ -250,10 +255,11 @@ pub async fn start_web_server(
     port: u16,
     config_json: serde_json::Value,
     config_update_sender: Option<ConfigUpdateSender>,
-    backtest_db_path: Option<std::path::PathBuf>,
+    backtest_state: Option<BacktestState>,
     plugin_api_state: Option<PluginApiState>,
     scheduled_export_config: Option<ScheduledExportConfig>,
     user_control_api_state: Option<UserControlApiState>,
+    remote_access_state: Option<RemoteAccessApiState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn scheduled export task if configured
     if let Some(export_config) = scheduled_export_config {
@@ -264,6 +270,11 @@ pub async fn start_web_server(
     let user_control_state = user_control_api_state
         .as_ref()
         .map(|uc| Arc::clone(&uc.state));
+
+    // Pre-clone values needed for mobile API routes (before they're moved)
+    let mobile_query_sender = query_sender.clone();
+    let mobile_i18n = i18n.clone();
+    let mobile_uc_api = user_control_api_state.clone();
 
     let app_state = AppState {
         query_sender,
@@ -302,33 +313,23 @@ pub async fn start_web_server(
             get(config_api::export_config_handler).with_state(config_state),
         );
 
-    // Add backtest routes if database path is provided
-    if let Some(db_path) = backtest_db_path {
-        info!("📊 Backtest feature enabled with database: {:?}", db_path);
-        let backtest_state = backtest::BacktestState::new(db_path, i18n);
-
-        app = app
-            .route(
-                "/backtest",
-                get(backtest::backtest_page_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/days",
-                get(backtest::available_days_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/day/{date}",
-                get(backtest::day_data_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/simulate",
-                axum::routing::post(backtest::simulate_handler).with_state(backtest_state.clone()),
-            )
-            .route(
-                "/api/backtest/compare",
-                axum::routing::post(backtest::compare_handler).with_state(backtest_state),
-            );
-    }
+    // Backtest routes are always registered; without a state they answer "not available"
+    let backtest_state = backtest_state.unwrap_or_else(|| {
+        BacktestState::unavailable(i18n.clone(), "the backtest needs Home Assistant history")
+    });
+    app = app
+        .route(
+            "/backtest",
+            get(backtest::backtest_page_handler).with_state(backtest_state.clone()),
+        )
+        .route(
+            "/api/backtest/days",
+            get(backtest::available_days_handler).with_state(backtest_state.clone()),
+        )
+        .route(
+            "/api/backtest/day/{date}",
+            get(backtest::day_handler).with_state(backtest_state),
+        );
 
     // Add plugin management API routes if state is provided
     if let Some(plugin_state) = plugin_api_state {
@@ -439,6 +440,10 @@ pub async fn start_web_server(
                 axum::routing::put(user_control_api::set_restrictions).with_state(uc_state.clone()),
             )
             .route(
+                "/api/user-control/default-mode",
+                axum::routing::put(user_control_api::set_default_mode).with_state(uc_state.clone()),
+            )
+            .route(
                 "/api/user-control/slots",
                 axum::routing::post(user_control_api::create_slot).with_state(uc_state.clone()),
             )
@@ -452,9 +457,24 @@ pub async fn start_web_server(
             );
     }
 
-    let app = app
+    let mut app = app
         .layer(CorsLayer::permissive()) // Allow HA Ingress
         .with_state(app_state);
+
+    // Add remote access routes (self-contained state, merged after main state)
+    if let Some(ra_state) = remote_access_state {
+        info!("Remote Access API enabled");
+        app = app.merge(remote_access_routes(ra_state));
+
+        // Add mobile-facing API routes (served over Tor to mobile devices)
+        let mobile_state = MobileApiState {
+            query_sender: mobile_query_sender.clone(),
+            i18n: mobile_i18n.clone(),
+            user_control_api_state: mobile_uc_api.clone(),
+            ui_version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        app = app.merge(mobile_api_routes(mobile_state));
+    }
 
     let addr = format!("0.0.0.0:{port}");
     info!("🌐 Starting web server on {addr}");
@@ -546,6 +566,7 @@ async fn stream_handler(
                         next_change_formatted: dashboard.next_change_formatted,
                         consumption_stats: dashboard.consumption_stats,
                         solar_forecast: dashboard.solar_forecast,
+                        battery_cost_basis: dashboard.battery_cost_basis,
                     };
 
                     let html = live_template.render().unwrap_or_else(|e| {
@@ -568,12 +589,16 @@ async fn stream_handler(
 #[derive(Serialize)]
 struct ChartDataJson {
     labels: Vec<String>,
+    /// Block start instants (RFC 3339, UTC), aligned with `labels`
+    block_starts_utc: Vec<String>,
     prices: Vec<f32>,
     modes: Vec<String>,
     strategies: Vec<Option<String>>,
     profits: Vec<Option<f32>>,
     current_time_label: Option<String>,
     current_battery_soc: Option<f32>,
+    /// Predicted SOC per block, so a refresh follows the default-mode switch (brief H19)
+    battery_soc_prediction: Vec<routes::SocPredictionPoint>,
     // Stacked bar data for HDO display
     spot_prices: Vec<f32>,
     grid_fees: Vec<f32>,
@@ -581,49 +606,114 @@ struct ChartDataJson {
     is_historical: Vec<bool>,
     reasons: Vec<Option<String>>,
     decision_uids: Vec<Option<String>>,
+    /// Total effective price: spot + grid_fee + buy_fees
+    effective_prices: Vec<f32>,
+    /// Hourly consumption profile (kWh per hour, index = UTC hour of day)
     #[serde(skip_serializing_if = "Option::is_none")]
     hourly_consumption_profile: Option<Vec<f32>>,
+    /// True when an HDO schedule is known, so `tariff_types` is real
+    tariff_known: bool,
+    /// Actual PV power (kW) per block from PV history, aligned with `labels`
+    pv_actual_kw: Vec<Option<f32>>,
+    /// Forecast PV power (kW) per not-yet-ended block, aligned with `labels` (corrected)
+    solar_forecast_kw: Vec<Option<f32>>,
+    /// The same forecast before the PV forecast correction (brief H34)
+    solar_forecast_raw_kw: Vec<Option<f32>>,
+    /// The PV forecast correction in force: factor, days, measured and forecast kWh
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pv_forecast_correction: Option<fluxion_core::pv_correction::CorrectionResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solar_forecast_remaining_today_kwh: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solar_forecast_tomorrow_kwh: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    utc_offset_minutes: Option<i32>,
+    /// Cost of charge of the battery energy (brief H33)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
+    /// Price source per block when not the HA price entity (`"ote_fallback"`, brief H35)
+    price_sources: Vec<Option<String>>,
+    /// Health of the spot price feed and the OTE fallback (brief H35)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    price_feed: Option<fluxion_core::price_feed::PriceFeedStatus>,
+}
+
+/// Build the chart refresh JSON from a dashboard response; `None` when there is no price data
+fn build_chart_data_json(response: &WebQueryResponse, i18n: Arc<I18n>) -> Option<ChartDataJson> {
+    // User control state not needed for chart data
+    let template = DashboardTemplate::from_query_response(
+        response.clone(),
+        i18n,
+        String::new(), // JSON endpoint doesn't need ingress path
+        None,
+    );
+
+    // Extract battery SOC from first inverter
+    let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
+
+    // Extract solar forecast data
+    let solar_remaining = response
+        .solar_forecast
+        .as_ref()
+        .filter(|sf| sf.available)
+        .map(|sf| sf.remaining_today_kwh);
+    let solar_tomorrow = response
+        .solar_forecast
+        .as_ref()
+        .filter(|sf| sf.available)
+        .map(|sf| sf.tomorrow_kwh);
+
+    // Calculate UTC offset from timezone string
+    let utc_offset_minutes = display_timezone(response).0.map(|tz| {
+        let now = chrono::Utc::now().with_timezone(&tz);
+        #[expect(clippy::integer_division)]
+        {
+            now.offset().fix().local_minus_utc() / 60
+        }
+    });
+
+    // Extract chart data from template
+    let chart = template.prices?.chart_data;
+    Some(ChartDataJson {
+        labels: chart.labels,
+        block_starts_utc: chart.block_starts_utc,
+        prices: chart.prices,
+        modes: chart.modes,
+        strategies: chart.strategies,
+        profits: chart.profits,
+        current_time_label: chart.current_time_label,
+        current_battery_soc,
+        battery_soc_prediction: chart.battery_soc_prediction,
+        // Stacked bar data
+        spot_prices: chart.spot_prices,
+        grid_fees: chart.grid_fees,
+        tariff_types: chart.tariff_types,
+        is_historical: chart.is_historical,
+        reasons: chart.reasons,
+        decision_uids: chart.decision_uids,
+        effective_prices: chart.effective_prices,
+        hourly_consumption_profile: chart.hourly_consumption_profile,
+        tariff_known: chart.tariff_known,
+        pv_actual_kw: chart.pv_actual_kw,
+        solar_forecast_kw: chart.solar_forecast_kw,
+        solar_forecast_raw_kw: chart.solar_forecast_raw_kw,
+        pv_forecast_correction: chart.pv_forecast_correction,
+        solar_forecast_remaining_today_kwh: solar_remaining,
+        solar_forecast_tomorrow_kwh: solar_tomorrow,
+        utc_offset_minutes,
+        battery_cost_basis: response.battery_cost_basis,
+        price_sources: chart.price_sources,
+        price_feed: response.price_feed.clone(),
+    })
 }
 
 /// Chart data endpoint - returns JSON for chart updates (once per minute)
 async fn chart_data_handler(State(app_state): State<AppState>) -> impl IntoResponse {
     match app_state.query_sender.query_dashboard().await {
-        Ok(response) => {
-            // User control state not needed for chart data
-            let template = DashboardTemplate::from_query_response(
-                response.clone(),
-                app_state.i18n.clone(),
-                String::new(), // JSON endpoint doesn't need ingress path
-                None,
-            );
-
-            // Extract battery SOC from first inverter
-            let current_battery_soc = response.inverters.first().map(|inv| inv.battery_soc);
-
-            // Extract chart data from template
-            if let Some(prices) = template.prices {
-                let chart_json = ChartDataJson {
-                    labels: prices.chart_data.labels,
-                    prices: prices.chart_data.prices,
-                    modes: prices.chart_data.modes,
-                    strategies: prices.chart_data.strategies,
-                    profits: prices.chart_data.profits,
-                    current_time_label: prices.chart_data.current_time_label,
-                    current_battery_soc,
-                    // Stacked bar data
-                    spot_prices: prices.chart_data.spot_prices,
-                    grid_fees: prices.chart_data.grid_fees,
-                    tariff_types: prices.chart_data.tariff_types,
-                    is_historical: prices.chart_data.is_historical,
-                    reasons: prices.chart_data.reasons,
-                    decision_uids: prices.chart_data.decision_uids,
-                    hourly_consumption_profile: prices.chart_data.hourly_consumption_profile,
-                };
-                Json(chart_json).into_response()
-            } else {
-                (axum::http::StatusCode::NO_CONTENT, "").into_response()
-            }
-        }
+        Ok(response) => match build_chart_data_json(&response, app_state.i18n.clone()) {
+            Some(chart_json) => Json(chart_json).into_response(),
+            None => (axum::http::StatusCode::NO_CONTENT, "").into_response(),
+        },
         Err(_) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "").into_response(),
     }
 }
@@ -708,6 +798,9 @@ fn create_compact_export(response: &WebQueryResponse) -> serde_json::Value {
             "errs": response.health.errors
         },
 
+        // Spot price feed and OTE fallback (brief H35)
+        "price_feed": response.price_feed,
+
         // Compact inverter data
         "inv": response.inverters.iter().map(|inv| {
             serde_json::json!({
@@ -779,7 +872,8 @@ fn create_compact_export(response: &WebQueryResponse) -> serde_json::Value {
                         "pr": block.expected_profit.map(round_2_decimals),
                         "r": block.reason.as_ref().map(|r| abbreviate_reason(r)),
                         "uid": block.decision_uid.as_ref(),
-                        "h": block.is_historical
+                        "h": block.is_historical,
+                        "src": block.price_source.as_ref()
                     })
                 }).collect::<Vec<_>>(),
 
@@ -852,6 +946,7 @@ fn abbreviate_operation(op: &str) -> &str {
         "charge" => "c",
         "discharge" => "d",
         "self-use" => "s",
+        "backup" => "b",
         _ => "u", // unknown
     }
 }
@@ -874,5 +969,935 @@ fn abbreviate_reason(reason: &str) -> String {
         format!("{}...", reason.get(..50).unwrap_or_default())
     } else {
         reason.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use fluxion_core::web_bridge::{
+        ConsumptionStats, HdoScheduleInfo, PriceBlockData, PriceData, SystemHealthData,
+        TimezoneSource,
+    };
+
+    fn block(ts: &str, solar_forecast_kw: Option<f32>) -> PriceBlockData {
+        let timestamp: DateTime<Utc> = ts.parse().unwrap();
+        PriceBlockData {
+            timestamp,
+            price: 2.0,
+            effective_buy_price: None,
+            block_type: "self-use".to_owned(),
+            target_soc: None,
+            strategy: None,
+            expected_profit: None,
+            reason: None,
+            decision_uid: None,
+            debug_info: None,
+            is_historical: false,
+            solar_forecast_kw,
+            solar_forecast_raw_kw: None,
+            backup_min_soc_pct: None,
+            price_source: None,
+        }
+    }
+
+    fn backup_block(ts: &str) -> PriceBlockData {
+        PriceBlockData {
+            block_type: "backup".to_owned(),
+            strategy: Some("Self-Use".to_owned()),
+            backup_min_soc_pct: Some(25),
+            ..block(ts, None)
+        }
+    }
+
+    #[test]
+    fn effective_back_up_blocks_show_mode_with_min_soc_on_render_and_refresh() {
+        let mut charge = block("2026-10-16T10:00:00Z", None);
+        charge.block_type = "charge".to_owned();
+        let mut planned_backup = block("2026-10-16T10:30:00Z", None);
+        planned_backup.block_type = "backup".to_owned();
+        let blocks = vec![
+            charge,
+            backup_block("2026-10-16T10:15:00Z"),
+            planned_backup,
+            block("2026-10-16T10:45:00Z", None),
+        ];
+        let mut resp = response(blocks, None);
+        resp.battery_soc_prediction =
+            Some(vec![fluxion_core::web_bridge::BatterySocPredictionPoint {
+                timestamp: "2026-10-16T10:15:00Z".parse().unwrap(),
+                soc: 25.0,
+            }]);
+
+        // Refresh (/chart-data)
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert_eq!(
+            json["modes"],
+            serde_json::json!([
+                "Force Charge",
+                "Back Up Mode (25%)",
+                "Back Up Mode",
+                "Self-Use"
+            ])
+        );
+        assert_eq!(json["battery_soc_prediction"][0]["soc"], 25.0);
+
+        // First render embeds the same labels; the page colours them with the Back Up colour
+        let html = DashboardTemplate::from_query_response(resp, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains(r#""Back Up Mode (25%)""#));
+        assert!(html.contains("mode.startsWith('Back Up Mode')"));
+        assert!(!html.contains("mode === 'Back Up Mode'"));
+    }
+
+    fn response(blocks: Vec<PriceBlockData>, hdo: Option<HdoScheduleInfo>) -> WebQueryResponse {
+        WebQueryResponse {
+            timestamp: Utc::now(),
+            debug_mode: false,
+            mode_control_enabled: true,
+            inverters: vec![],
+            schedule: None,
+            prices: Some(PriceData {
+                current_price: 2.0,
+                min_price: 2.0,
+                max_price: 2.0,
+                avg_price: 2.0,
+                blocks,
+                today_min_price: 2.0,
+                today_max_price: 2.0,
+                today_avg_price: 2.0,
+                today_median_price: 2.0,
+                tomorrow_min_price: None,
+                tomorrow_max_price: None,
+                tomorrow_avg_price: None,
+                tomorrow_median_price: None,
+            }),
+            health: SystemHealthData {
+                inverter_source: true,
+                price_source: true,
+                last_update: Utc::now(),
+                errors: vec![],
+            },
+            timezone: Some("Europe/Prague".to_owned()),
+            timezone_source: TimezoneSource::HomeAssistant,
+            battery_soc_history: None,
+            battery_soc_prediction: None,
+            pv_generation_history: None,
+            consumption_stats: Some(ConsumptionStats {
+                ema_kwh: None,
+                ema_days: 7,
+                today_import_kwh: None,
+                yesterday_import_kwh: None,
+                hourly_consumption_profile: Some(vec![0.5; 24]),
+            }),
+            hdo_schedule: hdo,
+            pricing_fees: None,
+            solar_forecast: None,
+            battery_cost_basis: None,
+            price_feed: None,
+        }
+    }
+
+    fn i18n() -> Arc<I18n> {
+        Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap())
+    }
+
+    /// Start the real web server on a free local port and return that port
+    async fn start_test_server(backtest_state: Option<BacktestState>) -> u16 {
+        let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (query_sender, _query_channel) = WebQuerySender::new();
+        tokio::spawn(async move {
+            let _ = start_web_server(
+                query_sender,
+                i18n(),
+                port,
+                serde_json::json!({}),
+                None,
+                backtest_state,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return port;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("web server did not start on port {port}");
+    }
+
+    /// Send a raw HTTP/1.1 GET and return the full response text
+    async fn http_get(port: u16, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// JSON body of a raw HTTP response
+    fn json_body(response: &str) -> serde_json::Value {
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+    }
+
+    mod backtest_history {
+        use chrono::{DateTime, Duration, TimeZone, Utc};
+        use fluxion_core::backtest::{
+            BacktestEntities, BacktestSite, HistoryError, HistoryReader, HistoryState,
+        };
+        use fluxion_types::config::{
+            ControlConfig, PriceSchedule, PricingConfig, WinterReserveConfigCore,
+        };
+
+        pub const TZ: chrono_tz::Tz = chrono_tz::Europe::Prague;
+
+        /// Three days after the replayed day
+        pub fn now() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 10, 23, 12, 0, 0).unwrap()
+        }
+
+        pub fn site() -> BacktestSite {
+            BacktestSite {
+                timezone: TZ,
+                entities: BacktestEntities {
+                    soc: "sensor.solax_battery_capacity".to_owned(),
+                    house_load: "sensor.solax_house_load".to_owned(),
+                    pv: vec!["sensor.solax_pv_power_total".to_owned()],
+                    grid_import: "sensor.solax_grid_import".to_owned(),
+                    grid_export: "sensor.solax_grid_export".to_owned(),
+                    spot_price: "sensor.spot_price".to_owned(),
+                    buy_price: None,
+                    hdo: None,
+                },
+                pricing: PricingConfig {
+                    spot_price_entity: "sensor.spot_price".to_owned(),
+                    tomorrow_price_entity: None,
+                    buy_price_entity: None,
+                    use_spot_prices_to_buy: true,
+                    use_spot_prices_to_sell: true,
+                    fixed_buy_price_czk: PriceSchedule::Flat(0.0),
+                    fixed_sell_price_czk: PriceSchedule::Flat(0.0),
+                    spot_buy_fee_czk: 0.4,
+                    spot_sell_fee_czk: 0.3,
+                    hdo_sensor_entity: String::new(),
+                    hdo_low_tariff_czk: 0.5,
+                    hdo_high_tariff_czk: 1.8,
+                },
+                control: ControlConfig::default(),
+                winter_reserve: WinterReserveConfigCore::default(),
+            }
+        }
+
+        /// Mocked HA history: hourly load and price shapes from 11 days before `now()`.
+        #[derive(Debug)]
+        pub struct MockHistory;
+
+        fn series(entity: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<HistoryState> {
+            let first = now() - Duration::days(11);
+            let mut out = Vec::new();
+            let mut t = first;
+            while t <= end {
+                let hour = t
+                    .with_timezone(&TZ)
+                    .format("%H")
+                    .to_string()
+                    .parse::<u32>()
+                    .unwrap();
+                let value = match entity {
+                    "sensor.solax_battery_capacity" => 40.0,
+                    "sensor.solax_house_load" => {
+                        if (17..21).contains(&hour) {
+                            2500.0
+                        } else {
+                            600.0
+                        }
+                    }
+                    "sensor.solax_pv_power_total" => {
+                        if (10..15).contains(&hour) {
+                            800.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    "sensor.solax_grid_import" => {
+                        if (17..21).contains(&hour) {
+                            2500.0
+                        } else {
+                            300.0
+                        }
+                    }
+                    "sensor.solax_grid_export" => 0.0,
+                    "sensor.spot_price" => {
+                        if (17..21).contains(&hour) {
+                            6.0
+                        } else if hour < 5 {
+                            1.0
+                        } else {
+                            3.0
+                        }
+                    }
+                    _ => return Vec::new(),
+                };
+                if t >= start || t + Duration::hours(1) > start {
+                    out.push(HistoryState::from_raw(
+                        t.max(start),
+                        &value.to_string(),
+                        None,
+                    ));
+                }
+                t += Duration::hours(1);
+            }
+            out
+        }
+
+        #[async_trait::async_trait]
+        impl HistoryReader for MockHistory {
+            async fn history(
+                &self,
+                entity_id: &str,
+                start: DateTime<Utc>,
+                end: DateTime<Utc>,
+                _with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                Ok(series(entity_id, start, end))
+            }
+        }
+
+        /// `MockHistory` that counts house-load reads (one per day load) and is slow
+        #[derive(Debug)]
+        pub struct CountingHistory {
+            pub loads: std::sync::atomic::AtomicUsize,
+            /// How long each house-load read takes
+            pub delay: std::time::Duration,
+        }
+
+        impl Default for CountingHistory {
+            fn default() -> Self {
+                Self::with_delay(std::time::Duration::from_millis(200))
+            }
+        }
+
+        impl CountingHistory {
+            pub fn with_delay(delay: std::time::Duration) -> Self {
+                Self {
+                    loads: std::sync::atomic::AtomicUsize::new(0),
+                    delay,
+                }
+            }
+
+            pub fn count(&self) -> usize {
+                self.loads.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl HistoryReader for CountingHistory {
+            async fn history(
+                &self,
+                entity_id: &str,
+                start: DateTime<Utc>,
+                end: DateTime<Utc>,
+                with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                if entity_id == "sensor.solax_house_load" {
+                    self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                }
+                MockHistory
+                    .history(entity_id, start, end, with_attributes)
+                    .await
+            }
+        }
+
+        /// `MockHistory` whose HDO entity lookup (`/api/states`) fails
+        #[derive(Debug)]
+        pub struct HdoLookupFails;
+
+        #[async_trait::async_trait]
+        impl HistoryReader for HdoLookupFails {
+            async fn history(
+                &self,
+                entity_id: &str,
+                start: DateTime<Utc>,
+                end: DateTime<Utc>,
+                with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                MockHistory
+                    .history(entity_id, start, end, with_attributes)
+                    .await
+            }
+
+            async fn resolve_hdo_entity(
+                &self,
+                _configured: &str,
+            ) -> Result<Option<String>, HistoryError> {
+                Err(HistoryError::Status(500))
+            }
+        }
+
+        /// HA refuses every request
+        #[derive(Debug)]
+        pub struct RefusingHistory;
+
+        #[async_trait::async_trait]
+        impl HistoryReader for RefusingHistory {
+            async fn history(
+                &self,
+                _entity_id: &str,
+                _start: DateTime<Utc>,
+                _end: DateTime<Utc>,
+                _with_attributes: bool,
+            ) -> Result<Vec<HistoryState>, HistoryError> {
+                Err(HistoryError::Unauthorized)
+            }
+        }
+    }
+
+    fn backtest_state(reader: Arc<dyn fluxion_core::backtest::HistoryReader>) -> BacktestState {
+        BacktestState::new(reader, Ok(backtest_history::site()), i18n())
+            .with_clock(backtest_history::now)
+    }
+
+    #[tokio::test]
+    async fn backtest_routes_registered_without_state() {
+        let port = start_test_server(None).await;
+        let response = http_get(port, "/api/backtest/days").await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(json_body(&response)["error"].is_string());
+        let page = http_get(port, "/backtest").await;
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn simulator_always_links_backtest() {
+        let port = start_test_server(None).await;
+        let response = http_get(port, "/simulator").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("href=\"/backtest\""));
+    }
+
+    #[tokio::test]
+    async fn backtest_day_returns_three_series_and_totals() {
+        let state = backtest_state(Arc::new(backtest_history::MockHistory));
+        let port = start_test_server(Some(state)).await;
+
+        let days = json_body(&http_get(port, "/api/backtest/days").await);
+        let listed: Vec<&str> = days["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["date"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&"2026-10-20"), "{days}");
+
+        let response = http_get(port, "/api/backtest/day/2026-10-20").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let report = json_body(&response);
+        assert_eq!(report["labels"].as_array().unwrap().len(), 96);
+        for series in ["actual", "self_use", "winter_reserve"] {
+            assert_eq!(
+                report[series]["soc_pct"].as_array().unwrap().len(),
+                96,
+                "{series}"
+            );
+            assert_eq!(report[series]["import_kwh"].as_array().unwrap().len(), 96);
+        }
+        assert_eq!(
+            report["winter_reserve"]["mode"].as_array().unwrap().len(),
+            96
+        );
+        for totals in ["totals_actual", "totals_self_use", "totals_winter_reserve"] {
+            assert!(report[totals]["cost_czk"].is_number(), "{totals}");
+        }
+        assert_eq!(report["data"]["usable_blocks"], 96);
+        assert_eq!(report["data"]["history_days"], 7);
+        assert!((report["fees"]["spot_buy_fee_czk"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!(report["summary"].as_str().unwrap().contains("2026-10-20"));
+        // Recorded import: 300 W (0.075 kWh per block) at spot 1.0 for 00-05 (20 blocks) and 3.0
+        // for 60 blocks, 2500 W (0.625 kWh) at 6.0 for 17-21 (16 blocks); buy = spot + 0.4 trade
+        // fee + 1.8 high tariff (no HDO schedule), no export
+        let actual = report["totals_actual"]["cost_czk"].as_f64().unwrap();
+        let expected = 0.075 * 20.0 * 3.2 + 0.075 * 60.0 * 5.2 + 0.625 * 16.0 * 8.2;
+        assert!((actual - expected).abs() < 0.01, "{actual} vs {expected}");
+
+        // Second request is served from the cache: identical body
+        let again = json_body(&http_get(port, "/api/backtest/day/2026-10-20").await);
+        assert_eq!(again, report);
+    }
+
+    #[tokio::test]
+    async fn backtest_uses_the_live_back_up_floor_and_says_so() {
+        let user_control = Arc::new(RwLock::new(UserControlState {
+            default_mode: fluxion_types::DefaultMode::Backup,
+            backup_min_soc_pct: 45,
+            ..Default::default()
+        }));
+        let state = backtest_state(Arc::new(backtest_history::MockHistory))
+            .with_user_control(Arc::clone(&user_control));
+        let port = start_test_server(Some(state)).await;
+        let min = |series: &serde_json::Value| {
+            series
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(serde_json::Value::as_f64)
+                .fold(f64::MAX, f64::min)
+        };
+
+        let backup = json_body(&http_get(port, "/api/backtest/day/2026-10-20").await);
+        assert_eq!(backup["floor"]["source"], "back_up_default_mode");
+        assert!((backup["floor"]["min_soc_pct"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+        assert!(
+            min(&backup["self_use"]["soc_pct"]) >= 45.0 - 1e-3,
+            "{}",
+            backup["self_use"]["soc_pct"]
+        );
+        assert!(min(&backup["winter_reserve"]["soc_pct"]) >= 45.0 - 1e-3);
+
+        // Switching the dashboard to Self-Use replays with the control minimum (not the cache)
+        user_control.write().default_mode = fluxion_types::DefaultMode::SelfUse;
+        let self_use = json_body(&http_get(port, "/api/backtest/day/2026-10-20").await);
+        assert_eq!(self_use["floor"]["source"], "control_min_battery_soc");
+        assert!(min(&self_use["self_use"]["soc_pct"]) < 45.0);
+    }
+
+    #[tokio::test]
+    async fn backtest_out_of_range_dates_are_clear_400s() {
+        let state = backtest_state(Arc::new(backtest_history::MockHistory));
+        let port = start_test_server(Some(state)).await;
+        for date in ["-262143-01-01", "2019-12-31", "2026-10-25", "+262142-12-31"] {
+            let response = http_get(port, &format!("/api/backtest/day/{date}")).await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{date}: {response}");
+            assert!(json_body(&response)["error"].is_string(), "{date}");
+        }
+        // The server survived (no panic took the handler down)
+        let ok = http_get(port, "/api/backtest/day/2026-10-20").await;
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    }
+
+    #[tokio::test]
+    async fn backtest_loads_one_day_at_a_time_and_reuses_the_result() {
+        let reader = Arc::new(backtest_history::CountingHistory::default());
+        let state =
+            backtest_state(Arc::clone(&reader) as Arc<dyn fluxion_core::backtest::HistoryReader>);
+        let port = start_test_server(Some(state)).await;
+        let (a, b) = tokio::join!(
+            http_get(port, "/api/backtest/day/2026-10-20"),
+            http_get(port, "/api/backtest/day/2026-10-20")
+        );
+        assert!(a.starts_with("HTTP/1.1 200") && b.starts_with("HTTP/1.1 200"));
+        assert_eq!(json_body(&a), json_body(&b));
+        assert_eq!(reader.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2026-10-22: its next day has not ended at now (2026-10-23 12:00), so the horizon is
+        // cut; the result is still cached (briefly, see the TTL test)
+        for _ in 0..2 {
+            let r = http_get(port, "/api/backtest/day/2026-10-22").await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        }
+        assert_eq!(reader.count(), 2);
+    }
+
+    /// State whose clock is `backtest_history::now()` plus the seconds in the returned cell
+    fn backtest_state_with_offset_clock(
+        reader: Arc<dyn fluxion_core::backtest::HistoryReader>,
+    ) -> (BacktestState, Arc<std::sync::atomic::AtomicI64>) {
+        let offset = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let clock_offset = Arc::clone(&offset);
+        let state = BacktestState::new(reader, Ok(backtest_history::site()), i18n()).with_clock(
+            move || {
+                backtest_history::now()
+                    + chrono::Duration::seconds(
+                        clock_offset.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+            },
+        );
+        (state, offset)
+    }
+
+    #[tokio::test]
+    async fn backtest_incomplete_day_is_cached_for_15_minutes_complete_day_stays() {
+        let reader = Arc::new(backtest_history::CountingHistory::with_delay(
+            std::time::Duration::ZERO,
+        ));
+        let (state, offset) = backtest_state_with_offset_clock(
+            Arc::clone(&reader) as Arc<dyn fluxion_core::backtest::HistoryReader>
+        );
+        let port = start_test_server(Some(state)).await;
+        let set = |secs: i64| offset.store(secs, std::sync::atomic::Ordering::SeqCst);
+        let get = |date: &'static str| async move {
+            let r = http_get(port, &format!("/api/backtest/day/{date}")).await;
+            assert!(r.starts_with("HTTP/1.1 200"), "{date}: {r}");
+        };
+
+        // 2026-10-22 is incomplete at now (its next day has not ended); 2026-10-20 is complete
+        get("2026-10-22").await;
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 2);
+        // Within 15 minutes both come from the cache
+        set(14 * 60 + 59);
+        get("2026-10-22").await;
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 2);
+        // After 15 minutes the incomplete day is read again (and cached again), the complete
+        // one is not
+        set(15 * 60);
+        get("2026-10-22").await;
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 3);
+        get("2026-10-22").await;
+        assert_eq!(reader.count(), 3);
+        set(10 * 3600);
+        get("2026-10-20").await;
+        assert_eq!(reader.count(), 3);
+    }
+
+    #[tokio::test]
+    async fn backtest_waiting_for_another_load_is_bounded_with_a_clear_503() {
+        let reader = Arc::new(backtest_history::CountingHistory::with_delay(
+            std::time::Duration::from_millis(1500),
+        ));
+        let state =
+            backtest_state(Arc::clone(&reader) as Arc<dyn fluxion_core::backtest::HistoryReader>)
+                .with_load_wait(std::time::Duration::from_millis(200));
+        let port = start_test_server(Some(state)).await;
+        let first = tokio::spawn(http_get(port, "/api/backtest/day/2026-10-20"));
+        // Let the first request take the permit
+        while reader.count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let waited = std::time::Instant::now();
+        let turned_away = http_get(port, "/api/backtest/day/2026-10-19").await;
+        assert!(waited.elapsed() < std::time::Duration::from_millis(1200));
+        assert!(turned_away.starts_with("HTTP/1.1 503"), "{turned_away}");
+        let message = json_body(&turned_away)["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(message, "another backtest day is loading, try again");
+        for leak in [
+            "/home/",
+            "/data/",
+            "http://",
+            "token",
+            "Bearer",
+            "supervisor",
+        ] {
+            assert!(!turned_away.contains(leak), "{leak} in {turned_away}");
+        }
+        // The first load finishes normally; the turned-away day never loaded
+        let first = first.await.unwrap();
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert_eq!(reader.count(), 1);
+        // Once the permit is free the other day loads
+        let later = http_get(port, "/api/backtest/day/2026-10-19").await;
+        assert!(later.starts_with("HTTP/1.1 200"), "{later}");
+        assert_eq!(reader.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn backtest_failed_hdo_lookup_falls_back_to_high_tariff() {
+        let site = || {
+            let mut site = backtest_history::site();
+            site.entities.hdo = Some("sensor.hdo_schedule".to_owned());
+            site
+        };
+        let state = |reader: Arc<dyn fluxion_core::backtest::HistoryReader>| {
+            BacktestState::new(reader, Ok(site()), i18n()).with_clock(backtest_history::now)
+        };
+        let port = start_test_server(Some(state(Arc::new(backtest_history::HdoLookupFails)))).await;
+        let response = http_get(port, "/api/backtest/day/2026-10-20").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let report = json_body(&response);
+        assert_eq!(report["data"]["hdo_source"], "lookup failed (high tariff)");
+        assert_eq!(report["data"]["missing_per_field"]["hdo"], 96);
+        assert!(
+            report["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("could not be looked up")),
+            "{}",
+            report["notes"]
+        );
+        // Priced like the day whose HDO sensor recorded no schedule (spot + 0.4 trade fee + 1.8
+        // high tariff)
+        let reference = json_body(
+            &http_get(
+                start_test_server(Some(state(Arc::new(backtest_history::MockHistory)))).await,
+                "/api/backtest/day/2026-10-20",
+            )
+            .await,
+        );
+        assert_eq!(reference["data"]["hdo_source"], "none (high tariff)");
+        assert_eq!(report["buy_czk"], reference["buy_czk"]);
+        assert_eq!(
+            report["totals_actual"]["cost_czk"],
+            reference["totals_actual"]["cost_czk"]
+        );
+    }
+
+    #[tokio::test]
+    async fn backtest_ha_error_is_clear_json_without_paths_or_tokens() {
+        let state = backtest_state(Arc::new(backtest_history::RefusingHistory));
+        let port = start_test_server(Some(state)).await;
+        for path in ["/api/backtest/day/2026-10-20", "/api/backtest/days"] {
+            let response = http_get(port, path).await;
+            assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+            let body = json_body(&response);
+            let message = body["error"].as_str().unwrap();
+            assert!(message.contains("Home Assistant"), "{message}");
+            for leak in [
+                "/home/",
+                "/data/",
+                "http://",
+                "token",
+                "Bearer",
+                "supervisor",
+            ] {
+                assert!(!response.contains(leak), "{leak} in {response}");
+            }
+        }
+        // A bad date and an unfinished day are clear 400s
+        let bad = http_get(port, "/api/backtest/day/20-10-2026").await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let today = http_get(port, "/api/backtest/day/2026-10-23").await;
+        assert!(today.starts_with("HTTP/1.1 400"), "{today}");
+    }
+
+    #[test]
+    fn chart_json_carries_the_battery_cost_of_charge() {
+        let blocks = vec![block("2026-10-16T10:00:00Z", None)];
+        let mut resp = response(blocks, None);
+        let none = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert!(none.get("battery_cost_basis").is_none());
+        resp.battery_cost_basis = Some(fluxion_core::web_bridge::BatteryCostBasisInfo {
+            usable_kwh: 4.25,
+            cost_czk_per_kwh: Some(1.854),
+            solar_pct: Some(60.0),
+            grid_pct: Some(40.0),
+            updated_at: None,
+        });
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        let basis = &json["battery_cost_basis"];
+        assert!((basis["usable_kwh"].as_f64().unwrap() - 4.25).abs() < 1e-6);
+        assert!((basis["cost_czk_per_kwh"].as_f64().unwrap() - 1.854).abs() < 1e-6);
+        let info = resp.battery_cost_basis.unwrap();
+        assert_eq!(info.usable_text(), "4.2");
+        assert_eq!(info.cost_text().as_deref(), Some("1.85"));
+        assert_eq!(info.shares_text(), Some(("60".into(), "40".into())));
+    }
+
+    #[test]
+    fn missing_prices_show_a_banner_and_fallback_blocks_are_marked() {
+        let mut fallback = block("2026-10-17T10:00:00Z", None);
+        fallback.price_source = Some("ote_fallback".to_owned());
+        let blocks = vec![block("2026-10-16T10:00:00Z", None), fallback];
+        let mut resp = response(blocks, None);
+
+        // All well: no banner, no status in the JSON
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert!(json.get("price_feed").is_none());
+        let html =
+            DashboardTemplate::from_query_response(resp.clone(), i18n(), String::new(), None)
+                .render()
+                .unwrap();
+        assert!(!html.contains("price-feed-banner"));
+
+        let banner = "Tomorrow's prices missing from sensor.current_spot_electricity_price_15min since 13:45 — using OTE fallback";
+        resp.price_feed = Some(fluxion_core::price_feed::PriceFeedStatus {
+            entity: "sensor.current_spot_electricity_price_15min".to_owned(),
+            check_time: "13:45".to_owned(),
+            tomorrow_missing: true,
+            fallback: fluxion_core::price_feed::FallbackState::Active,
+            fallback_slots: 96,
+            banner: Some(banner.to_owned()),
+            ..Default::default()
+        });
+
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+        assert_eq!(
+            json["price_sources"],
+            serde_json::json!([null, "ote_fallback"])
+        );
+        assert_eq!(json["price_feed"]["fallback"], "active");
+        assert_eq!(json["price_feed"]["tomorrow_missing"], true);
+        assert_eq!(json["price_feed"]["banner"], banner);
+
+        let export = create_compact_export(&resp);
+        assert_eq!(export["prices"]["blocks"][1]["src"], "ote_fallback");
+        assert_eq!(export["price_feed"]["fallback_slots"], 96);
+
+        let html = DashboardTemplate::from_query_response(resp, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("price-feed-banner"));
+        assert!(html.contains("Tomorrow&#x27;s prices missing from sensor.current_spot_electricity_price_15min since 13:45 — using OTE fallback")
+            || html.contains(banner), "banner text on the page");
+    }
+
+    #[test]
+    fn chart_json_carries_solar_forecast_series() {
+        let blocks = vec![
+            block("2026-10-16T10:00:00Z", None),
+            block("2026-10-16T10:15:00Z", Some(3.2)),
+            block("2026-10-16T10:30:00Z", Some(0.0)),
+        ];
+        let chart = build_chart_data_json(&response(blocks, None), i18n()).unwrap();
+        let json = serde_json::to_value(&chart).unwrap();
+
+        let forecast: Vec<Option<f64>> =
+            serde_json::from_value(json["solar_forecast_kw"].clone()).unwrap();
+        assert_eq!(forecast.len(), 3);
+        assert_eq!(forecast[0], None);
+        assert!((forecast[1].unwrap() - 3.2).abs() < 1e-6);
+        assert_eq!(forecast[2], Some(0.0));
+        // Aligned with the labels and UTC block starts
+        assert_eq!(json["labels"].as_array().unwrap().len(), 3);
+        assert_eq!(json["block_starts_utc"][1], "2026-10-16T10:15:00Z");
+        assert_eq!(json["pv_actual_kw"], serde_json::json!([null, null, null]));
+        assert_eq!(
+            json["hourly_consumption_profile"].as_array().unwrap().len(),
+            24
+        );
+        // No HDO schedule: tariff types are a default, not a known tariff
+        assert_eq!(json["tariff_known"], false);
+    }
+
+    /// H34: the chart carries the corrected and the raw forecast, and the factor with its days
+    #[test]
+    fn chart_json_carries_raw_and_corrected_forecast_with_factor() {
+        let mut corrected = block("2026-10-16T10:15:00Z", Some(3.51));
+        corrected.solar_forecast_raw_kw = Some(3.0);
+        let blocks = vec![block("2026-10-16T10:00:00Z", None), corrected];
+        let mut response = response(blocks, None);
+        let correction = fluxion_core::pv_correction::CorrectionResult {
+            factor: 1.17,
+            days_used: 7,
+            measured_kwh: 812.3,
+            forecast_kwh: 694.3,
+        };
+        response.solar_forecast = Some(fluxion_core::web_bridge::SolarForecastInfo {
+            total_today_kwh: 40.0,
+            remaining_today_kwh: 20.0,
+            tomorrow_kwh: 50.0,
+            actual_today_kwh: None,
+            accuracy_percent: None,
+            available: true,
+            correction: Some(correction),
+        });
+        let chart = build_chart_data_json(&response, i18n()).unwrap();
+        let json = serde_json::to_value(&chart).unwrap();
+        assert_eq!(
+            json["solar_forecast_raw_kw"],
+            serde_json::json!([null, 3.0])
+        );
+        let corrected: Vec<Option<f64>> =
+            serde_json::from_value(json["solar_forecast_kw"].clone()).unwrap();
+        assert!((corrected[1].unwrap() - 3.51).abs() < 1e-6);
+        assert!((json["pv_forecast_correction"]["factor"].as_f64().unwrap() - 1.17).abs() < 1e-6);
+        assert_eq!(json["pv_forecast_correction"]["days_used"], 7);
+
+        // The dashboard shows the factor and the days in the solar card, and the raw series
+        let html = DashboardTemplate::from_query_response(response, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("Forecast Correction"));
+        assert!(html.contains("×1.17"));
+        // The raw total, then the corrected one the planner uses (40 × 1.17)
+        assert!(html.contains("→ 46.8 kWh"), "corrected total");
+        assert!(html.contains("(7 days)"));
+        assert!(html.contains("Solar Forecast raw (kW)"));
+        assert!(html.contains(r#"id="solarForecastCorrection""#));
+
+        // Fewer than 3 valid days: "no correction yet", no factor, no corrected total
+        let mut early =
+            super::tests::response(vec![block("2026-10-16T10:00:00Z", Some(1.0))], None);
+        early.solar_forecast = Some(fluxion_core::web_bridge::SolarForecastInfo {
+            total_today_kwh: 40.0,
+            remaining_today_kwh: 20.0,
+            tomorrow_kwh: 50.0,
+            actual_today_kwh: None,
+            accuracy_percent: None,
+            available: true,
+            correction: Some(fluxion_core::pv_correction::CorrectionResult {
+                days_used: 2,
+                ..fluxion_core::pv_correction::CorrectionResult::neutral()
+            }),
+        });
+        let html = DashboardTemplate::from_query_response(early, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("no correction yet (2 days)"), "card");
+        assert!(!html.contains("×1.00"));
+        assert!(!html.contains("→ 40.0 kWh"));
+
+        // Without a correction no raw series and no factor are sent
+        let plain = build_chart_data_json(
+            &super::tests::response(vec![block("2026-10-16T10:00:00Z", Some(1.0))], None),
+            i18n(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("pv_forecast_correction").is_none());
+        assert_eq!(json["solar_forecast_raw_kw"], serde_json::json!([null]));
+    }
+
+    #[test]
+    fn dashboard_renders_chart_series_helper_and_toggles() {
+        let blocks = vec![block("2026-10-16T10:00:00Z", Some(1.0))];
+        let html = DashboardTemplate::from_query_response(
+            response(blocks, None),
+            i18n(),
+            String::new(),
+            None,
+        )
+        .render()
+        .unwrap();
+        assert!(html.contains("window.FluxionChartSeries"));
+        assert!(html.contains(r#"id="toggleSolarForecast""#));
+        assert!(html.contains(r#"id="toggleConsumptionProfile""#));
+        assert!(html.contains(r#""solar_forecast_kw":[1.0]"#));
+    }
+
+    #[test]
+    fn chart_json_marks_tariff_known_with_zero_fees() {
+        let hdo = HdoScheduleInfo {
+            low_tariff_periods: vec![("00:00".to_owned(), "12:00".to_owned())],
+            low_tariff_czk: 0.0,
+            high_tariff_czk: 0.0,
+            last_updated: None,
+        };
+        // 10:00Z = 12:00 Prague (high), 09:45Z = 11:45 Prague (low)
+        let blocks = vec![
+            block("2026-10-16T09:45:00Z", None),
+            block("2026-10-16T10:00:00Z", None),
+        ];
+        let chart = build_chart_data_json(&response(blocks, Some(hdo)), i18n()).unwrap();
+        let json = serde_json::to_value(&chart).unwrap();
+
+        assert_eq!(json["tariff_known"], true);
+        assert_eq!(json["tariff_types"], serde_json::json!(["low", "high"]));
+        assert_eq!(json["grid_fees"], serde_json::json!([0.0, 0.0]));
     }
 }

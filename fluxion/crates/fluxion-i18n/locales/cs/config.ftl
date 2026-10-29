@@ -110,7 +110,7 @@ config-control-min-consecutive-blocks = Min. po sobě jdoucí bloky
 config-control-min-consecutive-blocks-help = Minimální počet po sobě jdoucích 15minutových bloků pro nucené operace (zabraňuje nadměrnému zápisu do EEPROM)
 
 config-control-default-battery-mode = Výchozí režim baterie
-config-control-default-battery-mode-help = Režim baterie když není nucené nabíjení/vybíjení (SelfUse nebo BackUpMode)
+config-control-default-battery-mode-help = Režim baterie když není nucené nabíjení/vybíjení (SelfUse, BackUpMode nebo NoChargeNoDischarge)
 
 config-control-average-load = Průměrná spotřeba domácnosti
 config-control-average-load-help = Průměrná spotřeba v kW (použito pro predikce SOC)

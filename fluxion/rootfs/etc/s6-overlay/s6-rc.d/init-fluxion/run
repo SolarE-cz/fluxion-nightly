@@ -1,0 +1,23 @@
+#!/command/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Home Assistant Add-on: FluxION ECS
+# Initialization script, runs before the main service
+# ==============================================================================
+
+bashio::log.info "Initializing FluxION ECS..."
+
+# Validate configuration
+if ! bashio::config.has_value 'inverters'; then
+    bashio::log.fatal "No inverters configured! Please configure at least one inverter."
+    bashio::exit.nok
+fi
+
+# Export configuration as environment variables
+export DEBUG_MODE=$(bashio::config 'debug_mode')
+export LOG_LEVEL=$(bashio::config 'log_level')
+export SUPERVISOR_TOKEN="${SUPERVISOR_TOKEN}"
+
+bashio::log.info "Configuration validated successfully"
+bashio::log.info "Debug mode: ${DEBUG_MODE}"
+bashio::log.info "Log level: ${LOG_LEVEL}"

@@ -27,8 +27,9 @@
 //! The effective price for grid import is: `spot_price + grid_fee`
 //! where grid_fee depends on whether the current time is in HDO low or high tariff.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
-use std::collections::HashMap;
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono_tz::Tz;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 
 // ============================================================================
@@ -49,12 +50,28 @@ pub struct HdoDaySchedule {
     pub low_tariff_ranges: Vec<HdoTimeRange>,
 }
 
+/// Absolute interval `[start, end)` in UTC
+type UtcInterval = (DateTime<Utc>, DateTime<Utc>);
+
+/// One cached day: its local-day span and its low-tariff windows, all in UTC
+#[derive(Debug, Clone)]
+struct HdoDayIntervals {
+    day: UtcInterval,
+    low: Vec<UtcInterval>,
+}
+
 /// Cache for HDO schedules with TTL
+///
+/// HDO windows are local time. They are converted to UTC intervals once, when
+/// the schedules are loaded (or the timezone changes), so queries compare UTC only.
 #[derive(Debug)]
 pub struct HdoCache {
     schedules: RwLock<HashMap<NaiveDate, HdoDaySchedule>>,
+    days: RwLock<HashMap<NaiveDate, HdoDayIntervals>>,
     last_refresh: RwLock<Option<DateTime<Utc>>>,
     ttl_secs: u64,
+    /// Local timezone of the HDO windows (CEZ publishes local time)
+    timezone: RwLock<Tz>,
 }
 
 impl HdoCache {
@@ -62,9 +79,37 @@ impl HdoCache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             schedules: RwLock::new(HashMap::new()),
+            days: RwLock::new(HashMap::new()),
             last_refresh: RwLock::new(None),
             ttl_secs,
+            timezone: RwLock::new(chrono_tz::Europe::Prague),
         }
+    }
+
+    /// Local timezone of the HDO windows (the site timezone)
+    pub fn timezone(&self) -> Tz {
+        *self.timezone.read().unwrap()
+    }
+
+    /// Set the local timezone of the HDO windows and convert the cached schedules again
+    pub fn set_timezone(&self, tz: Tz) {
+        *self.timezone.write().unwrap() = tz;
+        self.rebuild();
+    }
+
+    /// Recompute the UTC intervals of every cached schedule
+    fn rebuild(&self) {
+        let tz = *self.timezone.read().unwrap();
+        let days = {
+            let schedules = self.schedules.read().unwrap();
+            schedules
+                .values()
+                .filter_map(|schedule| {
+                    day_intervals(tz, schedule).map(|intervals| (schedule.date, intervals))
+                })
+                .collect()
+        };
+        *self.days.write().unwrap() = days;
     }
 
     /// Check if cache needs refresh based on TTL
@@ -81,33 +126,73 @@ impl HdoCache {
 
     /// Update cache with new HDO schedules
     pub fn update(&self, schedules: Vec<HdoDaySchedule>) {
-        let mut cache = self.schedules.write().unwrap();
-        cache.clear();
-        for schedule in schedules {
-            cache.insert(schedule.date, schedule);
+        {
+            let mut cache = self.schedules.write().unwrap();
+            cache.clear();
+            for schedule in schedules {
+                cache.insert(schedule.date, schedule);
+            }
         }
+        self.rebuild();
         *self.last_refresh.write().unwrap() = Some(Utc::now());
     }
 
     /// Check if a given time is in low tariff period
     /// Returns None if no data available for that date (caller should default to high tariff)
     pub fn is_low_tariff(&self, dt: DateTime<Utc>) -> Option<bool> {
-        let date = dt.date_naive();
-        let time = dt.time();
-
-        let cache = self.schedules.read().unwrap();
-        let schedule = cache.get(&date)?;
-
-        Some(schedule.low_tariff_ranges.iter().any(|range| {
-            if range.start <= range.end {
-                // Normal range: e.g., 06:00-12:00
-                time >= range.start && time < range.end
-            } else {
-                // Overnight range: e.g., 22:00-06:00 (spans midnight)
-                time >= range.start || time < range.end
-            }
-        }))
+        let days = self.days.read().unwrap();
+        // Unknown unless dt falls inside a day the cache has data for
+        let day = days
+            .values()
+            .find(|day| day.day.0 <= dt && dt < day.day.1)?;
+        Some(day.low.iter().any(|(start, end)| *start <= dt && dt < *end))
     }
+}
+
+/// Convert a local wall-clock time to UTC.
+/// Ambiguous times (fall-back) take the earlier instant. Times skipped by a
+/// spring-forward gap use the offset in force before the gap.
+fn local_to_utc(tz: Tz, local: NaiveDateTime) -> DateTime<Utc> {
+    match tz.from_local_datetime(&local).earliest() {
+        Some(t) => t.with_timezone(&Utc),
+        None => tz
+            .from_local_datetime(&(local - Duration::hours(1)))
+            .earliest()
+            .map(|t| t.with_timezone(&Utc) + Duration::hours(1))
+            .unwrap_or_else(|| Utc.from_utc_datetime(&local)),
+    }
+}
+
+/// Convert one local schedule day into UTC intervals.
+/// A range with end 24:00 (stored as 23:59:59) runs to the next local midnight.
+/// A range whose start is after its end wraps midnight and is kept day-keyed
+/// (`[00:00, end)` and `[start, 24:00)` on the same date).
+fn day_intervals(tz: Tz, schedule: &HdoDaySchedule) -> Option<HdoDayIntervals> {
+    let date = schedule.date;
+    let next = date.succ_opt()?;
+    let midnight = |d: NaiveDate| local_to_utc(tz, d.and_time(NaiveTime::MIN));
+    let end_of_day = NaiveTime::from_hms_opt(23, 59, 59)?;
+
+    let mut low = Vec::new();
+    for range in &schedule.low_tariff_ranges {
+        let start = date.and_time(range.start);
+        let end = if range.end == end_of_day {
+            next.and_time(NaiveTime::MIN)
+        } else {
+            date.and_time(range.end)
+        };
+        if start < end {
+            low.push((local_to_utc(tz, start), local_to_utc(tz, end)));
+        } else if start > end {
+            low.push((midnight(date), local_to_utc(tz, end)));
+            low.push((local_to_utc(tz, start), midnight(next)));
+        }
+    }
+
+    Some(HdoDayIntervals {
+        day: (midnight(date), midnight(next)),
+        low,
+    })
 }
 
 impl Default for HdoCache {
@@ -184,6 +269,77 @@ fn parse_time(s: &str) -> Option<NaiveTime> {
     NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
+/// Parse the CEZ HDO schedule sensor's `attributes.schedule[]` entries
+/// (`{"start": "2026-10-14T17:00:00+02:00", "end": "2026-10-15T00:00:00+02:00", "tariff": "NT", "value": 1}`).
+///
+/// Times are taken as written (the local wall-clock of the entry's own offset).
+/// NT entries (or `value == 1`) become low tariff ranges, grouped by local start date and merged.
+/// An end on a later day runs to end of day, stored as 23:59:59 like `casy` "17:00-24:00".
+pub fn parse_hdo_schedule_attribute(entries: &[serde_json::Value]) -> Vec<HdoDaySchedule> {
+    let Some(end_of_day) = NaiveTime::from_hms_opt(23, 59, 59) else {
+        return Vec::new();
+    };
+
+    let mut by_day: BTreeMap<NaiveDate, Vec<HdoTimeRange>> = BTreeMap::new();
+    for entry in entries {
+        let is_low = entry.get("tariff").and_then(|t| t.as_str()) == Some("NT")
+            || entry.get("value").and_then(|v| v.as_i64()) == Some(1);
+        if !is_low {
+            continue;
+        }
+
+        let parse_rfc3339 = |key: &str| {
+            entry
+                .get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        };
+        let (Some(start), Some(end)) = (parse_rfc3339("start"), parse_rfc3339("end")) else {
+            continue;
+        };
+
+        let date = start.date_naive();
+        let end_time = if end.date_naive() > date {
+            end_of_day
+        } else {
+            end.time()
+        };
+        if end_time <= start.time() {
+            continue;
+        }
+
+        by_day.entry(date).or_default().push(HdoTimeRange {
+            start: start.time(),
+            end: end_time,
+        });
+    }
+
+    by_day
+        .into_iter()
+        .map(|(date, ranges)| HdoDaySchedule {
+            date,
+            low_tariff_ranges: merge_time_ranges(ranges),
+        })
+        .collect()
+}
+
+/// Sort time ranges and merge overlapping or adjacent ones
+fn merge_time_ranges(mut ranges: Vec<HdoTimeRange>) -> Vec<HdoTimeRange> {
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<HdoTimeRange> = Vec::new();
+    for range in ranges {
+        match merged.last_mut() {
+            Some(last) if range.start <= last.end => {
+                if range.end > last.end {
+                    last.end = range.end;
+                }
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
 /// Parse HDO sensor data from raw JSON format
 ///
 /// Supports multiple formats:
@@ -204,6 +360,19 @@ pub fn parse_hdo_sensor_data(raw_data: &str) -> Vec<HdoDaySchedule> {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw_data) else {
         return schedules;
     };
+
+    // Preferred: the schedule sensor's attributes.schedule[] (RFC 3339 local times).
+    // Falls through to the signals paths below when it yields no low tariff ranges.
+    if let Some(entries) = json
+        .get("attributes")
+        .and_then(|a| a.get("schedule"))
+        .and_then(|s| s.as_array())
+    {
+        schedules = parse_hdo_schedule_attribute(entries);
+        if !schedules.is_empty() {
+            return schedules;
+        }
+    }
 
     // Try multiple paths to find the signals array:
     // 1. attributes.raw_json.data.data.signals (new cez_hdo_raw_data sensor)
@@ -306,6 +475,14 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// Prague local wall-clock time (HDO windows are local) as a UTC instant
+    fn prague(day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        chrono_tz::Europe::Prague
+            .with_ymd_and_hms(2026, 1, day, hour, minute, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
     #[test]
     fn test_parse_czech_date() {
         assert_eq!(
@@ -363,21 +540,79 @@ mod tests {
         };
         cache.update(vec![schedule]);
 
-        // Test within first low tariff range
-        let dt1 = Utc.with_ymd_and_hms(2026, 1, 14, 3, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt1), Some(true));
+        // Test within first low tariff range (03:00 local)
+        assert_eq!(cache.is_low_tariff(prague(14, 3, 0)), Some(true));
 
-        // Test within second low tariff range
-        let dt2 = Utc.with_ymd_and_hms(2026, 1, 14, 12, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt2), Some(true));
+        // Test within second low tariff range (12:00 local)
+        assert_eq!(cache.is_low_tariff(prague(14, 12, 0)), Some(true));
 
-        // Test outside low tariff ranges (high tariff)
-        let dt3 = Utc.with_ymd_and_hms(2026, 1, 14, 8, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt3), Some(false));
+        // Test outside low tariff ranges (high tariff, 08:00 local)
+        assert_eq!(cache.is_low_tariff(prague(14, 8, 0)), Some(false));
 
         // Test date not in cache
-        let dt4 = Utc.with_ymd_and_hms(2026, 1, 15, 3, 0, 0).unwrap();
-        assert_eq!(cache.is_low_tariff(dt4), None);
+        assert_eq!(cache.is_low_tariff(prague(15, 3, 0)), None);
+    }
+
+    #[test]
+    fn test_hdo_cache_matches_local_time_not_utc() {
+        let cache = HdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
+            low_tariff_ranges: parse_time_ranges("22:00-24:00"),
+        }]);
+
+        // 21:30 UTC is 22:30 Prague (UTC+1 in winter): inside the low window
+        let dt = Utc.with_ymd_and_hms(2026, 1, 14, 21, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(true));
+
+        // 20:30 UTC is 21:30 Prague: outside the low window
+        let dt = Utc.with_ymd_and_hms(2026, 1, 14, 20, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(false));
+    }
+
+    #[test]
+    fn test_hdo_cache_timezone_is_configurable() {
+        let cache = HdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
+            low_tariff_ranges: parse_time_ranges("22:00-24:00"),
+        }]);
+
+        // Matched in UTC, 21:30 is outside the 22:00-24:00 window
+        cache.set_timezone(chrono_tz::UTC);
+        let dt = Utc.with_ymd_and_hms(2026, 1, 14, 21, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(false));
+    }
+
+    #[test]
+    fn test_hdo_cache_dst_day_window_is_two_utc_hours() {
+        // 2026-03-29: Prague clocks jump 02:00 -> 03:00 (CET -> CEST) at 01:00 UTC.
+        // Window 01:00-04:00 local is 00:00-02:00 UTC, i.e. two hours, not three.
+        let cache = HdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 3, 29).unwrap(),
+            low_tariff_ranges: parse_time_ranges("01:00-04:00"),
+        }]);
+
+        // 23:30 UTC on 28th is 00:30 local: before the window
+        let dt = Utc.with_ymd_and_hms(2026, 3, 28, 23, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(false));
+
+        // 00:30 UTC is 01:30 CET: inside
+        let dt = Utc.with_ymd_and_hms(2026, 3, 29, 0, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(true));
+
+        // 01:30 UTC is 03:30 CEST: still inside
+        let dt = Utc.with_ymd_and_hms(2026, 3, 29, 1, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(true));
+
+        // 02:00 UTC is 04:00 CEST: window end is exclusive
+        let dt = Utc.with_ymd_and_hms(2026, 3, 29, 2, 0, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), Some(false));
+
+        // Day not in cache
+        let dt = Utc.with_ymd_and_hms(2026, 3, 30, 0, 30, 0).unwrap();
+        assert_eq!(cache.is_low_tariff(dt), None);
     }
 
     #[test]
@@ -497,6 +732,55 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hdo_schedule_attribute_matches_casy() {
+        // attributes.schedule[] of sensor.cez_hdo_schedule_*; NT entries are the low tariff
+        let schedule_json = r#"{
+            "state": "2026-10-14T00:00:00+02:00",
+            "attributes": {
+                "signal": "EVV1",
+                "days": 7,
+                "schedule": [
+                    {"start": "2026-10-14T00:00:00+02:00", "end": "2026-10-14T06:00:00+02:00", "tariff": "NT", "value": 1},
+                    {"start": "2026-10-14T06:00:00+02:00", "end": "2026-10-14T07:00:00+02:00", "tariff": "VT", "value": 0},
+                    {"start": "2026-10-14T07:00:00+02:00", "end": "2026-10-14T09:00:00+02:00", "tariff": "NT", "value": 1},
+                    {"start": "2026-10-14T09:00:00+02:00", "end": "2026-10-14T17:00:00+02:00", "tariff": "VT", "value": 0},
+                    {"start": "2026-10-14T17:00:00+02:00", "end": "2026-10-15T00:00:00+02:00", "tariff": "NT", "value": 1},
+                    {"start": "2026-10-15T00:00:00+02:00", "end": "2026-10-15T06:00:00+02:00", "tariff": "NT", "value": 1}
+                ]
+            }
+        }"#;
+        let casy_json = r#"{
+            "data": {"signals": [
+                {"signal": "EVV1", "datum": "14.10.2026", "casy": "00:00-06:00;   07:00-09:00;   17:00-24:00"},
+                {"signal": "EVV1", "datum": "15.10.2026", "casy": "00:00-06:00"}
+            ]}
+        }"#;
+
+        let from_schedule = parse_hdo_sensor_data(schedule_json);
+        let from_casy = parse_hdo_sensor_data(casy_json);
+        assert_eq!(from_schedule.len(), 2);
+        assert_eq!(from_schedule.len(), from_casy.len());
+        for (a, b) in from_schedule.iter().zip(from_casy.iter()) {
+            assert_eq!(a.date, b.date);
+            let a_ranges: Vec<_> = a
+                .low_tariff_ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect();
+            let b_ranges: Vec<_> = b
+                .low_tariff_ranges
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect();
+            assert_eq!(a_ranges, b_ranges);
+        }
+        // 17:00 -> next-day 00:00 is stored as 17:00-23:59:59 on the start date
+        let last = from_schedule[0].low_tariff_ranges.last().unwrap();
+        assert_eq!(last.start, NaiveTime::from_hms_opt(17, 0, 0).unwrap());
+        assert_eq!(last.end, NaiveTime::from_hms_opt(23, 59, 59).unwrap());
+    }
+
+    #[test]
     fn test_calculate_effective_price() {
         let cache = HdoCache::new(3600);
 
@@ -513,20 +797,20 @@ mod tests {
         let high_tariff = 1.80;
         let spot_price = 2.0;
 
-        // During low tariff (3:00)
-        let dt_low = Utc.with_ymd_and_hms(2026, 1, 14, 3, 0, 0).unwrap();
+        // During low tariff (03:00 local)
+        let dt_low = prague(14, 3, 0);
         let eff_low =
             calculate_effective_price(spot_price, dt_low, &cache, low_tariff, high_tariff);
         assert!((eff_low - 2.50).abs() < 0.001); // 2.0 + 0.50
 
-        // During high tariff (8:00)
-        let dt_high = Utc.with_ymd_and_hms(2026, 1, 14, 8, 0, 0).unwrap();
+        // During high tariff (08:00 local)
+        let dt_high = prague(14, 8, 0);
         let eff_high =
             calculate_effective_price(spot_price, dt_high, &cache, low_tariff, high_tariff);
         assert!((eff_high - 3.80).abs() < 0.001); // 2.0 + 1.80
 
         // Unknown date (defaults to high)
-        let dt_unknown = Utc.with_ymd_and_hms(2026, 1, 15, 3, 0, 0).unwrap();
+        let dt_unknown = prague(15, 3, 0);
         let eff_unknown =
             calculate_effective_price(spot_price, dt_unknown, &cache, low_tariff, high_tariff);
         assert!((eff_unknown - 3.80).abs() < 0.001); // 2.0 + 1.80 (defaults to high)

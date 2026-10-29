@@ -50,6 +50,22 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
         });
     }
 
+    // Display timezone: optional IANA name, empty means not set
+    if let Some(tz) = config
+        .system_config
+        .display_timezone
+        .as_deref()
+        .map(str::trim)
+        .filter(|tz| !tz.is_empty())
+        && tz.parse::<chrono_tz::Tz>().is_err()
+    {
+        errors.push(ValidationIssue {
+            field: "system.display_timezone".to_owned(),
+            message: format!("Unknown timezone '{tz}', use an IANA name such as Europe/Prague"),
+            severity: "error".to_owned(),
+        });
+    }
+
     // ============= Control Settings =============
     let control = &config.control_config;
 
@@ -149,6 +165,42 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
         });
     }
 
+    if !control.export_curtail_at_or_below_czk.is_finite() {
+        errors.push(ValidationIssue {
+            field: "control.export_curtail_at_or_below_czk".to_owned(),
+            message: "Export curtailment price must be a number".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
+    if !(1.0..=1.5).contains(&control.planner_load_margin) {
+        errors.push(ValidationIssue {
+            field: "control.planner_load_margin".to_owned(),
+            message: "Planner load margin must be between 1.0 and 1.5".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
+    if control.force_discharge_enabled {
+        warnings.push(ValidationIssue {
+            field: "control.force_discharge_enabled".to_owned(),
+            message: "Battery force discharge is enabled and is not yet capped to the export limit"
+                .to_owned(),
+            severity: "warning".to_owned(),
+        });
+    }
+
+    // Export limits are unsigned watts (a negative value cannot be deserialised); the curtail
+    // target must not exceed the export maximum
+    if control.export_limit_min_w > control.maximum_export_power_w {
+        errors.push(ValidationIssue {
+            field: "control.export_limit_min_w".to_owned(),
+            message: "Export limit while curtailed must not exceed maximum_export_power_w"
+                .to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
     // ============= Pricing Settings =============
     let pricing = &config.pricing_config;
 
@@ -201,6 +253,43 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
         });
     }
 
+    // Winter Reserve
+    let wr = &strategies.winter_reserve;
+    if !(wr.cheap_percentile > 0.0 && wr.cheap_percentile <= 0.5) {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cheap_percentile".to_owned(),
+            message: "Cheap percentile must be in (0, 0.5]".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+    for (field, value) in [
+        ("insane_price_multiplier", wr.insane_price_multiplier),
+        ("load_safety_factor", wr.load_safety_factor),
+        ("pv_confidence", wr.pv_confidence),
+    ] {
+        if value <= 0.0 {
+            errors.push(ValidationIssue {
+                field: format!("strategies.winter_reserve.{field}"),
+                message: "Must be greater than 0".to_owned(),
+                severity: "error".to_owned(),
+            });
+        }
+    }
+    if !(0.1..=5.0).contains(&wr.soc_resolution_pct) {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.soc_resolution_pct".to_owned(),
+            message: "SOC resolution must be between 0.1 and 5 percent".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+    if wr.min_arbitrage_profit_czk < 0.0 {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.min_arbitrage_profit_czk".to_owned(),
+            message: "Minimum arbitrage profit must not be negative".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+
     (errors, warnings)
 }
 
@@ -211,6 +300,7 @@ mod tests {
         ConsumptionHistoryConfig, ControlConfig, PricingConfig, StrategiesConfigCore, SystemConfig,
         SystemSettingsConfig,
     };
+    use fluxion_types::config::{NotificationsConfigCore, RemoteAccessConfigCore};
 
     fn default_config() -> SystemConfig {
         SystemConfig {
@@ -218,6 +308,7 @@ mod tests {
             pricing_config: PricingConfig {
                 spot_price_entity: "sensor.spot_price".to_owned(),
                 tomorrow_price_entity: None,
+                buy_price_entity: None,
                 use_spot_prices_to_buy: true,
                 use_spot_prices_to_sell: true,
                 fixed_buy_price_czk: fluxion_core::resources::PriceSchedule::Flat(5.0),
@@ -235,11 +326,27 @@ mod tests {
                 display_currency: fluxion_core::resources::Currency::CZK,
                 language: fluxion_i18n::Language::English,
                 timezone: None,
+                display_timezone: None,
             },
             strategies_config: StrategiesConfigCore::default(),
             history: ConsumptionHistoryConfig::default(),
             solar_forecast: fluxion_core::resources::SolarForecastConfigCore::default(),
+            remote_access: RemoteAccessConfigCore::default(),
+            notifications: NotificationsConfigCore::default(),
         }
+    }
+
+    #[test]
+    fn force_discharge_enabled_is_a_warning_and_does_not_block_saving() {
+        let mut config = default_config();
+        config.control_config.force_discharge_enabled = true;
+        let (errors, warnings) = validate_config(&config);
+        assert!(errors.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.field == "control.force_discharge_enabled")
+        );
     }
 
     #[test]
@@ -248,6 +355,38 @@ mod tests {
         let (errors, warnings) = validate_config(&config);
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_display_timezone_validation() {
+        let mut config = default_config();
+
+        config.system_config.display_timezone = Some("Mars/Olympus".to_owned());
+        let (errors, _) = validate_config(&config);
+        assert!(errors.iter().any(|e| e.field == "system.display_timezone"));
+
+        config.system_config.display_timezone = Some("Europe/Prague".to_owned());
+        let (errors, _) = validate_config(&config);
+        assert!(!errors.iter().any(|e| e.field == "system.display_timezone"));
+
+        config.system_config.display_timezone = Some(String::new());
+        let (errors, _) = validate_config(&config);
+        assert!(!errors.iter().any(|e| e.field == "system.display_timezone"));
+    }
+
+    #[test]
+    fn test_display_timezone_survives_config_update() {
+        // Same flow as update_config_handler: merge the partial update into the
+        // current config JSON, then deserialize it back into SystemConfig.
+        let mut current = serde_json::to_value(default_config()).unwrap();
+        let update = serde_json::json!({ "system": { "display_timezone": "Europe/Prague" } });
+        merge_json(&mut current, update);
+
+        let config: SystemConfig = serde_json::from_value(current).unwrap();
+        assert_eq!(
+            config.system_config.display_timezone.as_deref(),
+            Some("Europe/Prague")
+        );
     }
 
     #[test]
@@ -319,6 +458,32 @@ mod tests {
             errors
                 .iter()
                 .any(|e| e.field == "strategies.winter_peak_discharge.min_spread_czk")
+        );
+    }
+
+    #[test]
+    fn test_winter_reserve_min_arbitrage_profit_must_not_be_negative() {
+        let mut config = default_config();
+        config
+            .strategies_config
+            .winter_reserve
+            .min_arbitrage_profit_czk = -0.5;
+        let (errors, _) = validate_config(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.field == "strategies.winter_reserve.min_arbitrage_profit_czk")
+        );
+
+        config
+            .strategies_config
+            .winter_reserve
+            .min_arbitrage_profit_czk = 0.0;
+        let (errors, _) = validate_config(&config);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.field == "strategies.winter_reserve.min_arbitrage_profit_czk")
         );
     }
 }

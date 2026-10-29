@@ -33,6 +33,11 @@ pub struct ConsumptionHistoryConfig {
     /// Home Assistant entity ID for daily solar production (e.g., "sensor.energy_production_today")
     pub solar_production_entity: String,
 
+    /// Home Assistant entity ID for house load power in W (e.g., "sensor.solax_house_load").
+    /// When set and it has at least 3 days of data, the hourly profile comes from it.
+    #[serde(default)]
+    pub house_load_power_entity: Option<String>,
+
     /// Number of days to track for EMA calculation
     pub ema_days: usize,
 
@@ -45,6 +50,7 @@ impl Default for ConsumptionHistoryConfig {
         Self {
             consumption_entity: "sensor.solax_today_s_import_energy".to_string(),
             solar_production_entity: "sensor.energy_production_today".to_string(),
+            house_load_power_entity: None,
             ema_days: 7,
             seasonal_detection_days: 3,
         }
@@ -92,10 +98,14 @@ impl DailyEnergySummary {
 /// Average hourly consumption profile computed from historical data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HourlyConsumptionProfile {
-    /// Average consumption per hour (kWh). Index 0 = 00:00-01:00, index 23 = 23:00-00:00
+    /// Average consumption per hour (kWh), indexed by UTC hour of day.
+    /// Index 0 = 00:00-01:00 UTC, index 23 = 23:00-00:00 UTC (not local time).
     pub hourly_avg_kwh: [f32; 24],
     /// Number of days used to compute the average
     pub days_averaged: usize,
+    /// Per-hour 75th percentile across days (kWh). Only set for house-load profiles.
+    #[serde(default)]
+    pub hourly_p75_kwh: Option<[f32; 24]>,
 }
 
 /// Resource storing historical consumption and energy balance data
@@ -354,6 +364,7 @@ pub fn aggregate_hourly_consumption(
     Some(HourlyConsumptionProfile {
         hourly_avg_kwh,
         days_averaged: total_days,
+        hourly_p75_kwh: None,
     })
 }
 

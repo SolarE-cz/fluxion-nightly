@@ -32,6 +32,19 @@ pub struct SpotPriceData {
 
     /// HA entity last_updated timestamp
     pub ha_last_updated: DateTime<Utc>,
+
+    /// Block starts whose price came from the OTE fallback, not from the HA price entity
+    /// (brief H35); empty when every block is from the entity
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_block_starts: Vec<DateTime<Utc>>,
+}
+
+impl SpotPriceData {
+    /// True when the price of the block starting at `start` came from the OTE fallback
+    #[must_use]
+    pub fn is_fallback_block(&self, start: DateTime<Utc>) -> bool {
+        self.fallback_block_starts.contains(&start)
+    }
 }
 
 impl Default for SpotPriceData {
@@ -41,6 +54,7 @@ impl Default for SpotPriceData {
             block_duration_minutes: 15,
             fetched_at: Utc::now(),
             ha_last_updated: Utc::now(),
+            fallback_block_starts: Vec::new(),
         }
     }
 }
@@ -60,6 +74,26 @@ pub struct TimeBlockPrice {
     /// Effective import price (CZK/kWh) = spot price + grid fees (HDO tariff)
     /// This is the final price strategies should use for buy decisions
     pub effective_price_czk_per_kwh: f32,
+
+    /// Spot sell price (CZK/kWh) = spot_price - spot_sell_fee, when available.
+    /// Only populated when use_spot_prices_to_sell is enabled.
+    /// Strategies can use this for arbitrage: charge at fixed price, sell at spot price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_sell_price_czk_per_kwh: Option<f32>,
+
+    /// Buy energy price (CZK/kWh, no grid fees) from the separate buy sensor
+    /// (`pricing.buy_price_entity`). None when that sensor is not configured or has no value for
+    /// this block; the spot price is then the buy energy price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buy_price_czk_per_kwh: Option<f32>,
+}
+
+impl TimeBlockPrice {
+    /// Energy price paid when buying (CZK/kWh, before grid fees): the buy sensor when present,
+    /// otherwise the spot price
+    pub fn buy_energy_price_czk_per_kwh(&self) -> f32 {
+        self.buy_price_czk_per_kwh.unwrap_or(self.price_czk_per_kwh)
+    }
 }
 
 /// Fixed price data when spot prices are disabled

@@ -20,12 +20,14 @@ use std::time::Duration;
 
 // ============= System Configuration (Imported from fluxion-types) =============
 pub use fluxion_types::config::{
-    ControlConfig, Currency, InverterConfig, InverterTopology, PriceSchedule, PricingConfig,
+    ControlConfig, Currency, FixedPriceArbitrageConfigCore, InverterConfig, InverterTopology,
+    NotificationsConfigCore, PriceSchedule, PricingConfig, RemoteAccessConfigCore,
     SolarAwareChargingConfigCore, SolarForecastConfigCore, StrategiesConfigCore,
     StrategyEnabledConfigCore, SystemConfig, SystemSettingsConfig, WinterAdaptiveConfigCore,
     WinterAdaptiveV2ConfigCore, WinterAdaptiveV3ConfigCore, WinterAdaptiveV4ConfigCore,
-    WinterAdaptiveV5ConfigCore, WinterAdaptiveV6ConfigCore, WinterAdaptiveV7ConfigCore,
-    WinterAdaptiveV8ConfigCore, WinterAdaptiveV9ConfigCore, WinterPeakDischargeConfigCore,
+    WinterAdaptiveV5ConfigCore, WinterAdaptiveV7ConfigCore, WinterAdaptiveV8ConfigCore,
+    WinterAdaptiveV9ConfigCore, WinterAdaptiveV10ConfigCore, WinterAdaptiveV20ConfigCore,
+    WinterPeakDischargeConfigCore, WinterReserveConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 
@@ -198,6 +200,16 @@ impl GlobalHdoCache {
     pub fn is_low_tariff(&self, dt: chrono::DateTime<chrono::Utc>) -> Option<bool> {
         self.0.is_low_tariff(dt)
     }
+
+    /// Local timezone used to match HDO windows (the site timezone)
+    pub fn timezone(&self) -> chrono_tz::Tz {
+        self.0.timezone()
+    }
+
+    /// Set the local timezone used to match HDO windows
+    pub fn set_timezone(&self, tz: chrono_tz::Tz) {
+        self.0.set_timezone(tz)
+    }
 }
 
 impl Default for GlobalHdoCache {
@@ -282,12 +294,30 @@ impl PriceCache {
 #[derive(Resource)]
 pub struct AsyncInverterWriter {
     source: Arc<dyn crate::traits::InverterDataSource>,
+    /// Backup minimum SOC (%) last confirmed by the adapter, per inverter. Set only when a
+    /// `SetBackupMode` returns Ok; cleared by any other write to that inverter, success or not.
+    backup_confirmed: Arc<parking_lot::Mutex<std::collections::HashMap<String, u8>>>,
 }
 
 impl AsyncInverterWriter {
     /// Create a new async inverter writer
     pub fn new(source: Arc<dyn crate::traits::InverterDataSource>) -> Self {
-        Self { source }
+        Self {
+            source,
+            backup_confirmed: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        }
+    }
+
+    /// Backup minimum SOC the adapter last confirmed for this inverter (brief H19)
+    pub fn confirmed_backup_min_soc(&self, inverter_id: &str) -> Option<u8> {
+        self.backup_confirmed.lock().get(inverter_id).copied()
+    }
+
+    /// Record a confirmed backup minimum SOC (used by tests and by the success path)
+    pub fn set_confirmed_backup_min_soc(&self, inverter_id: &str, min_soc_pct: u8) {
+        self.backup_confirmed
+            .lock()
+            .insert(inverter_id.to_string(), min_soc_pct);
     }
 
     /// Write a command synchronously (blocks until completion)
@@ -313,6 +343,7 @@ impl AsyncInverterWriter {
         command: crate::components::InverterCommand,
     ) {
         let source = self.source.clone();
+        let backup_confirmed = self.backup_confirmed.clone();
 
         tokio::spawn(async move {
             match source.write_command(&inverter_id, &command).await {
@@ -322,8 +353,17 @@ impl AsyncInverterWriter {
                         inverter_id,
                         command
                     );
+                    match command {
+                        crate::components::InverterCommand::SetBackupMode { min_soc_pct } => {
+                            backup_confirmed.lock().insert(inverter_id, min_soc_pct);
+                        }
+                        _ => {
+                            backup_confirmed.lock().remove(&inverter_id);
+                        }
+                    }
                 }
                 Err(e) => {
+                    backup_confirmed.lock().remove(&inverter_id);
                     tracing::error!(
                         "❌ Async command failed for {}: {:?} - {}",
                         inverter_id,
@@ -488,6 +528,17 @@ impl StateReadTimer {
 // ============= User Control Resource =============
 
 pub use fluxion_types::{FixedTimeSlot, UserControlState};
+
+/// Lever values synced from the HA helpers (see `docs/legacy-levers/CONTRACT.md`).
+/// `available` is false until the first successful sync; consumers then apply no lever rules.
+#[derive(Resource, Debug, Clone, Default)]
+pub struct UserLeversResource {
+    pub levers: fluxion_types::UserLevers,
+    pub available: bool,
+    /// True when the lever sync is enabled and running. Execution waits for `available` (max 120 s)
+    /// before writing any mode, so a kill switch that is on is seen before the planner writes.
+    pub sync_expected: bool,
+}
 
 /// Resource for user control state.
 ///

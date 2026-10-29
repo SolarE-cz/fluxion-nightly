@@ -200,6 +200,8 @@ fn simulate_winter_adaptive(
             price_czk_per_kwh: p.price_czk_per_kwh,
             effective_price_czk_per_kwh: p.price_czk_per_kwh,
             duration_minutes: 15,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         })
         .collect();
 
@@ -237,6 +239,8 @@ fn simulate_winter_adaptive(
             price_czk_per_kwh: price,
             effective_price_czk_per_kwh: price,
             duration_minutes: 15,
+            spot_sell_price_czk_per_kwh: None,
+            buy_price_czk_per_kwh: None,
         };
         let price_block = time_block_prices
             .get(price_idx % time_block_prices.len().max(1))
@@ -258,7 +262,12 @@ fn simulate_winter_adaptive(
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         let evaluation = strategy.evaluate(&context);
@@ -277,7 +286,10 @@ fn simulate_winter_adaptive(
                 let grid_kw = load_kw - pv_kw - bat_kw;
                 (grid_kw, bat_kw, "ForceDischarge")
             }
-            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+            InverterOperationMode::SelfUse
+            | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
+            | InverterOperationMode::NoChargeNoDischarge => {
                 // Self-use logic for other modes
                 let net_load = load_kw - pv_kw;
                 if net_load > 0.0 {

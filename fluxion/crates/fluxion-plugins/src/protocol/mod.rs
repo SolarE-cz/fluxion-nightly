@@ -15,7 +15,5 @@
 pub mod http;
 pub mod types;
 
-pub use http::{
-    HealthCheckResponse, HttpPlugin, PluginRegistrationRequest, PluginRegistrationResponse,
-};
+pub use http::{HttpPlugin, PluginRegistrationRequest, PluginRegistrationResponse};
 pub use types::*;

@@ -966,7 +966,7 @@ impl WinterAdaptiveStrategy {
             }
             // Battery full - at minimum don't export (we'd pay to export)
             return (
-                InverterOperationMode::BackUpMode,
+                InverterOperationMode::NoChargeNoDischarge,
                 format!(
                     "Negative price - avoiding export: {:.3} CZK/kWh",
                     context.price_block.price_czk_per_kwh
@@ -1238,9 +1238,9 @@ impl WinterAdaptiveStrategy {
         // Priority 2: Battery Protection
         if context.current_battery_soc < context.backup_discharge_min_soc {
             // If we are not charging, but battery is critically low,
-            // enter BackUpMode to prevent discharge
+            // enter NoChargeNoDischarge to prevent discharge
             return (
-                InverterOperationMode::BackUpMode,
+                InverterOperationMode::NoChargeNoDischarge,
                 format!(
                     "Battery critical ({:.1}% < {:.1}%)",
                     context.current_battery_soc, context.backup_discharge_min_soc
@@ -1310,7 +1310,7 @@ impl WinterAdaptiveStrategy {
 
                 if !has_cheap_charging_before_tomorrow && !has_force_charge_soon {
                     return (
-                        InverterOperationMode::BackUpMode,
+                        InverterOperationMode::NoChargeNoDischarge,
                         format!(
                             "Preserving for tomorrow (avg {:.2} > {:.2})",
                             analysis.tomorrow_peak_avg.unwrap_or(0.0),
@@ -1368,7 +1368,7 @@ impl WinterAdaptiveStrategy {
             // - No force charging within 3 hours (want battery as empty as possible)
             if (has_expensive_blocks_ahead || !has_cheap_charging_soon) && !has_force_charge_soon {
                 return (
-                    InverterOperationMode::BackUpMode,
+                    InverterOperationMode::NoChargeNoDischarge,
                     format!(
                         "Holding charge during cheap block ({:.3} < {:.3})",
                         context.price_block.price_czk_per_kwh, analysis.avg_all_price
@@ -1414,7 +1414,7 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
             current_battery_soc: context.current_battery_soc,
             battery_efficiency: context.control_config.battery_efficiency,
             battery_wear_cost_czk_per_kwh: context.control_config.battery_wear_cost_czk_per_kwh,
-            grid_import_price_czk_per_kwh: context.price_block.price_czk_per_kwh,
+            grid_import_price_czk_per_kwh: context.price_block.buy_energy_price_czk_per_kwh(),
             grid_export_price_czk_per_kwh: context.grid_export_price_czk_per_kwh,
         };
 
@@ -1492,7 +1492,10 @@ impl EconomicStrategy for WinterAdaptiveStrategy {
                     context.grid_export_price_czk_per_kwh,
                 );
             }
-            InverterOperationMode::SelfUse | InverterOperationMode::BackUpMode => {
+            InverterOperationMode::SelfUse
+            | InverterOperationMode::BackUpMode
+            | InverterOperationMode::FeedinPriority
+            | InverterOperationMode::NoChargeNoDischarge => {
                 // Estimate profit based on usable battery capacity vs consumption
                 // Usable capacity = current SOC minus hardware minimum (cannot discharge below this)
                 let usable_battery_kwh = ((context.current_battery_soc
@@ -1563,6 +1566,8 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 4.5, // Expensive
                 effective_price_czk_per_kwh: 4.5,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1573,6 +1578,8 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.2, // Very cheap
                 effective_price_czk_per_kwh: 1.2,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1583,6 +1590,8 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: 6.0, // Even more expensive (>20% higher than today)
                 effective_price_czk_per_kwh: 6.0,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             });
         }
 
@@ -1609,7 +1618,12 @@ mod tests {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         // Evaluate
@@ -1670,6 +1684,8 @@ mod tests {
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
                 effective_price_czk_per_kwh: price,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
             })
             .collect();
 
@@ -1693,7 +1709,12 @@ mod tests {
             solar_forecast_remaining_today_kwh: 0.0,
             solar_forecast_tomorrow_kwh: 0.0,
             battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
             hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: None,
+            timezone: None,
+            user_levers: None,
         };
 
         // Evaluate

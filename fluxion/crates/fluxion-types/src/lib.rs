@@ -11,9 +11,11 @@
 // For commercial licensing, please contact: info@solare.cz
 
 pub mod config;
+pub mod day_profile;
 pub mod health;
 pub mod history;
 pub mod inverter;
+pub mod levers;
 pub mod pricing;
 pub mod scheduling;
 pub mod user_control;
@@ -21,9 +23,11 @@ pub mod web;
 
 // Re-export common types for convenience
 pub use config::{ControlConfig, SystemConfig};
+pub use day_profile::DayMetrics;
 pub use health::{HealthStatus, SystemHealthData};
 pub use history::{ConsumptionHistory, ConsumptionHistoryConfig};
 pub use inverter::{Inverter, InverterOperationMode, InverterType};
+pub use levers::{DischargeWindowLimit, UserLevers, VprMode, VprPhase, VprWindow};
 pub use pricing::{PriceAnalysis, SpotPriceData};
 pub use scheduling::{BlockDebugInfo, OperationSchedule, ScheduledMode, StrategyEvaluation};
-pub use user_control::{FixedTimeSlot, UserControlState};
+pub use user_control::{DefaultMode, FixedTimeSlot, UserControlState};

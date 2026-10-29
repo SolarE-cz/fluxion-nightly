@@ -21,7 +21,8 @@ pub use battery_predictor::{
 };
 pub use consumption_history::{
     ConsumptionHistory, ConsumptionHistoryConfig, DailyEnergySummary, HourlyConsumptionProfile,
-    aggregate_daily_consumption, aggregate_hourly_consumption,
+    aggregate_daily_consumption, aggregate_hourly_consumption, aggregate_hourly_house_load,
+    pick_hourly_profile,
 };
 pub use pv_history::{PvHistory, PvHistoryPoint};
 
@@ -174,11 +175,14 @@ pub struct PendingCommand {
 }
 
 /// Commands that can be sent to an inverter
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InverterCommand {
     /// Set operation mode
     SetMode(InverterOperationMode),
 
     /// Set export power limit (watts)
     SetExportLimit(u32),
+
+    /// Set Back Up Mode after the inverter's backup minimum SOC (%) is in place (brief H19)
+    SetBackupMode { min_soc_pct: u8 },
 }
