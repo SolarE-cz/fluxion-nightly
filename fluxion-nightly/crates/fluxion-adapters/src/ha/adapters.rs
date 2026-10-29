@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::ha::actuation::{self, ActuationGuardConfig, ActuationState};
 use crate::ha::client::HomeAssistantClient;
+use fluxion_core::continuous_systems::STATE_STALE_SECS;
 use fluxion_core::pricing::parse_spot_price_response;
 use fluxion_core::{
     GenericInverterState, InverterCommand, InverterDataSource, InverterOperationMode,
@@ -42,6 +43,92 @@ pub struct HomeAssistantInverterAdapter {
     pv_extra_prefixes: HashMap<String, Vec<String>>,
     /// Extra PV entities already warned about as unavailable (WARN once each)
     pv_extra_warned: Mutex<std::collections::HashSet<String>>,
+    /// Capacity-weighted battery SOC per inverter id: its own battery plus read-only parallel
+    /// units' batteries. Only `read_state` uses them; no write path does.
+    battery_soc_weights: HashMap<String, BatterySocWeights>,
+    /// Extra battery SOC entities already warned about as unreadable (WARN once each)
+    battery_soc_warned: Mutex<std::collections::HashSet<String>>,
+    /// Last combined SOC per inverter id and when it was read, held while a parallel unit's SOC
+    /// is unreadable for up to `PAIR_SOC_HOLD_SECS`
+    battery_soc_last_good: Mutex<HashMap<String, (f32, DateTime<Utc>)>>,
+    /// Heartbeat entities per entity prefix, found once from `/api/states` (see `HEARTBEAT_SUFFIXES`)
+    heartbeats: Mutex<HashMap<String, Vec<String>>>,
+    /// Prefixes whose heartbeat discovery failed and was warned about (WARN once until it works)
+    heartbeat_discovery_warned: Mutex<std::collections::HashSet<String>>,
+    /// Parallel units whose SOC is taken in standby (INFO once per standby period)
+    standby_units: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Liveness of an entity prefix from its heartbeat entities
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Liveness {
+    /// No heartbeat entity exists: not age-checked
+    Unchecked,
+    /// The newest heartbeat `last_updated`, within `STATE_STALE_SECS`
+    Live(DateTime<Utc>),
+    /// No heartbeat updated within `STATE_STALE_SECS`: the newest one's age, if any was readable
+    Stale(Option<i64>),
+}
+
+/// A parallel unit whose battery and PV power both read within this of 0 W is in standby: its
+/// SOC cannot move, so a flat SOC with flat heartbeats is still right (PR #647 R5-1)
+const STANDBY_POWER_W: f32 = 50.0;
+
+/// A unit's standby is believed only while its master shows at most this much PV (W) and is not
+/// charging (battery at most `STANDBY_POWER_W`): with sun or a charge the unit would be moving
+/// too, so a unit frozen at 0 W then is dead, not idle (PR #647 R6-1). In all 145 standby
+/// windows on Jakub's site the master had PV 0 W and battery at most 1 W.
+const STANDBY_MASTER_PV_MAX_W: f32 = 200.0;
+
+/// Sensors of an inverter prefix whose `last_updated` moves on (almost) every poll: grid voltage
+/// and frequency change nearly always, the powers often. An inverter is live while any of them
+/// was updated within `STATE_STALE_SECS`. HA's REST API does not advance `last_reported` for a
+/// flat value, and a flat SOC keeps its `last_updated`, so neither can tell a stall (PR #647 R4-1).
+const HEARTBEAT_SUFFIXES: &[&str] = &[
+    "grid_voltage",
+    "grid_frequency",
+    "measured_power",
+    "inverter_power",
+    "house_load",
+    "pv_power_total",
+    "battery_power_charge",
+];
+
+/// Whether `entity_id` is a heartbeat sensor of `prefix` (`grid_voltage*` / `grid_frequency*`
+/// match per-phase variants too; the others match exactly)
+fn is_heartbeat_entity(prefix: &str, entity_id: &str) -> bool {
+    let Some(suffix) = entity_id.strip_prefix(&format!("sensor.{prefix}_")) else {
+        return false;
+    };
+    HEARTBEAT_SUFFIXES.iter().any(|h| match *h {
+        "grid_voltage" | "grid_frequency" => suffix.starts_with(h),
+        _ => suffix == *h,
+    })
+}
+
+/// While a parallel unit's SOC is unreadable, the last combined SOC is held at most this long
+/// (seconds)
+const PAIR_SOC_HOLD_SECS: i64 = 600;
+
+/// The newest heartbeat time of a live `prefix` (None when not age-checked), else an error
+fn require_live(prefix: &str, liveness: Liveness) -> Result<Option<DateTime<Utc>>> {
+    match liveness {
+        Liveness::Unchecked => Ok(None),
+        Liveness::Live(at) => Ok(Some(at)),
+        Liveness::Stale(newest) => anyhow::bail!(
+            "{prefix} not live: no heartbeat entity updated in the last {STATE_STALE_SECS} s (newest {})",
+            newest.map_or_else(|| "unreadable".to_owned(), |age| format!("{age} s ago"))
+        ),
+    }
+}
+
+/// Usable capacities that weight the SOC an inverter reports
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatterySocWeights {
+    /// Usable capacity (kWh) of the inverter's own battery
+    pub own_kwh: f32,
+    /// Entity prefix and usable capacity (kWh) of each read-only parallel unit's battery
+    pub extras: Vec<(String, f32)>,
 }
 
 /// PV values read from a parallel unit's entities
@@ -64,6 +151,12 @@ impl HomeAssistantInverterAdapter {
             actuation: Arc::new(ActuationState::default()),
             pv_extra_prefixes: HashMap::new(),
             pv_extra_warned: Mutex::new(std::collections::HashSet::new()),
+            battery_soc_weights: HashMap::new(),
+            battery_soc_warned: Mutex::new(std::collections::HashSet::new()),
+            battery_soc_last_good: Mutex::new(HashMap::new()),
+            heartbeats: Mutex::new(HashMap::new()),
+            heartbeat_discovery_warned: Mutex::new(std::collections::HashSet::new()),
+            standby_units: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -77,6 +170,221 @@ impl HomeAssistantInverterAdapter {
             .filter(|(_, prefixes)| !prefixes.is_empty())
             .collect();
         self
+    }
+
+    /// Capacity-weighted battery SOC per inverter id (see `BatterySocWeights`). The parallel
+    /// units' batteries are only read, never written to.
+    #[must_use]
+    pub fn with_battery_soc_weights(mut self, weights: HashMap<String, BatterySocWeights>) -> Self {
+        self.battery_soc_weights = weights;
+        self
+    }
+
+    /// The SOC an inverter reports: its own when it has no battery weights, otherwise the
+    /// capacity-weighted mean with each parallel unit's SOC. A unit's SOC is unreadable when the
+    /// read fails, is not a finite number, or the unit is not live (no heartbeat entity updated
+    /// within `STATE_STALE_SECS`; WARN once per entity). Then the last combined SOC is held for up to `PAIR_SOC_HOLD_SECS`;
+    /// after that this fails, so `read_state` fails and no new state is taken: the master's own
+    /// SOC alone is several kWh off the pair's. Returns the SOC and the (prefix, SOC) of each unit.
+    async fn read_battery_soc(
+        &self,
+        inverter_id: &str,
+        own_soc: f32,
+        master_quiet: bool,
+    ) -> Result<(f32, Vec<(String, f32)>)> {
+        let Some(weights) = self.battery_soc_weights.get(inverter_id) else {
+            return Ok((own_soc, Vec::new()));
+        };
+        let now = Utc::now();
+        let mut readings = Vec::with_capacity(weights.extras.len());
+        let mut unreadable = Vec::new();
+        for (prefix, _) in &weights.extras {
+            let entity = self.mapper.get_battery_soc_entity(prefix);
+            match self.read_extra_soc(prefix, now, master_quiet).await {
+                Ok(soc) => {
+                    self.battery_soc_warned.lock().remove(&entity);
+                    readings.push((prefix.clone(), soc));
+                }
+                Err(e) => {
+                    if self.battery_soc_warned.lock().insert(entity.clone()) {
+                        warn!(
+                            "⚠️ [ADAPTER] Extra battery SOC {} for {} unreadable, holding the last combined SOC for up to {} min: {:#}",
+                            entity,
+                            inverter_id,
+                            PAIR_SOC_HOLD_SECS / 60,
+                            e
+                        );
+                    }
+                    unreadable.push(entity);
+                }
+            }
+        }
+        let extras_kwh: f32 = weights.extras.iter().map(|(_, kwh)| kwh).sum();
+        let total_kwh = weights.own_kwh + extras_kwh;
+        if unreadable.is_empty() && total_kwh.is_finite() && total_kwh > 0.0 {
+            let weighted_sum: f32 = own_soc * weights.own_kwh
+                + readings
+                    .iter()
+                    .zip(&weights.extras)
+                    .map(|((_, soc), (_, kwh))| soc * kwh)
+                    .sum::<f32>();
+            let combined = weighted_sum / total_kwh;
+            self.battery_soc_last_good
+                .lock()
+                .insert(inverter_id.to_owned(), (combined, now));
+            return Ok((combined, readings));
+        }
+        let held = self.battery_soc_last_good.lock().get(inverter_id).copied();
+        match held {
+            Some((soc, at)) if (now - at).num_seconds() <= PAIR_SOC_HOLD_SECS => {
+                Ok((soc, Vec::new()))
+            }
+            _ => anyhow::bail!(
+                "combined battery SOC of {} unknown: {} unreadable and no combined SOC in the last {} min",
+                inverter_id,
+                unreadable.join(", "),
+                PAIR_SOC_HOLD_SECS / 60
+            ),
+        }
+    }
+
+    /// A parallel unit's SOC (`prefix`): a finite number while the unit is live (see
+    /// `ensure_live`), or while it is in standby with every heartbeat flat: battery and PV power
+    /// both within `STANDBY_POWER_W` of 0, so the SOC cannot move (Jakub's slave at its 10 % floor
+    /// for hours each night). Standby counts only while the master is quiet (`master_quiet`: PV
+    /// at most `STANDBY_MASTER_PV_MAX_W`, not charging), so a dead unit is found by morning. A
+    /// frozen non-zero power still fails. A flat SOC keeps its `last_updated`, so its own age says
+    /// nothing.
+    async fn read_extra_soc(
+        &self,
+        prefix: &str,
+        now: DateTime<Utc>,
+        master_quiet: bool,
+    ) -> Result<f32> {
+        let entity_id = self.mapper.get_battery_soc_entity(prefix);
+        let state = self
+            .client
+            .get_state(&entity_id)
+            .await
+            .with_context(|| format!("Failed to read entity: {entity_id}"))?;
+        let soc = state
+            .state
+            .parse::<f32>()
+            .with_context(|| format!("Failed to parse '{}' as float", state.state))?;
+        anyhow::ensure!(soc.is_finite(), "SOC {soc} is not finite");
+        let liveness = self.liveness(prefix, now).await?;
+        if let Liveness::Stale(_) = liveness
+            && master_quiet
+            && let Some((battery_w, pv_w)) = self.standby_powers(prefix).await
+        {
+            if self.standby_units.lock().insert(prefix.to_owned()) {
+                info!(
+                    "[ADAPTER] {prefix} in standby (battery {battery_w} W, PV {pv_w} W, no heartbeat for over {STATE_STALE_SECS} s): its SOC {soc} % is used as read"
+                );
+            }
+            return Ok(soc);
+        }
+        require_live(prefix, liveness)?;
+        self.standby_units.lock().remove(prefix);
+        Ok(soc)
+    }
+
+    /// Battery and PV power of `prefix` when both read within `STANDBY_POWER_W` of 0
+    async fn standby_powers(&self, prefix: &str) -> Option<(f32, f32)> {
+        let battery_w = self
+            .read_sensor_float(&self.mapper.get_battery_power_entity(prefix))
+            .await
+            .ok()?;
+        let pv_w = self
+            .read_sensor_float(&self.mapper.get_pv_power_entity(prefix))
+            .await
+            .ok()?;
+        (battery_w.abs() <= STANDBY_POWER_W && pv_w.abs() <= STANDBY_POWER_W)
+            .then_some((battery_w, pv_w))
+    }
+
+    /// The heartbeat entities of `prefix`, found once from `/api/states` and logged. None found:
+    /// one WARN, and the prefix is not age-checked. A failed listing fails this read (WARN once
+    /// until it works) and is retried on the next read: the age is never skipped silently
+    /// (PR #647 R5-4).
+    async fn heartbeat_entities(&self, prefix: &str) -> Result<Vec<String>> {
+        if let Some(found) = self.heartbeats.lock().get(prefix) {
+            return Ok(found.clone());
+        }
+        let states = match self.client.get_all_states().await {
+            Ok(states) => states,
+            Err(e) => {
+                if self
+                    .heartbeat_discovery_warned
+                    .lock()
+                    .insert(prefix.to_owned())
+                {
+                    warn!(
+                        "⚠️ [ADAPTER] Heartbeat discovery for {prefix} failed (/api/states), its state reads fail until it works: {e:#}"
+                    );
+                }
+                return Err(anyhow::Error::from(e)
+                    .context(format!("heartbeat discovery for {prefix} failed")));
+            }
+        };
+        self.heartbeat_discovery_warned.lock().remove(prefix);
+        let mut found: Vec<String> = states
+            .into_iter()
+            .map(|s| s.entity_id)
+            .filter(|id| is_heartbeat_entity(prefix, id))
+            .collect();
+        // Voltage and frequency first: they change on almost every poll
+        found.sort_by_key(|id| {
+            HEARTBEAT_SUFFIXES
+                .iter()
+                .position(|h| id.starts_with(&format!("sensor.{prefix}_{h}")))
+        });
+        if found.is_empty() {
+            warn!(
+                "⚠️ [ADAPTER] No heartbeat entity for {prefix} (sensor.{prefix}_{{{}}}): its state age is not checked",
+                HEARTBEAT_SUFFIXES.join(",")
+            );
+        } else {
+            info!(
+                "[ADAPTER] Heartbeat entities of {prefix}: {}",
+                found.join(", ")
+            );
+        }
+        self.heartbeats
+            .lock()
+            .insert(prefix.to_owned(), found.clone());
+        Ok(found)
+    }
+
+    /// Liveness of `prefix` at `now` from the newest `last_updated` of its heartbeat entities.
+    /// Fails only when the heartbeat entities cannot be listed.
+    async fn liveness(&self, prefix: &str, now: DateTime<Utc>) -> Result<Liveness> {
+        let heartbeats = self.heartbeat_entities(prefix).await?;
+        if heartbeats.is_empty() {
+            return Ok(Liveness::Unchecked);
+        }
+        let mut newest: Option<DateTime<Utc>> = None;
+        for entity_id in &heartbeats {
+            let Ok(state) = self.client.get_state(entity_id).await else {
+                continue;
+            };
+            let Ok(at) = DateTime::parse_from_rfc3339(&state.last_updated) else {
+                continue;
+            };
+            let at = at.with_timezone(&Utc);
+            newest = Some(newest.map_or(at, |n| n.max(at)));
+        }
+        Ok(match newest {
+            Some(at) if (now - at).num_seconds() <= STATE_STALE_SECS => Liveness::Live(at),
+            newest => Liveness::Stale(newest.map(|at| (now - at).num_seconds())),
+        })
+    }
+
+    /// Fail unless `prefix` is live (see `liveness`). Returns the newest heartbeat time: when the
+    /// data was last new, so the state's age counts from there (PR #647 R5-2). None without
+    /// heartbeat entities.
+    async fn ensure_live(&self, prefix: &str, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+        require_live(prefix, self.liveness(prefix, now).await?)
     }
 
     /// Sum the PV power and solar energy of the inverter's read-only extra prefixes.
@@ -300,11 +608,13 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
     async fn read_state(&self, inverter_id: &str) -> Result<GenericInverterState> {
         debug!("🔋 [ADAPTER] Reading inverter state for: {}", inverter_id);
 
-        // Read all required sensor entities
-        let battery_soc = self
+        // Read all required sensor entities. The inverter must be live (a heartbeat entity updated
+        // within STATE_STALE_SECS), or HA may be serving the values of a stalled integration.
+        let now = Utc::now();
+        let data_at = self.ensure_live(inverter_id, now).await?;
+        let own_soc = self
             .read_sensor_float(&self.mapper.get_battery_soc_entity(inverter_id))
             .await?;
-
         let grid_power = self
             .read_sensor_float(&self.mapper.get_grid_power_entity(inverter_id))
             .await?;
@@ -315,6 +625,13 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
 
         let pv_power = self
             .read_sensor_float(&self.mapper.get_pv_power_entity(inverter_id))
+            .await?;
+
+        // Capacity-weighted with read-only parallel units' batteries (battery_extra_prefixes). A
+        // unit's standby is believed only while this master shows no sun and no charge (R6-1).
+        let master_quiet = pv_power <= STANDBY_MASTER_PV_MAX_W && battery_power <= STANDBY_POWER_W;
+        let (battery_soc, battery_units) = self
+            .read_battery_soc(inverter_id, own_soc, master_quiet)
             .await?;
 
         // Read current work mode. ForceCharge may be a Manual sub-mode: read the sub-mode exactly,
@@ -441,6 +758,7 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             export_limit_w,
             export_limit_max_w,
             work_mode_ambiguous,
+            data_at,
             // Load & Grid detailed
             house_load_w,
             grid_import_w,
@@ -464,9 +782,20 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             ..Default::default()
         };
 
+        // With battery weights, show the combined SOC and each battery's SOC behind it
+        let soc_detail = if self.battery_soc_weights.contains_key(inverter_id) {
+            let units: String = battery_units
+                .iter()
+                .map(|(prefix, soc)| format!(", {prefix} {soc:.1}%"))
+                .collect();
+            format!(" (own {own_soc:.1}%{units})")
+        } else {
+            String::new()
+        };
         info!(
-            "✅ [ADAPTER] Inverter state: SOC={:.1}%, Mode={:?}, Grid={:.0}W, Batt={:.0}W, PV={:.0}W, IM={:.2}kW",
+            "✅ [ADAPTER] Inverter state: SOC={:.1}%{}, Mode={:?}, Grid={:.0}W, Batt={:.0}W, PV={:.0}W, IM={:.2}kW",
             state.battery_soc,
+            soc_detail,
             state.work_mode,
             state.grid_power_w,
             state.battery_power_w,
@@ -1541,8 +1870,18 @@ mod tests {
             .await;
     }
 
+    /// `/api/states` lists no heartbeat entity: the state age is not checked
+    async fn no_heartbeats(server: &mut mockito::ServerGuard) {
+        server
+            .mock("GET", "/api/states")
+            .with_body("[]")
+            .create_async()
+            .await;
+    }
+
     /// Master `solax_80` with its core reads, PV 2000 W, today 51.3 kWh, total 1000 kWh
     async fn master_states(server: &mut mockito::ServerGuard) {
+        no_heartbeats(server).await;
         for (entity, state) in [
             ("sensor.solax_80_battery_capacity", "55"),
             ("sensor.solax_80_grid_import", "-300"),
@@ -1613,6 +1952,7 @@ mod tests {
         ] {
             mock_state(&mut server, entity, state).await;
         }
+        no_heartbeats(&mut server).await;
         // The extra unit's house load, grid, SOC and controls are never read
         let untouched = server
             .mock("GET", Matcher::Regex(r"^/api/states/(sensor|select|number)\.solax_extra_(battery_capacity|house|grid|charger|export|lock|manual)".to_owned()))
@@ -1730,6 +2070,522 @@ mod tests {
         extra_reads.assert_async().await;
         extra_writes.assert_async().await;
         master_writes.assert_async().await;
+    }
+
+    // ---- Capacity-weighted SOC of parallel units (battery_extra_prefixes) ----
+
+    /// An entity as HA's REST API serves it: `last_reported` does not advance while the value is
+    /// flat, so it equals `last_changed` and `last_updated` (`updated_s_ago` seconds ago)
+    fn ha_body(entity: &str, state: &str, updated_s_ago: i64) -> String {
+        let at = (Utc::now() - chrono::Duration::seconds(updated_s_ago)).to_rfc3339();
+        format!(
+            r#"{{"entity_id":"{entity}","state":"{state}","attributes":{{}},"last_changed":"{at}","last_updated":"{at}","last_reported":"{at}"}}"#
+        )
+    }
+
+    async fn mock_entity(
+        server: &mut mockito::ServerGuard,
+        entity: &str,
+        state: &str,
+        updated_s_ago: i64,
+    ) {
+        server
+            .mock("GET", format!("/api/states/{entity}").as_str())
+            .with_body(ha_body(entity, state, updated_s_ago))
+            .create_async()
+            .await;
+    }
+
+    /// `/api/states` lists these heartbeat entities, each updated the given seconds ago
+    async fn heartbeats(server: &mut mockito::ServerGuard, entities: &[(&str, i64)]) {
+        let entities: Vec<(&str, &str, i64)> = entities
+            .iter()
+            .map(|(entity, age)| (*entity, "230.1", *age))
+            .collect();
+        heartbeat_states(server, &entities).await;
+    }
+
+    /// `/api/states` lists these heartbeat entities, each with its state, updated the given
+    /// seconds ago
+    async fn heartbeat_states(server: &mut mockito::ServerGuard, entities: &[(&str, &str, i64)]) {
+        let listing: Vec<String> = entities
+            .iter()
+            .map(|(entity, state, age)| ha_body(entity, state, *age))
+            .collect();
+        server
+            .mock("GET", "/api/states")
+            .with_body(format!("[{}]", listing.join(",")))
+            .create_async()
+            .await;
+        for (entity, state, age) in entities {
+            mock_entity(server, entity, state, *age).await;
+        }
+    }
+
+    /// Master `solax_80` (own 50 kWh, SOC flat for 10 min, grid voltage updated 5 s ago) and
+    /// parallel unit `solax_81` (30 kWh) whose SOC was last updated `extra_soc_age_s` ago and whose
+    /// grid voltage `slave_heartbeat_age_s` ago
+    async fn battery_states(
+        server: &mut mockito::ServerGuard,
+        master_soc: &'static str,
+        extra_soc: &'static str,
+        extra_soc_age_s: i64,
+        slave_heartbeat_age_s: i64,
+    ) {
+        mock_entity(server, "sensor.solax_80_battery_capacity", master_soc, 600).await;
+        for (entity, state) in [
+            ("sensor.solax_80_grid_import", "-300"),
+            ("sensor.solax_80_battery_power_charge", "1200"),
+            ("sensor.solax_80_pv_power_total", "2000"),
+            ("select.solax_80_charger_use_mode", "Self Use Mode"),
+        ] {
+            mock_state(server, entity, state).await;
+        }
+        mock_entity(
+            server,
+            "sensor.solax_81_battery_capacity",
+            extra_soc,
+            extra_soc_age_s,
+        )
+        .await;
+        heartbeats(
+            server,
+            &[
+                ("sensor.solax_80_grid_voltage_l1", 5),
+                ("sensor.solax_81_grid_voltage_l1", slave_heartbeat_age_s),
+            ],
+        )
+        .await;
+    }
+
+    fn battery_weights_adapter(url: String) -> HomeAssistantInverterAdapter {
+        let client = Arc::new(HomeAssistantClient::new(url, "test_token").unwrap());
+        HomeAssistantInverterAdapter::new(client, Arc::new(crate::solax::SolaxEntityMapper::new()))
+            .with_guard(guard(true))
+            .with_battery_soc_weights(HashMap::from([(
+                "solax_80".to_owned(),
+                BatterySocWeights {
+                    own_kwh: 50.0,
+                    extras: vec![("solax_81".to_owned(), 30.0)],
+                },
+            )]))
+    }
+
+    #[tokio::test]
+    async fn battery_soc_is_capacity_weighted_with_parallel_unit() {
+        let mut server = Server::new_async().await;
+        battery_states(&mut server, "40", "80", 0, 5).await;
+
+        let state = battery_weights_adapter(server.url())
+            .read_state("solax_80")
+            .await
+            .unwrap();
+
+        // (40 * 50 + 80 * 30) / 80
+        assert!((state.battery_soc - 55.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn unreadable_parallel_battery_holds_the_last_combined_soc_then_fails() {
+        let mut server = Server::new_async().await;
+        battery_states(&mut server, "40", "unavailable", 0, 5).await;
+        let adapter = battery_weights_adapter(server.url());
+
+        // No combined SOC yet: the read fails rather than report the master's own 40 %
+        assert!(adapter.read_state("solax_80").await.is_err());
+
+        // A combined SOC 5 min ago is held
+        adapter.battery_soc_last_good.lock().insert(
+            "solax_80".to_owned(),
+            (55.0, Utc::now() - chrono::Duration::minutes(5)),
+        );
+        let state = adapter.read_state("solax_80").await.unwrap();
+        assert!((state.battery_soc - 55.0).abs() < 0.01);
+        // Warned once per entity, not on every read
+        adapter.read_state("solax_80").await.unwrap();
+        assert_eq!(adapter.battery_soc_warned.lock().len(), 1);
+
+        // Over 10 min old: the read fails again
+        adapter.battery_soc_last_good.lock().insert(
+            "solax_80".to_owned(),
+            (55.0, Utc::now() - chrono::Duration::minutes(11)),
+        );
+        let error = adapter.read_state("solax_80").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("combined battery SOC"),
+            "{error:#}"
+        );
+    }
+
+    /// PR #647 R4-1: a slave SOC flat for 30 min with a fresh slave heartbeat is used; with every
+    /// slave heartbeat 125 s old the unit is not live and its SOC unreadable
+    #[tokio::test]
+    async fn parallel_battery_is_readable_while_its_unit_is_live() {
+        let mut server = Server::new_async().await;
+        battery_states(&mut server, "40", "80", 30 * 60, 5).await;
+        let adapter = battery_weights_adapter(server.url());
+        let state = adapter.read_state("solax_80").await.unwrap();
+        assert!((state.battery_soc - 55.0).abs() < 0.01);
+        assert_eq!(
+            adapter.battery_soc_last_good.lock()["solax_80"].0,
+            state.battery_soc
+        );
+        assert!(adapter.battery_soc_warned.lock().is_empty());
+
+        let mut server = Server::new_async().await;
+        battery_states(&mut server, "40", "80", 30 * 60, 125).await;
+        let adapter = battery_weights_adapter(server.url());
+        let error = adapter.read_state("solax_80").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("combined battery SOC"),
+            "{error:#}"
+        );
+        assert_eq!(adapter.battery_soc_warned.lock().len(), 1);
+    }
+
+    /// Master `solax_80` with its core reads; the SOC flat (updated `soc_age_s` ago)
+    async fn master_with_heartbeats(
+        server: &mut mockito::ServerGuard,
+        soc_age_s: i64,
+        heartbeat_ages: &[(&str, i64)],
+    ) {
+        mock_entity(server, "sensor.solax_80_battery_capacity", "55", soc_age_s).await;
+        for (entity, state) in [
+            ("sensor.solax_80_grid_import", "-300"),
+            ("sensor.solax_80_battery_power_charge", "1200"),
+            ("select.solax_80_charger_use_mode", "Self Use Mode"),
+        ] {
+            mock_state(server, entity, state).await;
+        }
+        heartbeats(server, heartbeat_ages).await;
+    }
+
+    fn plain_adapter(url: String) -> HomeAssistantInverterAdapter {
+        let client = Arc::new(HomeAssistantClient::new(url, "test_token").unwrap());
+        HomeAssistantInverterAdapter::new(client, Arc::new(crate::solax::SolaxEntityMapper::new()))
+    }
+
+    /// PR #647 R4-1: liveness is per inverter from its heartbeat entities' `last_updated`. HA
+    /// serves `last_reported == last_changed` for a flat value, so a SOC flat for 10 min must
+    /// not fail the read while the grid voltage moves.
+    #[tokio::test]
+    async fn flat_soc_with_a_fresh_heartbeat_reads() {
+        let mut server = Server::new_async().await;
+        master_with_heartbeats(
+            &mut server,
+            600,
+            &[
+                ("sensor.solax_80_grid_voltage_l1", 5),
+                ("sensor.solax_80_pv_power_total", 600),
+            ],
+        )
+        .await;
+        let adapter = plain_adapter(server.url());
+        let state = adapter.read_state("solax_80").await.unwrap();
+        assert!((state.battery_soc - 55.0).abs() < 0.01);
+        // Discovered once, voltage first
+        assert_eq!(
+            adapter.heartbeats.lock()["solax_80"],
+            vec![
+                "sensor.solax_80_grid_voltage_l1".to_owned(),
+                "sensor.solax_80_pv_power_total".to_owned()
+            ]
+        );
+    }
+
+    /// PR #647 R4-1: every heartbeat entity older than 125 s fails the read
+    #[tokio::test]
+    async fn every_heartbeat_over_120_s_old_fails_the_read() {
+        let mut server = Server::new_async().await;
+        master_with_heartbeats(
+            &mut server,
+            600,
+            &[
+                ("sensor.solax_80_grid_voltage_l1", 125),
+                ("sensor.solax_80_grid_frequency", 130),
+                ("sensor.solax_80_pv_power_total", 600),
+            ],
+        )
+        .await;
+        let error = plain_adapter(server.url())
+            .read_state("solax_80")
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("solax_80 not live"),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("newest 125 s ago"),
+            "{error:#}"
+        );
+    }
+
+    /// PR #647 R4-1: an inverter without heartbeat entities is not age-checked
+    #[tokio::test]
+    async fn no_heartbeat_entity_skips_the_age_check() {
+        let mut server = Server::new_async().await;
+        master_with_heartbeats(&mut server, 600, &[("sensor.other_grid_voltage", 999)]).await;
+        mock_state(&mut server, "sensor.solax_80_pv_power_total", "2000").await;
+        let adapter = plain_adapter(server.url());
+        adapter.read_state("solax_80").await.unwrap();
+        assert!(adapter.heartbeats.lock()["solax_80"].is_empty());
+    }
+
+    /// Master `solax_80` live (SOC 40 % flat, voltage 5 s old, PV `master_pv_w`, battery
+    /// `master_battery_w`) and parallel unit `solax_81` with every entity flat for `slave_age_s`:
+    /// SOC 10 %, PV `slave_pv_w`, battery `slave_battery_w`
+    async fn pair_with_flat_slave(
+        server: &mut mockito::ServerGuard,
+        (master_pv_w, master_battery_w): (&str, &str),
+        (slave_pv_w, slave_battery_w): (&str, &str),
+        slave_age_s: i64,
+    ) {
+        mock_entity(server, "sensor.solax_80_battery_capacity", "40", 600).await;
+        for (entity, state) in [
+            ("sensor.solax_80_grid_import", "-300"),
+            ("sensor.solax_80_battery_power_charge", master_battery_w),
+            ("sensor.solax_80_pv_power_total", master_pv_w),
+            ("select.solax_80_charger_use_mode", "Self Use Mode"),
+        ] {
+            mock_entity(server, entity, state, 5).await;
+        }
+        mock_entity(
+            server,
+            "sensor.solax_81_battery_capacity",
+            "10",
+            slave_age_s,
+        )
+        .await;
+        heartbeat_states(
+            server,
+            &[
+                ("sensor.solax_80_grid_voltage_l1", "230.1", 5),
+                ("sensor.solax_81_grid_voltage_l1", "230.1", slave_age_s),
+                ("sensor.solax_81_house_load", "0", slave_age_s),
+                ("sensor.solax_81_pv_power_total", slave_pv_w, slave_age_s),
+                (
+                    "sensor.solax_81_battery_power_charge",
+                    slave_battery_w,
+                    slave_age_s,
+                ),
+            ],
+        )
+        .await;
+    }
+
+    thread_local! {
+        static CAPTURED_LOGS: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes an event into this thread's capture buffer, if one is open
+    struct ThreadLogWriter;
+
+    impl std::io::Write for ThreadLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOGS.with(|logs| {
+                if let Some(logs) = logs.borrow_mut().as_mut() {
+                    logs.extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Start capturing log lines (INFO and above) emitted on this thread; `#[tokio::test]` runs
+    /// on one thread. One global subscriber writes each event to its own thread's buffer.
+    fn start_log_capture() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogWriter)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURED_LOGS.with(|logs| *logs.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// The lines captured since `start_log_capture`
+    fn captured_logs() -> String {
+        let logs = CAPTURED_LOGS.with(|logs| logs.borrow_mut().take().unwrap_or_default());
+        String::from_utf8_lossy(&logs).into_owned()
+    }
+
+    /// PR #647 R5-1, R6-1: Jakub's slave in standby at its 10 % floor, every heartbeat flat for
+    /// 4 h; the master live, no PV, discharging 3 kW. The slave's SOC cannot move, so the pair SOC
+    /// is used on every read (no hold, no failed read, so no stale exit), and the state's time is
+    /// the master's fresh heartbeat. INFO once.
+    #[tokio::test]
+    async fn slave_in_standby_at_its_floor_keeps_the_pair_soc() {
+        let mut server = Server::new_async().await;
+        pair_with_flat_slave(&mut server, ("0", "-3000"), ("0", "0"), 4 * 3600).await;
+        let adapter = battery_weights_adapter(server.url());
+        start_log_capture();
+        for _ in 0..3 {
+            let state = adapter.read_state("solax_80").await.unwrap();
+            // (40 * 50 + 10 * 30) / 80
+            assert!((state.battery_soc - 28.75).abs() < 0.01);
+            let data_age = Utc::now() - state.data_at.unwrap();
+            assert!(data_age.num_seconds() <= 10, "{data_age}");
+        }
+        let logs = captured_logs();
+        assert_eq!(logs.matches("solax_81 in standby").count(), 1, "{logs}");
+        assert!(adapter.battery_soc_warned.lock().is_empty());
+        assert!(adapter.standby_units.lock().contains("solax_81"));
+    }
+
+    /// PR #647 R6-1: a slave frozen at 0 W / 0 W is not believed in standby while the master
+    /// shows sun or charges (the slave would be moving too): its SOC is unreadable, WARN once
+    #[tokio::test]
+    async fn slave_frozen_at_zero_while_the_master_has_sun_or_charges_is_unreadable() {
+        for master in [("8000", "6000"), ("201", "0"), ("0", "51")] {
+            let mut server = Server::new_async().await;
+            pair_with_flat_slave(&mut server, master, ("0", "0"), 20 * 3600).await;
+            let adapter = battery_weights_adapter(server.url());
+            start_log_capture();
+            for _ in 0..3 {
+                let error = adapter.read_state("solax_80").await.unwrap_err();
+                assert!(
+                    format!("{error:#}").contains("combined battery SOC"),
+                    "{master:?} {error:#}"
+                );
+            }
+            let logs = captured_logs();
+            assert_eq!(
+                logs.matches(
+                    "Extra battery SOC sensor.solax_81_battery_capacity for solax_80 unreadable"
+                )
+                .count(),
+                1,
+                "{master:?} {logs}"
+            );
+            assert!(adapter.standby_units.lock().is_empty(), "{master:?}");
+        }
+    }
+
+    /// PR #647 R5-1, R6-2: a slave frozen with a non-zero battery power, or at 5 kW PV with the
+    /// battery at 0 W, is not in standby: its SOC is unreadable (master quiet)
+    #[tokio::test]
+    async fn slave_frozen_at_non_zero_power_is_unreadable() {
+        for slave in [("0", "-1200"), ("5000", "0")] {
+            let mut server = Server::new_async().await;
+            pair_with_flat_slave(&mut server, ("0", "-3000"), slave, 15 * 60).await;
+            let adapter = battery_weights_adapter(server.url());
+            let error = adapter.read_state("solax_80").await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("combined battery SOC"),
+                "{slave:?} {error:#}"
+            );
+            assert!(adapter.standby_units.lock().is_empty(), "{slave:?}");
+        }
+    }
+
+    /// PR #647 R5-2: the state's time is the newest heartbeat `last_updated`, so its age counts
+    /// from when the data last changed, not from the read
+    #[tokio::test]
+    async fn the_state_time_is_the_newest_heartbeat() {
+        let mut server = Server::new_async().await;
+        master_with_heartbeats(
+            &mut server,
+            600,
+            &[
+                ("sensor.solax_80_grid_voltage_l1", 90),
+                ("sensor.solax_80_grid_frequency", 30),
+                ("sensor.solax_80_pv_power_total", 600),
+            ],
+        )
+        .await;
+        let state = plain_adapter(server.url())
+            .read_state("solax_80")
+            .await
+            .unwrap();
+        let age = (Utc::now() - state.data_at.unwrap()).num_seconds();
+        assert!((30..=33).contains(&age), "{age}");
+    }
+
+    /// PR #647 R5-4: a failing `/api/states` fails each read (retried every time), with one WARN
+    #[tokio::test]
+    async fn failing_heartbeat_listing_fails_the_read() {
+        let mut server = Server::new_async().await;
+        mock_entity(&mut server, "sensor.solax_80_battery_capacity", "55", 9999).await;
+        for (entity, state) in [
+            ("sensor.solax_80_grid_import", "-300"),
+            ("sensor.solax_80_battery_power_charge", "1200"),
+            ("select.solax_80_charger_use_mode", "Self Use Mode"),
+            ("sensor.solax_80_pv_power_total", "2000"),
+        ] {
+            mock_state(&mut server, entity, state).await;
+        }
+        let listing = server
+            .mock("GET", "/api/states")
+            .with_status(500)
+            .expect(3)
+            .create_async()
+            .await;
+        let adapter = plain_adapter(server.url());
+        start_log_capture();
+        for _ in 0..3 {
+            let error = adapter.read_state("solax_80").await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("heartbeat discovery for solax_80 failed"),
+                "{error:#}"
+            );
+        }
+        listing.assert_async().await;
+        assert_eq!(adapter.heartbeat_discovery_warned.lock().len(), 1);
+        let logs = captured_logs();
+        assert_eq!(
+            logs.matches("Heartbeat discovery for solax_80 failed")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_entities_match_by_suffix() {
+        for id in [
+            "sensor.solax_80_grid_voltage",
+            "sensor.solax_80_grid_voltage_l2",
+            "sensor.solax_80_grid_frequency_l1",
+            "sensor.solax_80_measured_power",
+            "sensor.solax_80_house_load",
+        ] {
+            assert!(is_heartbeat_entity("solax_80", id), "{id}");
+        }
+        for id in [
+            "sensor.solax_81_grid_voltage",
+            "sensor.solax_80_battery_capacity",
+            "sensor.solax_80_house_load_today",
+            "number.solax_80_grid_voltage",
+        ] {
+            assert!(!is_heartbeat_entity("solax_80", id), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn battery_weights_never_write_to_parallel_unit() {
+        let mut server = Server::new_async().await;
+        battery_states(&mut server, "40", "80", 0, 5).await;
+        let no_writes = server
+            .mock("POST", Matcher::Regex(r"^/api/services/".to_owned()))
+            .match_body(Matcher::Regex("solax_81".to_owned()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        battery_weights_adapter(server.url())
+            .read_state("solax_80")
+            .await
+            .unwrap();
+
+        no_writes.assert_async().await;
     }
 
     #[tokio::test]
@@ -2088,6 +2944,7 @@ mod tests {
         ] {
             mock_state(&mut server, entity, state).await;
         }
+        no_heartbeats(&mut server).await;
         let wrong = server
             .mock(
                 "GET",

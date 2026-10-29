@@ -451,6 +451,7 @@ pub fn init_plugin_manager(
         min_mode_benefit_czk: wr_core.min_mode_benefit_czk,
         mode_switch_min_benefit_czk: wr_core.mode_switch_min_benefit_czk,
         soc_resolution_pct: wr_core.soc_resolution_pct,
+        export_floor_until_cheap: wr_core.export_floor_until_cheap,
     };
     manager.register(Arc::new(StrategyPlugin::new(
         WinterReserveStrategy::new(wr_core.enabled, wr_params),

@@ -46,6 +46,12 @@ pub struct BatteryParams {
     /// Export is a battery discharge: offered only when `control.force_discharge_enabled`
     #[serde(default)]
     pub force_discharge_enabled: bool,
+    /// HOLD as an EEPROM SolaX "Stop Charge and Discharge" runs it (`control.hold_pv_to_battery`,
+    /// measured on Jakub's Ultra pair): PV charges the battery first, the rest serves the house,
+    /// then the grid. False (default): HOLD means the house is not served from the battery: PV
+    /// serves the house, the surplus charges the battery, the rest is exported.
+    #[serde(default)]
+    pub hold_pv_to_battery: bool,
     /// Smallest stored energy (kWh) a Charge block must be able to add before the runtime guard
     /// stops it (max SOC − 1 %): max_charge_kw × one mode-change interval, at least 0.5 kWh (the
     /// export guard margin's rule). Stored at η × max_charge_kw, that takes longer than the
@@ -74,6 +80,10 @@ pub struct WinterReserveParams {
     /// over the whole run of blocks the switch is made for (brief H25)
     pub mode_switch_min_benefit_czk: f32,
     pub soc_resolution_pct: f32,
+    /// Export floor: the reserve deficit only until the next cheap block (buy at or below the
+    /// horizon median) when it comes before the next morning (`night_floors`)
+    #[serde(default)]
+    pub export_floor_until_cheap: bool,
 }
 
 impl Default for WinterReserveParams {
@@ -87,6 +97,7 @@ impl Default for WinterReserveParams {
             min_mode_benefit_czk: 0.10,
             mode_switch_min_benefit_czk: 1.0,
             soc_resolution_pct: 0.5,
+            export_floor_until_cheap: false,
         }
     }
 }
@@ -545,11 +556,31 @@ fn night_floors(
     });
     let mut floors = vec![emin; n];
     let mut next_morning = n;
+    // With `export_floor_until_cheap`, the reserve ends at the next cheap block when that comes
+    // first: from there the grid serves the house at a price at or below the horizon median and
+    // below the midpoint of its cheapest and dearest buy, so energy kept beyond it is worth only a
+    // cheap purchase. The midpoint keeps a dear majority at the median (and a flat horizon) from
+    // counting as cheap. n = no cheap block ahead. An open night (no morning ahead) also ends at a
+    // cheap block.
+    let cheap = if params.export_floor_until_cheap && n > 0 {
+        let mut buys: Vec<f32> = blocks.iter().map(|b| b.buy_czk).collect();
+        buys.sort_by(f32::total_cmp);
+        Some((median_of_sorted(&buys), (buys[0] + buys[n - 1]) / 2.0))
+    } else {
+        None
+    };
+    let mut next_cheap = n;
     for (k, block) in blocks.iter().enumerate().rev() {
-        let raw = if next_morning == n && night_open {
-            emax
+        let until = if next_cheap < next_morning {
+            Some(next_cheap)
+        } else if next_morning == n && night_open {
+            None
         } else {
-            (emin + prefix[next_morning] - prefix[k + 1]).min(emax)
+            Some(next_morning)
+        };
+        let raw = match until {
+            Some(end) => (emin + prefix[end] - prefix[k + 1]).min(emax),
+            None => emax,
         };
         // Insane price only counts against a known, positive cheap reference.
         let insane =
@@ -557,6 +588,9 @@ fn night_floors(
         floors[k] = if insane { emin } else { raw };
         if morning[k] {
             next_morning = k;
+        }
+        if cheap.is_some_and(|(median, mid)| block.buy_czk <= median && block.buy_czk < mid) {
+            next_cheap = k;
         }
     }
     floors
@@ -643,11 +677,22 @@ fn simulate_block_capped(
     // Below Emin the battery may still charge but never discharges: discharge headroom is
     // measured from Emin, so the gap below it is not available energy (brief H19 item 4).
     let e = energy_kwh.clamp(0.0, emax);
-    let (load, pv) = (block.load_kwh, block.pv_kwh);
+    // A negative forecast is no PV, not a discharge
+    let (load, pv) = (block.load_kwh, block.pv_kwh.max(0.0));
     let mut o = BlockOutcome::default();
 
     match mode {
-        PlanMode::SelfUse | PlanMode::NoDischarge if pv >= load => {
+        PlanMode::Hold if battery.hold_pv_to_battery => {
+            // EEPROM SolaX "Stop Charge and Discharge": PV charges the battery first (it never
+            // discharges), the rest serves the house, then the grid.
+            let c = pv.min(cmax).min(((emax - e) / eta).max(0.0));
+            o.battery_charge_kwh = c;
+            o.energy_end_kwh = e + c * eta;
+            grid_balance(&mut o, load - (pv - c), xmax);
+        }
+        // HOLD: the house is not served from the battery. PV serves the house, the surplus charges
+        // the battery and the rest is exported, as NoDischarge (SolaX direct VPP mode 7).
+        PlanMode::SelfUse | PlanMode::NoDischarge | PlanMode::Hold if pv >= load => {
             let surplus = pv - load;
             let c = surplus.min(cmax).min(((emax - e) / eta).max(0.0));
             o.battery_charge_kwh = c;
@@ -655,7 +700,7 @@ fn simulate_block_capped(
             o.grid_export_kwh = (surplus - c).min(xmax);
             o.curtailed_kwh = surplus - c - o.grid_export_kwh;
         }
-        PlanMode::SelfUse | PlanMode::NoDischarge => {
+        PlanMode::SelfUse | PlanMode::NoDischarge | PlanMode::Hold => {
             let deficit = load - pv;
             let q = match mode {
                 PlanMode::SelfUse => deficit.min(dmax).min(e - emin).max(0.0),
@@ -665,12 +710,8 @@ fn simulate_block_capped(
             o.energy_end_kwh = e - q;
             o.grid_import_kwh = deficit - q;
         }
-        PlanMode::Charge | PlanMode::Hold => {
-            let c = if mode == PlanMode::Charge {
-                cmax.min(((emax.min(charge_cap_kwh) - e) / eta).max(0.0))
-            } else {
-                0.0
-            };
+        PlanMode::Charge => {
+            let c = cmax.min(((emax.min(charge_cap_kwh) - e) / eta).max(0.0));
             o.battery_charge_kwh = c;
             o.energy_end_kwh = e + c * eta;
             grid_balance(&mut o, load + c - pv, xmax);
@@ -715,6 +756,16 @@ fn self_use_plan(blocks: &[PlanBlock], soc_pct: f32, capacity: f32, why: &str) -
     }
 }
 
+/// Median of ascending, non-empty `sorted` (mean of the two middle values for an even length).
+fn median_of_sorted(sorted: &[f32]) -> f32 {
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
 /// Mean of the lowest `ceil(percentile * n)` buy prices: the planner's `cheap_ref`.
 /// Input order does not matter.
 pub fn cheap_reference(buys: &[f32], percentile: f32) -> f32 {
@@ -738,6 +789,12 @@ pub fn plan(
     params: &WinterReserveParams,
 ) -> Plan {
     plan_from(blocks, soc_pct, tz, battery, params, None)
+}
+
+/// Head guard of an Export block: at or below the night floor plus the guard margin the block runs
+/// as SelfUse. The live head evaluation and the replay both apply it.
+pub fn export_guard_holds(live_kwh: f32, floor_kwh: f32, battery: &BatteryParams) -> bool {
+    live_kwh <= floor_kwh + battery.export_guard_margin_kwh
 }
 
 /// `plan`, with the mode currently applied to the inverter (`current`, None = unknown). Every
@@ -880,11 +937,7 @@ fn plan_with_rule(
 
     let mut buys: Vec<f32> = blocks.iter().map(|b| b.buy_czk).collect();
     buys.sort_by(f32::total_cmp);
-    let median_buy = if n % 2 == 1 {
-        buys[n / 2]
-    } else {
-        (buys[n / 2 - 1] + buys[n / 2]) / 2.0
-    };
+    let median_buy = median_of_sorted(&buys);
     let cheap_ref = cheap_reference(&buys, params.cheap_percentile);
     let floors: Vec<f32> = night_floors(blocks, battery, cheap_ref, params, tz)
         .into_iter()
@@ -1224,6 +1277,9 @@ pub fn battery_params(control: &ControlConfig) -> BatteryParams {
         max_export_kw: control.maximum_export_power_w as f32 / 1000.0,
         export_guard_margin_kwh: mode_change_kwh.max(0.5),
         force_discharge_enabled: control.force_discharge_enabled,
+        // TODO(#648): force false (INFO once) when `control.vpp_direct_enabled`: direct VPP
+        // writes HOLD as mode 7, which runs the default model.
+        hold_pv_to_battery: control.hold_pv_to_battery,
         min_charge_kwh: min_charge_kwh(
             control.max_battery_charge_rate_kw,
             control.min_mode_change_interval_secs,
@@ -1541,7 +1597,7 @@ impl super::EconomicStrategy for WinterReserveStrategy {
         let mut reason = entry.reason.clone();
         if is_head
             && mode == PlanMode::Export
-            && live_kwh <= entry.floor_kwh + battery.export_guard_margin_kwh
+            && export_guard_holds(live_kwh, entry.floor_kwh, &battery)
         {
             mode = PlanMode::SelfUse;
             reason = format!(
@@ -1644,6 +1700,7 @@ mod tests {
             max_export_kw: 10.0,
             export_guard_margin_kwh: 0.0,
             force_discharge_enabled: true,
+            hold_pv_to_battery: false,
             min_charge_kwh: 0.0,
             charge_cost_czk_per_kwh: None,
         }
@@ -1695,6 +1752,110 @@ mod tests {
     }
 
     // ---- Simulator ----
+
+    #[test]
+    fn sim_hold_solax_charges_battery_from_pv_first() {
+        let b = BatteryParams {
+            hold_pv_to_battery: true,
+            ..battery()
+        };
+        // PV 5, load 2: the battery takes all 5 kWh of PV, the house is served from the grid
+        let o = simulate_block(
+            PlanMode::Hold,
+            50.0,
+            &pblock(0, 3.0, 2.0, 2.0, 5.0),
+            9.6,
+            &b,
+        );
+        assert!(approx(o.battery_charge_kwh, 5.0));
+        assert!(approx(o.energy_end_kwh, 50.0 + 5.0 * 0.9));
+        assert!(approx(o.grid_import_kwh, 2.0));
+        assert!(approx(o.grid_export_kwh, 0.0));
+        assert!(approx(o.battery_discharge_kwh, 0.0));
+        // PV 12, load 2: charge limited to 7.5 kWh, 4.5 kWh serves the house, 2.5 exported
+        let o = simulate_block(
+            PlanMode::Hold,
+            50.0,
+            &pblock(0, 3.0, 2.0, 2.0, 12.0),
+            9.6,
+            &b,
+        );
+        assert!(approx(o.battery_charge_kwh, 7.5));
+        assert!(approx(o.grid_import_kwh, 0.0));
+        assert!(approx(o.grid_export_kwh, 2.5));
+        // No PV: the battery is idle and the house imports, as before
+        let o = simulate_block(
+            PlanMode::Hold,
+            50.0,
+            &pblock(0, 3.0, 2.0, 2.0, 0.0),
+            9.6,
+            &b,
+        );
+        assert!(approx(o.energy_end_kwh, 50.0));
+        assert!(approx(o.grid_import_kwh, 2.0));
+    }
+
+    #[test]
+    fn sim_hold_default_serves_house_from_pv_then_charges_surplus() {
+        let b = battery();
+        assert!(!b.hold_pv_to_battery);
+        // PV 5, load 2: the house takes 2, the battery the 3 kWh surplus, nothing exported
+        let o = simulate_block(
+            PlanMode::Hold,
+            50.0,
+            &pblock(0, 3.0, 2.0, 2.0, 5.0),
+            9.6,
+            &b,
+        );
+        assert!(approx(o.battery_charge_kwh, 3.0));
+        assert!(approx(o.energy_end_kwh, 50.0 + 3.0 * 0.9));
+        assert!(approx(o.grid_import_kwh, 0.0));
+        assert!(approx(o.grid_export_kwh, 0.0));
+        // Full battery: the surplus is exported
+        let (_, emax) = b.bounds_kwh();
+        let o = simulate_block(
+            PlanMode::Hold,
+            emax,
+            &pblock(0, 3.0, 2.0, 2.0, 5.0),
+            9.6,
+            &b,
+        );
+        assert!(approx(o.battery_charge_kwh, 0.0));
+        assert!(approx(o.grid_export_kwh, 2.5));
+        // PV 1, load 2: the battery never discharges, the grid covers the deficit
+        let o = simulate_block(
+            PlanMode::Hold,
+            50.0,
+            &pblock(0, 3.0, 2.0, 2.0, 1.0),
+            9.6,
+            &b,
+        );
+        assert!(approx(o.energy_end_kwh, 50.0));
+        assert!(approx(o.battery_discharge_kwh, 0.0));
+        assert!(approx(o.grid_import_kwh, 1.0));
+    }
+
+    #[test]
+    fn sim_hold_negative_pv_never_discharges() {
+        let b = BatteryParams {
+            hold_pv_to_battery: true,
+            ..battery()
+        };
+        let (_, emax) = b.bounds_kwh();
+        for e in [50.0, emax] {
+            let o = simulate_block(PlanMode::Hold, e, &pblock(0, 3.0, 2.0, 2.0, -1.0), 9.6, &b);
+            assert!(approx(o.energy_end_kwh, e), "{e}: {}", o.energy_end_kwh);
+            assert!(approx(o.battery_charge_kwh, 0.0));
+            assert!(approx(o.grid_import_kwh, 2.0));
+        }
+    }
+
+    #[test]
+    fn hold_routing_defaults_follow_the_control_config() {
+        let b = battery_params(&ControlConfig::default());
+        assert!(!b.hold_pv_to_battery);
+        assert!(!WinterReserveParams::default().export_floor_until_cheap);
+    }
 
     #[test]
     fn sim_selfuse_surplus_charges_and_exports_above_cap() {
@@ -1819,30 +1980,6 @@ mod tests {
     }
 
     #[test]
-    fn sim_hold_leaves_battery_untouched() {
-        let b = battery();
-        let o = simulate_block(
-            PlanMode::Hold,
-            50.0,
-            &pblock(0, 3.0, 2.0, 1.0, 0.0),
-            9.6,
-            &b,
-        );
-        assert!(approx(o.energy_end_kwh, 50.0));
-        assert!(approx(o.grid_import_kwh, 1.0));
-        let o = simulate_block(
-            PlanMode::Hold,
-            50.0,
-            &pblock(0, 3.0, 2.0, 1.0, 3.0),
-            9.6,
-            &b,
-        );
-        assert!(approx(o.energy_end_kwh, 50.0));
-        assert!(approx(o.grid_export_kwh, 2.0));
-        assert!(approx(o.grid_import_kwh, 0.0));
-    }
-
-    #[test]
     fn sim_export_limited_by_floor_cap_and_dmax() {
         let b = battery();
         // Floor 40 with 50 stored, no load: the inverter throttles to the 2.5 kWh export cap
@@ -1939,7 +2076,17 @@ mod tests {
             &battery(),
             &WinterReserveParams::default(),
         );
-        assert!(p.blocks.iter().all(|b| b.mode != PlanMode::Export));
+        // The battery is never sold; an Export in the sunny morning sells only PV (HOLD and
+        // SelfUse store the surplus, so Export is how PV reaches the grid at 5.5)
+        for (i, b) in p.blocks.iter().enumerate() {
+            if b.mode == PlanMode::Export {
+                assert!(i >= 48, "export at night block {i}");
+                assert!(
+                    approx(b.outcome.battery_discharge_kwh, 0.0),
+                    "battery sold at {i}"
+                );
+            }
+        }
         for (i, b) in p.blocks.iter().enumerate() {
             if b.mode == PlanMode::Charge {
                 assert!(
@@ -2040,6 +2187,86 @@ mod tests {
             "{} vs {expected}",
             p.blocks[8].floor_kwh
         );
+    }
+
+    #[test]
+    fn floor_until_cheap_ends_the_reserve_at_the_next_cheap_block() {
+        let tz = chrono_tz::Europe::Prague;
+        let b = battery();
+        // Load 0.75 everywhere, PV from 08:00 (block 56). Evening 18-22 dear (buy 8), night from
+        // 22:00 (block 16) cheap (buy 3), morning dear again.
+        let blocks: Vec<PlanBlock> = (0..60)
+            .map(|i| {
+                let buy = if (16..48).contains(&i) { 3.0 } else { 8.0 };
+                pblock(i, buy, buy - 1.0, 0.75, if i >= 56 { 2.0 } else { 0.0 })
+            })
+            .collect();
+        let deficit = |r: std::ops::Range<usize>| -> f32 {
+            blocks[r]
+                .iter()
+                .map(|x| (x.load_kwh - x.pv_kwh).max(0.0))
+                .sum()
+        };
+        let emin = b.bounds_kwh().0;
+        let mut params = WinterReserveParams::default();
+        let old = night_floors(&blocks, &b, 3.0, &params, tz);
+        params.export_floor_until_cheap = true;
+        let new = night_floors(&blocks, &b, 3.0, &params, tz);
+        // 20:00 (block 8): until the morning without the flag, until 22:00 (block 16) with it
+        assert!(approx(old[8], emin + deficit(9..56)), "{}", old[8]);
+        assert!(approx(new[8], emin + deficit(9..16)), "{}", new[8]);
+        // In the cheap night the next cheap block is the following one: the floor is Emin
+        assert!(approx(new[20], emin), "{}", new[20]);
+        // 06:00 (block 48) is dear and no cheap block follows before the morning: unchanged
+        assert!(approx(new[48], old[48]), "{} vs {}", new[48], old[48]);
+    }
+
+    #[test]
+    fn floor_until_cheap_ends_an_open_night_at_a_cheap_block() {
+        let tz = chrono_tz::Europe::Prague;
+        let b = battery();
+        // No PV at all (open night): the plain floor is Emax; a cheap block at 22:00 ends it
+        let blocks: Vec<PlanBlock> = (0..40)
+            .map(|i| {
+                let buy = if i >= 16 { 3.0 } else { 8.0 };
+                pblock(i, buy, buy - 1.0, 0.75, 0.0)
+            })
+            .collect();
+        let (emin, emax) = b.bounds_kwh();
+        let params = WinterReserveParams {
+            export_floor_until_cheap: true,
+            ..WinterReserveParams::default()
+        };
+        let old = night_floors(&blocks, &b, 3.0, &WinterReserveParams::default(), tz);
+        let new = night_floors(&blocks, &b, 3.0, &params, tz);
+        assert!(approx(old[8], emax));
+        assert!(approx(new[8], emin + 7.0 * 0.75), "{}", new[8]);
+    }
+
+    #[test]
+    fn floor_until_cheap_ignores_a_dear_majority_at_the_median_and_a_flat_horizon() {
+        let tz = chrono_tz::Europe::Prague;
+        let b = battery();
+        let (emin, emax) = b.bounds_kwh();
+        let params = WinterReserveParams {
+            export_floor_until_cheap: true,
+            ..WinterReserveParams::default()
+        };
+        // Open night, 32 blocks at 4 then 8 at 2: the median is the dear 4, not cheap
+        let blocks: Vec<PlanBlock> = (0..40)
+            .map(|i| {
+                let buy = if i >= 32 { 2.0 } else { 4.0 };
+                pblock(i, buy, 5.0, 0.75, 0.0)
+            })
+            .collect();
+        let new = night_floors(&blocks, &b, 2.0, &params, tz);
+        assert!(approx(new[0], (emin + 31.0 * 0.75).min(emax)), "{}", new[0]);
+        // Flat prices: nothing is cheap, the floor stays as without the option
+        let flat: Vec<PlanBlock> = (0..40).map(|i| pblock(i, 5.0, 8.0, 0.75, 0.0)).collect();
+        let old = night_floors(&flat, &b, 5.0, &WinterReserveParams::default(), tz);
+        let new = night_floors(&flat, &b, 5.0, &params, tz);
+        assert_eq!(old, new);
+        assert!(approx(new[0], emax));
     }
 
     #[test]
@@ -3834,6 +4061,7 @@ mod force_discharge_gate_tests {
             export_guard_margin_kwh: 0.0,
             min_charge_kwh: 0.0,
             force_discharge_enabled,
+            hold_pv_to_battery: false,
             charge_cost_czk_per_kwh: None,
         }
     }
@@ -3934,6 +4162,7 @@ mod keep_rule_tests {
             export_guard_margin_kwh: 0.0,
             min_charge_kwh: 0.0,
             force_discharge_enabled: false,
+            hold_pv_to_battery: false,
             charge_cost_czk_per_kwh: None,
         }
     }
@@ -4395,6 +4624,7 @@ mod h30_tests {
             export_guard_margin_kwh: 0.0,
             min_charge_kwh: min_charge_kwh(10.0, 300),
             force_discharge_enabled: false,
+            hold_pv_to_battery: false,
             charge_cost_czk_per_kwh: None,
         }
     }
@@ -4605,6 +4835,7 @@ mod h33_tests {
             max_export_kw: 5.0,
             export_guard_margin_kwh: 0.0,
             force_discharge_enabled: false,
+            hold_pv_to_battery: false,
             min_charge_kwh: 0.0,
             charge_cost_czk_per_kwh: None,
         }

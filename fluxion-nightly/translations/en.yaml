@@ -36,6 +36,15 @@ configuration:
     description: >-
       Entity prefixes of parallel units whose PV power and solar energy are
       added to this inverter's PV. They are only read, never controlled.
+  battery_extra_prefixes:
+    name: Extra Battery Prefixes (read-only)
+    description: >-
+      Entity prefixes of parallel units whose battery SOC is combined with this
+      inverter's SOC, weighted by capacity. They are only read, never controlled.
+  battery_extra_capacities_kwh:
+    name: Extra Battery Capacities (kWh)
+    description: >-
+      Usable capacity (kWh) of each extra battery prefix, in the same order (at least 0.1). The master's share is control.battery_capacity_kwh minus these, so that must be the pair's measured total. If a unit's SOC is unreadable for over 10 min, FluxION holds the last combined SOC, then takes no new state.
   min_battery_soc:
     name: Minimum Battery SOC
     description: >-
@@ -102,6 +111,10 @@ configuration:
     name: Mode Control
     description: >-
       When off, FluxION only curtails export (export limit 0 W at or below the curtail price, restored afterwards) and never writes the work mode, Back Up minimum SOC, HotStandBy or battery awaken. Default on.
+  hold_pv_to_battery:
+    name: EEPROM HOLD Charges From PV First
+    description: >-
+      Turn on only for a site whose EEPROM HOLD ("Stop Charge and Discharge") sends PV into the battery first while the house imports (measured on SolaX Ultra). Off: HOLD means PV serves the house, the surplus charges the battery, the rest is exported. Ignored with direct VPP control. Default off: keep it off unless a replay on the site shows a gain (on Jakub's site it replayed about 2 CZK/day worse).
   update_interval_secs:
     name: Update Interval (seconds)
     description: >-

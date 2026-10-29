@@ -20,11 +20,14 @@ use crate::{
     debug::DebugModeConfig,
     pricing::analyze_prices,
     resources::{SystemConfig, UserControlResource, UserLeversResource},
-    scheduling::{ScheduleConfig, active_user_levers, generate_schedule_with_optimizer},
+    scheduling::{
+        ScheduleConfig, active_user_levers, apply_learning_warmup, generate_schedule_with_optimizer,
+    },
     web_bridge::{ConfigUpdateChannel, UserControlUpdateChannel},
 };
 
 use super::BackupDischargeMinSoc;
+use super::price_fetcher::LearningWarmupLog;
 
 /// Generates consumption forecast for scheduling using priority-based data sources
 /// Priority: 1) Historical data (EMA), 2) Configured fallback. The instantaneous house load is
@@ -105,6 +108,7 @@ pub struct ConfigEventParams<'w, 's> {
     timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
     user_levers: Option<Res<'w, UserLeversResource>>,
     cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
+    warmup_log: Local<'s, LearningWarmupLog>,
 }
 
 /// Keep `control.mode_control_enabled` of the running config in `new` (brief H37): the inverter
@@ -299,7 +303,7 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
             // Corrected by the PV forecast correction factor (brief H34) when in force
             let solar =
                 super::planner_solar_inputs(params.solar_forecast.as_deref(), &block_starts);
-            let new_schedule = generate_schedule_with_optimizer(
+            let mut new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
@@ -332,6 +336,13 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                     .as_ref()
                     .and_then(|t| t.cost_czk_per_kwh()),
             );
+            // Brief H38: no planner moves until the house-load profile has MIN_HOUSE_LOAD_DAYS
+            if let Some(days) = params.warmup_log.observe(
+                history_profile_configured(&params.system_config.history),
+                params.consumption_history.hourly_profile(),
+            ) {
+                apply_learning_warmup(&mut new_schedule, days, MIN_HOUSE_LOAD_DAYS);
+            }
 
             // Update schedule
             if let Ok(mut schedule) = params.schedule_query.single_mut() {
@@ -392,6 +403,7 @@ pub struct UserControlEventParams<'w, 's> {
     timezone_config: Option<Res<'w, crate::resources::TimezoneConfig>>,
     user_levers: Option<Res<'w, UserLeversResource>>,
     cost_basis: Option<Res<'w, crate::battery_cost_basis::BatteryCostTracker>>,
+    warmup_log: Local<'s, LearningWarmupLog>,
 }
 
 /// System that processes user control update events from the web UI
@@ -480,7 +492,7 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
             // Corrected by the PV forecast correction factor (brief H34) when in force
             let solar =
                 super::planner_solar_inputs(params.solar_forecast.as_deref(), &block_starts);
-            let new_schedule = generate_schedule_with_optimizer(
+            let mut new_schedule = generate_schedule_with_optimizer(
                 &price_data.time_block_prices,
                 &params.system_config.control_config,
                 &schedule_config,
@@ -513,6 +525,13 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                     .as_ref()
                     .and_then(|t| t.cost_czk_per_kwh()),
             );
+            // Brief H38: no planner moves until the house-load profile has MIN_HOUSE_LOAD_DAYS
+            if let Some(days) = params.warmup_log.observe(
+                history_profile_configured(&params.system_config.history),
+                params.consumption_history.hourly_profile(),
+            ) {
+                apply_learning_warmup(&mut new_schedule, days, MIN_HOUSE_LOAD_DAYS);
+            }
 
             // Update schedule
             if let Ok(mut schedule) = params.schedule_query.single_mut() {

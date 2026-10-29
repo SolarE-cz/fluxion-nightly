@@ -24,7 +24,7 @@ use crate::components::{
 use crate::savings::RecordedBlock;
 use crate::strategy::winter_reserve::{
     BatteryParams, BlockOutcome, PlanBlock, PlanMode, WinterReserveParams, cheap_reference,
-    plan_from, simulate_block,
+    export_guard_holds, plan_from, simulate_block,
 };
 use crate::traits::HistoryDataPoint;
 
@@ -60,7 +60,7 @@ pub struct ReplayOptions {
     pub profile: ProfileSource,
     /// Multiplies the forecast PV the planner sees (the simulated reality uses actual PV)
     pub pv_forecast_bias: f32,
-    /// Future PV forecasts times a deterministic factor in [0.5, 1.3]
+    /// PV forecasts (the current block's included) times a deterministic factor in [0.5, 1.3]
     pub pv_noise: bool,
     /// Run self-use only
     pub baseline_only: bool,
@@ -71,6 +71,13 @@ pub struct ReplayOptions {
     /// Track the cost of charge of the simulated Winter Reserve battery and plan with it
     /// (brief H33). Off: the planner sees "cost unknown", as the backtest page does.
     pub track_cost_basis: bool,
+    /// What the planner assumes when it differs from the simulated battery, e.g. the live
+    /// config's capacity and efficiency, or the default HOLD model while the simulated inverter
+    /// runs EEPROM SolaX Stop Charge and Discharge (calibration against the meter). None = the
+    /// simulated battery's value.
+    pub plan_capacity_kwh: Option<f32>,
+    pub plan_efficiency: Option<f32>,
+    pub plan_hold_pv_to_battery: Option<bool>,
 }
 
 impl ReplayOptions {
@@ -89,6 +96,9 @@ impl ReplayOptions {
             from: None,
             until: None,
             track_cost_basis: false,
+            plan_capacity_kwh: None,
+            plan_efficiency: None,
+            plan_hold_pv_to_battery: None,
         }
     }
 }
@@ -471,7 +481,8 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                     ),
                     None => (load_fc, load_fc * params.load_safety_factor),
                 };
-                let noise = if opts.pv_noise && j > i {
+                // The current block's PV forecast takes the same noise as later blocks
+                let noise = if opts.pv_noise {
                     pv_noise_factor(j)
                 } else {
                     1.0
@@ -498,6 +509,15 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
             }
 
             let mut plan_battery = battery;
+            if let Some(capacity) = opts.plan_capacity_kwh {
+                plan_battery.capacity_kwh = capacity;
+            }
+            if let Some(efficiency) = opts.plan_efficiency {
+                plan_battery.efficiency = efficiency;
+            }
+            if let Some(to_battery) = opts.plan_hold_pv_to_battery {
+                plan_battery.hold_pv_to_battery = to_battery;
+            }
             if opts.track_cost_basis {
                 let basis = cost_basis.get_or_insert_with(|| {
                     // Start without a saved cost: unknown until the battery reaches the minimum.
@@ -514,7 +534,19 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                 .ok_or("planner returned an empty plan")?;
             planned_blocks += 1;
             applied = Some(first.mode);
-            (first.mode, first.floor_kwh, first.reason.clone())
+            // The live head guard: an Export at the night floor runs as SelfUse
+            let live_kwh = soc_now / 100.0 * plan_battery.capacity_kwh;
+            if first.mode == PlanMode::Export
+                && export_guard_holds(live_kwh, first.floor_kwh, &plan_battery)
+            {
+                (
+                    PlanMode::SelfUse,
+                    first.floor_kwh,
+                    format!("{} | guard: export held at night floor", first.reason),
+                )
+            } else {
+                (first.mode, first.floor_kwh, first.reason.clone())
+            }
         };
         acc.modes[mode_index(mode)] += 1;
         let wr_out = simulate_block(mode, e_wr, &actual_block, floor_kwh, &battery);

@@ -30,11 +30,22 @@
 //! Usage:
 //! `cargo run -p fluxion-core --example winter_reserve_replay -- data.json [--baseline-only]
 //!  [--csv out.csv] [--pv-noise] [--pv-forecast-bias 0.5] [--profile forecast|import|house]
-//!  [--from 2026-10-14T14:30:00Z] [--force-discharge] [--cost-basis] [--param key=value]...`
+//!  [--from 2026-10-14T14:30:00Z] [--force-discharge] [--cost-basis] [--hold-pv-to-battery]
+//!  [--plan-hold-to-house] [--plan-capacity 96] [--plan-efficiency 0.95]
+//!  [--param key=value]...`
 //!
 //! `--force-discharge` sets `force_discharge_enabled` (export to the grid allowed) on the battery.
 //! `--cost-basis` tracks the cost of charge of the simulated battery and plans with it (brief
 //! H33); without it the planner sees "cost unknown".
+//!
+//! Without flags HOLD runs the default model: PV → house → battery → grid, no discharge (direct
+//! VPP mode 7). `--hold-pv-to-battery` runs HOLD as an EEPROM SolaX Stop Charge and Discharge
+//! does (PV into the battery first, the house imports; `control.hold_pv_to_battery`), in the
+//! planner and the simulated inverter, for sites that still run EEPROM HOLD.
+//! `--plan-hold-to-house` (planner assumes the default HOLD model), `--plan-capacity` and
+//! `--plan-efficiency` change only what the planner assumes, so a replay can run the live config
+//! against the measured battery (calibration). `--param` takes numbers; a boolean parameter
+//! such as `export_floor_until_cheap` takes 1 or 0.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -87,7 +98,13 @@ fn set_param(params: &mut WinterReserveParams, assignment: &str) -> Result<(), S
     if !map.contains_key(key) {
         return Err(format!("unknown parameter {key}"));
     }
-    map.insert(key.to_string(), serde_json::json!(value));
+    // Boolean parameters take 1 (true) or 0 (false)
+    let json = if map[key].is_boolean() {
+        serde_json::json!(value != 0.0)
+    } else {
+        serde_json::json!(value)
+    };
+    map.insert(key.to_string(), json);
     *params = serde_json::from_value(serde_json::Value::Object(map))
         .map_err(|err| format!("--param {key}: {err}"))?;
     Ok(())
@@ -115,6 +132,10 @@ fn run() -> Result<(), String> {
     let mut params = WinterReserveParams::default();
     let mut force_discharge = false;
     let mut cost_basis = false;
+    let mut hold_pv_to_battery = false;
+    let mut plan_hold_to_house = false;
+    let mut plan_capacity: Option<f32> = None;
+    let mut plan_efficiency: Option<f32> = None;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -123,6 +144,17 @@ fn run() -> Result<(), String> {
             "--pv-noise" => pv_noise = true,
             "--force-discharge" => force_discharge = true,
             "--cost-basis" => cost_basis = true,
+            "--hold-pv-to-battery" => hold_pv_to_battery = true,
+            "--plan-hold-to-house" => plan_hold_to_house = true,
+            "--plan-capacity" | "--plan-efficiency" => {
+                let text = iter.next().ok_or(format!("{arg} needs a number"))?;
+                let value: f32 = text.parse().map_err(|err| format!("{arg} {text}: {err}"))?;
+                if arg == "--plan-capacity" {
+                    plan_capacity = Some(value);
+                } else {
+                    plan_efficiency = Some(value);
+                }
+            }
             "--pv-forecast-bias" => {
                 let text = iter.next().ok_or("--pv-forecast-bias needs a factor")?;
                 pv_forecast_bias = text
@@ -161,6 +193,7 @@ fn run() -> Result<(), String> {
     let mut battery = dataset.site.battery;
     // `control.force_discharge_enabled` (export to the grid); off unless the flag is given.
     battery.force_discharge_enabled |= force_discharge;
+    battery.hold_pv_to_battery |= hold_pv_to_battery;
     // The live planner derives the minimum useful charge from the charge power and the
     // mode-change debounce (brief H30); a dataset without it gets the live default.
     if battery.min_charge_kwh <= 0.0 {
@@ -224,6 +257,9 @@ fn run() -> Result<(), String> {
     options.baseline_only = baseline_only;
     options.from = from;
     options.track_cost_basis = cost_basis;
+    options.plan_capacity_kwh = plan_capacity;
+    options.plan_efficiency = plan_efficiency;
+    options.plan_hold_pv_to_battery = plan_hold_to_house.then_some(false);
     let run = replay(&rows, &options)?;
     let days = &run.days;
     let skipped_days = &run.skipped_days;
@@ -271,7 +307,7 @@ fn run() -> Result<(), String> {
     if pv_noise {
         let _ = writeln!(
             out,
-            "--pv-noise: future PV forecasts × deterministic factor in [0.5, 1.3] (seeded by block index); robustness check."
+            "--pv-noise: PV forecasts (current block included) × deterministic factor in [0.5, 1.3] (seeded by block index); robustness check."
         );
     }
     let counted = || {

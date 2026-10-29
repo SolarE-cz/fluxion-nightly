@@ -307,9 +307,25 @@ fn initialize_and_run() -> Result<()> {
             id, extras
         );
     }
+    // Read-only battery of parallel units, combined into their inverter's SOC by capacity
+    let battery_soc_weights: std::collections::HashMap<
+        String,
+        fluxion_adapters::ha::adapters::BatterySocWeights,
+    > = config
+        .inverters
+        .iter()
+        .filter_map(|inv| config.battery_soc_weights(inv).map(|w| (inv.id.clone(), w)))
+        .collect();
+    for (id, weights) in &battery_soc_weights {
+        info!(
+            "🔋 Inverter {} SOC is capacity-weighted: own {:.1} kWh, parallel units {:?}",
+            id, weights.own_kwh, weights.extras
+        );
+    }
     let inverter_adapter = HomeAssistantInverterAdapter::new(ha_client.clone(), mapper)
         .with_guard(actuation_guard)
-        .with_pv_extra_prefixes(pv_extra_prefixes);
+        .with_pv_extra_prefixes(pv_extra_prefixes)
+        .with_battery_soc_weights(battery_soc_weights);
     // Shared with the pre-wake system, so both use one awaken rate limit
     let actuation_state =
         fluxion_adapters::ha::actuation::ActuationStateResource(inverter_adapter.actuation_state());

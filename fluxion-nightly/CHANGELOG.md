@@ -10,6 +10,91 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.68] - 2026-10-29
+
+### Added
+
+- Export floor until the next cheap block: `strategies.winter_reserve.export_floor_until_cheap`
+  (default false). Export may go down to the reserve deficit until the next block whose buy is at or
+  below the horizon median and below the midpoint of the horizon's cheapest and dearest buy, instead
+  of until the next morning, when that block comes first (it also ends an open night). A dear
+  majority at the median or a flat horizon keeps the full floor. Needs
+  `control.force_discharge_enabled`.
+- Capacity-weighted SOC of a parallel pair: per-inverter `battery_extra_prefixes` and
+  `battery_extra_capacities_kwh` (each ≥ 0.1 kWh). The SOC an inverter reports is the
+  capacity-weighted mean of its own battery and the read-only parallel units' batteries (own
+  capacity = `control.battery_capacity_kwh` minus the extras, so that must be the pair's measured
+  total). A unit whose SOC is unreadable or that is not live: the last combined SOC is held for up
+  to 10 min, then the state read fails instead of using the master's own SOC (−7 to +6 kWh off on
+  Jakub's pair).
+- Replay example: `--hold-pv-to-battery`, `--plan-hold-to-house`, `--plan-capacity`,
+  `--plan-efficiency`; `--param` takes 1/0 for boolean parameters.
+- Learning house load: while a configured house-load or consumption history has fewer than 3 days of
+  profile (or none), every planned block is the default mode (Self-Use) instead of the planner's
+  moves, so a new site runs on its default until the profile is usable. Without a history source
+  nothing changes.
+
+### Changed
+
+- HOLD means the house is not served from the battery: the planner models it as PV → house → battery
+  → grid with no discharge (direct VPP mode 7), instead of an idle battery that exports the PV
+  surplus. In a sunny block the planner now plans Export to sell PV, where it used to rely on HOLD
+  exporting the surplus. Export runs as Force Discharge, so above the night floor it also discharges
+  the battery. At the floor plus the guard margin it runs as Self-Use, both live and in the replay.
+- `control.hold_pv_to_battery` (default false) describes an EEPROM HOLD ("Stop Charge and
+  Discharge") that sends PV into the battery first while the house imports, as measured on Jakub's
+  SolaX Ultra pair; the planner then models HOLD that way. To be ignored with direct VPP control
+  (#648). Keep it false unless a replay on the site shows a gain: on Jakub's site it replayed about
+  2 CZK/day worse. A negative PV forecast counts as no PV.
+- The add-on options `control.hold_pv_to_battery`,
+  `strategies.winter_reserve.export_floor_until_cheap` and `inverters[].battery_extra_*` apply over
+  a configuration saved by the web UI.
+- Replay `--pv-noise` also perturbs the current block's PV forecast. The replay applies the live
+  Export head guard (Self-Use at the night floor plus margin).
+- No planned inverter mode write (schedule, drift re-apply, VPR, fixed slots) after more than 120 s
+  without new data: the state's time is the master's newest heartbeat `last_updated`, and a failed
+  read keeps the previous state, so SOC and mode may be frozen. One good read in the window counts
+  as fresh. A running ForceCharge, ForceDischarge or HOLD is ended once with the default mode
+  (Self-Use, or Back Up in the Back Up default), because the EEPROM modes do not lapse. A forced
+  mode is re-entered only after 60 s of good reads (at least two), and the 300 s mode-change
+  debounce still applies, so reads recovering just past 120 s do not flap the inverter. After 2
+  stale exits within 60 min the inverter stays in the default basic mode until its state has been
+  fresh for 10 min (WARN once, INFO on the end), so reads that keep recovering between longer stalls
+  do not cost EEPROM writes. Each exit decides the back-off afresh: an exit with no other in the
+  last 60 min waits only the 60 s. WARN once on entry, INFO once on recovery; the kill switch and
+  mode-control-off are not gated.
+- Liveness per inverter (master or pair unit): live while any heartbeat sensor
+  (`<prefix>_grid_voltage*`, `_grid_frequency*`, `_measured_power`, `_inverter_power`,
+  `_house_load`, `_pv_power_total`, `_battery_power_charge`) was updated (`last_updated`) within 120
+  s; found once from `/api/states` and logged, no age check without any. A master that is not live
+  fails the state read; a unit that is not live makes its SOC unreadable, unless it is in standby
+  (battery and PV power both within 50 W of 0, so its SOC cannot move: Jakub's slave at its 10 %
+  floor at night) while the master shows at most 200 W of PV and is not charging. A failing
+  `/api/states` fails the read (WARN once) instead of skipping the check. `last_reported` is not
+  used: HA's REST API does not advance it while a value is flat. A unit outage outside standby
+  changes modes at the latest 120 s + 10 min (SOC hold) + 120 s after its last heartbeat; a unit
+  that fails in standby is found once the master shows over 200 W of PV or charges (by the next
+  morning at the latest), then 10 min + 120 s.
+- Invalid `inverters[].battery_extra_*` (lengths differ, capacity under 0.1 kWh, own prefix, no
+  capacity left for the master) are ignored with a WARN instead of stopping the add-on.
+- Replay on Jakub's site, 2026-10-16 03:15Z → end (10.69 days), 80 kWh, end-SOC adjusted: the live
+  configuration 147.1 CZK/day (raw 1687.74 CZK against 1676.24 actual, +0.7 %); as released (EEPROM
+  HOLD on the site, default HOLD model planned) 130.4; with `hold_pv_to_battery` 132.4; plus force
+  discharge, `export_floor_until_cheap`, profit gap 0.5 and wear 0.03: 102.4 as released (102.6 with
+  PV noise, 101.6 with a 20 % under-forecast), 104.6 with `hold_pv_to_battery`, 101.9 with
+  direct-VPP HOLD. Variants spread a few CZK/day either way (PV noise and the under-forecast move
+  these by −5.6 to +1.0), so these are estimates, not upper bounds.
+
+### Fixed
+
+- A matching initial sync (or one skipped for SOC) now records the hardware mode as the current
+  mode. After a restart in the middle of ForceCharge, the kill switch compared Self-Use with
+  Self-Use and wrote nothing.
+- The kill switch sets the default basic mode: Back Up Mode with the user's minimum SOC in the Back
+  Up default, not always Self-Use.
+- Mode drift re-apply ignores read-backs from before a mode write and forgets earlier mismatches, so
+  a resumed mode is not re-sent 5 s later.
+
 ## [0.2.67] - 2026-10-21
 
 ### Added

@@ -159,6 +159,93 @@ pub struct ScheduleWarnings {
     fixed_slots: BTreeSet<String>,
     /// The "mode writes suppressed" line was logged (brief H37)
     mode_control_off: bool,
+    /// Inverters with no successful state read for `STATE_STALE_SECS` (WARN logged on entry)
+    stale_state: BTreeSet<String>,
+    /// Stale inverters whose forced mode was already ended (one basic-mode write per stale period)
+    stale_exit_sent: BTreeSet<String>,
+    /// When the forced mode was ended, until the planned mode is written again: the exit broke
+    /// the block lock, so the resume is a good reason (PR #647 R4-2)
+    stale_exit_at: BTreeMap<String, DateTime<Utc>>,
+    /// Inverters fresh again after a stale exit, not yet settled: no forced mode is re-entered
+    /// until `SETTLE_SECS` and two good reads have passed (PR #647 R4-2)
+    settling: BTreeMap<String, Settling>,
+    /// Stale exits per inverter in the last `STALE_BACKOFF_WINDOW_SECS` (PR #647 R6-3)
+    stale_exits: BTreeMap<String, Vec<DateTime<Utc>>>,
+    /// Inverters backed off after repeated stale exits: no forced mode until the state has been
+    /// fresh for `STALE_BACKOFF_SETTLE_SECS` (PR #647 R6-3)
+    stale_backoff: BTreeSet<String>,
+}
+
+/// Good reads since an inverter's state was fresh again after a stale exit
+#[derive(Debug, Clone, Copy)]
+struct Settling {
+    since: DateTime<Utc>,
+    last_read: DateTime<Utc>,
+    reads: u32,
+}
+
+/// After a stale exit, a forced mode is re-entered only once the state has been fresh this long
+/// with at least two good reads, so reads recovering just past `STATE_STALE_SECS` cannot flap
+/// the inverter between the forced mode and the default (PR #647 R4-2)
+const SETTLE_SECS: i64 = 60;
+
+/// After this many stale exits within `STALE_BACKOFF_WINDOW_SECS`, an inverter stays in the
+/// default basic mode until its state has been fresh for `STALE_BACKOFF_SETTLE_SECS`: reads that
+/// keep recovering for a minute between longer stalls would otherwise cost about 18 EEPROM writes
+/// an hour (PR #647 R6-3)
+const STALE_BACKOFF_EXITS: usize = 2;
+const STALE_BACKOFF_WINDOW_SECS: i64 = 3600;
+const STALE_BACKOFF_SETTLE_SECS: i64 = 600;
+
+/// With no successful state read (5 s cadence) for longer than this the executor makes no mode
+/// write: a failed read keeps the previous state, so its SOC and mode may be frozen. Reads can
+/// stall for up to a minute, so one good read in the window counts as fresh (PR #647 N1, owner
+/// ruling 2026-10-28).
+pub const STATE_STALE_SECS: i64 = 120;
+
+/// Freshness of an inverter's state read
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateFreshness {
+    Fresh,
+    /// Fresh again after a stale period
+    Recovered,
+    Stale,
+}
+
+/// Whether `inverter_id` had no successful state read (`read_at`, the last one) for longer than
+/// `STATE_STALE_SECS`; WARN once on entry, INFO once on recovery.
+fn state_freshness(
+    stale_state: &mut BTreeSet<String>,
+    inverter_id: &str,
+    read_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> StateFreshness {
+    let stale = read_at.is_some_and(|at| now - at > chrono::Duration::seconds(STATE_STALE_SECS));
+    if stale {
+        if stale_state.insert(inverter_id.to_string()) {
+            warn!(
+                "No successful state read of {inverter_id} for over {STATE_STALE_SECS} s (last read {}): no mode writes until a fresh read",
+                read_at.map_or_else(String::new, |at| at.to_rfc3339())
+            );
+        }
+        StateFreshness::Stale
+    } else if stale_state.remove(inverter_id) {
+        info!("Inverter state of {inverter_id} is fresh again: mode writes resume");
+        StateFreshness::Recovered
+    } else {
+        StateFreshness::Fresh
+    }
+}
+
+/// A mode that keeps forcing the battery until FluxION ends it: an EEPROM Manual or HOLD mode has
+/// no lapse of its own (PR #647 R3-1)
+fn is_forced_mode(mode: InverterOperationMode) -> bool {
+    matches!(
+        mode,
+        InverterOperationMode::ForceCharge
+            | InverterOperationMode::ForceDischarge
+            | InverterOperationMode::NoChargeNoDischarge
+    )
 }
 
 /// Defence in depth: ForceDischarge is never sent while `control.force_discharge_enabled` is false.
@@ -357,6 +444,14 @@ pub struct ExecutorState {
 }
 
 impl ExecutorState {
+    /// A mode command was sent to `inverter_id` at `at` (see `ModeDriftWatch::mode_written`)
+    fn mode_written(&mut self, inverter_id: &str, at: DateTime<Utc>) {
+        self.drift
+            .entry(inverter_id.to_string())
+            .or_default()
+            .mode_written(at);
+    }
+
     /// Release this block's lock when the intent changed since it was taken. Called on every run
     /// before the gate, so a change seen before its replan lands still releases the lock.
     fn observe_intent(
@@ -407,6 +502,25 @@ impl ExecutorState {
     }
 }
 
+/// The default basic mode and its command: Self-Use, or Back Up Mode with the user's minimum SOC
+/// in the Back Up default. Ends a forced mode on a stale state and is what the kill switch sets.
+fn default_basic_mode(
+    backup_default: Option<&fluxion_types::user_control::UserControlState>,
+) -> (InverterCommand, InverterOperationMode) {
+    match backup_default {
+        Some(state) => (
+            InverterCommand::SetBackupMode {
+                min_soc_pct: state.backup_min_soc_pct,
+            },
+            InverterOperationMode::BackUpMode,
+        ),
+        None => (
+            InverterCommand::SetMode(InverterOperationMode::SelfUse),
+            InverterOperationMode::SelfUse,
+        ),
+    }
+}
+
 /// Drift watch for one inverter's mode: confirms a hardware mismatch over two state reads at
 /// least 30 s apart, then allows one re-apply per 5 minutes.
 #[derive(Debug, Default, Clone)]
@@ -415,12 +529,22 @@ pub struct ModeDriftWatch {
     mismatched_reads: u32,
     last_read_at: Option<DateTime<Utc>>,
     last_resend_at: Option<DateTime<Utc>>,
+    /// Last mode write: reads from before it say nothing about drift from the mode written
+    written_at: Option<DateTime<Utc>>,
 }
 
 impl ModeDriftWatch {
+    /// A mode was written at `at`: forget the mismatches seen so far and ignore reads up to `at`,
+    /// so a read-back from before the write cannot trigger a re-send (PR #647 R5-5)
+    fn mode_written(&mut self, at: DateTime<Utc>) {
+        self.first_mismatch_at = None;
+        self.mismatched_reads = 0;
+        self.written_at = Some(at);
+    }
+
     /// Feed one state read (`read_at` is the read time). Returns true when a re-apply is due.
     fn observe(&mut self, read_at: DateTime<Utc>, matches: bool, now: DateTime<Utc>) -> bool {
-        if self.last_read_at == Some(read_at) {
+        if self.last_read_at == Some(read_at) || self.written_at.is_some_and(|w| read_at <= w) {
             return false;
         }
         self.last_read_at = Some(read_at);
@@ -586,6 +710,14 @@ fn write_export_limit(
     limit_w
 }
 
+/// Levers, the Back Up minimum SOC and the clock of the executor (one tuple, to stay within the
+/// Bevy system parameter limit)
+type ExecutorInputs<'w> = (
+    Option<Res<'w, crate::resources::UserLeversResource>>,
+    Option<Res<'w, crate::async_systems::BackupDischargeMinSoc>>,
+    Option<Res<'w, crate::resources::ClockResource>>,
+);
+
 /// System that executes scheduled mode changes
 /// Runs every update cycle to check if mode changes are needed
 ///
@@ -609,10 +741,7 @@ pub fn schedule_execution_system(
     system_config: Res<crate::resources::SystemConfig>,
     mut sync_tracker: ResMut<InitialModeSyncTracker>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
-    (levers, backup_soc): (
-        Option<Res<crate::resources::UserLeversResource>>,
-        Option<Res<crate::async_systems::BackupDischargeMinSoc>>,
-    ),
+    (levers, backup_soc, clock): ExecutorInputs,
     timezone: Option<Res<crate::resources::TimezoneConfig>>,
     mut debug_was_enabled: Local<Option<bool>>,
     mut vpr_was_active: Local<bool>,
@@ -621,7 +750,7 @@ pub fn schedule_execution_system(
     mut executor: Local<ExecutorState>,
     mut warned: Local<ScheduleWarnings>,
 ) {
-    let now = Utc::now();
+    let now = crate::resources::clock_now(clock.as_deref());
     let force_discharge_enabled = system_config.control_config.force_discharge_enabled;
 
     // Mode control off (brief H37): no mode command from any path of the executor (schedule,
@@ -686,6 +815,12 @@ pub fn schedule_execution_system(
     let vpr_exited = *vpr_was_active && vpr_override.is_none();
     *vpr_was_active = vpr_override.is_some();
 
+    // Default mode Back Up (brief H19): planner Self-Use runs as Back Up Mode with the user's
+    // minimum SOC. Explicit overrides (VPR, a fixed slot active now) keep their own mode.
+    let backup_default = user_control
+        .as_ref()
+        .filter(|uc| uc.state.default_mode == fluxion_types::user_control::DefaultMode::Backup);
+
     // Kill switch: user disabled FluxION, or the "Zakázat Automatizaci" lever
     let kill_switch = user_control.as_ref().is_some_and(|uc| !uc.state.enabled)
         || levers.is_some_and(|l| l.automation_disabled);
@@ -697,7 +832,8 @@ pub fn schedule_execution_system(
     }
     *kill_was_active = kill_switch;
 
-    // Kill switch: VPR while active, otherwise SelfUse once, then no more mode commands
+    // Kill switch: VPR while active, otherwise the default basic mode once (Self-Use, or Back Up
+    // in the Back Up default), then no more mode commands
     if kill_switch {
         for (mut current_mode, inverter, battery_status, raw_state) in current_mode_query.iter_mut()
         {
@@ -705,12 +841,20 @@ pub fn schedule_execution_system(
             let Some(raw) = raw_state else {
                 continue;
             };
-            let (target, reason) = match &vpr_override {
-                Some((mode, reason)) => (*mode, reason.clone()),
-                None => (
-                    InverterOperationMode::SelfUse,
-                    "FluxION disabled by user".to_string(),
+            let (target, reason, command) = match &vpr_override {
+                Some((mode, reason)) => (
+                    *mode,
+                    reason.clone(),
+                    InverterCommand::SetMode(permitted_mode(
+                        *mode,
+                        force_discharge_enabled,
+                        &inverter.id,
+                    )),
                 ),
+                None => {
+                    let (command, mode) = default_basic_mode(backup_default.map(|uc| &uc.state));
+                    (mode, "FluxION disabled by user".to_string(), command)
+                }
             };
             let target = permitted_mode(target, force_discharge_enabled, &inverter.id);
             // Not synced yet (startup or after a resync): compare with the hardware mode
@@ -726,6 +870,9 @@ pub fn schedule_execution_system(
                 && raw.state.work_mode_ambiguous
                 && raw.state.work_mode == InverterOperationMode::ForceCharge;
             if compared == target && !ambiguous_manual_resync {
+                if is_initial_sync {
+                    current_mode.mode = raw.state.work_mode;
+                }
                 sync_tracker.synced_inverters.insert(inverter.id.clone());
                 continue;
             }
@@ -753,8 +900,8 @@ pub fn schedule_execution_system(
                 );
             } else {
                 info!("⏸️ {} - setting {} to {:?}", reason, inverter.id, target);
-                let command = InverterCommand::SetMode(target);
                 async_writer.write_command_async(inverter.id.clone(), command);
+                executor.mode_written(&inverter.id, now);
             }
             current_mode.mode = target;
             current_mode.set_at = now;
@@ -793,11 +940,6 @@ pub fn schedule_execution_system(
         now,
     );
 
-    // Default mode Back Up (brief H19): planner Self-Use runs as Back Up Mode with the user's
-    // minimum SOC. Explicit overrides (VPR, a fixed slot active now) keep their own mode.
-    let backup_default = user_control
-        .as_ref()
-        .filter(|uc| uc.state.default_mode == fluxion_types::user_control::DefaultMode::Backup);
     let explicit_override = vpr_override.is_some()
         || user_control
             .as_ref()
@@ -827,6 +969,116 @@ pub fn schedule_execution_system(
                 }
                 crate::resources::InverterTopology::Independent => {
                     trace!("Processing independent inverter {}", inverter.id);
+                }
+            }
+
+            // A stale state read (SOC and mode possibly frozen): no planner mode write. A forced
+            // mode is ended once with the default basic mode, because it would otherwise run on
+            // (charge to full, discharge to the cut-off). The kill switch and mode-control-off
+            // paths above are not gated. Once fresh again, a forced mode is re-entered only after
+            // the state settles (`SETTLE_SECS`), and the mode-change debounce still applies.
+            match state_freshness(
+                &mut warned.stale_state,
+                &inverter.id,
+                raw_state.map(|r| r.last_updated),
+                now,
+            ) {
+                StateFreshness::Fresh => {
+                    let settle_secs = if warned.stale_backoff.contains(&inverter.id) {
+                        STALE_BACKOFF_SETTLE_SECS
+                    } else {
+                        SETTLE_SECS
+                    };
+                    if let Some(read_at) = raw_state.map(|r| r.last_updated)
+                        && let Some(settling) = warned.settling.get_mut(&inverter.id)
+                    {
+                        if read_at > settling.last_read {
+                            settling.last_read = read_at;
+                            settling.reads += 1;
+                        }
+                        if settling.reads >= 2
+                            && now - settling.since >= chrono::Duration::seconds(settle_secs)
+                        {
+                            warned.settling.remove(&inverter.id);
+                            if warned.stale_backoff.remove(&inverter.id) {
+                                info!(
+                                    "State of {} fresh for {} min: forced modes may resume",
+                                    inverter.id,
+                                    STALE_BACKOFF_SETTLE_SECS / 60
+                                );
+                            }
+                        }
+                    }
+                }
+                StateFreshness::Recovered => {
+                    warned.stale_exit_sent.remove(&inverter.id);
+                    if warned.stale_exit_at.contains_key(&inverter.id)
+                        && let Some(read_at) = raw_state.map(|r| r.last_updated)
+                    {
+                        warned.settling.insert(
+                            inverter.id.clone(),
+                            Settling {
+                                since: read_at,
+                                last_read: read_at,
+                                reads: 1,
+                            },
+                        );
+                    }
+                }
+                StateFreshness::Stale => {
+                    warned.settling.remove(&inverter.id);
+                    // The forced mode tracked, else the one last read back
+                    let forced = Some(current_mode.mode)
+                        .filter(|m| is_forced_mode(*m))
+                        .or_else(|| {
+                            raw_state
+                                .map(|r| r.state.work_mode)
+                                .filter(|m| is_forced_mode(*m))
+                        });
+                    if let Some(forced) = forced
+                        && warned.stale_exit_sent.insert(inverter.id.clone())
+                    {
+                        let (command, mode) =
+                            default_basic_mode(backup_default.map(|uc| &uc.state));
+                        if debug.enabled {
+                            info!(
+                                "🔧 [DEBUG] Stale state of {} - would end {:?} with {:?}",
+                                inverter.id, forced, mode
+                            );
+                        } else {
+                            warn!(
+                                "Ending {:?} on {}: no successful state read for over {} s, setting {:?}",
+                                forced, inverter.id, STATE_STALE_SECS, mode
+                            );
+                            async_writer.write_command_async(inverter.id.clone(), command);
+                            executor.mode_written(&inverter.id, now);
+                        }
+                        current_mode.mode = mode;
+                        current_mode.set_at = now;
+                        current_mode.reason = "stale state: forced mode ended".to_string();
+                        warned.stale_exit_at.insert(inverter.id.clone(), now);
+                        let exits = warned.stale_exits.entry(inverter.id.clone()).or_default();
+                        exits.retain(|at| {
+                            now - *at < chrono::Duration::seconds(STALE_BACKOFF_WINDOW_SECS)
+                        });
+                        exits.push(now);
+                        let recent = exits.len();
+                        // Each exit decides the back-off afresh, so a flag left from an earlier
+                        // episode cannot hold a later isolated exit for 10 min (PR #647 R7-1)
+                        if recent < STALE_BACKOFF_EXITS {
+                            warned.stale_backoff.remove(&inverter.id);
+                        } else if warned.stale_backoff.insert(inverter.id.clone()) {
+                            warn!(
+                                "{} stale exits on {} within {} min: staying in {:?} until its state has been fresh for {} min",
+                                recent,
+                                inverter.id,
+                                STALE_BACKOFF_WINDOW_SECS / 60,
+                                mode,
+                                STALE_BACKOFF_SETTLE_SECS / 60
+                            );
+                        }
+                    }
+                    continue;
                 }
             }
 
@@ -966,6 +1218,12 @@ pub fn schedule_execution_system(
                     || ambiguous_manual_resync
                     || backup_pending
                 {
+                    // Fresh again after a stale exit but not settled: no forced mode yet
+                    if warned.settling.contains_key(&inverter.id)
+                        && is_forced_mode(scheduled_mode.mode)
+                    {
+                        continue;
+                    }
                     // Block boundaries (brief H25): a planner change inside a locked block waits for
                     // the next boundary, and a boundary waits briefly for the fresh schedule.
                     if scheduled_mode.mode != effective_current_mode {
@@ -983,11 +1241,17 @@ pub fn schedule_execution_system(
                                 || (current_mode.mode == InverterOperationMode::ForceDischarge
                                     && soc <= floor)
                         });
-                        // Not planner-originated: VPR, a fixed slot, initial sync, guards
+                        // Not planner-originated: VPR, a fixed slot, initial sync, guards, and the
+                        // resume after a stale exit inside this block
+                        let resume_after_stale_exit = warned
+                            .stale_exit_at
+                            .get(&inverter.id)
+                            .is_some_and(|at| *at >= scheduled_mode.block_start);
                         let good_reason = bypass_debounce
                             || explicit_override
                             || scheduled_mode.reason.contains("guard:")
-                            || safety_stop;
+                            || safety_stop
+                            || resume_after_stale_exit;
                         executor.observe_intent(&inverter.id, scheduled_mode.block_start, &intent);
                         match block_gate(
                             executor.locks.get(&inverter.id),
@@ -1086,6 +1350,8 @@ pub fn schedule_execution_system(
                         );
                         // Mark as synced even if skipped due to SOC (schedule is correct, just not needed)
                         if is_initial_sync {
+                            // Track what the hardware runs (PR #647 R4-3)
+                            current_mode.mode = effective_current_mode;
                             sync_tracker.synced_inverters.insert(inverter.id.clone());
                             info!(
                                 "🔄 Initial sync for {}: skipped (SOC at max), mode already aligned",
@@ -1113,6 +1379,7 @@ pub fn schedule_execution_system(
                         );
                         // Mark as synced even if skipped due to SOC
                         if is_initial_sync {
+                            current_mode.mode = effective_current_mode;
                             sync_tracker.synced_inverters.insert(inverter.id.clone());
                             info!(
                                 "🔄 Initial sync for {}: skipped (SOC at min), mode already aligned",
@@ -1166,6 +1433,7 @@ pub fn schedule_execution_system(
 
                         // Use async fire-and-forget for mode changes (don't block the ECS system)
                         async_writer.write_command_async(inverter.id.clone(), command);
+                        executor.mode_written(&inverter.id, now);
 
                         // Update current mode immediately (optimistic)
                         current_mode.mode = mode_sent;
@@ -1173,6 +1441,7 @@ pub fn schedule_execution_system(
                         current_mode.reason = scheduled_mode.reason.clone();
                     }
 
+                    warned.stale_exit_at.remove(&inverter.id);
                     // Mark inverter as synced after first mode change
                     if is_initial_sync {
                         sync_tracker.synced_inverters.insert(inverter.id.clone());
@@ -1195,8 +1464,10 @@ pub fn schedule_execution_system(
                             &intent,
                         );
                     }
-                    // Mode matches schedule - mark as synced
+                    // Mode matches schedule - mark as synced, tracking the hardware mode, so a later
+                    // kill switch or stale exit compares against it (PR #647 R4-3)
                     if is_initial_sync {
+                        current_mode.mode = effective_current_mode;
                         sync_tracker.synced_inverters.insert(inverter.id.clone());
                         info!(
                             "🔄 Initial sync for {}: mode already matches schedule ({:?})",
@@ -2011,13 +2282,15 @@ mod levers_execution_tests {
         }
     }
 
-    /// A VPR window covering the whole UTC day, so the tests do not depend on the time of day.
+    /// A 24 h VPR window (UTC) that opened an hour ago, so the tests do not depend on the time
+    /// of day: a window ending at 23:59 left them failing from 23:59 to midnight (PR #647 R7-4)
     fn vpr_all_day(mode: VprMode) -> VprWindow {
+        let set_at = Utc::now() - Duration::hours(1);
         VprWindow {
             mode,
-            from_local: chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-            until_local: chrono::NaiveTime::from_hms_opt(23, 59, 0).unwrap(),
-            set_at: Utc::now(),
+            from_local: set_at.time(),
+            until_local: set_at.time(),
+            set_at,
         }
     }
 
@@ -2364,6 +2637,874 @@ mod levers_execution_tests {
         assert!(h.sent_modes().await.is_empty());
     }
 
+    /// PR #647 N1: the plan of the current block is Hold, the hardware reads Self-Use.
+    fn n1_harness(now: DateTime<Utc>) -> Harness {
+        harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::NoChargeNoDischarge,
+            )],
+            false,
+        )
+    }
+
+    /// PR #647 N1 (owner ruling: fresh while one read succeeded in the last 120 s). Reads every
+    /// 5 s; the last good one was 115 s ago and every read since failed: the mode is still written.
+    #[tokio::test]
+    async fn reads_failing_for_115_s_still_write_the_planned_mode() {
+        let now = Utc::now();
+        let mut h = n1_harness(now);
+        h.set_hardware(InverterOperationMode::SelfUse, now - Duration::seconds(115));
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::NoChargeNoDischarge]
+        );
+    }
+
+    /// PR #647 N1: reads every 5 s fail from -125 s on: no mode write; the next good read resumes.
+    #[tokio::test]
+    async fn reads_failing_for_125_s_make_no_mode_write_until_a_good_read() {
+        let now = Utc::now();
+        let mut h = n1_harness(now);
+        // The last good read of a 5 s series, 125 s ago; the state keeps it while reads fail
+        for ago in (125..=160).rev().step_by(5) {
+            h.set_hardware(InverterOperationMode::SelfUse, now - Duration::seconds(ago));
+        }
+        h.run();
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+
+        h.set_hardware(InverterOperationMode::SelfUse, now);
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::NoChargeNoDischarge]
+        );
+    }
+
+    /// PR #647 N1: the kill switch is not gated by a stale state.
+    #[tokio::test]
+    async fn kill_switch_writes_self_use_on_a_stale_state() {
+        let now = Utc::now();
+        let mut h = n1_harness(now);
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        h.set_hardware(
+            InverterOperationMode::NoChargeNoDischarge,
+            now - Duration::seconds(125),
+        );
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// An inverter behind a stalling link: reads return `hardware` while `reachable`, else fail.
+    /// While `frozen_at` is set the data stopped changing then: like the HA adapter, reads carry
+    /// that time as `data_at` and fail once it is over `STATE_STALE_SECS` old (on `clock`).
+    /// Writes are recorded and, like the real inverter, change the hardware mode.
+    struct FlakySource {
+        reachable: Arc<Mutex<bool>>,
+        frozen_at: Arc<Mutex<Option<DateTime<Utc>>>>,
+        clock: Arc<Mutex<DateTime<Utc>>>,
+        hardware: Arc<Mutex<GenericInverterState>>,
+        commands: Arc<Mutex<Vec<(String, InverterCommand)>>>,
+    }
+
+    #[async_trait]
+    impl InverterDataSource for FlakySource {
+        async fn read_state(&self, _inverter_id: &str) -> anyhow::Result<GenericInverterState> {
+            anyhow::ensure!(*self.reachable.lock().unwrap(), "read stalled");
+            let mut state = self.hardware.lock().unwrap().clone();
+            if let Some(frozen_at) = *self.frozen_at.lock().unwrap() {
+                let age = *self.clock.lock().unwrap() - frozen_at;
+                anyhow::ensure!(age.num_seconds() <= STATE_STALE_SECS, "not live");
+                state.data_at = Some(frozen_at);
+            }
+            Ok(state)
+        }
+
+        async fn write_command(
+            &self,
+            inverter_id: &str,
+            command: &InverterCommand,
+        ) -> anyhow::Result<()> {
+            match command {
+                InverterCommand::SetMode(mode) => self.hardware.lock().unwrap().work_mode = *mode,
+                InverterCommand::SetBackupMode { .. } => {
+                    self.hardware.lock().unwrap().work_mode = InverterOperationMode::BackUpMode;
+                }
+                _ => {}
+            }
+            self.commands
+                .lock()
+                .unwrap()
+                .push((inverter_id.to_string(), command.clone()));
+            Ok(())
+        }
+
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn name(&self) -> &str {
+            "flaky"
+        }
+    }
+
+    /// The state reader and the executor on a stepped clock (`tick(secs)` after `t0`), one
+    /// inverter whose hardware runs `hardware_mode` at SOC 50 %, and one plan block of `plan_mode`
+    /// from a minute before `t0` lasting two hours.
+    struct CadenceRig {
+        world: World,
+        schedule: Schedule,
+        t0: DateTime<Utc>,
+        clock: Arc<Mutex<DateTime<Utc>>>,
+        reachable: Arc<Mutex<bool>>,
+        frozen_at: Arc<Mutex<Option<DateTime<Utc>>>>,
+        commands: Arc<Mutex<Vec<(String, InverterCommand)>>>,
+    }
+
+    /// Current-thread runtime: spawned writes run only when a tick drives them
+    fn cadence_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    impl CadenceRig {
+        fn new(hardware_mode: InverterOperationMode, plan_mode: InverterOperationMode) -> Self {
+            use crate::async_systems::read_inverter_states_system;
+            use crate::resources::{ClockResource, InverterStateReader, StateReadTimer};
+
+            let t0 = Utc::now();
+            let clock = Arc::new(Mutex::new(t0));
+            let reachable = Arc::new(Mutex::new(true));
+            let frozen_at = Arc::new(Mutex::new(None));
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let source = Arc::new(FlakySource {
+                reachable: reachable.clone(),
+                frozen_at: frozen_at.clone(),
+                clock: clock.clone(),
+                hardware: Arc::new(Mutex::new(GenericInverterState {
+                    work_mode: hardware_mode,
+                    battery_soc: 50.0,
+                    ..Default::default()
+                })),
+                commands: commands.clone(),
+            });
+            let mut world = World::new();
+            world.insert_resource(AsyncInverterWriter::new(source.clone()));
+            world.insert_resource(InverterStateReader::new(source));
+            world.insert_resource(StateReadTimer::new(0));
+            let tick_clock = clock.clone();
+            world.insert_resource(ClockResource(Arc::new(move || *tick_clock.lock().unwrap())));
+            world.insert_resource(ExecutionConfig {
+                min_mode_change_interval_secs: 300,
+            });
+            world.insert_resource(DebugModeConfig {
+                enabled: false,
+                ..Default::default()
+            });
+            world.insert_resource(system_config(8000));
+            world.insert_resource(InitialModeSyncTracker::default());
+            world.insert_resource(UserControlResource::new(UserControlState::default()));
+            world.insert_resource(UserLeversResource {
+                levers: UserLevers::default(),
+                available: true,
+                sync_expected: false,
+            });
+            world.spawn((
+                Inverter {
+                    id: "inv1".to_string(),
+                    inverter_type: fluxion_types::InverterType::Solax,
+                },
+                CurrentMode::default(),
+                BatteryStatus {
+                    soc_percent: 50,
+                    ..Default::default()
+                },
+            ));
+            let mut plan = block(t0 - Duration::minutes(1), plan_mode);
+            plan.duration_minutes = 120;
+            world.spawn(OperationSchedule {
+                scheduled_blocks: vec![plan],
+                generated_at: t0,
+                based_on_price_version: t0,
+            });
+            let mut schedule = Schedule::default();
+            schedule.set_executor_kind(bevy_ecs::schedule::ExecutorKind::SingleThreaded);
+            schedule.add_systems((read_inverter_states_system, schedule_execution_system).chain());
+            Self {
+                world,
+                schedule,
+                t0,
+                clock,
+                reachable,
+                frozen_at,
+                commands,
+            }
+        }
+
+        /// The source's data stops changing at `t0 + secs` (see `FlakySource`)
+        fn freeze_at(&self, secs: i64) {
+            *self.frozen_at.lock().unwrap() = Some(self.t0 + Duration::seconds(secs));
+        }
+
+        /// Tick every 5 s from 0 to `until` with reads reachable per `reachable(secs)`; the
+        /// writes sent, each with the second it was sent at
+        fn run(
+            &mut self,
+            rt: &tokio::runtime::Runtime,
+            until: i64,
+            reachable: impl Fn(i64) -> bool,
+        ) -> Vec<(i64, InverterCommand)> {
+            let mut out = Vec::new();
+            for secs in (0..=until).step_by(5) {
+                self.set_reachable(reachable(secs));
+                let seen = self.sent().len();
+                self.tick(rt, secs);
+                out.extend(self.sent()[seen..].iter().map(|c| (secs, c.clone())));
+            }
+            out
+        }
+
+        /// Run the reader and the executor at `t0 + secs`, then drive the fire-and-forget writes
+        /// to completion (current-thread `rt`), as the 5 s between real reads would
+        fn tick(&mut self, rt: &tokio::runtime::Runtime, secs: i64) {
+            *self.clock.lock().unwrap() = self.t0 + Duration::seconds(secs);
+            self.schedule.run(&mut self.world);
+            rt.block_on(async {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+
+        fn set_reachable(&self, reachable: bool) {
+            *self.reachable.lock().unwrap() = reachable;
+        }
+
+        /// Writes so far
+        fn sent(&self) -> Vec<InverterCommand> {
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, c)| c.clone())
+                .collect()
+        }
+    }
+
+    thread_local! {
+        static CAPTURED_LOGS: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes an event into this thread's capture buffer, if one is open
+    struct ThreadLogWriter;
+
+    impl std::io::Write for ThreadLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOGS.with(|logs| {
+                if let Some(logs) = logs.borrow_mut().as_mut() {
+                    logs.extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Log lines (INFO and above) emitted on this thread while `f` runs. One global test
+    /// subscriber writes each event to its own thread's buffer: a scoped subscriber loses events
+    /// when a parallel test thread caches the callsite interest without one.
+    pub(crate) fn captured_logs(f: impl FnOnce()) -> String {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogWriter)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURED_LOGS.with(|logs| *logs.borrow_mut() = Some(Vec::new()));
+        f();
+        let logs = CAPTURED_LOGS.with(|logs| logs.borrow_mut().take().unwrap_or_default());
+        String::from_utf8_lossy(&logs).into_owned()
+    }
+
+    /// PR #647 R3-1, R4-2 and N1, at the real 5 s read cadence: the state reader and the
+    /// executor run on a stepped clock against a source whose reads fail from 5 s on. The planned
+    /// ForceCharge is ended once with Self-Use when 120 s pass with no good read, nothing more is
+    /// written for 10 min, and once reads are back the plan resumes only after 60 s of good reads.
+    /// WARN and INFO once each.
+    #[test]
+    fn stalled_reads_end_a_forced_mode_once_then_settled_reads_resume_the_plan() {
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let logs = captured_logs(|| {
+            let mut rig = CadenceRig::new(
+                InverterOperationMode::ForceCharge,
+                InverterOperationMode::ForceCharge,
+            );
+            // 0 s: a good read, the hardware already runs the planned ForceCharge
+            rig.tick(&rt, 0);
+            assert!(rig.sent().is_empty());
+
+            // Reads fail from 5 s on: nothing up to 120 s, one Self-Use at 125 s, then 10 min quiet
+            rig.set_reachable(false);
+            for secs in (5..=120).step_by(5) {
+                rig.tick(&rt, secs);
+            }
+            assert!(rig.sent().is_empty());
+            rig.tick(&rt, 125);
+            let end = vec![InverterCommand::SetMode(InverterOperationMode::SelfUse)];
+            assert_eq!(rig.sent(), end);
+            for secs in (130..=725).step_by(5) {
+                rig.tick(&rt, secs);
+            }
+            assert_eq!(rig.sent(), end);
+
+            // Good reads every 5 s from 730 s: the plan resumes after 60 s of them, at 790 s
+            rig.set_reachable(true);
+            for secs in (730..=785).step_by(5) {
+                rig.tick(&rt, secs);
+            }
+            assert_eq!(rig.sent(), end);
+            rig.tick(&rt, 790);
+            assert_eq!(
+                rig.sent(),
+                vec![
+                    InverterCommand::SetMode(InverterOperationMode::SelfUse),
+                    InverterCommand::SetMode(InverterOperationMode::ForceCharge),
+                ]
+            );
+        });
+        let count = |needle: &str| logs.matches(needle).count();
+        assert_eq!(count("No successful state read of inv1"), 1);
+        assert_eq!(count("Ending ForceCharge on inv1"), 1);
+        assert_eq!(count("Inverter state of inv1 is fresh again"), 1);
+    }
+
+    /// PR #647 R4-2: one good read every 130 s for an hour (each just past the 120 s limit) must
+    /// not flap the inverter between ForceCharge and the default: at most 2 mode writes.
+    #[test]
+    fn a_good_read_every_130_s_for_an_hour_writes_at_most_twice() {
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::ForceCharge,
+            InverterOperationMode::ForceCharge,
+        );
+        for secs in (0..=3600).step_by(5) {
+            rig.set_reachable(secs % 130 == 0);
+            rig.tick(&rt, secs);
+        }
+        let sent = rig.sent();
+        assert!(sent.len() <= 2, "{sent:?}");
+        assert_eq!(
+            sent.first(),
+            Some(&InverterCommand::SetMode(InverterOperationMode::SelfUse))
+        );
+    }
+
+    /// PR #647 R4-3: after a restart in the middle of ForceCharge (plan ForceCharge too, so the
+    /// initial sync writes nothing) the kill switch must still write Self-Use exactly once.
+    #[tokio::test]
+    async fn kill_switch_after_a_restart_in_force_charge_writes_self_use_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+        assert_eq!(h.current_mode().mode, InverterOperationMode::ForceCharge);
+
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        h.run();
+        h.run();
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// PR #647 R5-2: the data freezes at T (reads still succeed while the heartbeats are under
+    /// 120 s old). The 120 s window counts from T, not from the last successful read, so the
+    /// forced mode is ended by T + 125 s, once.
+    #[test]
+    fn a_source_frozen_at_t_ends_the_forced_mode_by_t_plus_125() {
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::ForceCharge,
+            InverterOperationMode::ForceCharge,
+        );
+        rig.freeze_at(60);
+        let writes = rig.run(&rt, 60 + 125, |_| true);
+        assert_eq!(
+            writes,
+            vec![(
+                185,
+                InverterCommand::SetMode(InverterOperationMode::SelfUse)
+            )]
+        );
+    }
+
+    /// PR #647 R4-2 / R5-3: recovery does not resync, so the resume after a stale exit waits for
+    /// the 300 s mode-change debounce: exit at 125 s, good reads from 130 s, ForceCharge at 425 s
+    #[test]
+    fn resume_after_a_stale_exit_waits_for_the_debounce() {
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::ForceCharge,
+            InverterOperationMode::ForceCharge,
+        );
+        let writes = rig.run(&rt, 900, |s| !(5..=125).contains(&s));
+        assert_eq!(
+            writes,
+            vec![
+                (
+                    125,
+                    InverterCommand::SetMode(InverterOperationMode::SelfUse)
+                ),
+                (
+                    425,
+                    InverterCommand::SetMode(InverterOperationMode::ForceCharge)
+                ),
+            ]
+        );
+    }
+
+    /// PR #647 R6-3: 65 s of good reads, then a 125 s stall, for an hour. After the second stale
+    /// exit the inverter stays in the default mode (reads are never fresh for 10 min): at most 3
+    /// mode writes, the back-off logged once. With 10 min of good reads it resumes the plan.
+    #[test]
+    fn repeated_stale_exits_back_off_to_the_default_mode() {
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let logs = captured_logs(|| {
+            let mut rig = CadenceRig::new(
+                InverterOperationMode::ForceCharge,
+                InverterOperationMode::ForceCharge,
+            );
+            let writes = rig.run(&rt, 3600, |s| s % 190 < 65);
+            assert!(writes.len() <= 3, "{writes:?}");
+            assert_eq!(
+                writes.last().map(|(_, c)| c),
+                Some(&InverterCommand::SetMode(InverterOperationMode::SelfUse))
+            );
+            // Good reads from here on: ForceCharge again once fresh for 10 min, not before
+            let fresh_from = (3600 / 190 + 1) * 190;
+            for secs in (3605..fresh_from).step_by(5) {
+                rig.set_reachable(secs % 190 < 65);
+                rig.tick(&rt, secs);
+            }
+            let before = rig.sent().len();
+            rig.set_reachable(true);
+            for secs in (fresh_from..fresh_from + 595).step_by(5) {
+                rig.tick(&rt, secs);
+            }
+            assert_eq!(rig.sent().len(), before);
+            for secs in (fresh_from + 595..=fresh_from + 610).step_by(5) {
+                rig.tick(&rt, secs);
+            }
+            assert_eq!(
+                rig.sent()[before..],
+                [InverterCommand::SetMode(InverterOperationMode::ForceCharge)]
+            );
+        });
+        assert_eq!(
+            logs.matches("stale exits on inv1 within 60 min").count(),
+            1,
+            "{logs}"
+        );
+        assert_eq!(
+            logs.matches("State of inv1 fresh for 10 min").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// Replace the plan with one block of `mode` from `t0 + start` lasting 10 h, generated then
+    fn plan_from(rig: &mut CadenceRig, mode: InverterOperationMode, start: i64) {
+        let block_start = rig.t0 + Duration::seconds(start);
+        let mut q = rig.world.query::<&mut OperationSchedule>();
+        for mut s in q.iter_mut(&mut rig.world) {
+            let mut plan = block(block_start, mode);
+            plan.duration_minutes = 600;
+            s.scheduled_blocks = vec![plan];
+            s.generated_at = block_start;
+        }
+    }
+
+    /// Tick every 5 s from `from` to `until` (see `CadenceRig::run`)
+    fn run_span(
+        rig: &mut CadenceRig,
+        rt: &tokio::runtime::Runtime,
+        from: i64,
+        until: i64,
+        reachable: impl Fn(i64) -> bool,
+    ) -> Vec<(i64, InverterCommand)> {
+        let mut out = Vec::new();
+        for secs in (from..=until).step_by(5) {
+            rig.set_reachable(reachable(secs));
+            let seen = rig.sent().len();
+            rig.tick(rt, secs);
+            out.extend(rig.sent()[seen..].iter().map(|c| (secs, c.clone())));
+        }
+        out
+    }
+
+    /// PR #647 R7-1: the back-off ends with its episode. Two stale exits back off; a planned
+    /// Feed-in then clears the exit, so the next stall (in Feed-in) starts no settling and the
+    /// back-off is never settled. Back in ForceCharge, one isolated stall 90 min after the last
+    /// exit is held only by the 300 s debounce, not by the 10 min back-off.
+    #[test]
+    fn an_isolated_stale_exit_after_a_back_off_episode_resumes_after_the_debounce() {
+        use InverterOperationMode::{FeedinPriority, ForceCharge, SelfUse};
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let logs = captured_logs(|| {
+            let mut rig = CadenceRig::new(ForceCharge, ForceCharge);
+            let backoff = rig.run(&rt, 600, |s| s % 190 < 65);
+            assert_eq!(
+                backoff,
+                [
+                    (185, InverterCommand::SetMode(SelfUse)),
+                    (485, InverterCommand::SetMode(ForceCharge)),
+                    (565, InverterCommand::SetMode(SelfUse)),
+                ]
+            );
+            plan_from(&mut rig, FeedinPriority, 800);
+            let feed_in = run_span(&mut rig, &rt, 605, 1195, |s| !(900..1030).contains(&s));
+            assert_eq!(feed_in, [(800, InverterCommand::SetMode(FeedinPriority))]);
+            plan_from(&mut rig, ForceCharge, 1200);
+            let force = run_span(&mut rig, &rt, 1200, 5995, |_| true);
+            assert_eq!(force, [(1200, InverterCommand::SetMode(ForceCharge))]);
+            // Reads stall 6000..6130: Self-Use at 6120, ForceCharge again 300 s later
+            let isolated = run_span(&mut rig, &rt, 6000, 7200, |s| !(6000..6130).contains(&s));
+            assert_eq!(
+                isolated,
+                [
+                    (6120, InverterCommand::SetMode(SelfUse)),
+                    (6420, InverterCommand::SetMode(ForceCharge)),
+                ]
+            );
+        });
+        assert_eq!(
+            logs.matches("stale exits on inv1 within 60 min").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// PR #647 R7-1: a back-off that settled is over. It settles while the plan is Self-Use (no
+    /// write, so the exit is still recorded); a later stall with no exit then settles in 60 s,
+    /// not 10 min, and the planned ForceCharge starts with its block.
+    #[test]
+    fn a_settled_back_off_does_not_hold_the_next_settling() {
+        use InverterOperationMode::{ForceCharge, SelfUse};
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let logs = captured_logs(|| {
+            let mut rig = CadenceRig::new(ForceCharge, ForceCharge);
+            let backoff = rig.run(&rt, 595, |s| s % 190 < 65);
+            assert_eq!(
+                backoff.last(),
+                Some(&(565, InverterCommand::SetMode(SelfUse)))
+            );
+            plan_from(&mut rig, SelfUse, 600);
+            let quiet = run_span(&mut rig, &rt, 600, 1495, |s| !(1300..1430).contains(&s));
+            assert_eq!(quiet, []);
+            plan_from(&mut rig, ForceCharge, 1500);
+            let force = run_span(&mut rig, &rt, 1500, 2400, |_| true);
+            assert_eq!(force, [(1500, InverterCommand::SetMode(ForceCharge))]);
+        });
+        assert_eq!(
+            logs.matches("State of inv1 fresh for 10 min").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// PR #647 R7-3: the back-off counts exits within 60 min only. Two isolated 130 s stalls
+    /// 50 min apart: the second resume waits 10 min of fresh state. 61 min apart: it waits only
+    /// for the 300 s debounce.
+    #[test]
+    fn stale_exits_more_than_60_min_apart_do_not_back_off() {
+        use InverterOperationMode::{ForceCharge, SelfUse};
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        for (gap, resume) in [(3000, 3430 + 600), (3660, 4080 + 300)] {
+            let mut rig = CadenceRig::new(ForceCharge, ForceCharge);
+            let second = 300 + gap;
+            let writes = rig.run(&rt, second + 1500, |s| {
+                !(300..430).contains(&s) && !(second..second + 130).contains(&s)
+            });
+            assert_eq!(
+                writes,
+                [
+                    (420, InverterCommand::SetMode(SelfUse)),
+                    (720, InverterCommand::SetMode(ForceCharge)),
+                    (second + 120, InverterCommand::SetMode(SelfUse)),
+                    (resume, InverterCommand::SetMode(ForceCharge)),
+                ],
+                "gap {gap} s"
+            );
+        }
+    }
+
+    /// PR #647 R5-5: 65 s of good reads, then a 125 s stall, for an hour. A read-back from before
+    /// a write must not count as drift: no write repeats within 30 s.
+    #[test]
+    fn no_drift_re_send_right_after_a_resume() {
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::ForceCharge,
+            InverterOperationMode::ForceCharge,
+        );
+        let writes = rig.run(&rt, 3600, |s| s % 190 < 65);
+        assert!(!writes.is_empty());
+        for pair in writes.windows(2) {
+            assert!(pair[1].0 - pair[0].0 >= 30, "{writes:?}");
+        }
+    }
+
+    /// Run the executor at `now` (the clock the executor reads) with the hardware read-back
+    /// showing `mode` stamped `read_at`
+    fn run_at(
+        h: &mut Harness,
+        now: DateTime<Utc>,
+        mode: InverterOperationMode,
+        read_at: DateTime<Utc>,
+    ) {
+        h.world
+            .insert_resource(crate::resources::ClockResource(Arc::new(move || now)));
+        h.set_hardware(mode, read_at);
+        h.run();
+    }
+
+    /// After a mode write at `w`, three read-backs stamped 40, 20 and 5 s before it (more than
+    /// the two reads 30 s apart that confirm drift) still show the mode it replaced
+    fn feed_reads_from_before(h: &mut Harness, w: DateTime<Utc>, old: InverterOperationMode) {
+        for (after, before) in [(10, 40), (15, 20), (20, 5)] {
+            run_at(
+                h,
+                w + Duration::seconds(after),
+                old,
+                w - Duration::seconds(before),
+            );
+        }
+    }
+
+    /// PR #647 R7-2 (R5-5 wiring, planned write): the read-backs from before a planned
+    /// ForceCharge still show Self-Use. They are not drift: nothing is written again.
+    #[tokio::test]
+    async fn read_backs_from_before_a_planned_write_are_not_drift() {
+        let w = Utc::now();
+        let mut h = harness(
+            vec![block(
+                w - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::SelfUse);
+        run_at(
+            &mut h,
+            w,
+            InverterOperationMode::SelfUse,
+            w - Duration::seconds(1),
+        );
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+        feed_reads_from_before(&mut h, w, InverterOperationMode::SelfUse);
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::ForceCharge]
+        );
+    }
+
+    /// PR #647 R7-2 (R5-5 wiring, stale exit): a stale ForceCharge is ended with the planned
+    /// Self-Use; the read-backs from before the exit still show ForceCharge. Nothing more.
+    #[tokio::test]
+    async fn read_backs_from_before_a_stale_exit_are_not_drift() {
+        let w = Utc::now();
+        let mut h = harness(
+            vec![block(
+                w - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::ForceCharge);
+        run_at(
+            &mut h,
+            w,
+            InverterOperationMode::ForceCharge,
+            w - Duration::seconds(125),
+        );
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+        feed_reads_from_before(&mut h, w, InverterOperationMode::ForceCharge);
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// PR #647 R7-2 (R5-5 wiring, kill switch): the kill switch ends ForceCharge with Self-Use,
+    /// the plan is Self-Use once it is off again; the read-backs from before the kill switch
+    /// write still show ForceCharge. Nothing more is written.
+    #[tokio::test]
+    async fn read_backs_from_before_a_kill_switch_write_are_not_drift() {
+        let w = Utc::now();
+        let mut h = harness(
+            vec![block(
+                w - Duration::minutes(1),
+                InverterOperationMode::SelfUse,
+            )],
+            false,
+        );
+        h.mark_synced();
+        h.set_current(InverterOperationMode::ForceCharge);
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        run_at(
+            &mut h,
+            w,
+            InverterOperationMode::ForceCharge,
+            w - Duration::seconds(1),
+        );
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+        // Off again: the resync finds the hardware in the planned Self-Use
+        h.set_levers(UserLevers::default());
+        run_at(
+            &mut h,
+            w + Duration::seconds(5),
+            InverterOperationMode::SelfUse,
+            w + Duration::seconds(5),
+        );
+        feed_reads_from_before(&mut h, w, InverterOperationMode::ForceCharge);
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// PR #647 R4-3 / R5-3: after a restart with the hardware in ForceCharge and a planned
+    /// ForceDischarge skipped at the SOC floor (initial sync writes nothing), the kill switch
+    /// must still write Self-Use once
+    #[tokio::test]
+    async fn kill_switch_after_a_restart_on_the_soc_skip_path_writes_self_use_once() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceDischarge,
+            )],
+            false,
+        );
+        h.set_force_discharge(true);
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        let mut batteries = h.world.query::<&mut BatteryStatus>();
+        for mut battery in batteries.iter_mut(&mut h.world) {
+            battery.soc_percent = 10;
+        }
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+        assert_eq!(h.current_mode().mode, InverterOperationMode::ForceCharge);
+
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        for _ in 0..5 {
+            h.run();
+        }
+        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+    }
+
+    /// PR #647 R5-7: in the Back Up default the kill switch sets Back Up Mode with the user's
+    /// minimum SOC, not a hard-coded Self-Use
+    #[tokio::test]
+    async fn kill_switch_in_the_back_up_default_writes_back_up() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceCharge,
+            )],
+            false,
+        );
+        let min_soc_pct = {
+            let mut uc = h.world.resource_mut::<UserControlResource>();
+            uc.state.default_mode = fluxion_types::user_control::DefaultMode::Backup;
+            uc.state.backup_min_soc_pct
+        };
+        h.mark_synced();
+        h.set_current(InverterOperationMode::ForceCharge);
+        h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.set_levers(UserLevers {
+            automation_disabled: true,
+            ..Default::default()
+        });
+        for _ in 0..5 {
+            h.run();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let sent: Vec<InverterCommand> = h
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, c)| c.clone())
+            .collect();
+        assert_eq!(sent, vec![InverterCommand::SetBackupMode { min_soc_pct }]);
+    }
+
+    /// PR #647 R3-1: with the Back Up default, the forced mode is ended with Back Up Mode.
+    #[tokio::test]
+    async fn stale_forced_mode_ends_with_back_up_in_the_back_up_default() {
+        let now = Utc::now();
+        let mut h = harness(
+            vec![block(
+                now - Duration::minutes(1),
+                InverterOperationMode::ForceDischarge,
+            )],
+            false,
+        );
+        h.world
+            .resource_mut::<UserControlResource>()
+            .state
+            .default_mode = fluxion_types::user_control::DefaultMode::Backup;
+        h.mark_synced();
+        h.set_current(InverterOperationMode::ForceDischarge);
+        h.set_hardware(
+            InverterOperationMode::ForceDischarge,
+            now - Duration::seconds(125),
+        );
+        h.run();
+        h.run();
+        assert_eq!(
+            h.sent_modes().await,
+            vec![InverterOperationMode::BackUpMode]
+        );
+    }
+
     #[test]
     fn readback_is_exact_unless_sub_mode_is_unreadable() {
         let exact = |mode| crate::traits::GenericInverterState {
@@ -2401,6 +3542,23 @@ mod levers_execution_tests {
             &ambiguous,
             InverterOperationMode::SelfUse
         ));
+    }
+
+    /// PR #647 R5-5: a mode write forgets earlier mismatches and ignores reads up to the write,
+    /// so neither a mismatch from before it nor a read-back stamped at it starts the 30 s count
+    #[test]
+    fn mode_drift_watch_restarts_at_a_mode_write() {
+        let t0 = Utc::now();
+        let at = |secs| t0 + Duration::seconds(secs);
+        let mut watch = ModeDriftWatch::default();
+        assert!(!watch.observe(at(0), false, at(0)));
+        watch.mode_written(at(40));
+        // The read-back stamped at the write, then two after it 27 s apart: no re-send yet
+        for secs in [40, 45, 72] {
+            assert!(!watch.observe(at(secs), false, at(secs)), "{secs} s");
+        }
+        // 30 s after the first read that follows the write
+        assert!(watch.observe(at(75), false, at(75)));
     }
 
     #[test]

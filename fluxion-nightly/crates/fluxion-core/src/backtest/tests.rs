@@ -7,7 +7,7 @@
 use super::*;
 use crate::savings::RecordedBlock;
 use crate::strategy::pricing::{HdoDaySchedule, HdoTimeRange};
-use crate::strategy::winter_reserve::{BatteryParams, WinterReserveParams};
+use crate::strategy::winter_reserve::{BatteryParams, PlanMode, WinterReserveParams};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -539,7 +539,9 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     // flags, and `--profile house`). Like the example (and the live planner), the battery gets
     // the H30 minimum useful charge from the charge power and the live mode-change debounce.
     // Brief H33 (solar headroom on daytime grid charges) moved them from 150.67 (wear 13.21)
-    // and 155.46 (wear 12.62).
+    // and 155.46 (wear 12.62). HOLD as PV → house → battery → grid (owner ruling 2026-10-28;
+    // it exported the surplus with the battery idle before) moved them from 148.63 (wear 13.30)
+    // and 156.03 (wear 12.60).
     let (tz, mut battery, rows) = fixture_rows();
     assert!(battery.min_charge_kwh <= 0.0);
     battery.min_charge_kwh = crate::strategy::winter_reserve::min_charge_kwh(
@@ -550,7 +552,7 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     let run = replay(&rows, &options).unwrap();
     assert_eq!(
         printed_totals(&run),
-        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 148.63 CZK (wear 13.30)"
+        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 155.02 CZK (wear 13.30)"
     );
     assert_eq!(run.planned_blocks, 863);
     assert_eq!(run.fallback_blocks, 6151);
@@ -564,7 +566,7 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     let run = replay(&rows, &house).unwrap();
     assert_eq!(
         printed_totals(&run),
-        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 156.03 CZK (wear 12.60)"
+        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 164.24 CZK (wear 13.02)"
     );
 }
 
@@ -764,4 +766,49 @@ async fn horizon_cut_at_now_is_flagged() {
             .unwrap()
             .horizon_complete
     );
+}
+
+/// PR #647 N4 / R3-4: a sunny peak block at the night floor. The planner sells the PV surplus with
+/// Export; live, the head guard runs an Export at the floor as Self-Use, so the replay must too
+/// (the surplus then charges the battery instead of being sold).
+#[test]
+fn replay_runs_a_planned_export_at_the_floor_as_self_use_like_live() {
+    let (tz, mut battery, _) = fixture_rows();
+    battery.force_discharge_enabled = true;
+    let start = local_midnight_utc(date(2026, 10, 20), tz);
+    let noon = start + Duration::hours(12);
+    let rows: Vec<ReplayRow> = (0..192)
+        .map(|k| {
+            let at = start + Duration::minutes(15 * k);
+            let peak = at == noon;
+            ReplayRow {
+                block: RecordedBlock {
+                    start: at,
+                    buy_czk: if peak { 10.0 } else { 1.0 },
+                    sell_czk: if peak { 10.0 } else { 0.5 },
+                    load_kwh: 0.5,
+                    // 1.0 kWh surplus, under the 1.25 kWh export cap of a block
+                    pv_kwh: if peak { 1.5 } else { 0.0 },
+                    import_kwh: 0.5,
+                    export_kwh: 0.0,
+                },
+                soc_pct: battery.min_soc_pct,
+                gap_after: false,
+            }
+        })
+        .collect();
+    let mut options = ReplayOptions::new(tz, battery, WinterReserveParams::default());
+    options.from = Some(noon);
+    options.until = Some(noon + Duration::minutes(15));
+    let run = replay(&rows, &options).unwrap();
+    assert_eq!(run.blocks.len(), 1);
+    let step = run.blocks[0].winter_reserve.as_ref().unwrap();
+    assert_eq!(step.mode, PlanMode::SelfUse, "{}", step.reason);
+    assert!(
+        step.reason.contains("guard: export held"),
+        "{}",
+        step.reason
+    );
+    assert!(step.outcome.grid_export_kwh < 0.01, "{:?}", step.outcome);
+    assert!(step.outcome.battery_charge_kwh > 0.99, "{:?}", step.outcome);
 }

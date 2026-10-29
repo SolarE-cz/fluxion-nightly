@@ -38,11 +38,10 @@ pub fn setup_inverter_state_reader(
 pub fn read_inverter_states_system(
     state_reader: Res<crate::resources::InverterStateReader>,
     state_timer: ResMut<crate::resources::StateReadTimer>,
+    clock: Option<Res<crate::resources::ClockResource>>,
     mut commands: Commands,
     mut inverters: Query<(Entity, &Inverter, Option<&mut RawInverterState>)>,
 ) {
-    use chrono::Utc;
-
     // Check if it's time to read (non-blocking timer check)
     if !state_timer.should_read() {
         return;
@@ -60,9 +59,12 @@ pub fn read_inverter_states_system(
                     inverter.id, state.battery_soc
                 );
 
+                // The data's own time when the source knows it (never in the future)
+                let now = crate::resources::clock_now(clock.as_deref());
+                let last_updated = state.data_at.map_or(now, |at| at.min(now));
                 let raw_state = RawInverterState {
                     state,
-                    last_updated: Utc::now(),
+                    last_updated,
                 };
 
                 // Update or insert the RawInverterState component

@@ -481,6 +481,23 @@ pub fn pick_hourly_profile(
     }
 }
 
+/// Whether a house-load or consumption history source is configured (brief H31's profile wait and
+/// brief H38's warm-up both need it).
+pub fn history_profile_configured(history: &ConsumptionHistoryConfig) -> bool {
+    !history.consumption_entity.trim().is_empty()
+        || history
+            .house_load_power_entity
+            .as_deref()
+            .is_some_and(|entity| !entity.trim().is_empty())
+}
+
+/// Brief H38: the planner holds the default mode while a configured history has not yet produced
+/// `MIN_HOUSE_LOAD_DAYS` days of profile. `profile_days` is the `days_averaged` of the profile in
+/// use, None without one. Without a history source there is nothing to learn: no warm-up.
+pub fn learning_warmup_active(history_configured: bool, profile_days: Option<usize>) -> bool {
+    history_configured && profile_days.is_none_or(|days| days < MIN_HOUSE_LOAD_DAYS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,5 +779,36 @@ mod tests {
         let picked = pick_hourly_profile(Some(profile(3)), consumption).unwrap();
         assert_eq!(picked.days_averaged, 3);
         assert!(pick_hourly_profile(None, None).is_none());
+    }
+
+    #[test]
+    fn learning_warmup_holds_until_three_days_of_a_configured_history() {
+        // Brief H38: configured + no profile, or fewer than 3 days, holds the default mode
+        assert!(learning_warmup_active(true, None));
+        assert!(learning_warmup_active(true, Some(1)));
+        assert!(learning_warmup_active(true, Some(2)));
+        assert!(!learning_warmup_active(true, Some(3)));
+        assert!(!learning_warmup_active(true, Some(7)));
+        // Without a history source there is nothing to learn
+        assert!(!learning_warmup_active(false, None));
+        assert!(!learning_warmup_active(false, Some(1)));
+    }
+
+    #[test]
+    fn history_is_configured_by_either_entity() {
+        let mut history = ConsumptionHistoryConfig {
+            consumption_entity: String::new(),
+            house_load_power_entity: None,
+            ..Default::default()
+        };
+        assert!(!history_profile_configured(&history));
+        history.consumption_entity = "   ".to_string();
+        history.house_load_power_entity = Some(" ".to_string());
+        assert!(!history_profile_configured(&history));
+        history.house_load_power_entity = Some("sensor.house_load".to_string());
+        assert!(history_profile_configured(&history));
+        history.house_load_power_entity = None;
+        history.consumption_entity = "sensor.import".to_string();
+        assert!(history_profile_configured(&history));
     }
 }

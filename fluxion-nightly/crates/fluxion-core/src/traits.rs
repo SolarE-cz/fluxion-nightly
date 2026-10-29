@@ -80,6 +80,11 @@ pub struct GenericInverterState {
     /// so the real mode may be any Manual mode (Force Charge, Force Discharge or Hold)
     pub work_mode_ambiguous: bool,
 
+    /// When the source last had new data (the newest heartbeat `last_updated`), if known. The
+    /// state reader takes it as the read time, so a frozen source counts as stale from when it
+    /// froze, not from its last successful read (PR #647 R5-2).
+    pub data_at: Option<chrono::DateTime<chrono::Utc>>,
+
     // ============= Load & Grid Detailed (Optional) =============
     /// House/load consumption (W)
     pub house_load_w: Option<f32>,

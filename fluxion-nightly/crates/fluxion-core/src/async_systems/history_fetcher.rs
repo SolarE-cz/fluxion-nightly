@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use bevy_ecs::prelude::*;
+use chrono::{DateTime, Utc};
 use futures_timer::Delay;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,52 @@ use crate::{
 
 /// Days of house-load power history used for the hourly load profile
 const HOUSE_LOAD_HISTORY_DAYS: i64 = 7;
+
+/// While the history has no hourly profile or the last read failed, the fetcher retries this often
+/// (brief H38). Without it a failed startup fetch would wait for the next midnight.
+const HISTORY_RETRY_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
+
+/// After `HISTORY_FAST_RETRY_ATTEMPTS` failing retries in a row the fetcher retries this slowly.
+const HISTORY_SLOW_RETRY_INTERVAL: chrono::Duration = chrono::Duration::minutes(60);
+const HISTORY_FAST_RETRY_ATTEMPTS: u32 = 6;
+
+/// Retry interval after `attempts` consecutive failing retries (brief H38 round 3).
+pub fn retry_interval(attempts: u32) -> chrono::Duration {
+    if attempts < HISTORY_FAST_RETRY_ATTEMPTS {
+        HISTORY_RETRY_INTERVAL
+    } else {
+        HISTORY_SLOW_RETRY_INTERVAL
+    }
+}
+
+/// What a fetch produced: whether it gave an hourly profile, and whether a Home Assistant read failed.
+#[derive(Clone, Copy)]
+struct FetchStatus {
+    has_profile: bool,
+    failed: bool,
+}
+
+/// Whether the fetcher fetches again now (brief H38): without a profile, or after a failed read,
+/// once `interval` has passed since the last attempt. Otherwise only the midnight refresh fetches.
+pub fn should_refetch(
+    now: DateTime<Utc>,
+    last_attempt: DateTime<Utc>,
+    has_profile: bool,
+    last_failed: bool,
+    interval: chrono::Duration,
+) -> bool {
+    (!has_profile || last_failed) && now - last_attempt >= interval
+}
+
+/// Next daily refresh: 00:05 local on the day after `now`, when the daily sensors have reset.
+fn next_history_refresh(now: DateTime<chrono::Local>) -> DateTime<chrono::Local> {
+    (now + chrono::Duration::days(1))
+        .date_naive()
+        .and_hms_opt(0, 5, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .unwrap()
+}
 
 /// Spawns the consumption history fetcher worker task
 pub fn spawn_history_fetcher_worker(
@@ -43,38 +90,67 @@ pub fn spawn_history_fetcher_worker(
 
         // Fetch immediately on startup
         debug!("Fetching initial consumption history from HA...");
-        if let Err(e) =
-            fetch_consumption_history(&history_source_clone, &history_config, &history_tx).await
-        {
-            error!("❌ Failed to fetch initial consumption history: {e}");
-        }
+        let mut last_attempt = Utc::now();
+        let mut status =
+            fetch_and_report(&history_source_clone, &history_config, &history_tx).await;
+        // Failing retries in a row since the last clean fetch
+        let mut retry_attempts: u32 = 0;
 
-        // Then continue with daily polling (fetch at midnight)
+        // Then continue with daily polling (fetch at midnight), retrying while there is no profile
+        // or the last read failed
+        let mut next_refresh = next_history_refresh(chrono::Local::now());
         loop {
-            // Sleep until next midnight + 5 minutes (to ensure daily sensors have reset)
-            let now = chrono::Local::now();
-            let tomorrow_midnight = (now + chrono::Duration::days(1))
-                .date_naive()
-                .and_hms_opt(0, 5, 0)
-                .unwrap()
-                .and_local_timezone(chrono::Local)
-                .unwrap();
-            let sleep_duration = (tomorrow_midnight - now)
+            // Sleep until the next midnight refresh (+5 minutes, to ensure daily sensors have
+            // reset), or until the retry is due
+            let mut sleep_duration = (next_refresh - chrono::Local::now())
                 .to_std()
                 .unwrap_or(Duration::from_secs(3600));
+            if !status.has_profile || status.failed {
+                let retry_in = (last_attempt + retry_interval(retry_attempts)) - Utc::now();
+                sleep_duration = sleep_duration.min(retry_in.to_std().unwrap_or(Duration::ZERO));
+            }
 
             info!(
                 "💤 Consumption history fetcher: sleeping until {} ({} seconds)",
-                tomorrow_midnight.format("%Y-%m-%d %H:%M:%S"),
+                (chrono::Local::now()
+                    + chrono::Duration::from_std(sleep_duration).unwrap_or_default())
+                .format("%Y-%m-%d %H:%M:%S"),
                 sleep_duration.as_secs()
             );
             Delay::new(sleep_duration).await;
 
-            debug!("Fetching consumption history from HA (daily update)...");
-            if let Err(e) =
-                fetch_consumption_history(&history_source_clone, &history_config, &history_tx).await
-            {
-                error!("❌ Failed to fetch consumption history: {e}");
+            let refresh_due = chrono::Local::now() >= next_refresh;
+            if refresh_due {
+                next_refresh = next_history_refresh(chrono::Local::now());
+            }
+            let retry_due = should_refetch(
+                Utc::now(),
+                last_attempt,
+                status.has_profile,
+                status.failed,
+                retry_interval(retry_attempts),
+            );
+            if refresh_due || retry_due {
+                if refresh_due {
+                    debug!("Fetching consumption history from HA (daily update)...");
+                } else {
+                    let message = format!(
+                        "Retrying consumption history fetch (attempt {}, no house-load profile yet, or the last read failed)",
+                        retry_attempts + 1
+                    );
+                    if retry_attempts == 0 {
+                        info!("📊 {message}");
+                    } else {
+                        debug!("{message}");
+                    }
+                    retry_attempts = retry_attempts.saturating_add(1);
+                }
+                last_attempt = Utc::now();
+                status =
+                    fetch_and_report(&history_source_clone, &history_config, &history_tx).await;
+                if status.has_profile && !status.failed {
+                    retry_attempts = 0;
+                }
             }
         }
     });
@@ -141,12 +217,31 @@ pub fn poll_consumption_history_channel(
     }
 }
 
+/// Runs one fetch and logs its error; a failed fetch counts as a failed read without a profile.
+async fn fetch_and_report(
+    source: &Arc<dyn crate::traits::ConsumptionHistoryDataSource>,
+    config: &ConsumptionHistoryConfig,
+    tx: &crossbeam_channel::Sender<ConsumptionHistoryUpdate>,
+) -> FetchStatus {
+    match fetch_consumption_history(source, config, tx).await {
+        Ok(status) => status,
+        Err(e) => {
+            error!("❌ Failed to fetch consumption history: {e}");
+            FetchStatus {
+                has_profile: false,
+                failed: true,
+            }
+        }
+    }
+}
+
 /// Helper function to fetch consumption history from Home Assistant
 async fn fetch_consumption_history(
     source: &Arc<dyn crate::traits::ConsumptionHistoryDataSource>,
     config: &ConsumptionHistoryConfig,
     tx: &crossbeam_channel::Sender<ConsumptionHistoryUpdate>,
-) -> Result<()> {
+) -> Result<FetchStatus> {
+    let mut read_failed = false;
     info!(
         "📊 Fetching consumption history for last {} days",
         config.ema_days
@@ -166,6 +261,7 @@ async fn fetch_consumption_history(
         .await
         .unwrap_or_else(|e| {
             error!("❌ Failed to fetch consumption history: {e}");
+            read_failed = true;
             Vec::new()
         });
 
@@ -174,6 +270,7 @@ async fn fetch_consumption_history(
         "   Fetching solar production from: {}",
         config.solar_production_entity
     );
+    // Solar plays no part in the hourly profile, so its read error does not make the fetch failed
     let solar_history = source
         .get_history(&config.solar_production_entity, start_time, Some(now))
         .await
@@ -225,6 +322,7 @@ async fn fetch_consumption_history(
                         "House load history for {} could not be fetched, using the import profile instead: {e}",
                         entity
                     );
+                    read_failed = true;
                     None
                 }
             }
@@ -251,6 +349,10 @@ async fn fetch_consumption_history(
     }
 
     // Send to channel
+    let status = FetchStatus {
+        has_profile: hourly_profile.is_some(),
+        failed: read_failed,
+    };
     let update = ConsumptionHistoryUpdate {
         daily_summaries: summaries,
         hourly_profile,
@@ -259,7 +361,7 @@ async fn fetch_consumption_history(
         error!("❌ Failed to send history update to channel: {e}");
     }
 
-    Ok(())
+    Ok(status)
 }
 
 #[cfg(test)]
@@ -308,5 +410,136 @@ mod poll_tests {
         assert!(history.hourly_profile().is_none());
         // ...except that a fetch result arrived: the first schedule stops waiting (H31)
         assert!(history.fetch_received());
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    fn ten_minutes() -> chrono::Duration {
+        chrono::Duration::minutes(10)
+    }
+
+    #[test]
+    fn empty_or_failed_fetch_is_retried_within_ten_minutes() {
+        let t0 = Utc::now();
+        // No profile (empty fetch) or a failed read: the retry is due after 10 min, not before
+        for (has_profile, failed) in [(false, false), (false, true), (true, true)] {
+            assert!(!should_refetch(
+                t0 + chrono::Duration::minutes(9),
+                t0,
+                has_profile,
+                failed,
+                retry_interval(0)
+            ));
+            assert!(should_refetch(
+                t0 + chrono::Duration::minutes(10),
+                t0,
+                has_profile,
+                failed,
+                retry_interval(0)
+            ));
+        }
+    }
+
+    #[test]
+    fn clean_profile_waits_for_the_midnight_refresh() {
+        let t0 = Utc::now();
+        assert!(!should_refetch(
+            t0 + chrono::Duration::hours(2),
+            t0,
+            true,
+            false,
+            retry_interval(0)
+        ));
+    }
+
+    #[test]
+    fn retries_are_ten_minutes_then_hourly_after_six_failing_attempts() {
+        assert_eq!(retry_interval(0), ten_minutes());
+        assert_eq!(retry_interval(5), ten_minutes());
+        assert_eq!(retry_interval(6), chrono::Duration::minutes(60));
+        let t0 = Utc::now();
+        // Fast: due at 10 min
+        assert!(should_refetch(
+            t0 + chrono::Duration::minutes(10),
+            t0,
+            false,
+            false,
+            retry_interval(5)
+        ));
+        // Slow: not due at 10 or 30 min, due at 60 min
+        assert!(!should_refetch(
+            t0 + chrono::Duration::minutes(30),
+            t0,
+            false,
+            false,
+            retry_interval(6)
+        ));
+        assert!(should_refetch(
+            t0 + chrono::Duration::minutes(60),
+            t0,
+            false,
+            false,
+            retry_interval(6)
+        ));
+    }
+
+    /// Source whose reads of the listed entities fail; the others return no points.
+    struct ScriptedSource {
+        failing: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl crate::traits::ConsumptionHistoryDataSource for ScriptedSource {
+        async fn get_history(
+            &self,
+            entity_id: &str,
+            _start_time: chrono::DateTime<Utc>,
+            _end_time: Option<chrono::DateTime<Utc>>,
+        ) -> anyhow::Result<Vec<crate::traits::HistoryDataPoint>> {
+            if self.failing.contains(&entity_id) {
+                anyhow::bail!("HA read failed for {entity_id}");
+            }
+            Ok(Vec::new())
+        }
+
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+
+        fn name(&self) -> &str {
+            "scripted"
+        }
+    }
+
+    /// Runs one fetch with the given house-load entity (None: not configured) and failing entities.
+    fn fetch_status(house_load: Option<&str>, failing: Vec<&'static str>) -> FetchStatus {
+        let config = ConsumptionHistoryConfig {
+            consumption_entity: "sensor.import".to_string(),
+            solar_production_entity: "sensor.solar".to_string(),
+            house_load_power_entity: house_load.map(str::to_string),
+            ..Default::default()
+        };
+        let source: Arc<dyn crate::traits::ConsumptionHistoryDataSource> =
+            Arc::new(ScriptedSource { failing });
+        let (tx, _rx) = crossbeam_channel::bounded(10);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(fetch_consumption_history(&source, &config, &tx))
+            .unwrap()
+    }
+
+    #[test]
+    fn solar_read_error_is_not_a_failed_read() {
+        let status = fetch_status(None, vec!["sensor.solar"]);
+        assert!(!status.failed);
+    }
+
+    #[test]
+    fn import_or_house_load_read_error_is_a_failed_read() {
+        assert!(fetch_status(None, vec!["sensor.import"]).failed);
+        assert!(fetch_status(Some("sensor.house_load"), vec!["sensor.house_load"]).failed);
     }
 }

@@ -139,6 +139,50 @@ Maximum battery state of charge (%) that FluxION will charge to.
 
 Default value: `100`
 
+#### Option: `inverters[].battery_extra_prefixes` and `inverters[].battery_extra_capacities_kwh`
+
+For a parallel (master/slave) pair whose batteries FluxION sees through the master only: the entity
+prefixes of the other units (for example `solax_81_jakub`) and the usable capacity in kWh of each
+unit's battery, in the same order (each at least 0.1 kWh). The SOC this inverter reports is then the
+capacity-weighted mean of its own battery and the other units' batteries. The other units are only
+read, never written to.
+
+The master's own share is `control.battery_capacity_kwh` minus the extra capacities, so
+`control.battery_capacity_kwh` must be the pair's measured usable total (Jakub's pair: about 80 kWh,
+not the 96 kWh nameplate), and each extra capacity that unit's measured share. Once the web UI has
+saved its configuration, `control.battery_capacity_kwh` comes from the web UI (Settings), not from
+the add-on option, so set the pair's total there.
+
+Extras that do not validate (lengths differ, a capacity under 0.1 kWh, an inverter's own prefix, or
+extras that leave the master no capacity) are ignored with a WARN in the log, and FluxION starts on
+the master's own SOC.
+
+An inverter (master or unit) is live while any of its heartbeat sensors was updated within 120 s.
+The heartbeat sensors are `sensor.<prefix>_grid_voltage*`, `_grid_frequency*`, `_measured_power`,
+`_inverter_power`, `_house_load`, `_pv_power_total` and `_battery_power_charge`, whichever exist;
+the log lists them at start. A flat SOC does not count as stale: Home Assistant keeps its
+`last_updated`, and its REST API does not advance `last_reported` while a value stays the same. An
+inverter without any heartbeat sensor is not age-checked (one WARN). If Home Assistant cannot list
+its entities, state reads fail until it can (one WARN).
+
+A unit's SOC counts as unreadable when the read fails, the value is not a number, or the unit is not
+live. A unit in standby is the exception: with its battery and PV power both within 50 W of 0 its
+SOC cannot move, so it is used even with every heartbeat flat (a slave at its SOC floor at night).
+Standby is believed only while the master shows at most 200 W of PV and is not charging (battery at
+most +50 W); otherwise the unit would be moving too, so it counts as not live. FluxION holds the
+last combined SOC for up to 10 minutes while a unit is unreadable; after that it takes no new
+inverter state until the unit is readable again, rather than use the master's own SOC (several kWh
+off the pair's). A master that is not live fails the state read too. The state's age counts from the
+master's newest heartbeat. With no new data for over 120 s FluxION writes no planned mode, and ends
+a running force charge, force discharge or HOLD once with the default mode (Self-Use, or Back Up in
+the Back Up default). It re-enters a forced mode only after 60 s of good reads; when the exit is the
+second or later within 60 minutes, only after 10 minutes of good reads. A unit outage outside
+standby changes modes at the latest 120 s + 10 minutes + 120 s after the unit's last heartbeat. A
+unit that fails while in standby is found once the master shows more than 200 W of PV or charges (by
+the next morning at the latest), and modes change 10 minutes + 120 s after that. Set in the add-on
+configuration, both also apply when the web UI has saved its own configuration; removing them in the
+add-on UI clears them.
+
 ### Option Group: `pricing`
 
 Configure how FluxION obtains and uses electricity pricing information.
@@ -198,14 +242,14 @@ When the spot price entity lacks prices, fetch the OTE day-ahead prices directly
 CZK/kWh with the CNB EUR rate, like the Czech Energy Spot Prices integration) and fill only the
 missing slots. The OTE prices are used only if they match the entity on at least 90 % of today's
 slots (within 0.5 % or 0.01 CZK/kWh). With a separate buy price entity, the buy price of filled
-slots is derived as `a × spot + b` from today's prices; when that fit is not exact (within
-0.01 CZK/kWh) nothing is filled. The last successful check is kept in `/data`: when the entity has
-no prices of today at all (second day of an outage), a check at most 48 hours old is used instead
-and the banner says "validated <date>" (a check of one day covers that day and the next only).
-The add-on options `ote_fallback_enabled`, `price_alert_notification`,
-`tomorrow_prices_check_time`, `battery_wear_cost_czk_per_kwh`, `battery_efficiency` and
-`pv_forecast_correction_enabled` always apply from the add-on configuration, also on installs
-whose settings were saved in the web UI. The entity's prices always win once it has them again.
+slots is derived as `a × spot + b` from today's prices; when that fit is not exact (within 0.01
+CZK/kWh) nothing is filled. The last successful check is kept in `/data`: when the entity has no
+prices of today at all (second day of an outage), a check at most 48 hours old is used instead and
+the banner says "validated <date>" (a check of one day covers that day and the next only). The
+add-on options `ote_fallback_enabled`, `price_alert_notification`, `tomorrow_prices_check_time`,
+`battery_wear_cost_czk_per_kwh`, `battery_efficiency` and `pv_forecast_correction_enabled` always
+apply from the add-on configuration, also on installs whose settings were saved in the web UI. The
+entity's prices always win once it has them again.
 
 Default value: `true`
 
@@ -231,16 +275,35 @@ Default value: `10000`
 When `false`, FluxION only curtails export: while the sell price is at or below
 `export_curtail_at_or_below_czk` (with `export_curtailment_enabled: true`) it sets the inverter's
 export limit to `export_limit_min_w` and restores the limit it read before once the price is above
-the threshold. It writes nothing else: no work mode, Back Up minimum SOC, HotStandBy, battery
-awaken or pre-wake, and no unlock on a lock event (the export limit write still unlocks a Locked
-inverter first when `auto_unlock_inverter` is on). Planning, prices, alerts and the dashboard keep
-running; the dashboard header shows "mode control off". The FluxION kill switch and the
-"Zakázat Automatizaci" lever still stop curtailment. Curtailment needs a known export limit above
-0 W to restore: set the inverter's export limit above 0 W first. Set in the add-on configuration,
-it also applies when the web UI has saved its own configuration. A change needs an add-on restart
-(saving the add-on configuration restarts it); the web UI cannot change it while FluxION runs.
+the threshold. It writes nothing else: no work mode, Back Up minimum SOC, HotStandBy, battery awaken
+or pre-wake, and no unlock on a lock event (the export limit write still unlocks a Locked inverter
+first when `auto_unlock_inverter` is on). Planning, prices, alerts and the dashboard keep running;
+the dashboard header shows "mode control off". The FluxION kill switch and the "Zakázat
+Automatizaci" lever still stop curtailment. Curtailment needs a known export limit above 0 W to
+restore: set the inverter's export limit above 0 W first. Set in the add-on configuration, it also
+applies when the web UI has saved its own configuration. A change needs an add-on restart (saving
+the add-on configuration restarts it); the web UI cannot change it while FluxION runs.
 
 Default value: `true`
+
+#### Option: `control.hold_pv_to_battery`
+
+What HOLD does on this site. HOLD means the house is not served from the battery: by default
+(`false`) the planner models it as PV serving the house, the surplus charging the battery and the
+rest exported, and the battery never discharges. This is what direct VPP control's HOLD (mode 7)
+does. Set `true` only for a site that drives modes through EEPROM and whose "Stop Charge and
+Discharge" sends PV into the battery first while the house imports from the grid (measured on
+Jakub's SolaX Ultra pair, 2026-10-26); the planner then models HOLD that way. With direct VPP
+control the option is ignored. Set in the add-on configuration, it also applies when the web UI has
+saved its own configuration.
+
+Keep it `false` unless a replay on that site shows a gain. On Jakub's site, where it describes the
+inverter correctly, it replayed about 2 CZK/day worse (10.7 days, October 2026). The default model
+plans more midday HOLD. On that site, HOLD stores PV while the house imports, and the evening peaks
+paid back more than those imports cost. The gap is within the replay's run-to-run spread of a few
+CZK/day.
+
+Default value: `false`
 
 #### Option: `control.update_interval_secs`
 
@@ -261,6 +324,12 @@ optimal battery charging and discharging strategies. The system:
 
 The core principle is **profitability** - sometimes the most profitable action is to do nothing and
 let the system run naturally.
+
+**Learning period:** when history is configured (house-load power or consumption entity) but the
+house-load profile covers fewer than 3 days, FluxION does not plan battery moves yet. Every block
+runs the default mode (Self-Use, or Back Up when your default is Back Up) until 3 days of data are
+in. Without a history entity this does not apply. User price and discharge levers take effect once
+the learning period ends.
 
 ## Support
 
