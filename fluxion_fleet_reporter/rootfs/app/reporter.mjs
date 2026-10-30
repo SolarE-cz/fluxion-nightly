@@ -19834,6 +19834,7 @@ var MAX_FLUXION_VERSION = 64;
 var MAX_HA_VERSION = 32;
 var MAX_PLAN_SUMMARY = 280;
 var MAX_NETBIRD_FQDN = 253;
+var FLUXION_STALE_MS = 10 * 60 * 1e3;
 var UNUSABLE_STATES = /* @__PURE__ */ new Set(["", "none", "null", "unavailable", "unknown"]);
 var numericStateSchema = external_exports.coerce.number().finite();
 var versionTextSchema = external_exports.string().trim().min(1);
@@ -19844,7 +19845,8 @@ function entityIds(options) {
     options.import_today_entity,
     options.export_today_entity,
     options.plan_summary_entity,
-    options.fluxion_version_entity
+    options.fluxion_version_entity,
+    options.fluxion_alive_entity
   ].filter((id) => id !== null);
   return [...new Set(wanted)];
 }
@@ -19917,6 +19919,14 @@ function haVersion(version2) {
   }
   return truncate(parsed.data, MAX_HA_VERSION);
 }
+function fluxionFallback(state, nowIso) {
+  const updated = external_exports.iso.datetime({ offset: true }).safeParse(state?.last_updated);
+  if (!updated.success) {
+    return "unknown";
+  }
+  const ageMs = Date.parse(nowIso) - Date.parse(updated.data);
+  return ageMs <= FLUXION_STALE_MS ? "none" : "stale";
+}
 function planSummary(state) {
   if (state === null) {
     return null;
@@ -19958,6 +19968,7 @@ function buildLegacyHeartbeat(snapshot, options, nowIso) {
   const exported = stateOf(snapshot, options.export_today_entity);
   const plan = stateOf(snapshot, options.plan_summary_entity);
   const versionEntity = stateOf(snapshot, options.fluxion_version_entity);
+  const aliveEntity = stateOf(snapshot, options.fluxion_alive_entity);
   const pvValue = numericState(pv);
   const socValue = numericState(soc);
   const importValue = numericState(imported);
@@ -19973,7 +19984,7 @@ function buildLegacyHeartbeat(snapshot, options, nowIso) {
     health: {
       ha: snapshot.reachable ? "up" : "down",
       emhass: "absent",
-      fallback: "unknown"
+      fallback: fluxionFallback(aliveEntity, sentAtText)
     },
     plant: {
       pv_w: pvValue === null ? null : finiteOrNull(convertPower(pvValue, pv?.attributes.unit_of_measurement)),
@@ -20001,6 +20012,7 @@ var HA_TIMEOUT_MS = 1e4;
 var haStateSchema = external_exports.object({
   entity_id: external_exports.string(),
   state: external_exports.string(),
+  last_updated: external_exports.string().nullish(),
   attributes: external_exports.object({
     unit_of_measurement: external_exports.string().nullish(),
     installed_version: external_exports.string().nullish()
@@ -20371,8 +20383,9 @@ var optionsSchema = external_exports.object({
   soc_entity: external_exports.string().default("").transform(emptyToNull),
   import_today_entity: external_exports.string().default("").transform(emptyToNull),
   export_today_entity: external_exports.string().default("").transform(emptyToNull),
-  plan_summary_entity: external_exports.string().default("").transform(emptyToNull),
-  fluxion_version_entity: external_exports.string().default("update.fluxion_ecs_nightly_update").transform(emptyToNull)
+  plan_summary_entity: external_exports.string().default("sensor.fluxion_aktivni_pracovni_rezim").transform(emptyToNull),
+  fluxion_version_entity: external_exports.string().default("update.fluxion_ecs_nightly_update").transform(emptyToNull),
+  fluxion_alive_entity: external_exports.string().default("sensor.fluxion_pv_work_mode_plan").transform(emptyToNull)
 });
 function optionsPath(env) {
   const override = env.FLUXION_REPORTER_OPTIONS;

@@ -1,6 +1,6 @@
 name: FluxION Fleet Reporter
 slug: fluxion_fleet_reporter
-version: 0.1.2
+version: 0.1.3
 description: >-
   Reads Home Assistant states and posts a signed legacy heartbeat to the
   FluxION fleet register. It never writes to Home Assistant.
@@ -21,8 +21,9 @@ options:
   soc_entity: ""
   import_today_entity: ""
   export_today_entity: ""
-  plan_summary_entity: ""
+  plan_summary_entity: sensor.fluxion_aktivni_pracovni_rezim
   fluxion_version_entity: update.fluxion_ecs_nightly_update
+  fluxion_alive_entity: sensor.fluxion_pv_work_mode_plan
 schema:
   ingest_url: url
   claim_code: password?
@@ -34,3 +35,4 @@ schema:
   export_today_entity: str?
   plan_summary_entity: str?
   fluxion_version_entity: str?
+  fluxion_alive_entity: str?

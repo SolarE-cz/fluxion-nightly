@@ -11,8 +11,16 @@ retried every 10 minutes.
 ## What it reads
 
 Only the entities named in the options: `pv_power_entity`, `soc_entity`,
-`import_today_entity`, `export_today_entity`, `plan_summary_entity` and
-`fluxion_version_entity`, plus their unit and version attributes.
+`import_today_entity`, `export_today_entity`, `plan_summary_entity`,
+`fluxion_version_entity` and `fluxion_alive_entity`, plus their unit and version
+attributes.
+
+`fluxion_alive_entity` tells the register whether FluxION itself runs. FluxION
+refreshes it every few seconds, so the heartbeat reports `fallback` `none` while
+its last update is within 10 minutes, `stale` when it is older, and `unknown`
+when the option is empty or the entity is missing.
+`plan_summary_entity` defaults to the active FluxION work mode; an empty value
+sends no plan summary.
 
 ## Where the key lives
 
