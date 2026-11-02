@@ -284,6 +284,10 @@ pub struct EvaluationContext<'a> {
 
     /// User levers from the HA helpers (None = not synced; apply no lever rules)
     pub user_levers: Option<&'a fluxion_types::UserLevers>,
+
+    /// Cautious-PV signal from the solar forecast error (None = fewer than 3 measured days or
+    /// unknown; Winter Reserve then uses its fallback months)
+    pub cautious_pv: Option<fluxion_types::CautiousPvSignal>,
 }
 
 /// Trait for economic battery operation strategies

@@ -1114,6 +1114,9 @@ pub struct WinterReserveConfig {
     pub mode_switch_min_benefit_czk: f32,
     pub soc_resolution_pct: f32,
     pub export_floor_until_cheap: bool,
+    pub cautious_pv_mae_pct: f32,
+    pub cautious_pv_off_pct: f32,
+    pub cautious_pv_fallback_months: Vec<u32>,
 }
 
 impl Default for WinterReserveConfig {
@@ -1131,6 +1134,9 @@ impl Default for WinterReserveConfig {
             mode_switch_min_benefit_czk: core.mode_switch_min_benefit_czk,
             soc_resolution_pct: core.soc_resolution_pct,
             export_floor_until_cheap: core.export_floor_until_cheap,
+            cautious_pv_mae_pct: core.cautious_pv_mae_pct,
+            cautious_pv_off_pct: core.cautious_pv_off_pct,
+            cautious_pv_fallback_months: core.cautious_pv_fallback_months,
         }
     }
 }
@@ -2788,6 +2794,13 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .strategies
                         .winter_reserve
                         .export_floor_until_cheap,
+                    cautious_pv_mae_pct: app_config.strategies.winter_reserve.cautious_pv_mae_pct,
+                    cautious_pv_off_pct: app_config.strategies.winter_reserve.cautious_pv_off_pct,
+                    cautious_pv_fallback_months: app_config
+                        .strategies
+                        .winter_reserve
+                        .cautious_pv_fallback_months
+                        .clone(),
                 },
                 winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v10.enabled,
@@ -4213,6 +4226,50 @@ mod winter_reserve_config_tests {
         assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
         assert!((wr.mode_switch_min_benefit_czk - 1.0).abs() < 1e-6);
         assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
+        assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
+        assert!((wr.cautious_pv_off_pct - 20.0).abs() < 1e-6);
+        assert_eq!(wr.cautious_pv_fallback_months, vec![10, 11, 12, 1, 2, 3]);
+    }
+
+    /// Cautious PV options: defaults, explicit values, an empty month list, and the add-on schema
+    #[test]
+    fn test_winter_reserve_cautious_pv_options() {
+        let parse = |wr: &str| -> WinterReserveConfig {
+            let json = format!(r#"{{"winter_reserve": {{{wr}}}}}"#);
+            serde_json::from_str::<StrategiesConfig>(&json)
+                .unwrap()
+                .winter_reserve
+        };
+        let wr = parse(
+            r#""cautious_pv_mae_pct": 30.0, "cautious_pv_off_pct": 18.0, "cautious_pv_fallback_months": [11, 12]"#,
+        );
+        assert!((wr.cautious_pv_mae_pct - 30.0).abs() < 1e-6);
+        assert!((wr.cautious_pv_off_pct - 18.0).abs() < 1e-6);
+        assert_eq!(wr.cautious_pv_fallback_months, vec![11, 12]);
+        let wr = parse(r#""cautious_pv_fallback_months": []"#);
+        assert!(wr.cautious_pv_fallback_months.is_empty());
+        assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
+
+        // The options reach the core config and the planner parameters
+        let mut app = AppConfig::default();
+        app.strategies.winter_reserve.cautious_pv_mae_pct = 40.0;
+        app.strategies.winter_reserve.cautious_pv_off_pct = 30.0;
+        app.strategies.winter_reserve.cautious_pv_fallback_months = Vec::new();
+        let system: fluxion_core::SystemConfig = app.into();
+        let core = &system.strategies_config.winter_reserve;
+        assert!((core.cautious_pv_mae_pct - 40.0).abs() < 1e-6);
+        assert!((core.cautious_pv_off_pct - 30.0).abs() < 1e-6);
+        assert!(core.cautious_pv_fallback_months.is_empty());
+        let params = fluxion_core::backtest::winter_reserve_params(core);
+        assert!(params.cautious_pv_fallback_months.is_empty());
+
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("      cautious_pv_mae_pct: 25.0\n"));
+        assert!(addon.contains("      cautious_pv_fallback_months: [10, 11, 12, 1, 2, 3]\n"));
+        assert!(addon.contains("      cautious_pv_mae_pct: float(0,100)?\n"));
+        assert!(addon.contains("      cautious_pv_off_pct: 20.0\n"));
+        assert!(addon.contains("      cautious_pv_off_pct: float(0,100)?\n"));
+        assert!(addon.contains("      cautious_pv_fallback_months:\n        - int(1,12)?\n"));
     }
 
     #[test]
@@ -4359,6 +4416,35 @@ mod addon_schema_tests {
             winter_reserve_checked >= 6,
             "winter_reserve numeric options were not all checked"
         );
+    }
+
+    /// The add-on schema takes months 1-12 only (Supervisor rejects 13), and the default list fits
+    #[test]
+    fn test_addon_cautious_pv_months_schema_rejects_13() {
+        let yaml = include_str!("../../../fluxion/config.yaml");
+        let (options, schema) = yaml.split_once("\nschema:").expect("schema section");
+        let item = schema
+            .split_once("      cautious_pv_fallback_months:\n")
+            .expect("months in the schema")
+            .1
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .strip_prefix("- ")
+            .expect("months schema is a list");
+        let (lo, hi) = parse_numeric_range(item).expect("numeric item");
+        let accepts = |m: f64| lo.is_none_or(|l| m >= l) && hi.is_none_or(|h| m <= h);
+        assert!(item.starts_with("int("), "{item}");
+        assert!(!accepts(13.0) && !accepts(0.0), "{item}");
+        assert!(accepts(1.0) && accepts(12.0), "{item}");
+
+        let defaults =
+            read_scalars(options)["options.strategies.winter_reserve.cautious_pv_fallback_months"]
+                .clone();
+        let months: Vec<u32> = serde_json::from_str(&defaults).expect("default month list");
+        assert_eq!(months, vec![10, 11, 12, 1, 2, 3]);
+        assert!(months.iter().all(|m| accepts(f64::from(*m))));
     }
 
     #[test]

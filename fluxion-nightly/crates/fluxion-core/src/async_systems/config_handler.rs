@@ -335,6 +335,7 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
                     .cost_basis
                     .as_ref()
                     .and_then(|t| t.cost_czk_per_kwh()),
+                solar.cautious_pv,
             );
             // Brief H38: no planner moves until the house-load profile has MIN_HOUSE_LOAD_DAYS
             if let Some(days) = params.warmup_log.observe(
@@ -524,6 +525,7 @@ pub fn user_control_event_handler(mut params: UserControlEventParams) {
                     .cost_basis
                     .as_ref()
                     .and_then(|t| t.cost_czk_per_kwh()),
+                solar.cautious_pv,
             );
             // Brief H38: no planner moves until the house-load profile has MIN_HOUSE_LOAD_DAYS
             if let Some(days) = params.warmup_log.observe(

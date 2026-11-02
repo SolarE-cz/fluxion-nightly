@@ -268,6 +268,7 @@ fn simulate_winter_adaptive(
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let evaluation = strategy.evaluate(&context);

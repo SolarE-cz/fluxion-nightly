@@ -361,6 +361,7 @@ impl SimulationEngine {
                 block_forecasts: None,
                 timezone: None,
                 user_levers: None,
+                cautious_pv: None,
             };
 
             // Get strategy and evaluate

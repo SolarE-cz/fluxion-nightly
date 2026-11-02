@@ -10,6 +10,29 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.70] - 2026-11-02
+
+### Added
+
+- Cautious PV for Winter Reserve: once the over-forecast error of the corrected PV forecast reaches
+  `strategies.winter_reserve.cautious_pv_mae_pct` (default 25 %) with at least 5 valid days, the
+  plan uses the forecast PV times `pv_confidence`, not the forecast itself. It stays on until the
+  error drops below `strategies.winter_reserve.cautious_pv_off_pct` (default 20 %), and the state
+  survives a restart. The error is Σ max(f − a, 0) / Σ max(f, a) (0–100 %): only sun that was
+  forecast but did not come counts. `f` is each day's forecast scaled by the H34 correction factor
+  the planner applied that day (now kept with the day's forecast snapshot; days without one, rebuilt
+  from HA history or recorded earlier, use the current factor), over the last 7 complete days, and
+  the hours and days the correction skips (missing data, curtailed PV, dim days) are left out. It is
+  shown as the `cautious_pv` and `cautious_pv_error_pct` attributes of
+  `sensor.fluxion_solar_forecast_bias`. With fewer than 5 valid days, or the correction off, the
+  local months in `strategies.winter_reserve.cautious_pv_fallback_months` (default
+  `[10, 11, 12, 1, 2, 3]`) decide. The night reserve still uses `pv_confidence` in every month. The
+  `WinterReserve horizon:` log line shows `cautious_pv=yes|no` with its reason (`mae=39.2%` or
+  `fallback month`), and `pv_expected_kwh` is the PV the plan used. The replay example takes
+  `--cautious-pv on|off|months`. Why: on 2026-11-02 Jakub's site produced about 30 kWh of a 132 kWh
+  forecast, and the plan had skipped the 7.7 CZK night charge. `cautious_pv_mae_pct: 100` with an
+  empty month list restores the old behaviour.
+
 ## [0.2.69] - 2026-11-02
 
 ### Changed

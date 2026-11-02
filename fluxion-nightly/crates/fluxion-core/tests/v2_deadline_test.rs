@@ -136,6 +136,7 @@ fn test_v2_respects_deadline_constraint() {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

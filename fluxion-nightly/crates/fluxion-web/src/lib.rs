@@ -1796,6 +1796,7 @@ mod tests {
             days_used: 7,
             measured_kwh: 812.3,
             forecast_kwh: 694.3,
+            forecast_error_pct: None,
         };
         response.solar_forecast = Some(fluxion_core::web_bridge::SolarForecastInfo {
             total_today_kwh: 40.0,

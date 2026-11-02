@@ -173,6 +173,7 @@ fn test_v2_waits_for_cheapest_blocks() {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let eval = v1_strategy.evaluate(&context);
@@ -214,6 +215,7 @@ fn test_v2_waits_for_cheapest_blocks() {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

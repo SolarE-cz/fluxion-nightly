@@ -148,6 +148,7 @@ impl Plugin for HaPlugin {
             .add_systems(Update, super::actuation::prewake_system)
             .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel)
             .add_systems(Update, solar_forecast_fetcher::poll_pv_correction_channel)
+            .add_systems(Update, solar_forecast_fetcher::poll_cautious_pv_channel)
             .add_systems(
                 Update,
                 (

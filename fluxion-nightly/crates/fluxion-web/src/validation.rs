@@ -282,6 +282,31 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
             severity: "error".to_owned(),
         });
     }
+    if !(wr.cautious_pv_mae_pct > 0.0 && wr.cautious_pv_mae_pct <= 100.0) {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cautious_pv_mae_pct".to_owned(),
+            message: "Cautious PV forecast error must be in (0, 100] percent".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+    if !(0.0..=wr.cautious_pv_mae_pct).contains(&wr.cautious_pv_off_pct) {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cautious_pv_off_pct".to_owned(),
+            message: "Cautious PV off threshold must be between 0 and the on threshold".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+    if wr
+        .cautious_pv_fallback_months
+        .iter()
+        .any(|m| !(1..=12).contains(m))
+    {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cautious_pv_fallback_months".to_owned(),
+            message: "Months must be between 1 and 12".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
     if wr.min_arbitrage_profit_czk < 0.0 {
         errors.push(ValidationIssue {
             field: "strategies.winter_reserve.min_arbitrage_profit_czk".to_owned(),
@@ -346,6 +371,42 @@ mod tests {
             warnings
                 .iter()
                 .any(|w| w.field == "control.force_discharge_enabled")
+        );
+    }
+
+    #[test]
+    fn cautious_pv_months_outside_1_to_12_and_bad_threshold_are_errors() {
+        let mut config = default_config();
+        config
+            .strategies_config
+            .winter_reserve
+            .cautious_pv_fallback_months = Vec::new();
+        assert!(validate_config(&config).0.is_empty());
+        config
+            .strategies_config
+            .winter_reserve
+            .cautious_pv_fallback_months = vec![11, 13];
+        config.strategies_config.winter_reserve.cautious_pv_mae_pct = 0.0;
+        let fields: Vec<String> = validate_config(&config)
+            .0
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert!(
+            fields.contains(&"strategies.winter_reserve.cautious_pv_fallback_months".to_owned())
+        );
+        assert!(fields.contains(&"strategies.winter_reserve.cautious_pv_mae_pct".to_owned()));
+        // The off threshold must not exceed the on threshold
+        let mut config = default_config();
+        config.strategies_config.winter_reserve.cautious_pv_off_pct = 30.0;
+        let fields: Vec<String> = validate_config(&config)
+            .0
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["strategies.winter_reserve.cautious_pv_off_pct".to_owned()]
         );
     }
 

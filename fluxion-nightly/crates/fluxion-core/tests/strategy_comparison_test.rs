@@ -169,6 +169,7 @@ fn compare_v1_v2_on_czech_pattern() {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let v1_eval = v1_strategy.evaluate(&context);
@@ -427,6 +428,7 @@ fn compare_cost_overnight_charging() {
         block_forecasts: None,
         timezone: None,
         user_levers: None,
+        cautious_pv: None,
     };
 
     let v1_overnight = v1_strategy.evaluate(&context_overnight);
@@ -484,6 +486,7 @@ fn compare_peak_discharge_behavior() {
         block_forecasts: None,
         timezone: None,
         user_levers: None,
+        cautious_pv: None,
     };
 
     let v1_peak = v1_strategy.evaluate(&context_peak);
@@ -689,6 +692,7 @@ fn simulate_strategy<S: EconomicStrategy>(
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         // Get strategy decision

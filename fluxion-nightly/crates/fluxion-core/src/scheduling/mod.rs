@@ -24,7 +24,7 @@ use fluxion_types::config::{ControlConfig, Currency, PricingConfig};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
-use fluxion_types::{UserControlState, UserLevers};
+use fluxion_types::{CautiousPvSignal, UserControlState, UserLevers};
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
@@ -300,6 +300,7 @@ pub fn generate_schedule_with_optimizer(
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
     battery_charge_cost_czk_per_kwh: Option<f32>,
+    cautious_pv: Option<CautiousPvSignal>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
@@ -417,6 +418,7 @@ pub fn generate_schedule_with_optimizer(
             user_levers,
             planner_min_soc_pct,
             battery_charge_cost_czk_per_kwh,
+            cautious_pv,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -565,6 +567,7 @@ pub fn generate_schedule_with_optimizer(
             user_levers,
             planner_min_soc_pct,
             battery_charge_cost_czk_per_kwh,
+            cautious_pv,
         );
 
         // Get decision from plugin manager
@@ -1104,6 +1107,7 @@ fn create_evaluation_request(
     user_levers: Option<&UserLevers>,
     planner_min_soc_pct: Option<f32>,
     battery_charge_cost_czk_per_kwh: Option<f32>,
+    cautious_pv: Option<CautiousPvSignal>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -1154,6 +1158,7 @@ fn create_evaluation_request(
         timezone: timezone.map(str::to_owned),
         user_levers: user_levers.copied(),
         planner_min_soc_pct,
+        cautious_pv,
     }
 }
 
@@ -1313,11 +1318,17 @@ mod tests {
             Some("Europe/Prague"),
             None,
             None,
+            Some(fluxion_types::CautiousPvSignal {
+                mae_pct: 39.0,
+                cautious: true,
+            }),
         );
 
         let requests = plugin.requests.lock().unwrap();
         assert!(!requests.is_empty());
         for request in requests.iter() {
+            // The cautious-PV signal reaches every request
+            assert_eq!(request.cautious_pv.map(|c| c.cautious), Some(true));
             assert_eq!(request.block_forecasts.len(), request.all_blocks.len());
             assert_eq!(request.timezone.as_deref(), Some("Europe/Prague"));
 
@@ -1592,6 +1603,7 @@ mod tests {
                 None,
                 None,
                 active_user_levers(res),
+                None,
                 None,
             );
             plugin

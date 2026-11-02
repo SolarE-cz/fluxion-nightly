@@ -312,6 +312,50 @@ and 3600 seconds.
 
 Default value: `60`
 
+### Option Group: `strategies.winter_reserve`
+
+Only the cautious-PV options are described here; the other Winter Reserve options keep their
+defaults unless a replay shows a gain.
+
+#### Option: `strategies.winter_reserve.cautious_pv_mae_pct`
+
+Cautious PV: while the solar forecast misses a lot, the planner plans on the forecast PV times
+`pv_confidence` (default 0.70) instead of the forecast itself, so a sunny forecast that does not
+come true no longer skips a cheap night charge. Otherwise `pv_confidence` only sizes the night
+reserve.
+
+The trigger is the over-forecast error of the forecast the plan used (PV forecast correction,
+`solar_forecast.pv_forecast_correction_enabled`) over the last 7 complete days:
+Σ max(forecast − measured, 0) / Σ max(forecast, measured), always 0–100 %. Only sun that was
+forecast but did not come counts; more sun than forecast does not. It uses the same valid hours and
+days as the correction: hours with missing data or curtailed PV and dim days are left out. Each
+day's forecast is scaled by the correction factor the planner applied that day (the factor of the
+day's recompute, or the last one it held; kept with the day's forecast snapshot), so a steady bias that the correction already removed does not
+count, while a bias it had not caught yet does. Days without a stored factor (rebuilt from HA
+history, or recorded by an earlier version) use the current factor. Cautious PV turns on when the error reaches this value with at least 5
+valid days in the window, and stays on until the error drops below
+`strategies.winter_reserve.cautious_pv_off_pct`. With fewer than 5 valid days the fallback months
+decide. The state is kept across restarts and shown as the `cautious_pv` and
+`cautious_pv_error_pct` attributes of `sensor.fluxion_solar_forecast_bias`. `100` turns the
+trigger off. The value is read when the add-on starts.
+
+Default value: `25.0`
+
+#### Option: `strategies.winter_reserve.cautious_pv_off_pct`
+
+Once on, cautious PV stays on while the over-forecast error is at or above this value (%). It must
+not exceed `cautious_pv_mae_pct`. Read when the add-on starts.
+
+Default value: `20.0`
+
+#### Option: `strategies.winter_reserve.cautious_pv_fallback_months`
+
+Local calendar months (1–12) planned on cautious PV while the forecast error does not decide: fewer
+than 5 valid days, or the PV forecast correction off. An empty list turns the fallback off; with
+`cautious_pv_mae_pct: 100` as well, the planner behaves as before this option.
+
+Default value: `[10, 11, 12, 1, 2, 3]`
+
 ## How It Works
 
 FluxION operates on a 15-minute time block schedule, analyzing electricity spot prices to determine

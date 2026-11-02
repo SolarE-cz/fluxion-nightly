@@ -206,6 +206,15 @@ options:
       solar_window_end_hour: 14
       solar_window_start_hour: 10
     winter_reserve:
+      cautious_pv_fallback_months:
+      - 10
+      - 11
+      - 12
+      - 1
+      - 2
+      - 3
+      cautious_pv_mae_pct: 25.0
+      cautious_pv_off_pct: 20.0
       cheap_percentile: 0.2
       enabled: true
       export_floor_until_cheap: false
@@ -471,6 +480,10 @@ schema:
       solar_window_end_hour: int(0,23)?
       solar_window_start_hour: int(0,23)?
     winter_reserve:
+      cautious_pv_fallback_months:
+      - int(1,12)?
+      cautious_pv_mae_pct: float(0,100)?
+      cautious_pv_off_pct: float(0,100)?
       cheap_percentile: float(0,0.5)?
       enabled: bool?
       export_floor_until_cheap: bool?
@@ -490,4 +503,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.69
+version: 0.2.70

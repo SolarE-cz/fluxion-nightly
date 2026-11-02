@@ -1708,6 +1708,7 @@ mod tests {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let eval = strategy.evaluate(&context);

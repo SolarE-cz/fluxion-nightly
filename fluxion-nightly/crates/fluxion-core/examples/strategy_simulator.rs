@@ -427,6 +427,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 block_forecasts: None,
                 timezone: None,
                 user_levers: None,
+                cautious_pv: None,
             };
 
             let evaluation = state.strategy.evaluate(&context);

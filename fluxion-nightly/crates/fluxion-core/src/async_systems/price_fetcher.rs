@@ -507,6 +507,7 @@ pub fn update_prices_system(
             .and_then(|tz| tz.timezone.as_deref()),
         active_user_levers(user_levers.as_deref()),
         cost_basis.as_ref().and_then(|t| t.cost_czk_per_kwh()),
+        solar.cautious_pv,
     );
     // Brief H38: no planner moves until the house-load profile has MIN_HOUSE_LOAD_DAYS
     if let Some(days) = warmup_log.observe(

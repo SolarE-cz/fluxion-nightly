@@ -29,5 +29,7 @@ pub use history::{ConsumptionHistory, ConsumptionHistoryConfig};
 pub use inverter::{Inverter, InverterOperationMode, InverterType};
 pub use levers::{DischargeWindowLimit, UserLevers, VprMode, VprPhase, VprWindow};
 pub use pricing::{PriceAnalysis, SpotPriceData};
-pub use scheduling::{BlockDebugInfo, OperationSchedule, ScheduledMode, StrategyEvaluation};
+pub use scheduling::{
+    BlockDebugInfo, CautiousPvSignal, OperationSchedule, ScheduledMode, StrategyEvaluation,
+};
 pub use user_control::{DefaultMode, FixedTimeSlot, UserControlState};

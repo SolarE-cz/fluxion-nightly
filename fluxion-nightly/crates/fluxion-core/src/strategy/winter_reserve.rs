@@ -15,11 +15,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use fluxion_types::config::ControlConfig;
 use fluxion_types::inverter::InverterOperationMode;
-use fluxion_types::{DischargeWindowLimit, UserLevers};
+use fluxion_types::{CautiousPvSignal, DischargeWindowLimit, UserLevers};
 use serde::{Deserialize, Serialize};
 
 use super::{Assumptions, BlockEvaluation, EnergyFlows};
@@ -68,7 +68,7 @@ pub struct BatteryParams {
 }
 
 /// Tunables of the strategy (`strategies.winter_reserve` config section).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WinterReserveParams {
     pub min_arbitrage_profit_czk: f32,
     pub insane_price_multiplier: f32,
@@ -84,6 +84,80 @@ pub struct WinterReserveParams {
     /// horizon median) when it comes before the next morning (`night_floors`)
     #[serde(default)]
     pub export_floor_until_cheap: bool,
+    /// Local months (1-12) planned on cautious PV (forecast times `pv_confidence`) when the
+    /// forecast error is unknown (no `CautiousPvSignal`); empty = never
+    #[serde(default = "default_cautious_pv_fallback_months")]
+    pub cautious_pv_fallback_months: Vec<u32>,
+}
+
+fn default_cautious_pv_fallback_months() -> Vec<u32> {
+    vec![10, 11, 12, 1, 2, 3]
+}
+
+/// Fewest valid days in the 7-day window before the forecast error decides cautious PV; with
+/// fewer the fallback months decide (owner decision 2026-11-02, review #652 D-2)
+pub const CAUTIOUS_PV_MIN_DAYS: usize = 5;
+
+/// Hysteresis of cautious PV (`strategies.winter_reserve.cautious_pv_mae_pct` and
+/// `cautious_pv_off_pct`)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CautiousPvThresholds {
+    /// Turns on at this forecast error (%) or more; 100 or more = never
+    pub on_pct: f32,
+    /// Once on, stays on while the error is at or above this (%)
+    pub off_pct: f32,
+}
+
+/// Cautious PV state after a new forecast error (0-100 %): on at `on_pct` or more, and once on it
+/// stays on until the error drops below `off_pct`. An `on_pct` of 100 or more turns the trigger
+/// off.
+#[must_use]
+pub fn cautious_pv_next(was_on: bool, mae_pct: f32, t: CautiousPvThresholds) -> bool {
+    if t.on_pct >= 100.0 {
+        false
+    } else if was_on {
+        mae_pct >= t.off_pct
+    } else {
+        mae_pct >= t.on_pct
+    }
+}
+
+/// Cautious-PV signal from the forecast error of the H34 window (`CorrectionResult::
+/// forecast_error_pct` over `valid_days`) and the stored state: `None` when the error is unknown
+/// or rests on fewer than `CAUTIOUS_PV_MIN_DAYS` valid days, so the fallback months decide
+#[must_use]
+pub fn cautious_pv_signal(
+    error_pct: Option<f32>,
+    valid_days: usize,
+    was_on: bool,
+    t: CautiousPvThresholds,
+) -> Option<CautiousPvSignal> {
+    error_pct
+        .filter(|_| valid_days >= CAUTIOUS_PV_MIN_DAYS)
+        .map(|mae_pct| CautiousPvSignal {
+            mae_pct,
+            cautious: cautious_pv_next(was_on, mae_pct, t),
+        })
+}
+
+/// Whether the block starting at `start` plans on cautious PV: the forecast-error signal when there
+/// is one, else whether the block's local month (in `tz`) is in `fallback_months`
+#[must_use]
+pub fn cautious_pv_at(
+    start: DateTime<Utc>,
+    signal: Option<CautiousPvSignal>,
+    fallback_months: &[u32],
+    tz: Tz,
+) -> bool {
+    match signal {
+        Some(signal) => signal.cautious,
+        None => fallback_months.contains(&start.with_timezone(&tz).month()),
+    }
+}
+
+/// The timezone the planner reads local time in (nights, mornings, months)
+fn planner_tz(context: &super::EvaluationContext) -> Tz {
+    context.timezone.unwrap_or(chrono_tz::Europe::Prague)
 }
 
 impl Default for WinterReserveParams {
@@ -98,6 +172,7 @@ impl Default for WinterReserveParams {
             mode_switch_min_benefit_czk: 1.0,
             soc_resolution_pct: 0.5,
             export_floor_until_cheap: false,
+            cautious_pv_fallback_months: default_cautious_pv_fallback_months(),
         }
     }
 }
@@ -1130,6 +1205,20 @@ static LAST_PLAN_WARNED_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None)
 struct PlanInputs {
     block_forecasts: bool,
     profile: bool,
+    /// Forecast-error signal of the plan (`None` = fallback months)
+    cautious_pv: Option<CautiousPvSignal>,
+    /// Some horizon block plans on cautious PV
+    cautious_any: bool,
+}
+
+/// `yes (mae=39.2%)` or `no (fallback month)`: whether any horizon block plans on cautious PV,
+/// and what decided it
+fn cautious_pv_log(signal: Option<CautiousPvSignal>, any_cautious: bool) -> String {
+    let state = if any_cautious { "yes" } else { "no" };
+    match signal {
+        Some(s) => format!("{state} (mae={:.1}%)", s.mae_pct),
+        None => format!("{state} (fallback month)"),
+    }
 }
 
 #[derive(Serialize)]
@@ -1159,7 +1248,8 @@ fn log_replan(horizon: &[PlanBlock], plan: &Plan, soc_pct: f32, inputs: PlanInpu
     tracing::info!(
         "WinterReserve horizon: n={} first={} last={} block_forecasts={} profile={} \
          load_expected_kwh={:.2} pv_expected_kwh={:.2} load_reserve_kwh={:.2} pv_reserve_kwh={:.2} \
-         first_morning={first_morning} head_floor_kwh={:.2} head_mode={:?} soc_pct={soc_pct:.1}",
+         first_morning={first_morning} head_floor_kwh={:.2} head_mode={:?} soc_pct={soc_pct:.1} \
+         cautious_pv={}",
         horizon.len(),
         stamp(&horizon[0]),
         stamp(&horizon[horizon.len() - 1]),
@@ -1171,6 +1261,7 @@ fn log_replan(horizon: &[PlanBlock], plan: &Plan, soc_pct: f32, inputs: PlanInpu
         sum(|b| b.reserve_pv_kwh),
         head.floor_kwh,
         head.mode,
+        cautious_pv_log(inputs.cautious_pv, inputs.cautious_any),
     );
     dump_last_plan(horizon, plan, soc_pct);
 }
@@ -1422,8 +1513,9 @@ impl WinterReserveStrategy {
     /// Plan blocks from the evaluated block to the end of the known horizon.
     /// Expected load: non-empty UTC-hour mean profile, else aligned flat forecast, else average load.
     /// Reserve load: max(mean, p75) times `planner_load_margin` when p75 is available, else expected
-    /// times `load_safety_factor`. Expected PV: aligned forecast, else 0. Reserve PV: expected times
-    /// `pv_confidence`. Forecasts are used only when aligned with `all_price_blocks`.
+    /// times `load_safety_factor`. Expected PV: aligned forecast, else 0, times `pv_confidence` in
+    /// a cautious-PV block (`cautious_pv_at`). Reserve PV: the forecast times `pv_confidence`.
+    /// Forecasts are used only when aligned with `all_price_blocks`.
     /// The first entry is the evaluated block. User levers are applied to the blocks (see `apply_user_levers`).
     fn horizon_blocks(&self, context: &super::EvaluationContext) -> Vec<PlanBlock> {
         let block_start = context.price_block.block_start;
@@ -1441,6 +1533,7 @@ impl WinterReserveStrategy {
             .hourly_consumption_profile
             .filter(|p| p.iter().sum::<f32>() > 0.0);
         let p75 = context.hourly_consumption_p75.filter(|_| profile.is_some());
+        let tz = planner_tz(context);
         let mut blocks: Vec<PlanBlock> = all
             .iter()
             .enumerate()
@@ -1471,6 +1564,13 @@ impl WinterReserveStrategy {
                     Some(f) => f[i].solar_kwh,
                     None => 0.0,
                 };
+                // Cautious PV: the plan itself uses the reserve view of the sun
+                let cautious = cautious_pv_at(
+                    b.block_start,
+                    context.cautious_pv,
+                    &self.params.cautious_pv_fallback_months,
+                    tz,
+                );
                 PlanBlock {
                     start: b.block_start,
                     duration_minutes: b.duration_minutes,
@@ -1479,7 +1579,11 @@ impl WinterReserveStrategy {
                         .spot_sell_price_czk_per_kwh
                         .unwrap_or(control.grid_export_fee_czk_per_kwh),
                     load_kwh: expected_load,
-                    pv_kwh: pv,
+                    pv_kwh: if cautious {
+                        pv * self.params.pv_confidence
+                    } else {
+                        pv
+                    },
                     reserve_load_kwh: reserve_load,
                     reserve_pv_kwh: pv * self.params.pv_confidence,
                     force_charge: false,
@@ -1591,7 +1695,7 @@ impl super::EconomicStrategy for WinterReserveStrategy {
 
     fn evaluate(&self, context: &super::EvaluationContext) -> super::BlockEvaluation {
         let now = (self.clock)();
-        let tz = context.timezone.unwrap_or(chrono_tz::Europe::Prague);
+        let tz = planner_tz(context);
         let mut battery = battery_params(context.control_config);
         battery.charge_cost_czk_per_kwh = context.battery_charge_cost_czk_per_kwh;
         let horizon = self.horizon_blocks(context);
@@ -1610,6 +1714,15 @@ impl super::EconomicStrategy for WinterReserveStrategy {
             let inputs = PlanInputs {
                 block_forecasts: context.block_forecasts.is_some(),
                 profile: context.hourly_consumption_profile.is_some(),
+                cautious_pv: context.cautious_pv,
+                cautious_any: horizon.iter().any(|b| {
+                    cautious_pv_at(
+                        b.start,
+                        context.cautious_pv,
+                        &self.params.cautious_pv_fallback_months,
+                        tz,
+                    )
+                }),
             };
             log_replan(&horizon, plan, live_soc, inputs, tz);
         }
@@ -2641,6 +2754,7 @@ mod tests {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         }
     }
 
@@ -3838,7 +3952,7 @@ mod tests {
             }),
             ..UserLevers::default()
         };
-        let horizon = WinterReserveStrategy::new(true, params)
+        let horizon = WinterReserveStrategy::new(true, params.clone())
             .horizon_blocks(&lever_ctx(&blocks, &ctl, &levers));
         // Evening blocks 0..24 (18:00-24:00); the four highest sells are 20..24.
         let allowed: Vec<usize> = horizon
@@ -4244,7 +4358,7 @@ mod keep_rule_tests {
         let params = WinterReserveParams::default();
         let zero = WinterReserveParams {
             mode_switch_min_benefit_czk: 0.0,
-            ..params
+            ..params.clone()
         };
         let b = battery(20.0);
         // Hold applied; block 0 is dearer than the rest of the night, so SelfUse is the free choice
@@ -5575,5 +5689,343 @@ mod owner_fixed_buy_tests {
             assert_eq!(exports, cycles, "net {net}: export");
             assert_eq!(charges, cycles, "net {net}: charge");
         }
+    }
+}
+
+/// Cautious PV (owner ruling 2026-11-02): while the forecast error is high, or in a fallback month
+/// when too few days are measured, the plan itself uses the forecast PV times `pv_confidence`.
+#[cfg(test)]
+mod cautious_pv_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use fluxion_plugins::protocol::BlockForecast;
+    use fluxion_types::pricing::TimeBlockPrice;
+
+    const PRAGUE: Tz = chrono_tz::Europe::Prague;
+
+    fn thresholds(on_pct: f32) -> CautiousPvThresholds {
+        CautiousPvThresholds {
+            on_pct,
+            off_pct: 20.0,
+        }
+    }
+
+    fn signal(mae_pct: f32, threshold_pct: f32, was_on: bool) -> CautiousPvSignal {
+        CautiousPvSignal {
+            mae_pct,
+            cautious: cautious_pv_next(was_on, mae_pct, thresholds(threshold_pct)),
+        }
+    }
+
+    fn control(load_kw: f32) -> ControlConfig {
+        ControlConfig {
+            force_discharge_enabled: false,
+            battery_capacity_kwh: 96.0,
+            min_battery_soc: 10.0,
+            max_battery_soc: 100.0,
+            max_battery_charge_rate_kw: 30.0,
+            battery_efficiency: 0.9,
+            battery_wear_cost_czk_per_kwh: 0.125,
+            maximum_export_power_w: 10_000,
+            grid_export_fee_czk_per_kwh: 0.5,
+            average_household_load_kw: load_kw,
+            ..ControlConfig::default()
+        }
+    }
+
+    fn prices(starts: &[DateTime<Utc>], buy: impl Fn(DateTime<Utc>) -> f32) -> Vec<TimeBlockPrice> {
+        starts
+            .iter()
+            .map(|&s| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
+                block_start: s,
+                duration_minutes: 15,
+                price_czk_per_kwh: buy(s),
+                effective_price_czk_per_kwh: buy(s),
+                spot_sell_price_czk_per_kwh: Some(1.0),
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn context<'a>(
+        blocks: &'a [TimeBlockPrice],
+        index: usize,
+        control: &'a ControlConfig,
+        forecasts: &'a [BlockForecast],
+        soc: f32,
+        tz: Tz,
+        cautious_pv: Option<CautiousPvSignal>,
+    ) -> super::super::EvaluationContext<'a> {
+        super::super::EvaluationContext {
+            price_block: &blocks[index],
+            control_config: control,
+            current_battery_soc: soc,
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.0,
+            grid_export_price_czk_per_kwh: 0.5,
+            all_price_blocks: Some(blocks),
+            backup_discharge_min_soc: 10.0,
+            grid_import_today_kwh: None,
+            consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
+            hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: Some(forecasts),
+            timezone: Some(tz),
+            user_levers: None,
+            cautious_pv,
+        }
+    }
+
+    fn params(confidence: f32) -> WinterReserveParams {
+        WinterReserveParams {
+            pv_confidence: confidence,
+            ..WinterReserveParams::default()
+        }
+    }
+
+    /// One 10 kWh block at local noon on `day` (y, m, d) in Prague, planned with `signal`
+    fn noon_block(
+        ymd: (i32, u32, u32),
+        p: WinterReserveParams,
+        cautious_pv: Option<CautiousPvSignal>,
+    ) -> PlanBlock {
+        let start = PRAGUE
+            .with_ymd_and_hms(ymd.0, ymd.1, ymd.2, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let blocks = prices(&[start], |_| 5.0);
+        let forecasts = [BlockForecast {
+            solar_kwh: 10.0,
+            consumption_kwh: 0.5,
+        }];
+        let ctl = control(1.0);
+        WinterReserveStrategy::new(true, p).horizon_blocks(&context(
+            &blocks,
+            0,
+            &ctl,
+            &forecasts,
+            50.0,
+            PRAGUE,
+            cautious_pv,
+        ))[0]
+    }
+
+    #[test]
+    fn high_forecast_error_plans_on_cautious_pv_low_error_does_not() {
+        // MAE 39 % with the default threshold 25 %: cautious, PV 10 -> 7.0 (reserve 7.0)
+        let high = signal(39.0, 25.0, false);
+        assert!(high.cautious);
+        let b = noon_block((2026, 6, 15), params(0.7), Some(high));
+        assert!((b.pv_kwh - 7.0).abs() < 1e-5, "{}", b.pv_kwh);
+        assert!((b.reserve_pv_kwh - 7.0).abs() < 1e-5);
+        // MAE 10 %: not cautious, even in November (the signal wins over the months)
+        let low = signal(10.0, 25.0, false);
+        assert!(!low.cautious);
+        let b = noon_block((2026, 11, 15), params(0.7), Some(low));
+        assert!((b.pv_kwh - 10.0).abs() < 1e-5, "{}", b.pv_kwh);
+        assert!((b.reserve_pv_kwh - 7.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hysteresis_holds_the_state_between_20_and_25_percent() {
+        // Threshold 100 is off, even at the largest error the bounded metric gives
+        assert!(!cautious_pv_next(false, 100.0, thresholds(100.0)));
+        assert!(!cautious_pv_next(true, 100.0, thresholds(100.0)));
+        // Off: 22 % does not turn it on; 25 % does
+        assert!(!cautious_pv_next(false, 22.0, thresholds(25.0)));
+        assert!(cautious_pv_next(false, 25.0, thresholds(25.0)));
+        let mut on = false;
+        let mut states = Vec::new();
+        for mae in [30.0, 22.0, 20.0, 19.0, 22.0] {
+            on = cautious_pv_next(on, mae, thresholds(25.0));
+            states.push(on);
+        }
+        // 22 stays on after 30, 20 still on, 19 turns off, 22 stays off after 19
+        assert_eq!(states, vec![true, true, true, false, false]);
+        // The error decides only with at least 5 valid days in the window
+        let t = thresholds(25.0);
+        assert_eq!(cautious_pv_signal(Some(40.0), 4, false, t), None);
+        assert!(
+            cautious_pv_signal(Some(40.0), 5, false, t)
+                .unwrap()
+                .cautious
+        );
+    }
+
+    #[test]
+    fn without_a_signal_the_local_month_decides_at_the_prague_boundary() {
+        // Fallback months [10, 11, 12, 1, 2, 3]: 30 Sep 23:45 local is not cautious, 1 Oct 00:00
+        // local (30 Sep 22:00 UTC) is
+        let sep_last = Utc.with_ymd_and_hms(2026, 9, 30, 21, 45, 0).unwrap();
+        let oct_first = Utc.with_ymd_and_hms(2026, 9, 30, 22, 0, 0).unwrap();
+        let blocks = prices(&[sep_last, oct_first], |_| 5.0);
+        let forecasts = [BlockForecast {
+            solar_kwh: 10.0,
+            consumption_kwh: 0.5,
+        }; 2];
+        let ctl = control(1.0);
+        let s = WinterReserveStrategy::new(true, params(0.7));
+        let h = s.horizon_blocks(&context(&blocks, 0, &ctl, &forecasts, 50.0, PRAGUE, None));
+        assert!((h[0].pv_kwh - 10.0).abs() < 1e-5, "{}", h[0].pv_kwh);
+        assert!((h[1].pv_kwh - 7.0).abs() < 1e-5, "{}", h[1].pv_kwh);
+        // In UTC the second block is still 30 September: the site timezone is what counts
+        let h = s.horizon_blocks(&context(
+            &blocks,
+            0,
+            &ctl,
+            &forecasts,
+            50.0,
+            chrono_tz::UTC,
+            None,
+        ));
+        assert!((h[1].pv_kwh - 10.0).abs() < 1e-5, "{}", h[1].pv_kwh);
+        // The March/April end: 31 Mar 23:45 local cautious, 1 Apr 00:00 local (CEST) not
+        let mar_last = Utc.with_ymd_and_hms(2026, 3, 31, 21, 45, 0).unwrap();
+        let apr_first = Utc.with_ymd_and_hms(2026, 3, 31, 22, 0, 0).unwrap();
+        let blocks = prices(&[mar_last, apr_first], |_| 5.0);
+        let h = s.horizon_blocks(&context(&blocks, 0, &ctl, &forecasts, 50.0, PRAGUE, None));
+        assert!((h[0].pv_kwh - 7.0).abs() < 1e-5, "{}", h[0].pv_kwh);
+        assert!((h[1].pv_kwh - 10.0).abs() < 1e-5, "{}", h[1].pv_kwh);
+    }
+
+    #[test]
+    fn empty_months_and_threshold_100_give_the_old_horizon_exactly() {
+        let off = WinterReserveParams {
+            cautious_pv_fallback_months: Vec::new(),
+            ..params(0.7)
+        };
+        // A 39 % error under a 100 % threshold is not cautious
+        let sig = signal(39.0, 100.0, false);
+        assert!(!sig.cautious);
+        let start = PRAGUE
+            .with_ymd_and_hms(2026, 11, 2, 0, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let starts: Vec<_> = (0..96).map(|i| start + Duration::minutes(15 * i)).collect();
+        let blocks = prices(&starts, |_| 5.0);
+        let forecasts: Vec<BlockForecast> = (0..96)
+            .map(|i| BlockForecast {
+                solar_kwh: (i as f32 * 0.137).sin().max(0.0) * 1.3,
+                consumption_kwh: 0.3,
+            })
+            .collect();
+        let ctl = control(1.0);
+        let s = WinterReserveStrategy::new(true, off);
+        for cautious_pv in [None, Some(sig)] {
+            let h = s.horizon_blocks(&context(
+                &blocks,
+                0,
+                &ctl,
+                &forecasts,
+                50.0,
+                PRAGUE,
+                cautious_pv,
+            ));
+            for (b, f) in h.iter().zip(&forecasts) {
+                assert_eq!(b.pv_kwh.to_bits(), f.solar_kwh.to_bits());
+                assert_eq!(b.reserve_pv_kwh.to_bits(), (f.solar_kwh * 0.7).to_bits());
+            }
+        }
+    }
+
+    /// Jakub-like evening, 2 Nov 18:00 to 3 Nov 24:00 local: night 7.7, next day 9.5-10.5, 102 kWh
+    /// forecast for the next day, `pv_confidence` 0.35, 96 kWh at 17 %, 30 kW charge. Re-planned
+    /// every block from the simulated SOC; returns the SOC (%) at 06:00 and the night grid charge.
+    const JAKUB_LOAD_KWH: f32 = 0.6;
+
+    fn jakub_closed_loop(cautious_pv: Option<CautiousPvSignal>) -> (f32, f32) {
+        let start = PRAGUE
+            .with_ymd_and_hms(2026, 11, 2, 18, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let n = 120;
+        let starts: Vec<_> = (0..n).map(|i| start + Duration::minutes(15 * i)).collect();
+        let local_hour = |s: DateTime<Utc>| s.with_timezone(&PRAGUE).hour();
+        let is_next_day = |s: DateTime<Utc>| s.with_timezone(&PRAGUE).day() == 3;
+        let blocks = prices(&starts, |s| {
+            let h = local_hour(s);
+            if !is_next_day(s) && h >= 22 || is_next_day(s) && h < 6 {
+                7.7
+            } else if !is_next_day(s) {
+                10.5
+            } else {
+                9.5 + (h as f32 - 6.0) / 18.0
+            }
+        });
+        // 102 kWh over 08:00-16:00 local next day, a symmetric bell over 32 blocks
+        let weights: Vec<f32> = (0..32)
+            .map(|k| (std::f32::consts::PI * (k as f32 + 0.5) / 32.0).sin())
+            .collect();
+        let total: f32 = weights.iter().sum();
+        let forecasts: Vec<BlockForecast> = starts
+            .iter()
+            .map(|&s| {
+                let h = local_hour(s);
+                let solar_kwh = if is_next_day(s) && (8..16).contains(&h) {
+                    let k = (h - 8) as usize * 4 + s.with_timezone(&PRAGUE).minute() as usize / 15;
+                    102.0 * weights[k] / total
+                } else {
+                    0.0
+                };
+                BlockForecast {
+                    solar_kwh,
+                    consumption_kwh: JAKUB_LOAD_KWH,
+                }
+            })
+            .collect();
+        let ctl = control(JAKUB_LOAD_KWH * 4.0);
+        let s = WinterReserveStrategy::new(true, params(0.35));
+        let battery = battery_params(&ctl);
+        let mut soc = 17.0_f32;
+        let mut current = None;
+        let mut night_charge = 0.0_f32;
+        let mut soc_at_six = None;
+        for i in 0..n as usize {
+            if is_next_day(starts[i]) && local_hour(starts[i]) == 6 && soc_at_six.is_none() {
+                soc_at_six = Some(soc);
+            }
+            let horizon = s.horizon_blocks(&context(
+                &blocks,
+                i,
+                &ctl,
+                &forecasts,
+                soc,
+                PRAGUE,
+                cautious_pv,
+            ));
+            let p = s.run_plan(&horizon, soc, PRAGUE, &battery, current);
+            let head = &p.blocks[0];
+            if head.mode == PlanMode::Charge && blocks[i].effective_price_czk_per_kwh < 8.0 {
+                night_charge += head.outcome.battery_charge_kwh;
+            }
+            current = Some(head.mode);
+            soc = head.soc_end_pct;
+        }
+        (soc_at_six.expect("06:00 reached"), night_charge)
+    }
+
+    #[test]
+    fn jakub_high_forecast_error_charges_at_night_low_error_does_not() {
+        // Cautious (MAE 39 %): the plan sees 35.7 kWh of sun and fills the battery at 7.7 overnight.
+        // It stops short of 100 % because the charge cap leaves room for that cautious PV, so
+        // about 60 % is the most the night can add (59.2 % measured).
+        let (soc_six, charged) = jakub_closed_loop(Some(signal(39.0, 25.0, false)));
+        assert!(
+            soc_six >= 58.0 && charged >= 40.0,
+            "MAE 39 %: SOC at 06:00 {soc_six:.1} %, night charge {charged:.1} kWh"
+        );
+        // Face value (MAE 10 %): 102 kWh of sun covers the day, so the night buys only what the
+        // morning before sunrise needs (the reserve), not the day
+        let (soc_six, charged) = jakub_closed_loop(Some(signal(10.0, 25.0, false)));
+        assert!(
+            soc_six < 30.0 && charged < 20.0,
+            "MAE 10 %: SOC at 06:00 {soc_six:.1} %, night charge {charged:.1} kWh"
+        );
     }
 }
