@@ -10,6 +10,24 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.71] - 2026-11-03
+
+### Added
+
+- `arbitrage_benchmark` example: replay fixture plus 6-day closed-loop synthetic runs (15-minute
+  replans, tomorrow's prices at 13:00, missing on 1 day in 6) for an owner-like and a Jakub-like
+  site, with and without force discharge. The planner sees the forecast while the battery runs on
+  actual PV and load (lognormal error σ 0.25, fixed seeds); `--perfect-foresight` turns the error
+  off, `--seed <n>` changes the noise and `--owner-replay <path>` adds a recorded replay.
+
+### Fixed
+
+- WinterReserve with `export_floor_until_cheap`: when tomorrow's morning is not in the horizon (for
+  example tomorrow's prices are missing) and no cheap block is ahead (a flat low-tariff tail after
+  the evening peak), the export reserve now ends at the first later block that buys at or below
+  `cheap_ref` and nets `min_arbitrage_profit_czk` against this block's sell (losses and wear
+  included). Before, the reserve stayed at the full battery and the evening peak did not export.
+
 ## [0.2.70] - 2026-11-02
 
 ### Added

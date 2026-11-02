@@ -666,10 +666,30 @@ fn night_floors(
     } else {
         None
     };
+    let eta = battery.efficiency.max(1e-6);
+    let wear = battery.wear_cost_czk_per_kwh;
     let mut next_cheap = n;
     for (k, block) in blocks.iter().enumerate().rev() {
+        // With `export_floor_until_cheap`, when no cheap block and no morning are ahead (tomorrow's
+        // morning is not in the horizon, e.g. its prices are missing), the reserve ends at the
+        // first later block that refills at or below `cheap_ref` with a sell spread and a net gain
+        // of `min_arbitrage_profit_czk` against this block's sell (losses and wear included).
+        let refill_end = if params.export_floor_until_cheap && next_cheap == n && next_morning == n
+        {
+            (k + 1..n).find(|&j| {
+                let later = &blocks[j];
+                later.buy_czk <= cheap_ref
+                    && block.sell_czk > later.sell_czk + params.min_mode_benefit_czk
+                    && block.sell_czk - (later.buy_czk / eta + wear)
+                        >= params.min_arbitrage_profit_czk
+            })
+        } else {
+            None
+        };
         let until = if next_cheap < next_morning {
             Some(next_cheap)
+        } else if let Some(refill) = refill_end {
+            Some(refill)
         } else if next_morning == n && night_open {
             None
         } else {
@@ -5688,6 +5708,105 @@ mod owner_fixed_buy_tests {
             let charges = plan.blocks.iter().any(|b| b.mode == PlanMode::Charge);
             assert_eq!(exports, cycles, "net {net}: export");
             assert_eq!(charges, cycles, "net {net}: charge");
+        }
+    }
+
+    /// When a horizon starts at 19:00 (after the 16:00–19:00 high-tariff window ends) and ends
+    /// at 23:45 (tomorrow's prices missing), all remaining buy prices are flat at 3.22 while
+    /// 19:00–20:00 still has the evening sell peak (8.30 CZK) followed by cheap refill hours
+    /// (buy 3.22, sell 5.80). `export_floor_until_cheap` must recognize the later 20:00 block as
+    /// a cheap refill so the 19:00–20:00 blocks can export instead of clamping floor_kwh to Emax.
+    #[test]
+    fn floor_until_cheap_allows_evening_export_into_flat_low_tariff_tail() {
+        // Start at 19:00 of day 2 (skip = 96 + 76 = 172), leaving 20 blocks (19:00..24:00)
+        // where buy is flat LOW (3.22), sell is 8.30 at 19:00..20:00 and 5.80 at 20:00..24:00.
+        let (_, p) = owner_plan(172, 90.0, None);
+        assert!(
+            p.blocks[0].floor_kwh < 10.0,
+            "19:00 floor should end at the 20:00 low-tariff refill, got {} kWh",
+            p.blocks[0].floor_kwh
+        );
+        assert_eq!(
+            p.blocks[0].mode,
+            PlanMode::Export,
+            "19:00 peak block should export before refilling in the low-tariff tail: {:?}",
+            p.blocks[0].mode
+        );
+    }
+
+    /// With no morning in the horizon, the refill ends the reserve only when selling now and buying back later nets
+    /// `min_arbitrage_profit_czk`, losses and wear included: 4.60 − (3.22 / 0.95 + 0.1) = 1.11 and
+    /// 4.90 − (3.22 / 0.95 + 0.1) = 1.41 are below 1.5 (4.90 would clear it without the losses:
+    /// 4.90 − 3.22 − 0.1 = 1.58). Solar energy at a cost of 2.00 passes the export gate, but the
+    /// house would buy it back for more than the margin, so the 19:00 block keeps the night reserve
+    /// and does not export.
+    #[test]
+    fn floor_until_cheap_refill_must_clear_the_net_margin() {
+        for peak in [4.6, 4.9] {
+            let (_, p) = owner_plan_with(172, 90.0, Some(2.0), |h| {
+                (buy_at(h), if h == 19 { peak } else { 2.0 })
+            });
+            let (_, emax) = battery(None).bounds_kwh();
+            assert!(
+                p.blocks[0].floor_kwh >= emax - 1e-3,
+                "sell {peak}: a refill below the net margin must not end the night reserve, \
+                 floor {} kWh",
+                p.blocks[0].floor_kwh
+            );
+            assert!(
+                p.blocks[..4].iter().all(|b| b.mode != PlanMode::Export),
+                "sell {peak}: 19:00 must not sell night energy it would buy back at a loss: {:?}",
+                p.blocks[..4].iter().map(|b| b.mode).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The refill end applies only while tomorrow's morning is not in the horizon. From 19:00 on
+    /// day 1 with flat buy 3.22 (no cheap block), the 19:00 peak sells 8.30 and a 3.22 refill would
+    /// clear the margin, but day 2's sunny 10:00 morning is in the horizon: the floor keeps the
+    /// night's house load until then, and 19:00 does not sell it.
+    #[test]
+    fn floor_until_cheap_refill_waits_for_a_known_morning() {
+        let (blocks, p) =
+            owner_plan_with(76, 90.0, None, |h| (LOW, if h == 19 { 8.3 } else { 5.8 }));
+        let (emin, _) = battery(None).bounds_kwh();
+        let night: f32 = blocks
+            .iter()
+            .skip(1)
+            .take_while(|b| b.start.with_timezone(&Prague).hour() != 10)
+            .map(|b| (b.reserve_load_kwh - b.reserve_pv_kwh).max(0.0))
+            .sum();
+        assert!(
+            p.blocks[0].floor_kwh >= emin + night - 1e-3,
+            "the floor runs to the 10:00 morning ({:.1} kWh), got {} kWh",
+            emin + night,
+            p.blocks[0].floor_kwh
+        );
+        assert_ne!(p.blocks[0].mode, PlanMode::Export);
+    }
+
+    /// With no morning in the horizon, the refill must be at or below `cheap_ref`. From 18:00 (tomorrow's prices
+    /// missing): 18:00 buy 2.00, the 19:00 peak sells 6.50 at buy 4.00 (below the insane-price
+    /// 3 × cheap_ref), the night after buys 3.80. Selling at 6.50 and buying back at 3.80 would
+    /// clear the 1.5 margin, but no later block is cheap (3.80 is above the 3.00 midpoint) and
+    /// 3.80 is above cheap_ref (2.36), so the 19:00 peak keeps the whole night reserve.
+    #[test]
+    fn floor_until_cheap_refill_must_be_at_or_below_cheap_ref() {
+        let (_, p) = owner_plan_with(168, 90.0, None, |h| match h {
+            18 => (2.0, 3.0),
+            19 => (4.0, 6.5),
+            _ => (3.8, 3.0),
+        });
+        assert!(p.cheap_ref_czk < 3.8, "cheap_ref {}", p.cheap_ref_czk);
+        let (_, emax) = battery(None).bounds_kwh();
+        for b in &p.blocks[4..8] {
+            assert!(
+                b.floor_kwh >= emax - 1e-3,
+                "a refill at 3.80 above cheap_ref {:.2} must not end the reserve, floor {} kWh",
+                p.cheap_ref_czk,
+                b.floor_kwh
+            );
+            assert_ne!(b.mode, PlanMode::Export, "19:00 peak must keep the reserve");
         }
     }
 }
