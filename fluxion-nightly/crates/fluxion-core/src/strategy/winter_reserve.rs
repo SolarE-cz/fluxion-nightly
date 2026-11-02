@@ -322,6 +322,27 @@ fn candidate_modes(
     modes
 }
 
+/// Owner ruling 2026-11-02, "no battery for the house when it is worth more elsewhere": in a
+/// block where an Export candidate from this block on sells above the buy price now, Hold becomes
+/// the default mode instead of SelfUse. The house then runs from the grid and the battery keeps
+/// its energy for the export. SelfUse stays a candidate and must beat Hold by
+/// `min_mode_benefit_czk`, as any mode must beat the default.
+///
+/// The cost of charge alone (stored energy dearer than the grid, no export ahead) does not change
+/// the default: an inflated cost would then hold the battery (H33 frozen-horizon check).
+fn house_from_grid_defaults(blocks: &[PlanBlock], modes: &mut [Vec<PlanMode>]) {
+    let mut best_export_ahead = f32::NEG_INFINITY;
+    for (block, modes) in blocks.iter().zip(modes.iter_mut()).rev() {
+        if modes.contains(&PlanMode::Export) {
+            best_export_ahead = best_export_ahead.max(block.sell_czk);
+        }
+        if best_export_ahead > block.buy_czk && modes.first() == Some(&PlanMode::SelfUse) {
+            modes.retain(|m| *m != PlanMode::Hold);
+            modes.insert(0, PlanMode::Hold);
+        }
+    }
+}
+
 /// Cost (CZK) of one kWh of battery energy sold to the grid: its cost of charge, which already
 /// includes the losses and the wear (brief H33). Without a known cost: `cheap_ref / efficiency
 /// + wear`, the rule before H33. Export needs `sell − this ≥ min_arbitrage_profit_czk`.
@@ -405,7 +426,8 @@ fn same_physical_outcome(a: &BlockOutcome, b: &BlockOutcome) -> bool {
 }
 
 /// Anti-churn choice (PRD): SelfUse unless another mode is better by more than `min_benefit`.
-/// `modes[0]` must be SelfUse. Returns (mode, value, outcome).
+/// `modes[0]` is the default: SelfUse, or Hold where `house_from_grid_defaults` makes it the
+/// default. Returns (mode, value, outcome).
 ///
 /// `keep` is the mode applied to the previous block. When the chosen mode leaves the battery and
 /// grid exactly as `keep` would (for example SelfUse and Hold at the SOC floor), `keep` is returned:
@@ -455,7 +477,7 @@ fn switch_only(mode: PlanMode) -> bool {
     matches!(mode, PlanMode::SelfUse | PlanMode::Hold)
 }
 
-/// The selection rule of `choose`, on evaluated candidates (`evals[0]` is SelfUse).
+/// The selection rule of `choose`, on evaluated candidates (`evals[0]` is the default mode).
 fn select_mode(
     evals: &[(PlanMode, f32, BlockOutcome)],
     min_benefit: f32,
@@ -970,10 +992,11 @@ fn plan_with_rule(
         .collect();
 
     // values[k][i] = V_k at grid[i]; values[n] is the terminal value.
-    let all_modes: Vec<Vec<PlanMode>> = blocks
+    let mut all_modes: Vec<Vec<PlanMode>> = blocks
         .iter()
         .map(|b| candidate_modes(b, median_buy, cheap_ref, battery, params))
         .collect();
+    house_from_grid_defaults(blocks, &mut all_modes);
     let mut values: Vec<Vec<f32>> = vec![Vec::new(); n + 1];
     // Leftover energy is worth its cost of charge (else a cheap purchase minus the wear).
     let terminal_price = terminal_price(battery, cheap_ref);
@@ -5241,5 +5264,316 @@ mod h33_tests {
         assert!(at_cap.battery_charge_kwh.abs() < 1e-6);
         let below = simulate_block_capped(PlanMode::Charge, cap - 0.5, &blocks[0], 0.0, &b, cap);
         assert!((below.energy_end_kwh - cap).abs() < 1e-4);
+    }
+}
+
+/// Owner rules for a fixed-buy, spot-sell site (owner ruling 2026-11-02): an owner-like site
+/// with a 23 kWh battery, fixed buy 3.22 (low tariff) / 4.15 (high tariff) and spot sell with
+/// a morning and an evening peak.
+#[cfg(test)]
+mod owner_fixed_buy_tests {
+    use super::*;
+    use chrono::{TimeZone, Timelike};
+    use chrono_tz::Europe::Prague;
+
+    const LOW: f32 = 3.22;
+    const HIGH: f32 = 4.15;
+
+    /// Local midnight 2026-11-03 (CET)
+    fn day_start() -> DateTime<Utc> {
+        Prague
+            .with_ymd_and_hms(2026, 11, 3, 0, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn battery(charge_cost: Option<f32>) -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 10.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.95,
+            wear_cost_czk_per_kwh: 0.1,
+            max_export_kw: 9.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: true,
+            hold_pv_to_battery: false,
+            min_charge_kwh: 0.0,
+            charge_cost_czk_per_kwh: charge_cost,
+        }
+    }
+
+    fn params() -> WinterReserveParams {
+        WinterReserveParams {
+            min_arbitrage_profit_czk: 1.5,
+            export_floor_until_cheap: true,
+            ..WinterReserveParams::default()
+        }
+    }
+
+    fn levers() -> UserLevers {
+        let window = DischargeWindowLimit {
+            hours: 4,
+            min_soc_pct: 25.0,
+        };
+        UserLevers {
+            morning_discharge: Some(window),
+            evening_discharge: Some(window),
+            ..UserLevers::default()
+        }
+    }
+
+    /// High tariff 07–09 and 16–19 local, else low
+    fn buy_at(hour: u32) -> f32 {
+        if (7..9).contains(&hour) || (16..19).contains(&hour) {
+            HIGH
+        } else {
+            LOW
+        }
+    }
+
+    /// Net spot sell 4.5–8.5: morning peak 07–09, evening peak 17–20
+    fn sell_at(hour: u32) -> f32 {
+        match hour {
+            7 => 7.6,
+            8 => 8.0,
+            9 => 6.2,
+            10..=15 => 4.5,
+            16 => 6.0,
+            17 => 8.2,
+            18 => 8.5,
+            19 => 8.3,
+            20..=23 => 5.8,
+            _ => 5.0,
+        }
+    }
+
+    /// Two local days from `day_start() + skip` blocks; `price` maps (local hour) to (buy, sell)
+    fn blocks_with(skip: usize, price: impl Fn(u32) -> (f32, f32)) -> Vec<PlanBlock> {
+        (skip as i64..192)
+            .map(|i| {
+                let start = day_start() + Duration::minutes(15 * i);
+                let hour = start.with_timezone(&Prague).hour();
+                let (buy, sell) = price(hour);
+                let pv = if (10..14).contains(&hour) { 0.4 } else { 0.0 };
+                PlanBlock {
+                    start,
+                    duration_minutes: 15,
+                    buy_czk: buy,
+                    sell_czk: sell,
+                    load_kwh: 0.3,
+                    pv_kwh: pv,
+                    reserve_load_kwh: 0.3 * 1.1,
+                    reserve_pv_kwh: pv * 0.7,
+                    force_charge: false,
+                    no_discharge: false,
+                    force_charge_at_or_below_czk: None,
+                    export_min_soc_pct: None,
+                    export_allowed: true,
+                }
+            })
+            .collect()
+    }
+
+    fn owner_plan(skip: usize, soc: f32, cost: Option<f32>) -> (Vec<PlanBlock>, Plan) {
+        owner_plan_with(skip, soc, cost, |h| (buy_at(h), sell_at(h)))
+    }
+
+    fn owner_plan_with(
+        skip: usize,
+        soc: f32,
+        cost: Option<f32>,
+        price: impl Fn(u32) -> (f32, f32),
+    ) -> (Vec<PlanBlock>, Plan) {
+        let mut blocks = blocks_with(skip, price);
+        apply_user_levers(&mut blocks, Some(&levers()), Some(Prague));
+        let plan = plan_from(&blocks, soc, Prague, &battery(cost), &params(), None);
+        (blocks, plan)
+    }
+
+    fn hour(b: &PlannedBlock) -> u32 {
+        b.start.with_timezone(&Prague).hour()
+    }
+
+    /// Without an export ahead, a cost of charge above the buy price keeps SelfUse the default
+    #[test]
+    fn rule1_cost_of_charge_alone_keeps_self_use() {
+        let blocks = blocks_with(0, |_| (LOW, 3.0));
+        let b = battery(Some(4.0));
+        let mut modes: Vec<Vec<PlanMode>> = blocks
+            .iter()
+            .map(|x| candidate_modes(x, LOW, LOW, &b, &params()))
+            .collect();
+        house_from_grid_defaults(&blocks, &mut modes);
+        assert!(modes.iter().all(|m| m[0] == PlanMode::SelfUse));
+    }
+
+    /// Review S-2a: the best export ahead sells below this block's buy price, so covering the
+    /// house now is worth more: SelfUse stays the default everywhere.
+    #[test]
+    fn rule1_export_ahead_below_buy_keeps_self_use() {
+        let blocks = blocks_with(0, |h| (9.0, sell_at(h)));
+        let b = battery(None);
+        let mut modes: Vec<Vec<PlanMode>> = blocks
+            .iter()
+            .map(|x| candidate_modes(x, LOW, LOW, &b, &params()))
+            .collect();
+        assert!(modes.iter().any(|m| m.contains(&PlanMode::Export)));
+        house_from_grid_defaults(&blocks, &mut modes);
+        assert!(modes.iter().all(|m| m[0] == PlanMode::SelfUse));
+    }
+
+    /// Review S-2b: a high sell ahead that may not be exported (`export_allowed` false, e.g. a
+    /// discharge lever) is no reason to hold: SelfUse stays the default everywhere.
+    #[test]
+    fn rule1_sell_ahead_without_export_keeps_self_use() {
+        let mut blocks = blocks_with(0, |h| (LOW, sell_at(h)));
+        for block in &mut blocks {
+            block.export_allowed = false;
+        }
+        let b = battery(None);
+        let mut modes: Vec<Vec<PlanMode>> = blocks
+            .iter()
+            .map(|x| candidate_modes(x, LOW, LOW, &b, &params()))
+            .collect();
+        assert!(modes.iter().all(|m| !m.contains(&PlanMode::Export)));
+        house_from_grid_defaults(&blocks, &mut modes);
+        assert!(modes.iter().all(|m| m[0] == PlanMode::SelfUse));
+    }
+
+    /// Review R3: a lever block (force charge `[Charge]`, no discharge `[NoDischarge, ..]`)
+    /// keeps its candidates even with a dearer export ahead: never `[Hold, Charge]`.
+    #[test]
+    fn rule1_never_touches_lever_blocks() {
+        let mut blocks = blocks_with(0, |h| (LOW, sell_at(h)));
+        blocks[0].force_charge = true;
+        blocks[0].force_charge_at_or_below_czk = Some(LOW);
+        blocks[1].no_discharge = true;
+        let b = battery(None);
+        let mut modes: Vec<Vec<PlanMode>> = blocks
+            .iter()
+            .map(|x| candidate_modes(x, LOW, LOW, &b, &params()))
+            .collect();
+        assert_eq!(modes[0], vec![PlanMode::Charge]);
+        assert_eq!(modes[1], vec![PlanMode::NoDischarge, PlanMode::Charge]);
+        house_from_grid_defaults(&blocks, &mut modes);
+        assert_eq!(modes[0], vec![PlanMode::Charge]);
+        assert_eq!(modes[1], vec![PlanMode::NoDischarge, PlanMode::Charge]);
+        // The guard is what keeps them: a plain block with the same export ahead gets Hold first
+        assert_eq!(modes[2][0], PlanMode::Hold);
+    }
+
+    /// Rule 1b: the battery is kept for a later export that earns more than covering the house
+    /// now (sell − cost ≥ 1.5 net): the night blocks before the morning peak run from the grid.
+    #[test]
+    fn rule1_energy_worth_more_as_export_is_kept_from_the_house() {
+        let (_, plan) = owner_plan(0, 80.0, None);
+        for b in plan.blocks.iter().filter(|b| hour(b) < 7) {
+            assert!(
+                b.outcome.battery_discharge_kwh < 1e-6 || b.mode == PlanMode::Export,
+                "battery serves the house before the peak: {} {:?}",
+                b.start,
+                b.mode
+            );
+        }
+    }
+
+    /// Rule 2: export goes into the most profitable blocks. Between two charges the battery
+    /// holds a fixed amount of energy, so no export-allowed block that stays idle may sell
+    /// higher than a block that exports in the same stretch. Exports stay within the 9 kW cap and
+    /// stop at the 25 % discharge lever.
+    #[test]
+    fn rule2_export_takes_the_highest_sell_blocks() {
+        for (soc, cost) in [(50.0, None), (100.0, None), (80.0, Some(4.0))] {
+            let (blocks, plan) = owner_plan(0, soc, cost);
+            let mut stretch: Vec<usize> = Vec::new();
+            let check = |stretch: &[usize]| {
+                let exported = stretch
+                    .iter()
+                    .filter(|&&k| plan.blocks[k].mode == PlanMode::Export)
+                    .map(|&k| blocks[k].sell_czk)
+                    .fold(f32::INFINITY, f32::min);
+                for &k in stretch {
+                    let b = &plan.blocks[k];
+                    assert!(
+                        b.mode == PlanMode::Export
+                            || !blocks[k].export_allowed
+                            || blocks[k].sell_czk <= exported,
+                        "soc {soc}: {} idle at sell {} while {exported} exports",
+                        b.start,
+                        blocks[k].sell_czk
+                    );
+                }
+            };
+            for (k, b) in plan.blocks.iter().enumerate() {
+                if b.mode == PlanMode::Charge {
+                    check(&stretch);
+                    stretch.clear();
+                } else {
+                    stretch.push(k);
+                }
+            }
+            check(&stretch);
+            assert!(plan.blocks.iter().any(|b| b.mode == PlanMode::Export));
+            for (b, block) in plan.blocks.iter().zip(&blocks) {
+                assert!(b.outcome.grid_export_kwh <= 9.0 * 0.25 + 1e-4);
+                if b.mode == PlanMode::Export {
+                    assert!(
+                        block.export_allowed,
+                        "{} exports outside the lever",
+                        b.start
+                    );
+                    assert!(b.soc_end_pct >= 25.0 - 1e-3, "{} below the lever", b.start);
+                }
+            }
+        }
+    }
+
+    /// Rule 3: a morning and an evening peak each get a charge before them (two cycles a day)
+    #[test]
+    fn rule3_charges_before_each_peak() {
+        let (_, plan) = owner_plan(0, 30.0, None);
+        let day1 = |b: &&PlannedBlock| b.start < day_start() + Duration::hours(24);
+        let in_hours = |lo: u32, hi: u32, mode: PlanMode| {
+            plan.blocks
+                .iter()
+                .filter(day1)
+                .any(|b| (lo..hi).contains(&hour(b)) && b.mode == mode)
+        };
+        assert!(
+            in_hours(0, 7, PlanMode::Charge),
+            "no charge before the morning peak"
+        );
+        assert!(in_hours(7, 10, PlanMode::Export), "no morning export");
+        assert!(
+            in_hours(10, 17, PlanMode::Charge),
+            "no charge between the peaks"
+        );
+        assert!(in_hours(17, 20, PlanMode::Export), "no evening export");
+    }
+
+    /// Rule 4: the 1.5 CZK margin is net of losses and wear: sell − (buy / 0.95 + 0.1)
+    #[test]
+    fn rule4_minimum_profit_is_net_of_losses_and_wear() {
+        let unit = LOW / 0.95 + 0.1;
+        for (net, cycles) in [(1.4, false), (1.6, true)] {
+            let price = |h: u32| {
+                (
+                    LOW,
+                    if (17..20).contains(&h) {
+                        unit + net
+                    } else {
+                        3.0
+                    },
+                )
+            };
+            let (_, plan) = owner_plan_with(0, 30.0, None, price);
+            let exports = plan.blocks.iter().any(|b| b.mode == PlanMode::Export);
+            let charges = plan.blocks.iter().any(|b| b.mode == PlanMode::Charge);
+            assert_eq!(exports, cycles, "net {net}: export");
+            assert_eq!(charges, cycles, "net {net}: charge");
+        }
     }
 }

@@ -10,6 +10,23 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.69] - 2026-11-02
+
+### Changed
+
+- WinterReserve: in a block where a later allowed export sells above the block's buy price, the
+  house runs from the grid (Hold is the default mode instead of Self-Use) and the battery keeps its
+  energy for that export; Self-Use must beat Hold by `min_mode_benefit_czk`. Lever blocks (force
+  charge, no discharge) are unchanged (owner ruling 2026-11-02, rule 1b).
+
+### Fixed
+
+- Fixed buy prices (`pricing.use_spot_prices_to_buy: false`) keep the spot horizon: with spot sell,
+  the price blocks follow the spot timeline for today and tomorrow (buy = fixed price at the block's
+  local hour, sell = spot minus the fee); without spot data, fixed blocks cover today and tomorrow
+  in local time. Before, only today's blocks (UTC date) were built, so the WinterReserve horizon
+  ended at local midnight and the night floor held the whole battery.
+
 ## [0.2.68] - 2026-10-29
 
 ### Added

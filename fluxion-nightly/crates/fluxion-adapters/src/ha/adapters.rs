@@ -1259,6 +1259,8 @@ pub struct ConfigurablePriceDataSource {
     buy_state: Mutex<BuyPriceState>,
     /// Price feed health check and OTE fallback (brief H35)
     fallback: Option<Arc<crate::price_fallback::PriceFallback>>,
+    /// Wall clock for the fixed-price day boundaries (replaced in tests)
+    clock: fn() -> DateTime<Utc>,
 }
 
 /// Default minimum time between two reads of the buy price sensor (prices change per 15 minutes,
@@ -1298,72 +1300,96 @@ impl ConfigurablePriceDataSource {
             buy_fetch_interval: BUY_PRICE_FETCH_INTERVAL,
             buy_state: Mutex::new(BuyPriceState::default()),
             fallback: None,
+            clock: Utc::now,
         }
     }
 
-    /// Generate SpotPriceData from fixed hourly prices
-    /// Expands 24 hourly prices to 96 15-minute blocks (4 blocks per hour with same price)
-    fn generate_fixed_price_data(&self) -> Result<SpotPriceData> {
-        use chrono::Utc;
-        use fluxion_core::TimeBlockPrice;
+    /// Replace the wall clock (tests).
+    #[must_use]
+    pub fn with_clock(mut self, clock: fn() -> DateTime<Utc>) -> Self {
+        self.clock = clock;
+        self
+    }
 
+    /// Site timezone for the fixed prices: the one synchronised from Home Assistant, else
+    /// Europe/Prague (the scheduler's HDO cache uses the same; the container runs in UTC).
+    fn local_timezone(&self) -> Tz {
+        self.spot_adapter
+            .get_timezone()
+            .unwrap_or(chrono_tz::Europe::Prague)
+    }
+
+    /// The 24 hourly fixed buy prices (the config check allows only 24 here)
+    fn fixed_hourly_prices(&self) -> Result<&[f32]> {
         if self.fixed_buy_prices.len() != 24 {
             anyhow::bail!(
                 "Fixed buy prices must have exactly 24 hourly values, got {}",
                 self.fixed_buy_prices.len()
             );
         }
+        Ok(&self.fixed_buy_prices)
+    }
 
-        let now = Utc::now();
-        let today_start = now
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .context("Failed to create today start time")?
-            .and_local_timezone(chrono::Local)
-            .single()
-            .context("Ambiguous time")?
-            .with_timezone(&Utc);
+    /// Fixed buy prices for today and tomorrow in the site's local time (192 blocks on a day
+    /// without a DST change), so the plan horizon does not end at local midnight. Used when
+    /// there is no spot timeline (spot sell off, or the spot read failed).
+    fn generate_fixed_price_data(&self) -> Result<SpotPriceData> {
+        let hourly = self.fixed_hourly_prices()?;
+        let tz = self.local_timezone();
+        let now = (self.clock)();
+        let today = now.with_timezone(&tz).date_naive();
+        let midnight = |date: chrono::NaiveDate| -> Result<DateTime<Utc>> {
+            let naive = date
+                .and_hms_opt(0, 0, 0)
+                .context("Invalid local midnight")?;
+            Ok(naive
+                .and_local_timezone(tz)
+                .earliest()
+                .context("Local midnight does not exist")?
+                .with_timezone(&Utc))
+        };
+        let start = midnight(today)?;
+        let end = midnight(today + chrono::Days::new(2))?;
 
-        let mut time_block_prices = Vec::with_capacity(96);
-
-        // Generate 96 15-minute blocks for today
-        for hour in 0..24 {
-            let hour_price = self.fixed_buy_prices[hour];
-
-            for quarter in 0..4 {
-                let minutes = quarter * 15;
-                let block_start = today_start
-                    + chrono::Duration::hours(hour as i64)
-                    + chrono::Duration::minutes(minutes);
-
-                time_block_prices.push(TimeBlockPrice {
-                    block_start,
-                    duration_minutes: 15,
-                    price_czk_per_kwh: hour_price,
-                    // Effective price will be calculated by scheduler with HDO fees
-                    effective_price_czk_per_kwh: hour_price,
-                    spot_sell_price_czk_per_kwh: None,
-                    buy_price_czk_per_kwh: None,
-                });
-            }
+        let mut time_block_prices = Vec::with_capacity(192);
+        let mut block_start = start;
+        while block_start < end {
+            let price = fixed_price_at(hourly, block_start, tz);
+            time_block_prices.push(TimeBlockPrice {
+                block_start,
+                duration_minutes: 15,
+                price_czk_per_kwh: price,
+                // Effective price will be calculated by scheduler with HDO fees
+                effective_price_czk_per_kwh: price,
+                spot_sell_price_czk_per_kwh: None,
+                buy_price_czk_per_kwh: None,
+            });
+            block_start += chrono::Duration::minutes(15);
         }
 
         let spot_data = SpotPriceData {
             time_block_prices,
             block_duration_minutes: 15,
-            fetched_at: Utc::now(),
-            ha_last_updated: Utc::now(),
+            fetched_at: now,
+            ha_last_updated: now,
             fallback_block_starts: Vec::new(),
         };
 
         info!(
-            "✅ [ConfigurablePrice] Generated fixed price data: {} blocks from {} hourly prices",
+            "✅ [ConfigurablePrice] Generated fixed price data: {} blocks (today and tomorrow, {}) from {} hourly prices",
             spot_data.time_block_prices.len(),
-            self.fixed_buy_prices.len()
+            tz.name(),
+            hourly.len()
         );
 
         Ok(spot_data)
     }
+}
+
+/// Fixed buy price of the block at `start`: the hourly price at the block's local hour
+fn fixed_price_at(hourly: &[f32], start: DateTime<Utc>, tz: Tz) -> f32 {
+    use chrono::Timelike;
+    hourly[start.with_timezone(&tz).hour() as usize % hourly.len()]
 }
 
 impl ConfigurablePriceDataSource {
@@ -1427,23 +1453,35 @@ impl ConfigurablePriceDataSource {
     }
 }
 
-/// Fixed-buy blocks: sell at spot minus `fee`, matched by block start. Blocks whose spot price
-/// is from the OTE fallback keep that marker (brief H35).
-fn set_spot_sell_prices(data: &mut SpotPriceData, spot_data: &SpotPriceData, fee: f32) {
-    for block in &mut data.time_block_prices {
-        if let Some(spot_block) = spot_data
-            .time_block_prices
-            .iter()
-            .find(|sb| sb.block_start == block.block_start)
-        {
-            block.spot_sell_price_czk_per_kwh = Some(spot_block.price_czk_per_kwh - fee);
-            if spot_data.is_fallback_block(block.block_start) {
-                data.fallback_block_starts.push(block.block_start);
+/// Fixed buy with spot sell: the blocks of the spot timeline (today and, once published,
+/// tomorrow). Buy is the fixed price at the block's local hour, sell is spot minus `fee`. The
+/// OTE fallback markers, `fetched_at` and `ha_last_updated` stay those of the spot data (brief H35).
+fn fixed_buy_on_spot_timeline(
+    spot_data: SpotPriceData,
+    hourly: &[f32],
+    tz: Tz,
+    fee: f32,
+) -> SpotPriceData {
+    let time_block_prices = spot_data
+        .time_block_prices
+        .iter()
+        .map(|spot| {
+            let price = fixed_price_at(hourly, spot.block_start, tz);
+            TimeBlockPrice {
+                block_start: spot.block_start,
+                duration_minutes: spot.duration_minutes,
+                price_czk_per_kwh: price,
+                // Effective price will be calculated by scheduler with HDO fees
+                effective_price_czk_per_kwh: price,
+                spot_sell_price_czk_per_kwh: Some(spot.price_czk_per_kwh - fee),
+                buy_price_czk_per_kwh: None,
             }
-        }
+        })
+        .collect();
+    SpotPriceData {
+        time_block_prices,
+        ..spot_data
     }
-    data.fallback_block_starts.sort();
-    data.fallback_block_starts.dedup();
 }
 
 /// Median of buy/spot over the blocks that have both prices (None when there are none)
@@ -1571,17 +1609,29 @@ impl PriceDataSource for ConfigurablePriceDataSource {
             debug!(
                 "💰 [ConfigurablePrice] Using fixed prices for buy decisions (use_spot_prices_to_buy=false)"
             );
-            let mut data = self.generate_fixed_price_data()?;
-
-            // When selling at spot but buying at fixed price, fetch spot prices separately
-            // to populate spot_sell_price_czk_per_kwh for arbitrage strategies
+            // Selling at spot: the blocks follow the spot timeline (today and tomorrow), so the
+            // horizon does not stop at local midnight. Without spot data: fixed blocks for
+            // today and tomorrow.
             if self.use_spot_for_sell {
                 match self.read_spot_prices(false).await {
-                    Ok(spot_data) => {
-                        set_spot_sell_prices(&mut data, &spot_data, self.spot_sell_fee_czk);
+                    Ok(spot_data) if !spot_data.time_block_prices.is_empty() => {
+                        let hourly = self.fixed_hourly_prices()?;
+                        let data = fixed_buy_on_spot_timeline(
+                            spot_data,
+                            hourly,
+                            self.local_timezone(),
+                            self.spot_sell_fee_czk,
+                        );
                         debug!(
-                            "💰 [ConfigurablePrice] Populated spot sell prices on fixed-buy blocks (fee: {:.2} CZK/kWh)",
+                            "💰 [ConfigurablePrice] Fixed buy on the spot timeline: {} blocks (sell fee: {:.2} CZK/kWh)",
+                            data.time_block_prices.len(),
                             self.spot_sell_fee_czk
+                        );
+                        return Ok(data);
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "⚠️ [ConfigurablePrice] Spot price entity has no blocks. Spot sell prices will be unavailable."
                         );
                     }
                     Err(e) => {
@@ -1592,7 +1642,7 @@ impl PriceDataSource for ConfigurablePriceDataSource {
                 }
             }
 
-            Ok(data)
+            self.generate_fixed_price_data()
         }
     }
 
@@ -3876,23 +3926,19 @@ mod price_fallback_source_tests {
             spot_sell_price_czk_per_kwh: None,
             buy_price_czk_per_kwh: None,
         };
-        let mut fixed = SpotPriceData {
-            time_block_prices: (0..4).map(|i| blk(i, 5.0)).collect(),
-            ..SpotPriceData::default()
-        };
         let spot = SpotPriceData {
             time_block_prices: (0..4).map(|i| blk(i, 2.0)).collect(),
             fallback_block_starts: vec![t0 + chrono::Duration::minutes(30)],
             ..SpotPriceData::default()
         };
 
-        set_spot_sell_prices(&mut fixed, &spot, 0.5);
+        let fixed = fixed_buy_on_spot_timeline(spot, &[5.0; 24], Prague, 0.5);
 
         assert!(
             fixed
                 .time_block_prices
                 .iter()
-                .all(|b| b.spot_sell_price_czk_per_kwh == Some(1.5))
+                .all(|b| b.spot_sell_price_czk_per_kwh == Some(1.5) && b.price_czk_per_kwh == 5.0)
         );
         assert_eq!(
             fixed.fallback_block_starts,
@@ -3922,4 +3968,329 @@ mod price_fallback_source_tests {
                 .starts_with("Today's and tomorrow's prices missing from sensor.current_spot_electricity_price_15min — no fallback available")
         );
     }
+}
+
+/// Fixed buy prices keep the spot horizon (today and tomorrow), brief fixed-buy-horizon
+#[cfg(test)]
+mod fixed_buy_horizon_tests {
+    use super::*;
+    use chrono::{TimeZone, Timelike};
+    use chrono_tz::Europe::Prague;
+    use fluxion_core::strategy::winter_reserve::{
+        BatteryParams, PlanBlock, PlanMode, WinterReserveParams, plan_from,
+    };
+    use mockito::Server;
+    use serde_json::json;
+
+    const SPOT: &str = "sensor.current_spot_electricity_price_15min";
+    const FEE: f32 = 0.5;
+
+    /// 2026-11-02 17:00 Prague (CET, no DST change on 2026-11-02 or 2026-11-03)
+    fn now_day1() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 2, 16, 0, 0).unwrap()
+    }
+
+    /// Local midnight 2026-11-02 in UTC
+    fn day1_start() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 1, 23, 0, 0).unwrap()
+    }
+
+    fn hourly() -> Vec<f32> {
+        (0..24).map(|h| 2.0 + h as f32 * 0.1).collect()
+    }
+
+    /// Spot entity with 192 blocks (2026-11-02 and 2026-11-03 Prague), `spot(i)` per block
+    async fn spot_mock(server: &mut Server, spot: impl Fn(i64) -> f32) -> mockito::Mock {
+        let attrs: serde_json::Map<String, serde_json::Value> = (0..192)
+            .map(|i| {
+                let start =
+                    (day1_start() + chrono::Duration::minutes(15 * i)).with_timezone(&Prague);
+                (start.to_rfc3339(), json!(spot(i)))
+            })
+            .collect();
+        server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(200)
+            .with_body(
+                json!({
+                    "entity_id": SPOT,
+                    "state": "3.0",
+                    "attributes": attrs,
+                    "last_changed": "2026-11-02T12:00:00Z",
+                    "last_updated": "2026-11-02T12:00:00Z",
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await
+    }
+
+    fn source(url: &str, sell_at_spot: bool, fixed: Vec<f32>) -> ConfigurablePriceDataSource {
+        let client = Arc::new(HomeAssistantClient::new(url.to_owned(), "t").unwrap());
+        let spot = Arc::new(CzSpotPriceAdapter::new(client, SPOT));
+        spot.set_timezone(Some(Prague));
+        ConfigurablePriceDataSource::new(spot, false, sell_at_spot, fixed, vec![], FEE)
+            .with_clock(now_day1)
+    }
+
+    fn local_hour(start: DateTime<Utc>) -> usize {
+        start.with_timezone(&Prague).hour() as usize
+    }
+
+    /// Test 1: fixed buy with spot sell follows the spot timeline (today and tomorrow)
+    #[tokio::test]
+    async fn fixed_buy_with_spot_sell_keeps_the_spot_horizon() {
+        let mut server = Server::new_async().await;
+        let spot = |i: i64| 1.0 + i as f32 * 0.01;
+        let _m = spot_mock(&mut server, spot).await;
+        let fixed = hourly();
+
+        let data = source(&server.url(), true, fixed.clone())
+            .read_prices()
+            .await
+            .unwrap();
+
+        assert_eq!(data.time_block_prices.len(), 192);
+        for (i, b) in data.time_block_prices.iter().enumerate() {
+            assert_eq!(
+                b.block_start,
+                day1_start() + chrono::Duration::minutes(15 * i as i64)
+            );
+            assert_eq!(
+                b.price_czk_per_kwh,
+                fixed[local_hour(b.block_start)],
+                "block {i}"
+            );
+            assert_eq!(
+                b.effective_price_czk_per_kwh,
+                fixed[local_hour(b.block_start)]
+            );
+            assert_eq!(b.buy_price_czk_per_kwh, None);
+            let sell = b.spot_sell_price_czk_per_kwh.expect("spot sell");
+            assert!((sell - (spot(i as i64) - FEE)).abs() < 1e-5, "block {i}");
+        }
+        // 23:15 UTC on day 1 is 00:15 local on day 2: hour 0, not hour 23
+        let late = Utc.with_ymd_and_hms(2026, 11, 2, 23, 15, 0).unwrap();
+        let b = data
+            .time_block_prices
+            .iter()
+            .find(|b| b.block_start == late)
+            .expect("block after local midnight");
+        assert_eq!(b.price_czk_per_kwh, fixed[0]);
+        assert_eq!(
+            data.ha_last_updated,
+            Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap()
+        );
+    }
+
+    /// Test 2: without spot data the fixed blocks cover today and tomorrow locally
+    #[tokio::test]
+    async fn fixed_buy_without_spot_covers_today_and_tomorrow() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(404)
+            .create_async()
+            .await;
+        let fixed = hourly();
+
+        for sell_at_spot in [true, false] {
+            let data = source(&server.url(), sell_at_spot, fixed.clone())
+                .read_prices()
+                .await
+                .unwrap();
+            assert_eq!(
+                data.time_block_prices.len(),
+                192,
+                "sell_at_spot={sell_at_spot}"
+            );
+            for (i, b) in data.time_block_prices.iter().enumerate() {
+                assert_eq!(
+                    b.block_start,
+                    day1_start() + chrono::Duration::minutes(15 * i as i64)
+                );
+                assert_eq!(b.price_czk_per_kwh, fixed[local_hour(b.block_start)]);
+                assert_eq!(b.spot_sell_price_czk_per_kwh, None);
+            }
+        }
+    }
+
+    /// Review R4: "today" is the local date. At 23:30 UTC on 2026-11-02 it is 00:30 on
+    /// 2026-11-03 in Prague, so the blocks start at local midnight of 2026-11-03.
+    #[tokio::test]
+    async fn fixed_blocks_take_today_from_the_local_date() {
+        fn late_utc() -> DateTime<Utc> {
+            Utc.with_ymd_and_hms(2026, 11, 2, 23, 30, 0).unwrap()
+        }
+        let data = source("http://127.0.0.1:9", false, hourly())
+            .with_clock(late_utc)
+            .read_prices()
+            .await
+            .unwrap();
+        let local_midnight = Utc.with_ymd_and_hms(2026, 11, 2, 23, 0, 0).unwrap();
+        assert_eq!(data.time_block_prices.len(), 192);
+        assert_eq!(data.time_block_prices[0].block_start, local_midnight);
+        assert_eq!(
+            data.time_block_prices[191].block_start,
+            local_midnight + chrono::Duration::minutes(15 * 191)
+        );
+    }
+
+    /// Test 3: the WinterReserve horizon from fixed-buy data passes local midnight and finds
+    /// tomorrow's morning, so the night floor is no longer the whole battery and the plan exports
+    /// in the evening peak (the owner's site at 17:00 on 2026-11-02 logged `first_morning=none
+    /// head_floor_kwh=23.00`). Tomorrow's own peak is followed by the end of the horizon (an open
+    /// night, floor Emax by design) until the day after's prices arrive, so the export goes to
+    /// today's peak.
+    #[tokio::test]
+    async fn winter_reserve_horizon_reaches_tomorrows_morning_and_exports_in_the_peak() {
+        let mut server = Server::new_async().await;
+        // Sell 8.4 net from 17:00 to 20:00 local on both days, else 2.0 net
+        let peak = |i: i64| (68..80).contains(&(i % 96));
+        let today_peak = |i: i64| (68..80).contains(&i);
+        let _m = spot_mock(&mut server, |i| if peak(i) { 8.4 + FEE } else { 2.0 + FEE }).await;
+
+        let data = source(&server.url(), true, vec![3.22; 24])
+            .read_prices()
+            .await
+            .unwrap();
+
+        let tz = Prague;
+        let blocks: Vec<PlanBlock> = data
+            .time_block_prices
+            .iter()
+            .filter(|b| b.block_start >= now_day1())
+            .map(|b| {
+                let h = local_hour(b.block_start);
+                let day2 = b.block_start >= day1_start() + chrono::Duration::days(1);
+                let pv = if day2 && (8..15).contains(&h) {
+                    1.0
+                } else {
+                    0.0
+                };
+                PlanBlock {
+                    start: b.block_start,
+                    duration_minutes: b.duration_minutes,
+                    buy_czk: b.effective_price_czk_per_kwh,
+                    sell_czk: b.spot_sell_price_czk_per_kwh.unwrap_or(FEE),
+                    load_kwh: 0.25,
+                    pv_kwh: pv,
+                    reserve_load_kwh: 0.25 * 1.1,
+                    reserve_pv_kwh: pv * 0.7,
+                    force_charge: false,
+                    no_discharge: false,
+                    force_charge_at_or_below_czk: None,
+                    export_min_soc_pct: None,
+                    export_allowed: true,
+                }
+            })
+            .collect();
+        let local_midnight = day1_start() + chrono::Duration::days(1);
+        assert!(
+            blocks.last().unwrap().start > local_midnight,
+            "horizon stops at midnight"
+        );
+        // first_morning: pv >= load after a deficit run of at least 4 h, on day 2
+        let first_morning = blocks
+            .iter()
+            .enumerate()
+            .find(|(i, b)| *i >= 16 && b.pv_kwh >= b.load_kwh)
+            .map(|(_, b)| b.start);
+        assert_eq!(
+            first_morning,
+            Some(Utc.with_ymd_and_hms(2026, 11, 3, 7, 0, 0).unwrap())
+        );
+
+        let battery = BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 10.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.95,
+            wear_cost_czk_per_kwh: 0.1,
+            max_export_kw: 9.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: true,
+            hold_pv_to_battery: false,
+            min_charge_kwh: 0.0,
+            charge_cost_czk_per_kwh: None,
+        };
+        let plan = plan_from(
+            &blocks,
+            95.0,
+            tz,
+            &battery,
+            &WinterReserveParams::default(),
+            None,
+        );
+        assert!(
+            plan.blocks[0].floor_kwh < 23.0,
+            "open night: floor is the whole battery"
+        );
+        let exports_in_peak: Vec<_> = plan
+            .blocks
+            .iter()
+            .filter(|b| b.mode == PlanMode::Export)
+            .map(|b| b.start)
+            .collect();
+        assert!(!exports_in_peak.is_empty(), "no export planned");
+        assert!(
+            exports_in_peak.iter().all(|s| {
+                let i = (*s - day1_start()).num_minutes() / 15;
+                today_peak(i)
+            }),
+            "exports outside the peak: {exports_in_peak:?}"
+        );
+    }
+
+    /// Test 4: spot buy output is unchanged
+    #[tokio::test]
+    async fn spot_buy_output_is_unchanged() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(200)
+            .with_body(
+                json!({
+                    "entity_id": SPOT,
+                    "state": "3.0",
+                    "attributes": {
+                        "2026-11-02T23:30:00+01:00": 2.0,
+                        "2026-11-02T23:45:00+01:00": 3.0,
+                        "2026-11-03T00:00:00+01:00": 4.0,
+                    },
+                    "last_changed": "2026-11-02T12:00:00Z",
+                    "last_updated": "2026-11-02T12:00:00Z",
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "t").unwrap());
+        let spot = Arc::new(CzSpotPriceAdapter::new(client, SPOT));
+        spot.set_timezone(Some(Prague));
+        let data = ConfigurablePriceDataSource::new(spot, true, true, hourly(), vec![], FEE)
+            .with_clock(now_day1)
+            .read_prices()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&data.time_block_prices).unwrap(),
+            EXPECTED_SPOT_BUY
+        );
+        assert_eq!(data.block_duration_minutes, 15);
+        assert!(data.fallback_block_starts.is_empty());
+        assert_eq!(
+            data.ha_last_updated,
+            Utc.with_ymd_and_hms(2026, 11, 2, 12, 0, 0).unwrap()
+        );
+    }
+
+    const EXPECTED_SPOT_BUY: &str = concat!(
+        r#"[{"block_start":"2026-11-02T22:30:00Z","duration_minutes":15,"price_czk_per_kwh":2.0,"effective_price_czk_per_kwh":2.0,"spot_sell_price_czk_per_kwh":1.5},"#,
+        r#"{"block_start":"2026-11-02T22:45:00Z","duration_minutes":15,"price_czk_per_kwh":3.0,"effective_price_czk_per_kwh":3.0,"spot_sell_price_czk_per_kwh":2.5},"#,
+        r#"{"block_start":"2026-11-02T23:00:00Z","duration_minutes":15,"price_czk_per_kwh":4.0,"effective_price_czk_per_kwh":4.0,"spot_sell_price_czk_per_kwh":3.5}]"#
+    );
 }
