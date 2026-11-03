@@ -11,6 +11,7 @@
 // For commercial licensing, please contact: info@solare.cz
 
 use crate::ha::errors::{HaError, HaResult};
+use crate::ha::transport::ensure_token_transport;
 use crate::ha::types::{HaEntityState, HaHistoryState, HistoryDataPoint};
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
@@ -35,13 +36,16 @@ pub struct HomeAssistantClient {
 impl HomeAssistantClient {
     /// Create a new HA client with custom configuration
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> HaResult<Self> {
+        let base_url = base_url.into();
+        // Scan N4: the token is sent on every request, so the same transport policy as the websocket applies
+        ensure_token_transport(&base_url)?;
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| HaError::ConfigError(format!("Failed to build HTTP client: {}", e)))?;
 
         Ok(Self {
-            base_url: base_url.into(),
+            base_url,
             token: token.into(),
             client,
             max_retries: 3,
@@ -774,6 +778,32 @@ mod tests {
 
         assert!(result.is_ok());
         mock.assert_async().await;
+    }
+
+    /// Scan N4: the REST token is refused for a public plaintext host, as on the websocket
+    #[test]
+    fn new_refuses_public_plaintext_host() {
+        match HomeAssistantClient::new("http://203.0.113.10:8123", "t") {
+            Ok(_) => panic!("public plaintext http client was accepted"),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("use an https:// Home Assistant URL"),
+                "{err}"
+            ),
+        }
+        assert!(HomeAssistantClient::new("http://ha.example.com:8123", "t").is_err());
+    }
+
+    #[test]
+    fn new_allows_lan_supervisor_and_https() {
+        assert!(HomeAssistantClient::new("http://192.168.1.5:8123", "t").is_ok());
+        assert!(HomeAssistantClient::new("http://supervisor/core", "t").is_ok());
+        assert!(HomeAssistantClient::new("https://ha.example.com", "t").is_ok());
+    }
+
+    #[test]
+    fn new_refuses_userinfo_in_base_url() {
+        assert!(HomeAssistantClient::new("http://user:pw@192.168.1.5:8123", "t").is_err());
     }
 
     #[tokio::test]

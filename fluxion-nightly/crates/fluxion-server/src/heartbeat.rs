@@ -186,3 +186,54 @@ pub async fn heartbeat_handler(
         }),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ServerConfig;
+    use crate::test_log::{captured_logs, start_log_capture};
+    use serde_json::json;
+
+    /// Scan #24: an unauthenticated instance id reaches the log escaped, never as a new line
+    #[tokio::test]
+    async fn rejected_heartbeat_log_escapes_instance_id() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            [auth]
+            shared_secret = "real-secret"
+            [email]
+            smtp_host = "127.0.0.1"
+            smtp_username = "u"
+            smtp_password = "p"
+            from_address = "fluxion@example.com"
+            use_tls = false
+            admin_recipients = ["ops@example.com"]
+            "#,
+        )
+        .expect("test config");
+        let request: HeartbeatRequest = serde_json::from_value(json!({
+            "instance_id": "site-a\nINFO forged: instance approved",
+            "shared_secret": "wrong-secret",
+            "timestamp": "2026-11-03T00:00:00Z",
+            "fluxion_version": "0.2.72",
+            "status": {"friendly_name": null, "online": true, "strategy_name": null, "battery_soc": null}
+        }))
+        .expect("test request");
+        let state = HeartbeatState {
+            db: Arc::new(Database::open(":memory:").expect("test db")),
+            notifier: Arc::new(EmailNotifier::new(&config.email).expect("test notifier")),
+            config: Arc::new(config),
+        };
+
+        start_log_capture();
+        let _ = heartbeat_handler(State(state), Json(request)).await;
+        let logs = captured_logs();
+
+        assert!(logs.contains("Heartbeat rejected"), "{logs}");
+        assert!(
+            !logs.lines().any(|line| line.starts_with("INFO forged")),
+            "{logs}"
+        );
+    }
+}

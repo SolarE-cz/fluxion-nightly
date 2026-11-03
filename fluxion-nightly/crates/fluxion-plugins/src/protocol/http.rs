@@ -188,7 +188,8 @@ impl Plugin for HttpPlugin {
                             decision.priority = self.manifest.default_priority;
                             // Identity and markers come from the controller, not the plugin:
                             // the core trusts strategy_name, decision_uid and reason substrings.
-                            decision.strategy_name = Some(self.manifest.name.clone());
+                            decision.strategy_name =
+                                Some(self.manifest.name.replace("guard:", "guard;"));
                             decision.decision_uid = decision
                                 .decision_uid
                                 .map(|uid| format!("ext:{}:{uid}", self.manifest.name));
@@ -441,5 +442,19 @@ mod tests {
         );
         assert_eq!(decision.reason, "guard; charge held at SOC 100%");
         assert_eq!(plugin.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_manifest_name_with_guard_marker_is_defused_in_strategy_name() {
+        let url = serve_once(decision_json("2026-11-03T10:00:00Z", 15));
+        let mut manifest = create_test_manifest();
+        manifest.name = "guard: x".to_owned();
+        let plugin = HttpPlugin::new(manifest, url);
+
+        let decision = plugin
+            .evaluate(&create_test_request())
+            .expect("matching block is accepted");
+
+        assert_eq!(decision.strategy_name.as_deref(), Some("guard; x"));
     }
 }

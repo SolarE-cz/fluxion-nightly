@@ -24,6 +24,7 @@ use axum::{
 };
 use parking_lot::Mutex;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -54,11 +55,20 @@ impl AccessMode {
     /// Pick the mode from the environment
     #[must_use]
     pub fn from_env() -> Self {
-        if std::env::var_os("SUPERVISOR_TOKEN").is_none() {
+        Self::from_lookup(|key| std::env::var_os(key))
+    }
+
+    /// Pick the mode with `lookup` as the environment. The add-on is detected by the presence of
+    /// `SUPERVISOR_TOKEN`, whatever its value (a non-UTF-8 token still means the add-on).
+    #[must_use]
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<OsString>) -> Self {
+        if lookup("SUPERVISOR_TOKEN").is_none() {
             return Self::Standalone;
         }
-        let (trusted_peers, rejected) =
-            parse_trusted_peers(&std::env::var("FLUXION_TRUSTED_PEERS").unwrap_or_default());
+        let raw = lookup("FLUXION_TRUSTED_PEERS")
+            .and_then(|v| v.into_string().ok())
+            .unwrap_or_default();
+        let (trusted_peers, rejected) = parse_trusted_peers(&raw);
         for entry in &rejected {
             warn!(
                 "Ignoring FLUXION_TRUSTED_PEERS entry {:?}: not an IP address",
@@ -206,6 +216,35 @@ mod tests {
             vec!["bad".to_owned(), "192.168.1.0/24".to_owned()]
         );
         assert_eq!(parse_trusted_peers(""), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn mode_is_the_add_on_only_when_the_supervisor_token_is_set() {
+        let addon = AccessMode::from_lookup(|key| match key {
+            "SUPERVISOR_TOKEN" => Some(OsString::from("token")),
+            "FLUXION_TRUSTED_PEERS" => Some(OsString::from("10.1.2.3, bad, 10.9.8.7")),
+            _ => None,
+        });
+        assert_eq!(
+            addon,
+            AccessMode::AddOn {
+                trusted_peers: vec![ip("10.1.2.3"), ip("10.9.8.7")],
+            }
+        );
+        let standalone = AccessMode::from_lookup(|key| {
+            (key == "FLUXION_TRUSTED_PEERS").then(|| OsString::from("10.1.2.3"))
+        });
+        assert_eq!(standalone, AccessMode::Standalone);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_supervisor_token_still_selects_the_add_on() {
+        use std::os::unix::ffi::OsStringExt;
+        let mode = AccessMode::from_lookup(|key| {
+            (key == "SUPERVISOR_TOKEN").then(|| OsString::from_vec(vec![0xff, 0xfe]))
+        });
+        assert!(matches!(mode, AccessMode::AddOn { .. }), "{mode:?}");
     }
 
     #[test]

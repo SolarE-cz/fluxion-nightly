@@ -19,8 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ha::client::HomeAssistantClient;
+use crate::ha::errors::HaResult;
 use crate::ha::levers;
 use crate::ha::solar_forecast_fetcher;
+use crate::ha::transport::ensure_token_transport;
 
 /// Resource: configuration for Home Assistant API access
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +184,34 @@ fn ha_init_config_system(mut cfg: ResMut<HaConfig>) {
     }
 }
 
+/// GET one entity state from HA. The token is not sent to a base URL the transport policy forbids.
+async fn get_entity_state(base: &str, token: &str, entity_id: &str) -> HaResult<reqwest::Response> {
+    ensure_token_transport(base)?;
+    let url = format!("{}/api/states/{}", base.trim_end_matches('/'), entity_id);
+    let client = reqwest::Client::new();
+    Ok(client.get(url).bearer_auth(token).send().await?)
+}
+
+/// POST `select_option` to HA. The token is not sent to a base URL the transport policy forbids.
+async fn post_select_option(
+    base: &str,
+    token: &str,
+    payload: &serde_json::Value,
+) -> HaResult<reqwest::Response> {
+    ensure_token_transport(base)?;
+    let url = format!(
+        "{}/api/services/select/select_option",
+        base.trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+    Ok(client
+        .post(url)
+        .bearer_auth(token)
+        .json(payload)
+        .send()
+        .await?)
+}
+
 /// System: periodically read the value of select.solax_manual_mode_select
 fn ha_poll_select_manual_mode_system(
     mut ticker: ResMut<HaPollTicker>,
@@ -211,18 +241,14 @@ fn ha_poll_select_manual_mode_system(
         if let Some(token) = cfg.token.clone() {
             let base = cfg.base_url.clone();
             tokio::spawn(async move {
-                let url = format!("{}/api/states/{}", base.trim_end_matches('/'), entity_id);
-                let client = reqwest::Client::new();
-                let res = client.get(url).bearer_auth(token).send().await;
-                if let Ok(resp) = res {
-                    match resp.text().await {
+                match get_entity_state(&base, &token, &entity_id).await {
+                    Ok(resp) => match resp.text().await {
                         Ok(body) => {
                             tracing::info!("HA state {}: {}", entity_id, body);
                         }
                         Err(e) => tracing::warn!("HA read body error: {}", e),
-                    }
-                } else if let Err(e) = res {
-                    tracing::warn!("HA read error: {}", e);
+                    },
+                    Err(e) => tracing::warn!("HA read error: {}", e),
                 }
             });
         } else {
@@ -313,21 +339,11 @@ fn ha_write_select_system(mut ev: MessageReader<HaSelectWrite>, cfg: Res<HaConfi
             let entity_id = format!("select.{}_{}", inverter_entity_prefix, select_suffix);
             tokio::spawn(async move {
                 // Call Home Assistant service to set select option
-                let url = format!(
-                    "{}/api/services/select/select_option",
-                    base.trim_end_matches('/')
-                );
                 let payload = serde_json::json!({
                     "entity_id": entity_id,
                     "option": value,
                 });
-                let client = reqwest::Client::new();
-                let res = client
-                    .post(url)
-                    .bearer_auth(token)
-                    .json(&payload)
-                    .send()
-                    .await;
+                let res = post_select_option(&base, &token, &payload).await;
                 match res {
                     Ok(resp) => {
                         if !resp.status().is_success() {
@@ -911,6 +927,7 @@ pub fn poll_hdo_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ha::errors::HaError;
 
     /// Thread-local log sink for the HDO test (`#[tokio::test]` runs on one thread)
     #[derive(Clone, Default)]
@@ -1236,5 +1253,55 @@ mod tests {
         let periods = parse_hdo_periods_from_state(&state);
 
         assert!(periods.is_empty(), "Expected no periods for non-HDO sensor");
+    }
+
+    /// Scan N4 follow-up: neither plugin path sends the token to a public plaintext base URL.
+    /// The policy error comes back before any request, so no connect attempt can fail first.
+    #[tokio::test]
+    async fn plugin_refuses_token_to_public_plaintext_base() {
+        let base = "http://203.0.113.10:8123";
+        let payload = serde_json::json!({"entity_id": "select.x", "option": "Hold"});
+
+        let read = get_entity_state(base, "t", "select.x").await;
+        assert!(
+            matches!(&read, Err(HaError::ConfigError(msg)) if msg.contains("use an https:// Home Assistant URL")),
+            "{read:?}"
+        );
+        let write = post_select_option(base, "t", &payload).await;
+        assert!(
+            matches!(&write, Err(HaError::ConfigError(msg)) if msg.contains("use an https:// Home Assistant URL")),
+            "{write:?}"
+        );
+    }
+
+    /// LAN plaintext (127.0.0.1 here) still sends the token on both plugin paths
+    #[tokio::test]
+    async fn plugin_sends_token_to_allowed_base() {
+        let mut server = mockito::Server::new_async().await;
+        let get = server
+            .mock("GET", "/api/states/select.x")
+            .match_header("authorization", "Bearer t")
+            .with_status(200)
+            .with_body("Hold")
+            .create_async()
+            .await;
+        let post = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_header("authorization", "Bearer t")
+            .with_status(200)
+            .create_async()
+            .await;
+        let payload = serde_json::json!({"entity_id": "select.x", "option": "Hold"});
+
+        let read = get_entity_state(&server.url(), "t", "select.x")
+            .await
+            .expect("read allowed");
+        assert_eq!(read.text().await.expect("body"), "Hold");
+        let write = post_select_option(&server.url(), "t", &payload)
+            .await
+            .expect("write allowed");
+        assert!(write.status().is_success());
+        get.assert_async().await;
+        post.assert_async().await;
     }
 }

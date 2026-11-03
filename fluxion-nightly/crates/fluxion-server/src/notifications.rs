@@ -110,3 +110,78 @@ impl EmailNotifier {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_log::{captured_logs, start_log_capture};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    /// Accepts one message on localhost and answers the SMTP dialogue with success
+    async fn fake_smtp() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake SMTP");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = socket.into_split();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            let _ = writer.write_all(b"220 fake\r\n").await;
+            let mut in_data = false;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let reply: &[u8] = if in_data {
+                    if line == "." {
+                        in_data = false;
+                        b"250 queued\r\n"
+                    } else {
+                        continue;
+                    }
+                } else if line.starts_with("EHLO") || line.starts_with("HELO") {
+                    b"250-fake\r\n250 AUTH PLAIN\r\n"
+                } else if line.starts_with("AUTH") {
+                    b"235 authenticated\r\n"
+                } else if line.starts_with("DATA") {
+                    in_data = true;
+                    b"354 end with dot\r\n"
+                } else if line.starts_with("QUIT") {
+                    let _ = writer.write_all(b"221 bye\r\n").await;
+                    break;
+                } else {
+                    b"250 ok\r\n"
+                };
+                let _ = writer.write_all(reply).await;
+            }
+        });
+        port
+    }
+
+    /// Scan #41: a reporter-supplied name reaches the log escaped, never as a new line
+    #[tokio::test]
+    async fn sent_email_log_escapes_subject() {
+        let port = fake_smtp().await;
+        let notifier = EmailNotifier::new(&EmailSettings {
+            smtp_host: "127.0.0.1".to_owned(),
+            smtp_port: port,
+            smtp_username: "u".to_owned(),
+            smtp_password: "p".to_owned(),
+            from_address: "fluxion@example.com".to_owned(),
+            use_tls: false,
+            admin_recipients: vec!["ops@example.com".to_owned()],
+        })
+        .expect("test notifier");
+
+        start_log_capture();
+        notifier
+            .send_recovery_alert("site-a", "Plant\nINFO forged: subject")
+            .await
+            .expect("send recovery alert");
+        let logs = captured_logs();
+
+        assert!(logs.contains("Email sent"), "{logs}");
+        assert!(
+            !logs.lines().any(|line| line.starts_with("INFO forged")),
+            "{logs}"
+        );
+    }
+}

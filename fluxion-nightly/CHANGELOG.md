@@ -10,6 +10,23 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.73] - 2026-11-03
+
+### Security
+
+- The dashboard price-feed banner is HTML-escaped; a CI check now flags a bare `|e` in the two
+  `escape = "none"` templates (review r1 N1).
+- Remote-access devices stored as read-only are migrated to full access when the device list loads,
+  and the pairing pages no longer label a device read-only (review r1 N6).
+- The add-on documentation for `system.trusted_peers` says that only containers on the Home
+  Assistant add-on network can reach port 8099 (review r1 N7).
+- The Home Assistant access token is sent over plaintext http only to LAN, loopback, overlay or
+  Supervisor hosts, for the REST client as well as the websocket (review r1 N4).
+- A Home Assistant URL with a user or password in it is refused, so the host check cannot be
+  bypassed by userinfo such as `ws://ha.local:8123@evil.com/` (review r1 N5).
+- External strategy plugin names are limited to 1-64 letters, digits, spaces, `.`, `_` or `-`, so a
+  name can no longer carry a `guard:` reason marker into the schedule (scan #35).
+
 ## [0.2.72] - 2026-11-03
 
 ### Security

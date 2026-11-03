@@ -1063,6 +1063,234 @@ mod tests {
     }
 
     #[test]
+    fn chart_json_in_the_dashboard_cannot_close_the_script_element() {
+        let prices: fluxion_core::web_bridge::PriceData =
+            serde_json::from_value(serde_json::json!({
+                "current_price": 2.0,
+                "min_price": 2.0,
+                "max_price": 2.0,
+                "avg_price": 2.0,
+                "blocks": [{
+                    "timestamp": "2026-10-17T10:00:00Z",
+                    "price": 2.0,
+                    "block_type": "self-use",
+                    "strategy": "</script><i>strategy</i>",
+                    "reason": "</script><b>reason</b>",
+                    "is_historical": false
+                }],
+                "today_min_price": 2.0,
+                "today_max_price": 2.0,
+                "today_avg_price": 2.0,
+                "today_median_price": 2.0
+            }))
+            .unwrap();
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.prices = Some(prices);
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let html = DashboardTemplate::from_query_response(response, i18n, String::new(), None)
+            .render()
+            .unwrap();
+        let chart_line = html
+            .lines()
+            .find(|line| line.contains("const chartData = {"))
+            .expect("chart data line");
+        assert!(!chart_line.contains("</script"), "{chart_line}");
+        assert!(chart_line.contains("\\u003c/script\\u003e"), "{chart_line}");
+    }
+
+    /// Dashboard response with one price block carrying `label` as its strategy and reason
+    fn response_with_one_priced_block(label: &str) -> WebQueryResponse {
+        let prices: fluxion_core::web_bridge::PriceData =
+            serde_json::from_value(serde_json::json!({
+                "current_price": 2.0,
+                "min_price": 2.0,
+                "max_price": 2.0,
+                "avg_price": 2.0,
+                "blocks": [{
+                    "timestamp": "2026-10-17T10:00:00Z",
+                    "price": 2.0,
+                    "block_type": "self-use",
+                    "strategy": label,
+                    "reason": label,
+                    "is_historical": false
+                }],
+                "today_min_price": 2.0,
+                "today_max_price": 2.0,
+                "today_avg_price": 2.0,
+                "today_median_price": 2.0
+            }))
+            .unwrap();
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.prices = Some(prices);
+        response
+    }
+
+    #[test]
+    fn index_chart_timezone_label_is_html_escaped() {
+        let response = response_with_one_priced_block("chart");
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let mut template =
+            DashboardTemplate::from_query_response(response, i18n, String::new(), None);
+        template.display_tz_label = "<b h3>".to_owned();
+        let html = template.render().unwrap();
+        assert!(
+            html.contains("Price Chart (48h) <span class=\"tz-label\""),
+            "chart h3 missing"
+        );
+        assert!(
+            html.contains("&#60;b h3&#62;"),
+            "chart timezone label not escaped"
+        );
+        assert!(
+            !html.contains("<b h3>"),
+            "chart timezone label rendered as HTML"
+        );
+    }
+
+    #[test]
+    fn index_ha_timezone_option_is_html_escaped() {
+        let response = response_with_timezone(None, TimezoneSource::Unknown);
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let mut template =
+            DashboardTemplate::from_query_response(response, i18n, String::new(), None);
+        template.ha_timezone = Some("<b ha>".to_owned());
+        let html = template.render().unwrap();
+        assert!(
+            html.contains("Home Assistant (&#60;b ha&#62;)"),
+            "ha timezone option not escaped"
+        );
+        assert!(
+            !html.contains("<b ha>"),
+            "ha timezone option rendered as HTML"
+        );
+    }
+
+    #[test]
+    fn index_schedule_mode_text_and_class_are_html_escaped() {
+        let schedule: ScheduleData = serde_json::from_value(serde_json::json!({
+            "current_mode": "<i mode>",
+            "current_reason": "",
+            "current_strategy": null,
+            "expected_profit": null,
+            "next_change": null,
+            "blocks_today": 0,
+            "target_soc_max": 100.0,
+            "target_soc_min": 10.0,
+            "total_expected_profit": null,
+            "total_blocks_scheduled": 0,
+            "schedule_hours": 0.0,
+            "schedule_generated_at": "2026-10-17T10:00:00Z",
+            "schedule_ends_at": null
+        }))
+        .unwrap();
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.schedule = Some(schedule);
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let html = DashboardTemplate::from_query_response(response, i18n, String::new(), None)
+            .render()
+            .unwrap();
+        assert!(
+            html.contains("mode-&#60;i-mode&#62;"),
+            "schedule mode class not escaped"
+        );
+        assert!(
+            html.contains("&#60;i mode&#62;"),
+            "schedule mode text not escaped"
+        );
+        assert!(!html.contains("<i mode>"), "schedule mode rendered as HTML");
+    }
+
+    #[test]
+    fn index_health_error_and_timezone_label_are_html_escaped() {
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.health.errors = vec!["<b err>".to_owned()];
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let mut template =
+            DashboardTemplate::from_query_response(response, i18n, String::new(), None);
+        let html = template.render().unwrap();
+        assert!(
+            html.contains("&#60;b err&#62;"),
+            "index health error not escaped"
+        );
+        assert!(
+            !html.contains("<b err>"),
+            "index health error rendered as HTML"
+        );
+
+        template.display_tz_label = "<b tz>".to_owned();
+        let html = template.render().unwrap();
+        assert!(
+            html.contains("&#60;b tz&#62;"),
+            "timezone label not escaped"
+        );
+        assert!(!html.contains("<b tz>"), "timezone label rendered as HTML");
+    }
+
+    #[test]
+    fn live_data_health_error_and_inverter_fields_are_html_escaped() {
+        let inverter: InverterData = serde_json::from_value(serde_json::json!({
+            "id": "<i id>", "topology": "<i topo>", "mode": "<i mode>", "mode_reason": "",
+            "actual_mode": "<i mode>", "mode_synced": true,
+            "battery_soc": 50.0, "battery_power_w": 0.0,
+            "battery_voltage_v": 0.0, "battery_current_a": 0.0, "battery_temperature_c": 0.0,
+            "grid_power_w": 0.0, "grid_voltage_v": 0.0, "grid_frequency_hz": 50.0,
+            "pv_power_w": 0.0, "pv1_power_w": 0.0, "pv2_power_w": 0.0,
+            "daily_energy_kwh": 0.0, "total_energy_kwh": 0.0, "online": true,
+            "run_mode": "Normal", "error_code": 0, "inverter_temperature_c": 0.0
+        }))
+        .unwrap();
+        let mut health = response_with_timezone(None, TimezoneSource::Unknown).health;
+        health.errors = vec!["<b err>".to_owned()];
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let html = LiveDataTemplate {
+            debug_mode: false,
+            inverters: vec![inverter],
+            schedule: None,
+            prices: None,
+            health,
+            i18n,
+            last_update_formatted: String::new(),
+            next_change_formatted: None,
+            consumption_stats: None,
+            solar_forecast: None,
+            battery_cost_basis: None,
+        }
+        .render()
+        .unwrap();
+        assert!(
+            html.contains("&#60;b err&#62;"),
+            "live data health error not escaped"
+        );
+        assert!(
+            !html.contains("<b err>"),
+            "live data health error rendered as HTML"
+        );
+        assert!(html.contains("&#60;i id&#62;"), "inverter id not escaped");
+        assert!(!html.contains("<i id>"), "inverter id rendered as HTML");
+        assert!(
+            html.contains("&#60;i mode&#62;"),
+            "inverter mode text not escaped"
+        );
+        assert!(!html.contains("<i mode>"), "inverter mode rendered as HTML");
+        assert!(
+            html.contains("mode-&#60;i-mode&#62;"),
+            "inverter mode class not escaped"
+        );
+        assert!(
+            html.contains("&#60;i topo&#62;"),
+            "inverter topology not escaped"
+        );
+        assert!(
+            !html.contains("<i topo>"),
+            "inverter topology rendered as HTML"
+        );
+    }
+
+    #[test]
     fn inverter_names_and_modes_are_html_escaped() {
         let markup = "<img src=x onerror=alert(1)>";
         let inverter: InverterData = serde_json::from_value(serde_json::json!({
@@ -1143,6 +1371,28 @@ mod tests {
         assert!(
             live.contains(live_strategy),
             "strategy not escaped in live data"
+        );
+    }
+
+    #[test]
+    fn price_feed_banner_is_html_escaped() {
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.price_feed = Some(fluxion_core::price_feed::PriceFeedStatus {
+            banner: Some("<img src=x onerror=alert(1)>".to_owned()),
+            ..Default::default()
+        });
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let html = DashboardTemplate::from_query_response(response, i18n, String::new(), None)
+            .render()
+            .unwrap();
+        assert!(
+            html.contains("&#60;img src=x onerror=alert(1)&#62;"),
+            "price feed banner not escaped"
+        );
+        assert!(
+            !html.contains("<img src=x onerror"),
+            "price feed banner rendered as HTML"
         );
     }
 }

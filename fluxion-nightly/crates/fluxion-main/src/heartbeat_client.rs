@@ -27,7 +27,8 @@ use crate::config::ServerHeartbeatConfig;
 use crate::version::VERSION;
 
 /// Spawns a background task that periodically sends heartbeats to the central server.
-pub fn spawn_heartbeat_task(config: ServerHeartbeatConfig, query_sender: WebQuerySender) {
+/// Returns `false` and starts nothing when the server URL may not carry the shared secret.
+pub fn spawn_heartbeat_task(config: ServerHeartbeatConfig, query_sender: WebQuerySender) -> bool {
     info!(
         server_url = %config.server_url,
         instance_id = %config.instance_id,
@@ -35,17 +36,17 @@ pub fn spawn_heartbeat_task(config: ServerHeartbeatConfig, query_sender: WebQuer
         "Starting heartbeat client"
     );
 
+    let Some(url) = heartbeat_endpoint(&config.server_url) else {
+        error!(
+            server_url = %config.server_url,
+            "Heartbeat server URL must use https or a private-network address; heartbeat disabled"
+        );
+        return false;
+    };
+
     tokio::spawn(async move {
         let client = build_heartbeat_client();
         let interval = Duration::from_secs(config.interval_seconds);
-        let url = format!("{}/api/heartbeat", config.server_url.trim_end_matches('/'));
-        if !heartbeat_url_is_allowed(&url) {
-            error!(
-                server_url = %config.server_url,
-                "Heartbeat server URL must use https or a private-network address; heartbeat disabled"
-            );
-            return;
-        }
         let mut first_heartbeat = true;
 
         loop {
@@ -114,6 +115,13 @@ pub fn spawn_heartbeat_task(config: ServerHeartbeatConfig, query_sender: WebQuer
             tokio::time::sleep(interval).await;
         }
     });
+    true
+}
+
+/// The heartbeat endpoint for a server URL, or `None` when the shared secret may not be sent there
+fn heartbeat_endpoint(server_url: &str) -> Option<String> {
+    let url = format!("{}/api/heartbeat", server_url.trim_end_matches('/'));
+    heartbeat_url_is_allowed(&url).then_some(url)
 }
 
 /// Heartbeats carry the shared secret, so they may go over https, or over http only to a
@@ -326,7 +334,10 @@ fn build_sync_data(dashboard: &WebQueryResponse) -> ClientSyncData {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_heartbeat_client, heartbeat_url_is_allowed};
+    use super::{build_heartbeat_client, heartbeat_url_is_allowed, spawn_heartbeat_task};
+    use crate::config::ServerHeartbeatConfig;
+    use fluxion_core::WebQuerySender;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -374,6 +385,44 @@ mod tests {
         for (url, expected) in cases {
             assert_eq!(heartbeat_url_is_allowed(url), *expected, "{url}");
         }
+    }
+
+    /// Scan #21 follow-up: a public plaintext server never starts the heartbeat task. The start
+    /// decision is the return value, so the refused case needs no wait. The started case polls
+    /// for the task's first query (a bounded 10 s), so a loaded machine cannot flake it.
+    #[tokio::test]
+    async fn heartbeat_task_starts_only_for_allowed_server() {
+        let config = |server_url: &str| ServerHeartbeatConfig {
+            enabled: true,
+            server_url: server_url.to_owned(),
+            ..ServerHeartbeatConfig::default()
+        };
+
+        let (sender, mut channel) = WebQuerySender::new();
+        assert!(!spawn_heartbeat_task(
+            config("http://203.0.113.10:8100"),
+            sender
+        ));
+        // The refused sender was dropped with the call, so nothing can ever arrive
+        assert!(channel.receiver.try_recv().is_err());
+
+        let (sender, mut channel) = WebQuerySender::new();
+        assert!(spawn_heartbeat_task(
+            config("http://192.168.1.10:8100"),
+            sender
+        ));
+        let mut arrived = false;
+        for _ in 0..500 {
+            if channel.receiver.try_recv().is_ok() {
+                arrived = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            arrived,
+            "the allowed heartbeat task never queried the dashboard"
+        );
     }
 
     #[tokio::test]

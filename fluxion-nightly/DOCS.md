@@ -91,8 +91,9 @@ recommended setting unless you are troubleshooting.
 ### Option: `system.trusted_peers`
 
 Comma-separated IP addresses that may call the FluxION web interface (port 8099) besides the Home
-Assistant ingress proxy and the add-on itself. Leave it empty unless another host on your network
-must reach FluxION directly. Entries that are not IP addresses are ignored and logged as warnings.
+Assistant ingress proxy and the add-on itself. Leave it empty. Only containers on the Home Assistant
+add-on network (no ports are exposed) can reach port 8099. Entries that are not IP addresses are
+ignored and logged as warnings.
 
 ### Option Group: `inverters`
 

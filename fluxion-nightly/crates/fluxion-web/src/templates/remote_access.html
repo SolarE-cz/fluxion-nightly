@@ -161,7 +161,7 @@ async function loadDevices() {
       const name = document.createElement('strong');
       name.textContent = d.name;
       const badge = document.createElement('span');
-      badge.className = `badge ${d.access_mode === 'full' ? 'badge-full' : 'badge-readonly'}`;
+      badge.className = 'badge badge-full';
       badge.textContent = d.access_mode;
       const added = document.createElement('span');
       added.className = 'text-secondary';

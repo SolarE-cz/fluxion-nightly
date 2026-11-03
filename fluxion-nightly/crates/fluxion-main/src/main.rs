@@ -190,6 +190,14 @@ fn remote_access_state_if_enabled(
     enabled.then(|| RemoteAccessApiState::new(data_dir, 8099, "FluxION".to_string()))
 }
 
+/// Remote access state for the configuration the add-on runs with
+fn remote_access_state_for_config(
+    config: &config::AppConfig,
+    data_dir: &std::path::Path,
+) -> Option<RemoteAccessApiState> {
+    remote_access_state_if_enabled(config.remote_access.enabled, data_dir)
+}
+
 fn initialize_and_run() -> Result<()> {
     // Initialize tracing with env filter support
     // Respects RUST_LOG environment variable
@@ -548,10 +556,8 @@ fn initialize_and_run() -> Result<()> {
     )
     .with_user_control(Arc::clone(&user_control_api_state.state));
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
-    let remote_access_state = remote_access_state_if_enabled(
-        config.remote_access.enabled,
-        std::path::Path::new("./data"),
-    );
+    let remote_access_state =
+        remote_access_state_for_config(&config, std::path::Path::new("./data"));
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -564,6 +570,7 @@ fn initialize_and_run() -> Result<()> {
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
             Some(user_control_api_state),                        // User control API state
             remote_access_state,                                 // Remote access pairing API
+            fluxion_web::AccessMode::from_env(),                 // Peer guard: add-on or standalone
         )
         .await
         {
@@ -661,5 +668,15 @@ mod tests {
     fn remote_access_is_registered_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
         assert!(remote_access_state_if_enabled(true, dir.path()).is_some());
+    }
+
+    #[test]
+    fn remote_access_state_follows_the_config_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config::AppConfig::default();
+        config.remote_access.enabled = false;
+        assert!(remote_access_state_for_config(&config, dir.path()).is_none());
+        config.remote_access.enabled = true;
+        assert!(remote_access_state_for_config(&config, dir.path()).is_some());
     }
 }

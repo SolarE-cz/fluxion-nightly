@@ -726,6 +726,29 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(&text).unwrap()["config"].clone()
     }
 
+    /// Scan #49: the handler refuses an auto-unlock change, saves nothing and keeps the running value
+    #[tokio::test]
+    async fn auto_unlock_change_is_refused_by_the_handler_and_nothing_is_saved() {
+        let mut current = serde_json::to_value(crate::validation::tests::default_config()).unwrap();
+        current["control"]["auto_unlock_inverter"] = json!(true);
+        let (state, _dir) = handler_state_from(current, None);
+        let response =
+            post_update(&state, json!({"control": {"auto_unlock_inverter": false}})).await;
+        assert!(!response.success);
+        assert_eq!(
+            response.validation.errors[0].field,
+            "control.auto_unlock_inverter"
+        );
+        assert!(
+            !std::path::Path::new(&state.config_path).exists(),
+            "refused update was saved"
+        );
+        assert_eq!(
+            state.config.read()["control"]["auto_unlock_inverter"],
+            json!(true)
+        );
+    }
+
     #[tokio::test]
     async fn unknown_keys_are_not_persisted() {
         let (state, _dir) = handler_state(None);

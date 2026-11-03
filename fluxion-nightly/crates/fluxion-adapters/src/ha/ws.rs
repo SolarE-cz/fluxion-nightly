@@ -16,9 +16,9 @@
 //! A session authenticates once and then makes request/response calls with incrementing ids.
 
 use crate::ha::errors::{HaError, HaResult};
+use crate::ha::transport::ensure_token_transport;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::net::IpAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -40,52 +40,6 @@ pub fn websocket_url(base_url: &str) -> Option<String> {
     } else {
         format!("{ws}/api/websocket")
     })
-}
-
-/// Refuses a plaintext `ws://` URL that would carry the access token to a public host (scan
-/// #12, #31). Plaintext stays allowed for loopback, RFC1918 and link-local addresses, `.local`
-/// and single-label names (the Supervisor's `supervisor`). `wss://` URLs pass unchecked.
-pub fn ensure_token_transport(url: &str) -> HaResult<()> {
-    let Some(rest) = url.strip_prefix("ws://") else {
-        return Ok(());
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
-    let host = match authority.strip_prefix('[') {
-        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
-        None => authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host),
-    };
-    if plaintext_host_allowed(host) {
-        Ok(())
-    } else {
-        Err(HaError::ConfigError(format!(
-            "refusing plaintext websocket to {host}: the access token would cross the network unencrypted; use an https:// Home Assistant URL"
-        )))
-    }
-}
-
-fn plaintext_host_allowed(host: &str) -> bool {
-    let host = host.to_ascii_lowercase();
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => {
-            // 100.64.0.0/10: the NetBird and Tailscale overlay, already encrypted (scan #12, #31)
-            let [first, second, ..] = ip.octets();
-            let overlay = first == 100 && (second & 0xc0) == 0x40;
-            ip.is_loopback() || ip.is_private() || ip.is_link_local() || overlay
-        }
-        Ok(IpAddr::V6(ip)) => {
-            let first = ip.segments()[0];
-            ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-        }
-        Err(_) => {
-            host == "localhost"
-                || host.ends_with(".local")
-                || host.ends_with(".netbird.cloud")
-                || host.ends_with(".ts.net")
-                || !host.contains('.')
-        }
-    }
 }
 
 /// An authenticated websocket session.
@@ -242,6 +196,8 @@ mod tests {
             ("ws://100.63.255.255:8123/api/websocket", false),
             ("ws://100.128.0.1:8123/api/websocket", false),
             ("ws://notts.net:8123/api/websocket", false),
+            ("ws://ha.local:8123@evil.com/api/websocket", false),
+            ("ws://user:pw@192.168.1.5:8123/api/websocket", false),
         ];
         for (url, allowed) in cases {
             let result = ensure_token_transport(url);
@@ -260,5 +216,30 @@ mod tests {
     fn encrypted_and_non_websocket_urls_are_not_checked() {
         assert!(ensure_token_transport("wss://ha.example.com/api/websocket").is_ok());
         assert!(ensure_token_transport("https://ha.example.com").is_ok());
+    }
+
+    /// Scan N5: the host is the one after the `@`, not the one before it
+    #[test]
+    fn userinfo_cannot_hide_the_real_host() {
+        for url in [
+            "ws://ha.local:8123@evil.com/api/websocket",
+            "ws://user:pw@192.168.1.5:8123/api/websocket",
+        ] {
+            assert!(ensure_token_transport(url).is_err(), "{url}");
+        }
+    }
+
+    /// Scan N2: the policy runs before any network attempt. A missing check would dial the
+    /// public address and fail with a connect or timeout error instead.
+    #[tokio::test]
+    async fn connect_refuses_public_plaintext_before_dialing() {
+        match HaWsSession::connect("ws://203.0.113.10:8123/api/websocket", "t").await {
+            Ok(_) => panic!("public plaintext websocket was accepted"),
+            Err(err) => assert!(
+                err.to_string()
+                    .contains("use an https:// Home Assistant URL"),
+                "{err}"
+            ),
+        }
     }
 }

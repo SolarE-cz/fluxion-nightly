@@ -72,6 +72,16 @@ fn is_reserved_plugin_name(name: &str) -> bool {
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
+/// Whether a plugin name is safe to embed in a scheduled reason: 1-64 ASCII letters, digits,
+/// spaces, `.`, `_` or `-`. A colon would let the name forge a reason marker such as `guard:`.
+fn is_valid_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+}
+
 /// Plugin info response
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginInfo {
@@ -160,6 +170,19 @@ pub async fn register_plugin_handler(
                     "Plugin name '{}' is reserved for a built-in strategy",
                     request.manifest.name
                 )),
+                plugin_id: None,
+            }),
+        );
+    }
+
+    if !is_valid_plugin_name(&request.manifest.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PluginRegistrationResponse {
+                success: false,
+                error: Some(
+                    "Plugin name must be 1-64 letters, digits, spaces, '.', '_' or '-'".to_owned(),
+                ),
                 plugin_id: None,
             }),
         );
@@ -366,6 +389,54 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(state.plugin_manager.read().list_plugins().is_empty());
+    }
+
+    /// Registers a plugin with `name` and returns the response status and the number of
+    /// plugins left in the manager.
+    fn register_with_name(name: &str) -> (StatusCode, usize) {
+        let state = PluginApiState::new(Arc::new(RwLock::new(PluginManager::new())));
+        let request = PluginRegistrationRequest {
+            manifest: fluxion_plugins::protocol::PluginManifest {
+                name: name.to_owned(),
+                version: "1.0.0".to_owned(),
+                description: String::new(),
+                default_priority: 100,
+                enabled: true,
+            },
+            callback_url: "http://127.0.0.1:9/evaluate".to_owned(),
+        };
+
+        // Same single-poll pattern as test_register_rejects_builtin_strategy_name.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut future =
+            std::pin::pin!(register_plugin_handler(State(state.clone()), Json(request)));
+        let std::task::Poll::Ready(response) = future.as_mut().poll(&mut cx) else {
+            panic!("register handler should complete in one poll");
+        };
+        let status = response.into_response().status();
+        let count = state.plugin_manager.read().list_plugins().len();
+        (status, count)
+    }
+
+    #[test]
+    fn test_register_rejects_plugin_names_with_markers_or_controls() {
+        let long_name = "a".repeat(65);
+        for name in ["guard: x", "a\nb", "", long_name.as_str()] {
+            let (status, count) = register_with_name(name);
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "name {name:?} was accepted"
+            );
+            assert_eq!(count, 0, "name {name:?} was registered");
+        }
+    }
+
+    #[test]
+    fn test_register_accepts_plain_plugin_name() {
+        let (status, count) = register_with_name("My Plugin-2.0");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(count, 1);
     }
 
     #[test]

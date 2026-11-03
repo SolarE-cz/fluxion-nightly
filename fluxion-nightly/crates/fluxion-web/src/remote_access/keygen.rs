@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use tracing::warn;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,13 +65,30 @@ impl DeviceStore {
         }
     }
 
-    /// Load all devices from persistent storage.
+    /// Load all devices from persistent storage. Devices paired as read-only before read-only
+    /// pairing was refused are migrated to full access, which is what they really have, and the
+    /// file is rewritten.
     #[must_use]
     pub fn load_devices(&self) -> Vec<DeviceEntry> {
-        match std::fs::read_to_string(&self.devices_path) {
+        let mut devices: Vec<DeviceEntry> = match std::fs::read_to_string(&self.devices_path) {
             Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
             Err(_) => Vec::new(),
+        };
+        let mut migrated = false;
+        for device in &mut devices {
+            if device.access_mode == "readonly" {
+                warn!(
+                    "Remote access device {:?} was read-only; migrated to full access",
+                    device.id
+                );
+                "full".clone_into(&mut device.access_mode);
+                migrated = true;
+            }
         }
+        if migrated && let Err(e) = self.save_devices(&devices) {
+            warn!("Could not save migrated remote access devices: {e}");
+        }
+        devices
     }
 
     /// Save devices to persistent storage.
@@ -165,6 +183,33 @@ mod tests {
         // x25519 public key is 32 bytes → base32 with no padding is 52 chars
         assert_eq!(encoded.len(), 52);
         assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn readonly_devices_are_migrated_to_full_and_the_file_is_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DeviceStore::new(tmp.path());
+        let devices_path = tmp.path().join("tor").join("devices.json");
+        std::fs::create_dir_all(devices_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &devices_path,
+            r#"[
+                {"id": "old-ro", "name": "Old phone", "access_mode": "readonly", "pubkey_base32": "AAAA", "created_at": "2026-10-01T10:00:00Z", "last_seen": null},
+                {"id": "old-full", "name": "Laptop", "access_mode": "full", "pubkey_base32": "BBBB", "created_at": "2026-10-01T10:00:00Z", "last_seen": null}
+            ]"#,
+        )
+        .unwrap();
+
+        let devices = store.load_devices();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].id, "old-ro");
+        assert_eq!(devices[0].access_mode, "full");
+        assert_eq!(devices[1].access_mode, "full");
+
+        // The migration is persisted, not only applied in memory
+        let stored = std::fs::read_to_string(&devices_path).unwrap();
+        assert!(!stored.contains("readonly"), "{stored}");
+        assert!(store.load_devices().iter().all(|d| d.access_mode == "full"));
     }
 
     #[test]

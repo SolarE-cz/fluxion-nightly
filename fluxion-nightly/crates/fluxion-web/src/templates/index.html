@@ -1455,7 +1455,7 @@
     <!-- Price Chart (Outside SSE update area - updates once per minute) -->
     {% if let Some(banner) = price_feed_banner %}
     <div class="price-feed-banner" role="alert" style="padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; border: 1px solid var(--warning); background: var(--bg-tertiary); color: var(--text-primary);">
-        ⚠️ {{ banner|e }}
+        ⚠️ {{ banner|e("html") }}
     </div>
     {% endif %}
     {% if timezone_unknown %}
@@ -4366,15 +4366,10 @@ function handleStep2Confirm() {
     document.getElementById('pairing-success-device-name').textContent = pairingState.deviceName;
 
     const badge = document.getElementById('pairing-success-device-badge');
-    if (pairingState.accessMode === 'full') {
-        badge.textContent = 'Full Access';
-        badge.className = 'success-device-badge full';
-    } else {
-        badge.textContent = 'Read Only';
-        badge.className = 'success-device-badge readonly';
-    }
+    badge.textContent = 'Full Access';
+    badge.className = 'success-device-badge full';
 
-    announceToScreenReader(`Device ${pairingState.deviceName} paired successfully with ${pairingState.accessMode === 'full' ? 'full access' : 'read only'} mode.`);
+    announceToScreenReader(`Device ${pairingState.deviceName} paired successfully with full access mode.`);
 }
 
 // Handle "Pair Another" button

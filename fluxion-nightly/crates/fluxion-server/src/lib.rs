@@ -16,3 +16,5 @@ pub mod db;
 pub mod heartbeat;
 pub mod monitor;
 pub mod notifications;
+#[cfg(test)]
+pub(crate) mod test_log;
