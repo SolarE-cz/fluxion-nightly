@@ -8,6 +8,8 @@ Set `ingest_url` to the register and paste the one-time claim code into
 `claim_code`. The code is used once and is never logged. A refused code is
 retried every 10 minutes.
 
+The reporter sends nothing unless `ingest_url` is https, or plain HTTP to a loopback, private-network (RFC 1918, CGNAT such as NetBird or Tailscale, link-local) or `.local`, `.netbird.cloud` or `.ts.net` host.
+
 ## What it reads
 
 Only the entities named in the options: `pv_power_entity`, `soc_entity`,

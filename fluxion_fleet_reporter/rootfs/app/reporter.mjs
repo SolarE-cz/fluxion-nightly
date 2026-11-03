@@ -20040,6 +20040,40 @@ function apiToken(env) {
   }
   return env.SUPERVISOR_TOKEN ?? "";
 }
+var MAX_BODY_BYTES2 = 1024 * 1024;
+async function readBodyText(response, maxBytes) {
+  if (response.body === null) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (; ; ) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error(`the response body is larger than ${maxBytes} bytes`);
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+async function discardBodyOf(response) {
+  try {
+    await response.body?.cancel();
+  } catch {
+  }
+}
 async function fetchTextWithTimeout(fetchImpl, url2, init, timeoutMs, shutdown) {
   const controller2 = new AbortController();
   const timer = setTimeout(() => {
@@ -20048,7 +20082,11 @@ async function fetchTextWithTimeout(fetchImpl, url2, init, timeoutMs, shutdown) 
   const signal = shutdown === void 0 ? controller2.signal : AbortSignal.any([controller2.signal, shutdown]);
   try {
     const response = await fetchImpl(url2, { ...init, signal });
-    const body = await response.text();
+    if (!response.ok) {
+      await discardBodyOf(response);
+      return { status: response.status, ok: response.ok, body: "" };
+    }
+    const body = await readBodyText(response, MAX_BODY_BYTES2);
     return { status: response.status, ok: response.ok, body };
   } finally {
     clearTimeout(timer);
@@ -20285,8 +20323,53 @@ async function loadOrCreateIdentity(dir) {
 
 // src/client.ts
 var CLIENT_TIMEOUT_MS = 15e3;
+var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "[::1]"]);
+var PRIVATE_NAME_SUFFIXES = [".local", ".netbird.cloud", ".ts.net"];
 function registerUrl(url2, path) {
   return `${url2.replace(/\/+$/, "")}${path}`;
+}
+function isDecimalOctet(part) {
+  return /^\d{1,3}$/.test(part) && Number(part) <= 255;
+}
+function ipv4Head(host) {
+  const parts = host.split(".");
+  if (parts.length !== 4 || !parts.every(isDecimalOctet)) {
+    return null;
+  }
+  return [Number(parts[0]), Number(parts[1])];
+}
+function isPrivateIpv4(first, second) {
+  return first === 10 || first === 172 && second >= 16 && second <= 31 || first === 192 && second === 168 || first === 100 && second >= 64 && second <= 127 || first === 169 && second === 254;
+}
+function isPrivateIpv6(address) {
+  const leading = Number.parseInt(address.split(":")[0] || "0", 16);
+  return (leading & 65024) === 64512 || (leading & 65472) === 65152;
+}
+function isPrivateNetworkHost(host) {
+  if (LOOPBACK_HOSTS.has(host)) {
+    return true;
+  }
+  if (host.startsWith("[")) {
+    return isPrivateIpv6(host.slice(1, -1));
+  }
+  const head = ipv4Head(host);
+  if (head !== null) {
+    return isPrivateIpv4(head[0], head[1]);
+  }
+  if (!host.includes(".")) {
+    return true;
+  }
+  return PRIVATE_NAME_SUFFIXES.some((suffix) => host.endsWith(suffix));
+}
+function isSecureRegisterUrl(url2) {
+  const parsed = URL.parse(url2);
+  if (parsed === null) {
+    return false;
+  }
+  if (parsed.protocol === "https:") {
+    return true;
+  }
+  return parsed.protocol === "http:" && isPrivateNetworkHost(parsed.hostname);
 }
 async function enroll(fetchImpl, url2, claimCode, identity, bounds) {
   const request = enrollRequestSchema.safeParse({
@@ -20305,6 +20388,8 @@ async function enroll(fetchImpl, url2, claimCode, identity, bounds) {
       registerUrl(url2, "/enroll"),
       {
         method: "POST",
+        // A redirect would resend the claim code or the signed body elsewhere.
+        redirect: "error",
         headers: { "content-type": "application/json" },
         body: bytes
       },
@@ -20342,6 +20427,8 @@ async function postHeartbeat(fetchImpl, url2, identity, body, bounds) {
       registerUrl(url2, "/heartbeat"),
       {
         method: "POST",
+        // A redirect would resend the claim code or the signed body elsewhere.
+        redirect: "error",
         headers: {
           "content-type": "application/json",
           [HEADER_KEY_ID]: identity.keyId,
@@ -20544,6 +20631,13 @@ async function enrollStep(runtime, working, nowMs) {
   if (nowMs < working.nextEnrollAttemptMs) {
     return null;
   }
+  if (!isSecureRegisterUrl(runtime.options.ingest_url)) {
+    working.nextEnrollAttemptMs = nowMs + ENROLL_RETRY_MS;
+    return {
+      key: "enroll:insecure-url",
+      message: "not enrolled: ingest_url is not https or a private-network address, so nothing is sent to it; set one and restart the add-on"
+    };
+  }
   const hasClaimCode = runtime.options.claim_code.trim() !== "";
   let failure2 = null;
   if (hasClaimCode) {
@@ -20644,6 +20738,12 @@ function haHealth(runtime, working, reachable, nowMs, heartbeat, reason) {
   };
 }
 async function heartbeatStep(runtime, working, nowMs) {
+  if (!isSecureRegisterUrl(runtime.options.ingest_url)) {
+    return {
+      key: "heartbeat:insecure-url",
+      message: "heartbeat not sent: ingest_url is not https or a private-network address; set one and restart the add-on"
+    };
+  }
   const snapshot = await readSnapshot(runtime.reader, entityIds(runtime.options));
   const body = buildLegacyHeartbeat(snapshot, runtime.options, new Date(nowMs).toISOString());
   const outcome = await postHeartbeat(
