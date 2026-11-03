@@ -35,6 +35,21 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
+    // ============= Inverters =============
+    // Scan #15: ids are compared trimmed, as the control map keys them; a duplicate is refused here
+    let mut ids: Vec<&str> = Vec::new();
+    for inverter in &config.inverters {
+        let id = inverter.id.trim();
+        if ids.contains(&id) {
+            errors.push(ValidationIssue {
+                field: "inverters".to_owned(),
+                message: format!("Inverter id '{id}' is used by more than one inverter"),
+                severity: "error".to_owned(),
+            });
+        }
+        ids.push(id);
+    }
+
     // ============= System Settings =============
     if config.system_config.update_interval_secs < 5 {
         errors.push(ValidationIssue {
@@ -319,7 +334,7 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use fluxion_core::resources::{
         ConsumptionHistoryConfig, ControlConfig, PricingConfig, StrategiesConfigCore, SystemConfig,
@@ -327,7 +342,7 @@ mod tests {
     };
     use fluxion_types::config::{NotificationsConfigCore, RemoteAccessConfigCore};
 
-    fn default_config() -> SystemConfig {
+    pub(crate) fn default_config() -> SystemConfig {
         SystemConfig {
             inverters: vec![],
             pricing_config: PricingConfig {
@@ -545,6 +560,30 @@ mod tests {
             !errors
                 .iter()
                 .any(|e| e.field == "strategies.winter_reserve.min_arbitrage_profit_czk")
+        );
+    }
+
+    /// Scan #15: the web save refuses two inverters with one id (trimmed, as the control map keys them)
+    #[test]
+    fn duplicate_inverter_id_is_an_error() {
+        let inverter = |id: &str| -> fluxion_types::config::InverterConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "inverter_type": "solax",
+                "entity_prefix": "solax",
+                "topology": "independent",
+            }))
+            .unwrap()
+        };
+        let mut config = default_config();
+        config.inverters = vec![inverter("main"), inverter(" main")];
+
+        let (errors, _) = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.field == "inverters"
+                && e.message == "Inverter id 'main' is used by more than one inverter"),
+            "{:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 }

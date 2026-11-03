@@ -229,6 +229,7 @@ options:
   system:
     debug_mode: true
     log_level: info
+    trusted_peers: ''
     update_interval_secs: 60
 panel_icon: mdi:solar-power
 schema:
@@ -499,8 +500,9 @@ schema:
     debug_mode: bool?
     display_timezone: str?
     log_level: list(trace|debug|info|warning|error)?
+    trusted_peers: str?
     update_interval_secs: int(10,3600)?
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.71
+version: 0.2.72

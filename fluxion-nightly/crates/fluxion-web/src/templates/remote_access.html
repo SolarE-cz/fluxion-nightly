@@ -35,7 +35,6 @@
           <select id="access-mode"
                   style="background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); padding: 8px 12px; border-radius: 6px;">
             <option value="full">Full Access</option>
-            <option value="readonly">Read Only</option>
           </select>
         </div>
         <button type="submit" class="btn btn-primary">Generate QR Code</button>
@@ -116,14 +115,29 @@ async function loadStatus() {
     const res = await fetch(BASE + '/api/remote/status');
     const data = await res.json();
     const el = document.getElementById('status-content');
-    el.innerHTML = `
-      <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
-        <span class="status-dot ${data.tor_running ? 'status-running' : 'status-stopped'}"></span>
-        <span>${data.tor_running ? 'Running' : 'Stopped'}</span>
-      </div>
-      ${data.onion_address ? `<p style="font-family: monospace; font-size: 0.85em; word-break: break-all; color: var(--text-secondary);">${data.onion_address}</p>` : ''}
-      <p class="text-secondary" style="margin-top: 8px;">${data.device_count} device(s) paired</p>
-    `;
+    el.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.style.cssText = 'display: flex; align-items: center; gap: 12px; margin-bottom: 8px;';
+    const dot = document.createElement('span');
+    dot.className = `status-dot ${data.tor_running ? 'status-running' : 'status-stopped'}`;
+    const state = document.createElement('span');
+    state.textContent = data.tor_running ? 'Running' : 'Stopped';
+    header.append(dot, state);
+    el.appendChild(header);
+
+    if (data.onion_address) {
+      const onion = document.createElement('p');
+      onion.style.cssText = 'font-family: monospace; font-size: 0.85em; word-break: break-all; color: var(--text-secondary);';
+      onion.textContent = data.onion_address;
+      el.appendChild(onion);
+    }
+
+    const count = document.createElement('p');
+    count.className = 'text-secondary';
+    count.style.cssText = 'margin-top: 8px;';
+    count.textContent = `${data.device_count} device(s) paired`;
+    el.appendChild(count);
   } catch (e) {
     document.getElementById('status-content').innerHTML = '<p style="color: var(--error);">Failed to load status</p>';
   }
@@ -138,18 +152,38 @@ async function loadDevices() {
       el.innerHTML = '<p class="text-secondary">No devices paired yet.</p>';
       return;
     }
-    el.innerHTML = devices.map(d => `
-      <div class="device-row">
-        <div>
-          <strong>${escapeHtml(d.name)}</strong>
-          <span class="badge ${d.access_mode === 'full' ? 'badge-full' : 'badge-readonly'}">${d.access_mode}</span>
-          <br>
-          <span class="text-secondary" style="font-size: 0.8em;">Added: ${new Date(d.created_at).toLocaleDateString()}</span>
-          ${d.last_seen ? `<span class="text-secondary" style="font-size: 0.8em; margin-left: 12px;">Last seen: ${new Date(d.last_seen).toLocaleString()}</span>` : ''}
-        </div>
-        <button class="btn btn-danger" onclick="revokeDevice('${d.id}', '${escapeHtml(d.name)}')">Revoke</button>
-      </div>
-    `).join('');
+    el.innerHTML = '';
+    devices.forEach(d => {
+      const row = document.createElement('div');
+      row.className = 'device-row';
+
+      const info = document.createElement('div');
+      const name = document.createElement('strong');
+      name.textContent = d.name;
+      const badge = document.createElement('span');
+      badge.className = `badge ${d.access_mode === 'full' ? 'badge-full' : 'badge-readonly'}`;
+      badge.textContent = d.access_mode;
+      const added = document.createElement('span');
+      added.className = 'text-secondary';
+      added.style.cssText = 'font-size: 0.8em;';
+      added.textContent = `Added: ${new Date(d.created_at).toLocaleDateString()}`;
+      info.append(name, ' ', badge, document.createElement('br'), added);
+      if (d.last_seen) {
+        const seen = document.createElement('span');
+        seen.className = 'text-secondary';
+        seen.style.cssText = 'font-size: 0.8em; margin-left: 12px;';
+        seen.textContent = `Last seen: ${new Date(d.last_seen).toLocaleString()}`;
+        info.append(' ', seen);
+      }
+
+      const revoke = document.createElement('button');
+      revoke.className = 'btn btn-danger';
+      revoke.textContent = 'Revoke';
+      revoke.addEventListener('click', () => revokeDevice(d.id, d.name));
+
+      row.append(info, revoke);
+      el.appendChild(row);
+    });
   } catch (e) {
     document.getElementById('devices-list').innerHTML = '<p style="color: var(--error);">Failed to load devices</p>';
   }
@@ -174,7 +208,7 @@ document.getElementById('pair-form').addEventListener('submit', async (e) => {
     }
 
     document.getElementById('qr-device-name').textContent = `Scan to pair: ${name}`;
-    document.getElementById('qr-svg').innerHTML = data.qr_svg;
+    document.getElementById('qr-svg').innerHTML = data.qr_svg; // trusted-html: server-generated QR SVG, no user text
     document.getElementById('qr-modal').style.display = 'block';
     document.getElementById('device-name').value = '';
 
@@ -194,12 +228,6 @@ async function revokeDevice(id, name) {
   } catch (e) {
     alert('Revoke failed: ' + e.message);
   }
-}
-
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
 }
 
 loadStatus();

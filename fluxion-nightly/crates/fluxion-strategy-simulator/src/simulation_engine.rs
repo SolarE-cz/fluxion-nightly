@@ -67,6 +67,10 @@ impl SimulationEngine {
         day: SyntheticDay,
         sim_config: SimulationConfig,
     ) -> Result<SimulationState> {
+        if day.blocks.len() != 96 {
+            anyhow::bail!("a simulated day needs 96 blocks, got {}", day.blocks.len());
+        }
+
         // Collect enabled strategy IDs
         let mut strategy_ids: Vec<String> = sim_config
             .strategies
@@ -511,6 +515,36 @@ mod tests {
         for result in state.strategy_results.values() {
             assert_eq!(result.evaluations.len(), 96);
         }
+    }
+
+    #[test]
+    fn test_prebuilt_day_must_have_96_blocks() {
+        let engine = SimulationEngine::new();
+        let day = SyntheticDayGenerator::generate(&SyntheticDayConfig::default()).unwrap();
+        assert_eq!(day.blocks.len(), 96);
+
+        let mut oversized = day.clone();
+        let extra = oversized.blocks[95].clone();
+        oversized.blocks.push(extra);
+        assert!(
+            engine
+                .create_simulation_from_day(oversized, SimulationConfig::default())
+                .is_err()
+        );
+
+        let mut short = day.clone();
+        short.blocks.truncate(95);
+        assert!(
+            engine
+                .create_simulation_from_day(short, SimulationConfig::default())
+                .is_err()
+        );
+
+        assert!(
+            engine
+                .create_simulation_from_day(day, SimulationConfig::default())
+                .is_ok()
+        );
     }
 
     #[test]

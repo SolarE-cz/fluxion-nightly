@@ -181,6 +181,15 @@ fn pv_correction_site(
     })
 }
 
+/// Remote access state (pairing and the Tor-served mobile API) exists only when the owner enabled
+/// remote access. Without it the pairing and mobile routes are not registered at all.
+fn remote_access_state_if_enabled(
+    enabled: bool,
+    data_dir: &std::path::Path,
+) -> Option<RemoteAccessApiState> {
+    enabled.then(|| RemoteAccessApiState::new(data_dir, 8099, "FluxION".to_string()))
+}
+
 fn initialize_and_run() -> Result<()> {
     // Initialize tracing with env filter support
     // Respects RUST_LOG environment variable
@@ -539,8 +548,10 @@ fn initialize_and_run() -> Result<()> {
     )
     .with_user_control(Arc::clone(&user_control_api_state.state));
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
-    let remote_access_state =
-        RemoteAccessApiState::new(std::path::Path::new("./data"), 8099, "FluxION".to_string());
+    let remote_access_state = remote_access_state_if_enabled(
+        config.remote_access.enabled,
+        std::path::Path::new("./data"),
+    );
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -552,7 +563,7 @@ fn initialize_and_run() -> Result<()> {
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
             Some(user_control_api_state),                        // User control API state
-            Some(remote_access_state),                           // Remote access pairing API
+            remote_access_state,                                 // Remote access pairing API
         )
         .await
         {
@@ -633,4 +644,22 @@ fn initialize_and_run() -> Result<()> {
     app.run();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_access_is_not_registered_while_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remote_access_state_if_enabled(false, dir.path()).is_none());
+        assert!(!dir.path().join("tor").exists());
+    }
+
+    #[test]
+    fn remote_access_is_registered_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remote_access_state_if_enabled(true, dir.path()).is_some());
+    }
 }

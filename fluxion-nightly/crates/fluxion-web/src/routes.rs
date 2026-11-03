@@ -117,6 +117,7 @@ pub struct ChartData {
 
 /// Live data template (for SSE updates only)
 #[derive(Template)]
+// trusted-template: every user/plugin string in live_data.html is escaped with |e("html")
 #[template(path = "live_data.html", escape = "none")]
 pub struct LiveDataTemplate {
     #[expect(
@@ -184,8 +185,20 @@ fn format_in_display_tz(ts: DateTime<Utc>, tz: Option<Tz>, fmt: &str) -> String 
     }
 }
 
+/// Serialize a value as JSON for embedding inside a `<script>` element.
+/// `<`, `>` and `&` are written as JSON unicode escapes, so no string in the data can close the
+/// script element (`</script>`) or open an HTML comment. The result is still valid JSON.
+fn json_for_script(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "null".to_owned())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
 /// Dashboard template
 #[derive(Template)]
+// trusted-template: every user/plugin string in index.html is escaped with |e("html"); chart JSON goes through json_for_script
 #[template(path = "index.html", escape = "none")]
 pub struct DashboardTemplate {
     pub debug_mode: bool,
@@ -579,10 +592,10 @@ impl DashboardTemplate {
         });
 
         // Serialize chart data to JSON for JavaScript
-        let chart_data_json = prices
-            .as_ref()
-            .and_then(|p| serde_json::to_string(&p.chart_data).ok())
-            .unwrap_or_else(|| "{\"labels\":[],\"prices\":[],\"modes\":[],\"target_socs\":[],\"strategies\":[],\"profits\":[]}".to_owned());
+        let chart_data_json = prices.as_ref().map_or_else(
+            || "{\"labels\":[],\"prices\":[],\"modes\":[],\"target_socs\":[],\"strategies\":[],\"profits\":[]}".to_owned(),
+            |p| json_for_script(&p.chart_data),
+        );
 
         Self {
             debug_mode: response.debug_mode,
@@ -1034,5 +1047,102 @@ mod tests {
 
         block.block_type = "feedin-priority".to_owned();
         assert_eq!(display_mode_label(&block), "Feed-in Priority");
+    }
+
+    #[test]
+    fn json_for_script_cannot_close_the_script_element() {
+        let value = serde_json::json!({ "reason": "</script><img src=x onerror=alert(1)>" });
+        let json = json_for_script(&value);
+        assert!(!json.contains("</script"), "{json}");
+        assert!(
+            !json.contains('<') && !json.contains('>') && !json.contains('&'),
+            "{json}"
+        );
+        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, value);
+    }
+
+    #[test]
+    fn inverter_names_and_modes_are_html_escaped() {
+        let markup = "<img src=x onerror=alert(1)>";
+        let inverter: InverterData = serde_json::from_value(serde_json::json!({
+            "id": markup, "topology": markup, "mode": markup, "mode_reason": "",
+            "actual_mode": markup, "mode_synced": false,
+            "battery_soc": 50.0, "battery_power_w": 0.0,
+            "battery_voltage_v": 0.0, "battery_current_a": 0.0, "battery_temperature_c": 0.0,
+            "grid_power_w": 0.0, "grid_voltage_v": 0.0, "grid_frequency_hz": 50.0,
+            "pv_power_w": 0.0, "pv1_power_w": 0.0, "pv2_power_w": 0.0,
+            "daily_energy_kwh": 0.0, "total_energy_kwh": 0.0, "online": true,
+            "run_mode": "Normal", "error_code": 0, "inverter_temperature_c": 0.0
+        }))
+        .unwrap();
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.inverters = vec![inverter];
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let html = DashboardTemplate::from_query_response(response, i18n, String::new(), None)
+            .render()
+            .unwrap();
+        assert!(!html.contains(markup), "inverter field rendered as HTML");
+        assert!(html.contains("&#60;img src=x onerror=alert(1)&#62;"));
+    }
+
+    #[test]
+    fn schedule_reason_is_html_escaped_in_both_templates() {
+        let schedule: ScheduleData = serde_json::from_value(serde_json::json!({
+            "current_mode": "SelfUse",
+            "current_reason": "<b onmouseover=x>",
+            "current_strategy": "<i>strategy</i>",
+            "expected_profit": null,
+            "next_change": null,
+            "blocks_today": 0,
+            "target_soc_max": 100.0,
+            "target_soc_min": 10.0,
+            "total_expected_profit": null,
+            "total_blocks_scheduled": 0,
+            "schedule_hours": 0.0,
+            "schedule_generated_at": "2026-10-17T10:00:00Z",
+            "schedule_ends_at": null
+        }))
+        .unwrap();
+        let mut response =
+            response_with_timezone(Some("Europe/Prague"), TimezoneSource::Configured);
+        response.schedule = Some(schedule.clone());
+        let i18n = Arc::new(I18n::new(fluxion_i18n::Language::English).unwrap());
+        let dashboard = DashboardTemplate::from_query_response(
+            response.clone(),
+            i18n.clone(),
+            String::new(),
+            None,
+        )
+        .render()
+        .unwrap();
+        let live = LiveDataTemplate {
+            debug_mode: false,
+            inverters: vec![],
+            schedule: Some(schedule),
+            prices: None,
+            health: response.health.clone(),
+            i18n,
+            last_update_formatted: String::new(),
+            next_change_formatted: None,
+            consumption_stats: None,
+            solar_forecast: None,
+            battery_cost_basis: None,
+        }
+        .render()
+        .unwrap();
+        for html in [&dashboard, &live] {
+            assert!(
+                html.contains("&#60;b onmouseover=x&#62;"),
+                "reason not escaped"
+            );
+            assert!(!html.contains("<b onmouseover"), "reason rendered as HTML");
+        }
+        let live_strategy = "&#60;i&#62;strategy&#60;/i&#62;";
+        assert!(
+            live.contains(live_strategy),
+            "strategy not escaped in live data"
+        );
     }
 }

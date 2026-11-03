@@ -44,7 +44,7 @@ pub async fn heartbeat_handler(
     // Validate shared secret
     if request.shared_secret != state.config.auth.shared_secret {
         warn!(
-            instance_id = %request.instance_id,
+            instance_id = ?request.instance_id,
             "Heartbeat rejected: invalid shared secret"
         );
         return (
@@ -60,15 +60,10 @@ pub async fn heartbeat_handler(
     // Check if client was previously offline (for recovery notification)
     let was_offline = state
         .db
-        .get_all_clients()
+        .get_client_status(&request.instance_id)
         .ok()
-        .and_then(|clients| {
-            clients
-                .iter()
-                .find(|c| c.instance_id == request.instance_id)
-                .map(|c| c.status == "offline")
-        })
-        .unwrap_or(false);
+        .flatten()
+        .is_some_and(|status| status == "offline");
 
     // Upsert client record
     let payload_json = serde_json::to_string(&request).unwrap_or_default();
@@ -154,7 +149,7 @@ pub async fn heartbeat_handler(
             .clone()
             .unwrap_or_else(|| request.instance_id.clone());
         info!(
-            instance_id = %request.instance_id,
+            instance_id = ?request.instance_id,
             "Client recovered from offline status"
         );
 
@@ -175,8 +170,8 @@ pub async fn heartbeat_handler(
     }
 
     info!(
-        instance_id = %request.instance_id,
-        version = %request.fluxion_version,
+        instance_id = ?request.instance_id,
+        version = ?request.fluxion_version,
         has_telemetry = request.telemetry.is_some(),
         has_sync_data = request.sync_data.is_some(),
         "Heartbeat received"

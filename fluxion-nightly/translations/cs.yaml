@@ -8,6 +8,10 @@ configuration:
   log_level:
     name: Úroveň logování
     description: Množství informací, které bude add-on zaznamenávat.
+  trusted_peers:
+    name: Důvěryhodné adresy
+    description: >-
+      IP adresy oddělené čárkou, které mohou kromě proxy Home Assistant ingress volat FluxION. Nechte prázdné.
   inverters:
     name: Střídače
     description: Konfigurace vašich solárních střídačů.

@@ -682,12 +682,12 @@ async fn fetch_and_send_hdo(
 
             if low_tariff_periods.is_empty() {
                 tracing::warn!(
-                    "⚠️ HDO schedule fetched but NO low tariff periods found! Sensor state: '{}'. Check sensor attributes format.",
+                    "⚠️ HDO schedule fetched but NO low tariff periods found! Sensor state: {:?}. Check sensor attributes format.",
                     state.state
                 );
             } else {
                 tracing::info!(
-                    "✅ HDO schedule fetched: {} low tariff periods for today (sensor state: '{}')",
+                    "✅ HDO schedule fetched: {} low tariff periods for today (sensor state: {:?})",
                     low_tariff_periods.len(),
                     state.state
                 );
@@ -911,6 +911,70 @@ pub fn poll_hdo_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Thread-local log sink for the HDO test (`#[tokio::test]` runs on one thread)
+    #[derive(Clone, Default)]
+    struct LogSink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> LogSink {
+            self.clone()
+        }
+    }
+
+    /// Scan #25: an HDO state with a newline must not start a log line of its own; the state
+    /// text is logged with `{:?}`, which escapes it
+    #[tokio::test]
+    async fn hdo_state_text_is_logged_escaped() {
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut server = mockito::Server::new_async().await;
+        let states = serde_json::json!([{
+            "entity_id": "sensor.hdo_tariff",
+            "state": "x\nINFO forged record",
+            "attributes": {},
+            "last_changed": "2026-11-03T10:00:00+00:00",
+            "last_updated": "2026-11-03T10:00:00+00:00"
+        }]);
+        server
+            .mock("GET", "/api/states")
+            .with_body(states.to_string())
+            .create_async()
+            .await;
+        let client = HomeAssistantClient::new(server.url(), "test_token").unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut discovery = HdoDiscovery::default();
+
+        fetch_and_send_hdo(&client, "sensor.hdo_tariff", &sender, &mut discovery).await;
+
+        let logs = String::from_utf8_lossy(&sink.0.lock()).into_owned();
+        assert!(logs.contains("NO low tariff periods found"), "{logs}");
+        assert!(
+            logs.contains(r#"Sensor state: "x\nINFO forged record""#),
+            "{logs}"
+        );
+        assert!(
+            !logs.lines().any(|line| line.starts_with("INFO forged")),
+            "{logs}"
+        );
+    }
 
     /// Brief H36: the lock and manual-mode polls use the control prefix, else the entity prefix
     #[test]

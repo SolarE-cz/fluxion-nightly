@@ -8,6 +8,10 @@ configuration:
   log_level:
     name: Log Level
     description: The amount of logging the add-on should produce.
+  trusted_peers:
+    name: Trusted Peers
+    description: >-
+      Comma-separated IP addresses allowed to call FluxION besides the Home Assistant ingress proxy. Leave empty.
   inverters:
     name: Inverters
     description: Configure your solar inverters.

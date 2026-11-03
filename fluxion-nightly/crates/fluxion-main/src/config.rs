@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use bevy_ecs::prelude::*;
 use fluxion_i18n::Language;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Main application configuration - FluxION MVP
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -1945,6 +1945,20 @@ impl AppConfig {
         dropped
     }
 
+    /// The first inverter id that another inverter also has, compared trimmed as the control
+    /// map keys them (scan #15): the later entry would otherwise win the control prefix
+    fn duplicate_inverter_id(&self) -> Option<String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for inverter in &self.inverters {
+            let id = inverter.id.trim();
+            if seen.contains(&id) {
+                return Some(id.to_owned());
+            }
+            seen.push(id);
+        }
+        None
+    }
+
     pub fn validate_detailed(&self) -> ValidationResult {
         let mut result = ValidationResult::success();
 
@@ -1955,6 +1969,12 @@ impl AppConfig {
                 "Configuration must include at least one inverter",
             );
             return result; // Early return if no inverters
+        }
+        if let Some(id) = self.duplicate_inverter_id() {
+            result.add_error(
+                "inverters",
+                format!("Inverter id '{id}' is used by more than one inverter"),
+            );
         }
 
         for (idx, inverter) in self.inverters.iter().enumerate() {
@@ -2146,6 +2166,15 @@ impl AppConfig {
         // Validate at least one inverter
         if self.inverters.is_empty() {
             anyhow::bail!("Configuration must include at least one inverter");
+        }
+
+        // Startup keeps running (scan #15): the add-on overlay and the control map both use the
+        // last entry with this id, so they agree; the web UI refuses a duplicate on save
+        if let Some(id) = self.duplicate_inverter_id() {
+            error!(
+                "Inverter id {:?} is used by more than one inverter; the last entry with it is used",
+                id
+            );
         }
 
         // Validate inverter configs
@@ -3085,6 +3114,32 @@ mod tests {
                 .to_string()
                 .contains("at least one inverter")
         );
+    }
+
+    /// Scan #15: two inverters with one id (the control map trims ids, so " main" counts too).
+    /// The web validation refuses it (`validate_detailed`); startup `validate()` only logs it,
+    /// so the add-on still starts (see the persistence tests for which entry wins)
+    #[test]
+    fn test_validate_duplicate_inverter_ids() {
+        let mut config = AppConfig::default();
+        let mut second = config.inverters[0].clone();
+        second.id = " main_inverter".to_owned();
+        second.entity_prefix = "solax_2".to_owned();
+        config.inverters.push(second);
+
+        assert!(config.validate().is_ok());
+        let detailed = config.validate_detailed();
+        assert!(!detailed.valid);
+        assert!(
+            detailed
+                .errors
+                .iter()
+                .any(|e| e.message
+                    == "Inverter id 'main_inverter' is used by more than one inverter"),
+        );
+
+        config.inverters[1].id = "second_inverter".to_owned();
+        assert!(config.validate_detailed().valid);
     }
 
     #[test]

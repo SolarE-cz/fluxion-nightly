@@ -102,7 +102,7 @@ impl EmailNotifier {
                 .context("Failed to build email message")?;
 
             match self.transport.send(message).await {
-                Ok(_) => info!(recipient = %recipient, subject = %subject, "Email sent"),
+                Ok(_) => info!(recipient = %recipient, subject = ?subject, "Email sent"),
                 Err(e) => error!(recipient = %recipient, error = %e, "Failed to send email"),
             }
         }

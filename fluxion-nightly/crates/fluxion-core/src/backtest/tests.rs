@@ -617,6 +617,23 @@ fn replay_horizon_block_pv_and_reserve_pv() {
     }
 }
 
+/// A block repeated far beyond the 15-minute cadence puts too many records in one planning
+/// horizon: the replay rejects the dataset instead of planning it.
+#[test]
+fn replay_rejects_a_dense_planning_horizon() {
+    let (tz, mut battery, mut rows) = fixture_rows();
+    battery.min_charge_kwh = crate::strategy::winter_reserve::min_charge_kwh(
+        battery.max_charge_kw,
+        ControlConfig::default().min_mode_change_interval_secs,
+    );
+    let mid = rows.len() / 2;
+    let copy = rows[mid];
+    rows.splice(mid..mid, std::iter::repeat_n(copy, 800));
+    let options = ReplayOptions::new(tz, battery, WinterReserveParams::default());
+    let err = replay(&rows, &options).unwrap_err();
+    assert!(err.contains("too dense"), "{err}");
+}
+
 #[test]
 fn replay_until_simulates_one_day_with_the_next_in_the_horizon() {
     let (tz, battery, rows) = fixture_rows();

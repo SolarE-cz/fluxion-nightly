@@ -1421,7 +1421,10 @@ impl ConfigurablePriceDataSource {
     /// entity read is reported to the fallback as an entity without prices; the read still fails
     /// unless the fallback filled blocks (second day of an outage).
     async fn read_spot_prices(&self, with_buy: bool) -> Result<SpotPriceData> {
-        let read = self.spot_adapter.read_prices().await;
+        let read = self.spot_adapter.read_prices().await.map(|mut data| {
+            crate::price_fallback::drop_invalid_blocks(&mut data);
+            data
+        });
         let buy_entity = self.buy_price_entity.as_deref().filter(|_| with_buy);
         let Some(fallback) = &self.fallback else {
             let data = read?;
@@ -3323,6 +3326,43 @@ mod buy_price_tests {
             ))
             .create_async()
             .await
+    }
+
+    /// Scan #10: a forecast block whose end is before its start never reaches the schedule, with
+    /// or without a price fallback; the other blocks come through unchanged
+    #[tokio::test]
+    async fn reversed_forecast_block_is_dropped_on_the_read_path() {
+        let mut server = Server::new_async().await;
+        let _spot = server
+            .mock("GET", format!("/api/states/{SPOT}").as_str())
+            .with_status(200)
+            .with_body(entity_body(
+                SPOT,
+                "3.0",
+                json!({"forecast": [
+                    {"start": "2026-10-15T00:00:00+02:00", "end": "2026-10-14T23:00:00+02:00", "price": 9.0},
+                    {"start": "2026-10-15T00:15:00+02:00", "end": "2026-10-15T00:30:00+02:00", "price": 2.0},
+                    {"start": "2026-10-15T00:30:00+02:00", "end": "2026-10-15T00:45:00+02:00", "price": 3.0},
+                ]}),
+            ))
+            .create_async()
+            .await;
+        let data = source(server.url(), None).read_prices().await.unwrap();
+        assert!(
+            data.time_block_prices
+                .iter()
+                .all(|b| b.duration_minutes <= 48 * 60)
+        );
+        assert!(data.time_block_prices.iter().all(|b| {
+            b.block_start
+                != "2026-10-15T00:00:00+02:00"
+                    .parse::<DateTime<Utc>>()
+                    .unwrap()
+        }));
+        assert_eq!(
+            block_at(&data, "2026-10-14T22:15:00Z").price_czk_per_kwh,
+            2.0
+        );
     }
 
     #[tokio::test]

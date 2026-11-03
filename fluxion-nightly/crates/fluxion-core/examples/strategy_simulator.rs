@@ -122,10 +122,9 @@ fn aggregate_to_blocks(rows: &[InverterDataRow]) -> Vec<AggregatedBlock> {
             }
             block_rows.clear();
 
-            // Advance block start
-            while row.timestamp >= current_block_start + chrono::Duration::minutes(15) {
-                current_block_start += chrono::Duration::minutes(15);
-            }
+            // Jump to the block of this record: empty blocks in between yield nothing
+            let steps = (row.timestamp - current_block_start).num_minutes() / 15;
+            current_block_start += chrono::Duration::minutes(steps * 15);
         }
         block_rows.push(row);
     }
@@ -477,4 +476,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration as StdDuration;
+
+    fn row(timestamp: DateTime<Utc>) -> InverterDataRow {
+        InverterDataRow {
+            timestamp,
+            total_pv_yield_kwh: 0.0,
+            total_battery_discharge_kwh: 0.0,
+            total_battery_charge_kwh: 0.0,
+            total_exported_kwh: 0.0,
+            total_imported_kwh: 0.0,
+            battery_soc: 50.0,
+        }
+    }
+
+    #[test]
+    fn aggregation_jumps_to_the_next_record_block() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        // 200,000 years later: stepping through the empty quarter-hours takes minutes
+        let far = Utc.with_ymd_and_hms(202_026, 1, 1, 0, 0, 0).unwrap();
+        let rows = vec![
+            row(start),
+            row(start + chrono::Duration::minutes(1)),
+            row(far),
+            row(far + chrono::Duration::minutes(1)),
+        ];
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let starts: Vec<DateTime<Utc>> = aggregate_to_blocks(&rows)
+                .iter()
+                .map(|b| b.start_time)
+                .collect();
+            let _ = tx.send(starts);
+        });
+        let starts = rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("aggregation stepped through the empty blocks");
+        assert_eq!(starts, vec![start, far]);
+    }
 }

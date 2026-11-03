@@ -468,7 +468,7 @@ function updateTimeline() {
         if (last && last.mode === mode) last.count++; else segments.push({ mode, count: 1 });
     });
     const cls = { S: 'selfuse', C: 'charge', H: 'hold', E: 'discharge', '-': 'missing' };
-    el.innerHTML = segments.map(seg => {
+    el.innerHTML = segments.map(seg => { // trusted-html: fixed mode letters and computed widths only
         const width = (seg.count / modes.length) * 100;
         return `<div class="timeline-segment ${cls[seg.mode] || 'selfuse'}" style="width: ${width}%">${width > 4 && seg.mode !== '-' ? seg.mode : ''}</div>`;
     }).join('');

@@ -1022,6 +1022,34 @@ impl Horizon<'_> {
     }
 }
 
+/// Most steps of the stored-energy grid. Steps = (max - min) / resolution, whatever the capacity;
+/// 1000 is the finest resolution the web settings allow (0.1 %) over the full 0..100 % span.
+const MAX_SOC_GRID_STEPS: usize = 1000;
+
+/// Energy grid from Emin to Emax; the last point is exactly Emax. A resolution finer than
+/// `MAX_SOC_GRID_STEPS` is coarsened to the cap, so an input cannot size the grid.
+fn soc_grid(emin: f32, emax: f32, capacity: f32, resolution_pct: f32) -> Vec<f32> {
+    let span = (emax - emin).max(0.0);
+    let mut grid_step = resolution_pct / 100.0 * capacity;
+    if grid_step > 0.0 && span / grid_step > MAX_SOC_GRID_STEPS as f32 {
+        grid_step = span / MAX_SOC_GRID_STEPS as f32;
+    }
+    let steps = if span > 0.0 && grid_step > 0.0 {
+        (span / grid_step).ceil() as usize
+    } else {
+        0
+    };
+    (0..=steps)
+        .map(|i| {
+            if i == steps {
+                emin + span
+            } else {
+                emin + (i as f32 * grid_step).min(span)
+            }
+        })
+        .collect()
+}
+
 fn plan_with_rule(
     blocks: &[PlanBlock],
     soc_pct: f32,
@@ -1048,7 +1076,12 @@ fn plan_with_rule(
     {
         return self_use_plan(blocks, soc_pct, capacity, "invalid price data");
     }
-    if battery.min_soc_pct >= battery.max_soc_pct || capacity.is_nan() || capacity <= 0.0 {
+    if battery.min_soc_pct >= battery.max_soc_pct
+        || !(0.0..=100.0).contains(&battery.min_soc_pct)
+        || !(0.0..=100.0).contains(&battery.max_soc_pct)
+        || capacity.is_nan()
+        || capacity <= 0.0
+    {
         return self_use_plan(blocks, soc_pct, capacity, "invalid battery config");
     }
 
@@ -1068,23 +1101,7 @@ fn plan_with_rule(
 
     let caps = charge_caps(blocks, battery, tz);
 
-    // Energy grid from Emin to Emax; the last point is exactly Emax.
-    let span = (emax - emin).max(0.0);
-    let grid_step = params.soc_resolution_pct / 100.0 * capacity;
-    let steps = if span > 0.0 && grid_step > 0.0 {
-        (span / grid_step).ceil() as usize
-    } else {
-        0
-    };
-    let grid: Vec<f32> = (0..=steps)
-        .map(|i| {
-            if i == steps {
-                emin + span
-            } else {
-                emin + (i as f32 * grid_step).min(span)
-            }
-        })
-        .collect();
+    let grid = soc_grid(emin, emax, capacity, params.soc_resolution_pct);
 
     // values[k][i] = V_k at grid[i]; values[n] is the terminal value.
     let mut all_modes: Vec<Vec<PlanMode>> = blocks
@@ -6146,5 +6163,90 @@ mod cautious_pv_tests {
             soc_six < 30.0 && charged < 20.0,
             "MAE 10 %: SOC at 06:00 {soc_six:.1} %, night charge {charged:.1} kWh"
         );
+    }
+}
+
+#[cfg(test)]
+mod soc_bounds_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn battery(min_soc_pct: f32, max_soc_pct: f32) -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 10.0,
+            min_soc_pct,
+            max_soc_pct,
+            max_charge_kw: 5.0,
+            max_discharge_kw: 5.0,
+            efficiency: 0.9,
+            wear_cost_czk_per_kwh: 0.1,
+            max_export_kw: 5.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: false,
+            hold_pv_to_battery: false,
+            min_charge_kwh: 0.0,
+            charge_cost_czk_per_kwh: None,
+        }
+    }
+
+    fn blocks() -> Vec<PlanBlock> {
+        let start = Utc.with_ymd_and_hms(2026, 10, 20, 10, 0, 0).unwrap();
+        (0..4)
+            .map(|i| PlanBlock {
+                start: start + Duration::minutes(15 * i),
+                duration_minutes: 15,
+                buy_czk: 2.0,
+                sell_czk: 0.5,
+                load_kwh: 0.5,
+                pv_kwh: 0.0,
+                reserve_load_kwh: 0.5,
+                reserve_pv_kwh: 0.0,
+                force_charge: false,
+                no_discharge: false,
+                force_charge_at_or_below_czk: None,
+                export_min_soc_pct: None,
+                export_allowed: true,
+            })
+            .collect()
+    }
+
+    /// SOC limits outside 0..=100 (or NaN) are an invalid battery config, not a grid to size.
+    #[test]
+    fn soc_limits_outside_0_to_100_are_rejected() {
+        for (min, max) in [
+            (-5.0, 100.0),
+            (10.0, 150.0),
+            (f32::NAN, 100.0),
+            (10.0, f32::NAN),
+        ] {
+            let p = plan(
+                &blocks(),
+                50.0,
+                chrono_tz::Europe::Prague,
+                &battery(min, max),
+                &WinterReserveParams::default(),
+            );
+            assert!(
+                p.blocks[0].reason.ends_with("invalid battery config"),
+                "{min}..{max}: {}",
+                p.blocks[0].reason
+            );
+        }
+    }
+
+    /// The grid holds (max - min) / resolution steps; a finer resolution is coarsened to the cap
+    /// and the grid still runs from Emin to Emax.
+    #[test]
+    fn soc_grid_is_capped_and_reaches_emax() {
+        let normal = soc_grid(0.0, 8.0, 8.0, 12.5);
+        assert_eq!(normal.len(), 9);
+        let fine = soc_grid(0.0, 8.0, 8.0, 1e-5);
+        assert!(
+            fine.len() <= MAX_SOC_GRID_STEPS + 2,
+            "{} points",
+            fine.len()
+        );
+        assert_eq!(fine[0], 0.0);
+        assert_eq!(*fine.last().unwrap(), 8.0);
     }
 }

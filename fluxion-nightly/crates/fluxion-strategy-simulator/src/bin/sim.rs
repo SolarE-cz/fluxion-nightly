@@ -331,7 +331,11 @@ fn build_run_args_from_scenario(
 
     // Build CSV path
     let csv_path = if output_config.format == "csv" || output_config.format == "both" {
-        Some(format!("{}/{}.csv", output_dir, scenario.name))
+        Some(format!(
+            "{}/{}.csv",
+            output_dir,
+            report_file_stem(&scenario.name)
+        ))
     } else {
         None
     };
@@ -358,6 +362,22 @@ fn build_run_args_from_scenario(
         solar: "none".to_string(), // Batch mode uses scenario-defined solar (TODO: add to batch config)
         strategy_config: None,     // Batch mode doesn't support strategy config overrides yet
     })
+}
+
+/// Report file name from a scenario name: `[A-Za-z0-9._-]` only, no leading dot, so it stays one
+/// path component inside the output directory.
+fn report_file_stem(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    stem.trim_start_matches('.').to_string()
 }
 
 /// Validate RunArgs for correctness
@@ -556,5 +576,49 @@ fn toml_to_json(value: toml::Value) -> serde_json::Value {
             serde_json::Value::Object(map)
         }
         toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxion_strategy_simulator::cli::config::{
+        OutputConfig, ScenarioConfig, ScenarioSource, SimulationParams,
+    };
+
+    #[test]
+    fn report_file_stem_keeps_one_safe_component() {
+        assert_eq!(report_file_stem("usual_day-1.v2"), "usual_day-1.v2");
+        assert_eq!(report_file_stem("../../etc/x"), "_.._etc_x");
+        assert_eq!(report_file_stem("..hidden"), "hidden");
+        assert_eq!(report_file_stem("a b/c\\d"), "a_b_c_d");
+        assert_eq!(report_file_stem("..."), "");
+    }
+
+    #[test]
+    fn batch_report_path_stays_in_output_dir() {
+        let scenario = ScenarioConfig {
+            name: "../../outside/report".to_string(),
+            source: ScenarioSource::Json {
+                json_path: "x.json".to_string(),
+            },
+        };
+        let sim = SimulationParams {
+            battery_capacity_kwh: 10.0,
+            initial_soc: 50.0,
+            strategies: vec!["naive".to_string()],
+        };
+        let output = OutputConfig {
+            format: "csv".to_string(),
+            csv_dir: "out".to_string(),
+            include_decision_log: false,
+        };
+        let args = build_run_args_from_scenario(&scenario, &sim, "out", &output).unwrap();
+        let csv = args.csv_path.unwrap();
+        assert_eq!(csv, "out/_.._outside_report.csv");
+        assert_eq!(
+            std::path::Path::new(&csv).parent(),
+            Some(std::path::Path::new("out"))
+        );
     }
 }

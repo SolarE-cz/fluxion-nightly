@@ -320,6 +320,10 @@ fn add_outcome(acc: &mut RunTotals, out: &BlockOutcome, block: &RecordedBlock, w
     acc.export_kwh += out.grid_export_kwh;
 }
 
+/// Most records one planning horizon may hold: two local days of 96 blocks at 4 records per block.
+/// A denser dataset is rejected rather than planned.
+const MAX_HORIZON_RECORDS: usize = 2 * 96 * 4;
+
 /// Replay `rows` (usable blocks in time order; missing blocks are left out and flagged with
 /// `gap_after` on the row before them). Both runs start from the recorded SOC of the first
 /// simulated block, clamped to the battery bounds.
@@ -507,6 +511,12 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                 };
                 let forecast_pv = later_input.block.pv_kwh * opts.pv_forecast_bias * noise;
                 let (pv_kwh, reserve_pv_kwh) = plan_pv(forecast_pv, later.start, opts);
+                if horizon.len() >= MAX_HORIZON_RECORDS {
+                    return Err(format!(
+                        "dataset too dense: more than {MAX_HORIZON_RECORDS} records in one planning horizon, near {}",
+                        later.start
+                    ));
+                }
                 horizon.push(PlanBlock {
                     start: later.start,
                     duration_minutes: 15,

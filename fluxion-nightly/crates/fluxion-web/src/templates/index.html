@@ -1467,7 +1467,7 @@
     <div class="card" id="chart-container">
         <h2>💰 Price Chart (48h)</h2>
         <div class="price-chart-container">
-            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h) <span class="tz-label" style="font-size: 0.7em; color: var(--text-secondary);">{{ display_tz_label }}</span></h3>
+            <h3 style="margin-top: 20px; margin-bottom: 10px;">Price Chart (48h) <span class="tz-label" style="font-size: 0.7em; color: var(--text-secondary);">{{ display_tz_label|e("html") }}</span></h3>
             <div class="price-legend">
                 <span><div class="legend-box charge"></div> Force Charge</span>
                 <span><div class="legend-box discharge"></div> Force Discharge</span>
@@ -1836,7 +1836,7 @@
     </script>
     <script>
         (function() {
-            const chartData = {{ chart_data_json|safe }};
+            const chartData = {{ chart_data_json|safe }}; {# trusted: json_for_script escapes < > & #}
             window.priceChartData = chartData;
             const initialChartData = chartData;
             {% if let Some(inv) = inverters.first() %}
@@ -2702,11 +2702,11 @@
         {% if !health.errors.is_empty() %}
         <div class="error-list">
             {% for error in health.errors %}
-            <div class="error-item">⚠️ {{ error }}</div>
+            <div class="error-item">⚠️ {{ error|e("html") }}</div>
             {% endfor %}
         </div>
         {% endif %}
-        <div class="timestamp">Last update: {{ last_update_formatted }} {{ display_tz_label }}</div>
+        <div class="timestamp">Last update: {{ last_update_formatted }} {{ display_tz_label|e("html") }}</div>
     </div>
 
     <!-- Inverters Grid -->
@@ -2716,21 +2716,21 @@
         {% for inverter in inverters %}
         <!-- Inverter Card -->
         <div class="card">
-            <h2>🔌 {{ inverter.id }}</h2>
+            <h2>🔌 {{ inverter.id|e("html") }}</h2>
             <div class="stat">
                 <span class="stat-label">{{ self.t("inverter-mode") }}</span>
                 {% if let Some(actual) = inverter.actual_mode %}
-                <span class="mode-badge mode-{{ actual.to_lowercase().replace(" ", "-") }}">
-                    {{ actual }}
+                <span class="mode-badge mode-{{ actual.to_lowercase().replace(" ", "-")|e("html") }}">
+                    {{ actual|e("html") }}
                 </span>
                 {% if !inverter.mode_synced %}
-                <span class="mode-sync-warning" title="Planned: {{ inverter.mode }}">
-                    (pending: {{ inverter.mode }})
+                <span class="mode-sync-warning" title="Planned: {{ inverter.mode|e("html") }}">
+                    (pending: {{ inverter.mode|e("html") }})
                 </span>
                 {% endif %}
                 {% else %}
-                <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-") }}">
-                    {{ inverter.mode }}
+                <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-")|e("html") }}">
+                    {{ inverter.mode|e("html") }}
                 </span>
                 <span class="mode-sync-warning">(no data)</span>
                 {% endif %}
@@ -2745,7 +2745,7 @@
             </div>
             <div class="stat">
                 <span class="stat-label">{{ self.t("inverter-topology") }}</span>
-                <span class="stat-value">{{ inverter.topology }}</span>
+                <span class="stat-value">{{ inverter.topology|e("html") }}</span>
             </div>
             {% if let Some(load) = inverter.house_load_w %}
             <div class="stat">
@@ -2873,13 +2873,13 @@
         <h2>📅 {{ self.t("section-schedule") }}</h2>
         <div class="stat">
             <span class="stat-label">{{ self.t("inverter-mode") }}</span>
-            <span class="mode-badge mode-{{ schedule.current_mode.to_lowercase().replace(" ", "-") }}">
-                {{ schedule.current_mode }}
+            <span class="mode-badge mode-{{ schedule.current_mode.to_lowercase().replace(" ", "-")|e("html") }}">
+                {{ schedule.current_mode|e("html") }}
             </span>
         </div>
         <div class="stat">
             <span class="stat-label">{{ self.t("schedule-reason") }}</span>
-            <span>{{ schedule.current_reason }}</span>
+            <span>{{ schedule.current_reason|e("html") }}</span>
         </div>
         <div class="stat">
             <span class="stat-label">{{ self.t("schedule-current-block") }}</span>
@@ -3230,7 +3230,7 @@
                         <div class="config-form-group">
                             <label class="config-form-label" for="display_timezone">Timezone</label>
                             <select id="display_timezone" class="config-form-input">
-                                <option value="">{% if let Some(ha) = ha_timezone %}Home Assistant ({{ ha }}){% else %}Not set{% endif %}</option>
+                                <option value="">{% if let Some(ha) = ha_timezone %}Home Assistant ({{ ha|e("html") }}){% else %}Not set{% endif %}</option>
                             </select>
                             <span class="config-form-help">Times are stored in UTC and shown in this timezone</span>
                         </div>
@@ -3738,16 +3738,30 @@ async function openSlotDialog(prefillData = null) {
             const toTime = new Date(slot.to).toLocaleString();
             const slotDiv = document.createElement('div');
             slotDiv.className = 'slot-item';
-            slotDiv.innerHTML = `
-                <div class="slot-item-info">
-                    <div class="slot-item-time">${fromTime} - ${toTime}</div>
-                    <div class="slot-item-mode">${slot.mode}${slot.note ? ' - ' + slot.note : ''}</div>
-                </div>
-                <div class="slot-item-actions">
-                    <button class="slot-item-btn slot-edit-btn" onclick="editSlot('${slot.id}')">Edit</button>
-                    <button class="slot-item-btn slot-remove-btn" onclick="deleteSlot('${slot.id}')">Delete</button>
-                </div>
-            `;
+
+            const info = document.createElement('div');
+            info.className = 'slot-item-info';
+            const timeLine = document.createElement('div');
+            timeLine.className = 'slot-item-time';
+            timeLine.textContent = `${fromTime} - ${toTime}`;
+            const modeLine = document.createElement('div');
+            modeLine.className = 'slot-item-mode';
+            modeLine.textContent = `${slot.mode}${slot.note ? ' - ' + slot.note : ''}`;
+            info.append(timeLine, modeLine);
+
+            const actions = document.createElement('div');
+            actions.className = 'slot-item-actions';
+            const editBtn = document.createElement('button');
+            editBtn.className = 'slot-item-btn slot-edit-btn';
+            editBtn.textContent = 'Edit';
+            editBtn.addEventListener('click', () => editSlot(slot.id));
+            const deleteBtn = document.createElement('button');
+            deleteBtn.className = 'slot-item-btn slot-remove-btn';
+            deleteBtn.textContent = 'Delete';
+            deleteBtn.addEventListener('click', () => deleteSlot(slot.id));
+            actions.append(editBtn, deleteBtn);
+
+            slotDiv.append(info, actions);
             slotsList.appendChild(slotDiv);
         });
     } else {
@@ -3998,16 +4012,6 @@ document.addEventListener('DOMContentLoaded', function() {
                                     Full Access
                                 </div>
                                 <div class="access-mode-description">Monitor and control your solar plant</div>
-                            </div>
-                        </label>
-                        <label class="access-mode-option">
-                            <input type="radio" name="access-mode" value="read_only">
-                            <div class="access-mode-card">
-                                <div class="access-mode-title">
-                                    <span class="mdi mdi-eye access-mode-icon readonly"></span>
-                                    Read Only
-                                </div>
-                                <div class="access-mode-description">View status without control</div>
                             </div>
                         </label>
                     </div>
@@ -4304,7 +4308,7 @@ async function handleStep1Submit() {
         pairingState.deviceId = result.device_id;
 
         // Display QR code
-        document.getElementById('pairing-qr-wrapper').innerHTML = result.qr_svg;
+        document.getElementById('pairing-qr-wrapper').innerHTML = result.qr_svg; // trusted-html: server-generated QR SVG, no user text
 
         // Update aria-label with device name
         document.getElementById('pairing-qr-wrapper').setAttribute(

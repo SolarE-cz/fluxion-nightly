@@ -12,6 +12,7 @@
 
 mod backtest;
 mod config_api;
+mod peer_guard;
 mod plugin_api;
 pub mod remote_access;
 mod routes;
@@ -46,6 +47,7 @@ use fluxion_types::UserControlState;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -476,13 +478,36 @@ pub async fn start_web_server(
         app = app.merge(mobile_api_routes(mobile_state));
     }
 
-    let addr = format!("0.0.0.0:{port}");
+    // Only the ingress proxy, loopback and trusted peers may reach the add-on (findings 4, 7, 19,
+    // 34, 36, 48). Standalone installs are not filtered, so they bind to loopback by default.
+    let access_mode = peer_guard::AccessMode::from_env();
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        peer_guard::PeerGuard::new(access_mode.clone()),
+        peer_guard::enforce,
+    ));
+    let bind_ip = peer_guard::bind_ip(
+        &access_mode,
+        std::env::var("FLUXION_BIND_ADDR").ok().as_deref(),
+    )?;
+    let addr = SocketAddr::new(bind_ip, port);
     info!("🌐 Starting web server on {addr}");
-    info!("📱 Standalone: http://localhost:{}/", port);
+    match access_mode {
+        peer_guard::AccessMode::AddOn { .. } => info!(
+            "🔒 Add-on mode: only the HA ingress proxy, loopback and FLUXION_TRUSTED_PEERS may connect"
+        ),
+        peer_guard::AccessMode::Standalone => info!(
+            "📱 Standalone: http://localhost:{}/ (set FLUXION_BIND_ADDR to listen on other interfaces)",
+            port
+        ),
+    }
     info!("🏠 HA Ingress: http://homeassistant:8123/api/hassio_ingress/fluxion/");
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

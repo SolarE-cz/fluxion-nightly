@@ -45,6 +45,33 @@ impl PluginApiState {
     }
 }
 
+/// Names of the built-in strategies registered by `init_plugin_manager`.
+///
+/// External plugins must not register under these names (case-insensitive): the core
+/// grants policy exemptions by strategy name, and a re-registration would replace the built-in.
+/// `test_every_registered_builtin_name_is_reserved` keeps this list in sync.
+const BUILTIN_STRATEGY_NAMES: &[&str] = &[
+    "Winter-Adaptive",
+    "Winter-Adaptive-V2",
+    "Winter-Adaptive-V3",
+    "Winter-Adaptive-V4",
+    "Winter-Adaptive-V5",
+    "Winter-Adaptive-V7",
+    "Winter-Adaptive-V8",
+    "Winter-Adaptive-V9",
+    "Winter-Adaptive-V10",
+    "Winter-Adaptive-V20",
+    "Winter-Reserve",
+    "FP-Arbitrage",
+];
+
+/// Whether a plugin name collides with a built-in strategy
+fn is_reserved_plugin_name(name: &str) -> bool {
+    BUILTIN_STRATEGY_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
 /// Plugin info response
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginInfo {
@@ -119,6 +146,20 @@ pub async fn register_plugin_handler(
             Json(PluginRegistrationResponse {
                 success: false,
                 error: Some("Plugin name cannot be empty".to_owned()),
+                plugin_id: None,
+            }),
+        );
+    }
+
+    if is_reserved_plugin_name(&request.manifest.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(PluginRegistrationResponse {
+                success: false,
+                error: Some(format!(
+                    "Plugin name '{}' is reserved for a built-in strategy",
+                    request.manifest.name
+                )),
                 plugin_id: None,
             }),
         );
@@ -284,5 +325,63 @@ pub async fn update_enabled_handler(
                 "error": format!("Plugin '{}' not found", name)
             })),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_builtin_strategy_names_are_reserved() {
+        assert!(is_reserved_plugin_name("Winter-Reserve"));
+        assert!(is_reserved_plugin_name("winter-reserve"));
+        assert!(is_reserved_plugin_name("FP-ARBITRAGE"));
+        assert!(!is_reserved_plugin_name("simple-price-strategy"));
+    }
+
+    #[test]
+    fn test_register_rejects_builtin_strategy_name() {
+        let state = PluginApiState::new(Arc::new(RwLock::new(PluginManager::new())));
+        let request = PluginRegistrationRequest {
+            manifest: fluxion_plugins::protocol::PluginManifest {
+                name: "winter-reserve".to_owned(),
+                version: "1.0.0".to_owned(),
+                description: String::new(),
+                default_priority: 100,
+                enabled: true,
+            },
+            callback_url: "http://127.0.0.1:9/evaluate".to_owned(),
+        };
+
+        // The handler has no await points, so one poll completes it. No runtime is entered,
+        // which keeps the plugin's blocking HTTP client out of async context.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut future =
+            std::pin::pin!(register_plugin_handler(State(state.clone()), Json(request)));
+        let std::task::Poll::Ready(response) = future.as_mut().poll(&mut cx) else {
+            panic!("register handler should complete in one poll");
+        };
+        let response = response.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.plugin_manager.read().list_plugins().is_empty());
+    }
+
+    #[test]
+    fn test_every_registered_builtin_name_is_reserved() {
+        let manager = fluxion_core::plugin_adapters::create_plugin_manager(
+            None,
+            &fluxion_types::config::ControlConfig::default(),
+        );
+
+        let plugins = manager.list_plugins();
+        assert!(!plugins.is_empty());
+        for (name, _, _) in plugins {
+            assert!(
+                is_reserved_plugin_name(name),
+                "built-in {name} is not reserved"
+            );
+        }
     }
 }

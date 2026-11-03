@@ -239,6 +239,77 @@ fn dam_query_asks_for_15_minute_periods() {
 // Validation and filling
 // ---------------------------------------------------------------------------------------------
 
+/// Scan #10: a block whose end is before its start arrives as a huge unsigned duration (-15 min
+/// as u32). It is skipped with a WARN instead of being expanded into quarter-hour slots, and
+/// tomorrow's first slot is still filled from OTE
+#[test]
+fn reversed_block_is_skipped_not_expanded() {
+    let fb = fallback_with(config());
+    inject(&fb, market_2026_10_13());
+    let mut data = spot_data(&entity_2026_10_13());
+    data.time_block_prices.push(TimeBlockPrice {
+        block_start: prague("2026-10-14 00:00"),
+        duration_minutes: u32::MAX - 14,
+        price_czk_per_kwh: 1.0,
+        effective_price_czk_per_kwh: 1.0,
+        spot_sell_price_czk_per_kwh: None,
+        buy_price_czk_per_kwh: None,
+    });
+
+    fb.apply(&mut data, None, prague("2026-10-13 18:00"));
+
+    assert_eq!(data.fallback_block_starts, day_slots(day("2026-10-14")));
+    // The invalid block is dropped from the list, not just left unexpanded
+    assert!(
+        data.time_block_prices
+            .iter()
+            .all(|b| b.duration_minutes <= 48 * 60)
+    );
+    let status = fb.status();
+    assert_eq!(status.fallback, FallbackState::Active);
+    assert_eq!(status.fallback_slots, 96);
+}
+
+/// Scan #10: blocks over 48 h (a reversed interval wraps to one) are dropped; zero-length blocks
+/// stay, as the parser's "length not known yet" marker
+#[test]
+fn drop_invalid_blocks_keeps_the_rest_in_order() {
+    let block = |start: &str, minutes: u32| TimeBlockPrice {
+        block_start: prague(start),
+        duration_minutes: minutes,
+        price_czk_per_kwh: 1.0,
+        effective_price_czk_per_kwh: 1.0,
+        spot_sell_price_czk_per_kwh: None,
+        buy_price_czk_per_kwh: None,
+    };
+    let mut data = SpotPriceData {
+        time_block_prices: vec![
+            block("2026-10-13 00:00", 15),
+            block("2026-10-13 00:15", u32::MAX - 14),
+            block("2026-10-13 00:30", 0),
+            block("2026-10-13 00:45", 48 * 60 + 1),
+            block("2026-10-13 01:00", 60),
+        ],
+        ..SpotPriceData::default()
+    };
+
+    drop_invalid_blocks(&mut data);
+
+    let starts: Vec<_> = data
+        .time_block_prices
+        .iter()
+        .map(|b| b.block_start)
+        .collect();
+    assert_eq!(
+        starts,
+        vec![
+            prague("2026-10-13 00:00"),
+            prague("2026-10-13 00:30"),
+            prague("2026-10-13 01:00"),
+        ]
+    );
+}
+
 #[test]
 fn only_missing_slots_are_filled_and_entity_values_kept() {
     let fb = fallback_with(config());

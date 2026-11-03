@@ -20,7 +20,7 @@
     {% if !health.errors.is_empty() %}
     <div class="error-list">
         {% for error in health.errors %}
-        <div class="error-item">⚠️ {{ error }}</div>
+        <div class="error-item">⚠️ {{ error|e("html") }}</div>
         {% endfor %}
     </div>
     {% endif %}
@@ -34,11 +34,11 @@
     {% for inverter in inverters %}
     <!-- Inverter Card -->
     <div class="card">
-        <h2>🔌 {{ inverter.id }}</h2>
+        <h2>🔌 {{ inverter.id|e("html") }}</h2>
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-cog"></i>{{ self.t("inverter-mode") }}</span>
-            <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-") }}">
-                {{ inverter.mode }}
+            <span class="mode-badge mode-{{ inverter.mode.to_lowercase().replace(" ", "-")|e("html") }}">
+                {{ inverter.mode|e("html") }}
             </span>
         </div>
         <div class="stat">
@@ -51,7 +51,7 @@
         </div>
         <div class="stat">
             <span class="stat-label"><i class="mdi mdi-sitemap"></i>{{ self.t("inverter-topology") }}</span>
-            <span class="stat-value">{{ inverter.topology }}</span>
+            <span class="stat-value">{{ inverter.topology|e("html") }}</span>
         </div>
         {% if let Some(load) = inverter.house_load_w %}
         <div class="stat">
@@ -179,19 +179,19 @@
     <h2>📅 {{ self.t("section-schedule") }}</h2>
     <div class="stat">
         <span class="stat-label"><i class="mdi mdi-cog"></i>{{ self.t("inverter-mode") }}</span>
-        <span class="mode-badge mode-{{ schedule.current_mode.to_lowercase().replace(" ", "-") }}">
-            {{ schedule.current_mode }}
+        <span class="mode-badge mode-{{ schedule.current_mode.to_lowercase().replace(" ", "-")|e("html") }}">
+            {{ schedule.current_mode|e("html") }}
         </span>
     </div>
     {% if let Some(strategy) = schedule.current_strategy %}
     <div class="stat">
         <span class="stat-label"><i class="mdi mdi-strategy"></i>Strategy</span>
-        <span class="strategy-badge">{{ strategy }}</span>
+        <span class="strategy-badge">{{ strategy|e("html") }}</span>
     </div>
     {% endif %}
     <div class="stat">
         <span class="stat-label"><i class="mdi mdi-information"></i>{{ self.t("schedule-reason") }}</span>
-        <span>{{ schedule.current_reason }}</span>
+        <span>{{ schedule.current_reason|e("html") }}</span>
     </div>
     {% if let Some(total_profit) = schedule.total_expected_profit %}
     <div class="stat">

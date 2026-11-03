@@ -62,6 +62,24 @@ pub const BUY_FIT_MAX_RESIDUAL: f64 = 0.01;
 pub const DEFAULT_VALIDATION_PATH: &str = "/data/price_fallback_validation.json";
 
 const SLOT: Duration = Duration::minutes(15);
+/// Longest block the price entity may report (scan #10). A reversed interval (end before start)
+/// arrives as a huge unsigned duration, so such blocks are dropped before anything uses them.
+const MAX_BLOCK_MINUTES: u32 = 48 * 60;
+
+/// Drop the blocks that cannot be real (scan #10): a reversed interval wraps to a huge unsigned
+/// duration. Each one is logged with a WARN; the rest of the list is unchanged.
+pub fn drop_invalid_blocks(data: &mut SpotPriceData) {
+    data.time_block_prices.retain(|block| {
+        if block.duration_minutes <= MAX_BLOCK_MINUTES {
+            return true;
+        }
+        warn!(
+            "⚠️ Price entity block at {} has an invalid length ({} minutes, end before start or over 48 h); ignored",
+            block.block_start, block.duration_minutes
+        );
+        false
+    });
+}
 
 /// Settings of the health check and the fallback
 #[derive(Debug, Clone)]
@@ -358,6 +376,7 @@ impl PriceFallback {
         buy: Option<&HashMap<DateTime<Utc>, f32>>,
         now: DateTime<Utc>,
     ) {
+        drop_invalid_blocks(data);
         let prague_now = now.with_timezone(&Prague);
         let today = prague_now.date_naive();
         let Some(tomorrow) = today.succ_opt() else {

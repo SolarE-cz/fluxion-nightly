@@ -329,9 +329,17 @@ fn overlay_inverter_options(
             .iter()
             .filter_map(|inv| inv.get("id").and_then(|v| v.as_str()).map(str::to_owned))
             .collect();
+        // The last entry with this id, compared trimmed: the control map takes the last one too,
+        // so both consumers agree when ids repeat (scan #15)
         let Some(inverter) = inverters
             .iter_mut()
-            .find(|inv| inv.get("id").and_then(|v| v.as_str()) == Some(id))
+            .rev()
+            .find(|inv| {
+                inv.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .is_some_and(|config_id| config_id == id.trim())
+            })
             .and_then(|inv| inv.as_object_mut())
         else {
             // Only an add-on inverter that sets one of the keys (non-empty) has something that
@@ -615,6 +623,55 @@ mod tests {
             logs.matches("ignored, the SOC is the inverter's own")
                 .count(),
             1,
+            "{logs}"
+        );
+    }
+
+    /// Scan #15: two inverters with one id (the second written with a space): the add-on overlay
+    /// and the control map both use the last entry, and startup validation logs and carries on
+    #[test]
+    fn duplicate_inverter_ids_overlay_and_control_map_pick_the_same_entry() {
+        let mut config = AppConfig::default();
+        config.inverters[0].control_entity_prefix = "solax_first".to_owned();
+        let mut second = config.inverters[0].clone();
+        second.id = format!(" {}", second.id);
+        second.control_entity_prefix = "solax_second".to_owned();
+        config.inverters.push(second);
+        let id = config.inverters[0].id.clone();
+        let options = serde_json::json!({
+            "inverters": [{"id": id, "control_entity_prefix": "solax_addon"}]
+        });
+
+        let mut overlaid = config.clone();
+        overlay_addon_options(&mut overlaid, &options);
+
+        assert_eq!(overlaid.inverters[0].control_entity_prefix, "solax_first");
+        assert_eq!(overlaid.inverters[1].control_entity_prefix, "solax_addon");
+        assert_eq!(overlaid.control_prefixes().resolve(&id), "solax_addon");
+    }
+
+    /// Scan #15: startup with duplicate ids logs the id and still starts
+    #[test]
+    fn duplicate_inverter_ids_do_not_stop_startup() {
+        let dir = TempDir::new().unwrap();
+        let options = dir.path().join("options.json");
+        fs::write(&options, "{}").unwrap();
+        let mut config = AppConfig::default();
+        let mut second = config.inverters[0].clone();
+        second.id = config.inverters[0].id.clone();
+        config.inverters.push(second);
+        let id = config.inverters[0].id.clone();
+
+        let mut loaded = None;
+        let logs = crate::config::tests::captured_logs(|| {
+            loaded = Some(with_addon_options(config, &options));
+        });
+
+        assert!(loaded.unwrap().is_ok());
+        assert!(
+            logs.contains(&format!(
+                "Inverter id \"{id}\" is used by more than one inverter"
+            )),
             "{logs}"
         );
     }

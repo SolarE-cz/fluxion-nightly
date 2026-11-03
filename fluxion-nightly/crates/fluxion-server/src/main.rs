@@ -91,8 +91,12 @@ async fn main() -> anyhow::Result<()> {
         notifier,
     };
 
+    if config.auth.dashboard_token.is_none() {
+        info!("Dashboard disabled: set auth.dashboard_token to enable it");
+    }
     let dashboard_state = DashboardState {
         db: Arc::clone(&db),
+        dashboard_token: config.auth.dashboard_token.clone(),
     };
 
     let app = Router::new()

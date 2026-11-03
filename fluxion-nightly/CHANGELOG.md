@@ -10,6 +10,61 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.72] - 2026-11-03
+
+### Security
+
+- Dashboard and remote-access pages no longer render slot notes, schedule reasons, strategy names or
+  device names as HTML or JavaScript; chart JSON is escaped before embedding in a script element
+  (scan #1, #3, #5, #6, #17, #18, #26, #33, #39, #43).
+- Refuse web API calls from peers other than the HA ingress proxy and `FLUXION_TRUSTED_PEERS` in the
+  add-on; loopback may only read `/api/upgrader/status` and `/health` and call `/mobile/*` (scan #4,
+  #7, #19, #34, #36, #48).
+- Register remote access (pairing and mobile API) only when `remote_access.enabled` is true (scan
+  #20).
+- Refuse read-only device pairing until mobile devices are authenticated (scan #2, #42).
+- Standalone web listener binds to 127.0.0.1 unless `FLUXION_BIND_ADDR` is set.
+- New add-on option `system.trusted_peers`: comma-separated IP addresses that may call FluxION
+  besides the HA ingress proxy (exported as `FLUXION_TRUSTED_PEERS`). Default empty.
+- Web config updates persist only keys of the typed config; `ha_base_url`, `ha_token` and
+  `server_heartbeat` are never written from the web API, and stored values of them are kept (scan
+  #37).
+- External strategy plugins can no longer forge block identity, learning-warm-up or guard markers,
+  and cannot register under a built-in strategy name (scan #9, #11, #16, #35)
+- Server dashboard requires `auth.dashboard_token` as a bearer token and returns 404 when unset
+  (scan #38)
+- Server telemetry retention deletes snapshot child rows in the same transaction as the snapshot
+  (scan #13)
+- Server clamps stored telemetry timestamps to server time plus 5 minutes (scan #32)
+- Server heartbeat recovery check looks up only the reporting instance instead of loading every
+  client (scan #22, #27)
+- Server logs escape instance IDs, versions and notification subjects supplied by reporters (scan
+  #24, #41)
+- Heartbeat client sends its shared secret only over HTTPS or to private-network/loopback addresses,
+  and does not follow redirects (scan #21)
+- `strategy_simulator` example: block aggregation jumps to the next record's block instead of
+  stepping through every empty quarter-hour (scan #8).
+- `fluxion-sim` batch: report file names are sanitized to `[A-Za-z0-9._-]` with no leading dot, so a
+  scenario name cannot escape the output directory (scan #14).
+- WinterReserve planner: SOC limits outside 0..=100 are an invalid battery config, and the SOC grid
+  is capped at 1000 steps; finer resolutions are coarsened to the cap (scan #23, #30).
+- Simulation engine: a prebuilt day must have 96 blocks, otherwise it is rejected (scan #40).
+- Replay: a planning horizon of more than 768 records (4 per block over two days) is rejected
+  instead of planned (scan #44).
+- Price entity blocks whose end is before their start (over 48 h once wrapped) are dropped with a
+  WARN before they reach the schedule or the fallback (scan #10).
+- A plaintext `ws://` connection carrying the HA access token is refused for public hosts; loopback,
+  LAN, `.local`, single-label, Supervisor, NetBird/Tailscale overlay (100.64.0.0/10,
+  `.netbird.cloud`, `.ts.net`) addresses stay allowed, and the error says to use https (scan #12,
+  #31).
+- Two inverters with the same id (trimmed) are refused when saved through the web UI and logged at
+  startup; the Supervisor overlay and the control map both use the last entry with that id (scan
+  #15).
+- HDO sensor state is logged escaped, so a newline in it cannot start a log line (scan #25).
+- `control.auto_unlock_inverter` cannot change at runtime: the config API refuses the update, as for
+  `mode_control_enabled` (scan #49). A changed `control.max_battery_soc` is accepted with a warning
+  that the Back Up reserve limit keeps its startup value until the add-on restarts (scan #46).
+
 ## [0.2.71] - 2026-11-03
 
 ### Added

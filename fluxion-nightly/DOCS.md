@@ -31,6 +31,10 @@ installation.
 
 5. Check the logs to verify everything is working correctly.
 
+## Network access
+
+In the add-on, the web interface on port 8099 accepts requests only from the Home Assistant ingress proxy and from the add-on itself; hosts listed in `FLUXION_TRUSTED_PEERS` (comma-separated IP addresses) may also connect. Outside the add-on the listener binds to `127.0.0.1` unless `FLUXION_BIND_ADDR` is set (for example to `0.0.0.0`).
+
 ## Configuration
 
 **Note**: _Remember to restart the add-on when the configuration is changed._
@@ -83,6 +87,12 @@ are:
 Please note that each level automatically includes log messages from a more severe level, e.g.,
 `debug` also shows `info` messages. By default, the `log_level` is set to `info`, which is the
 recommended setting unless you are troubleshooting.
+
+### Option: `system.trusted_peers`
+
+Comma-separated IP addresses that may call the FluxION web interface (port 8099) besides the Home
+Assistant ingress proxy and the add-on itself. Leave it empty unless another host on your network
+must reach FluxION directly. Entries that are not IP addresses are ignored and logged as warnings.
 
 ### Option Group: `inverters`
 

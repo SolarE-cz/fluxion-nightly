@@ -10,6 +10,7 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -35,9 +36,16 @@ pub fn spawn_heartbeat_task(config: ServerHeartbeatConfig, query_sender: WebQuer
     );
 
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = build_heartbeat_client();
         let interval = Duration::from_secs(config.interval_seconds);
         let url = format!("{}/api/heartbeat", config.server_url.trim_end_matches('/'));
+        if !heartbeat_url_is_allowed(&url) {
+            error!(
+                server_url = %config.server_url,
+                "Heartbeat server URL must use https or a private-network address; heartbeat disabled"
+            );
+            return;
+        }
         let mut first_heartbeat = true;
 
         loop {
@@ -106,6 +114,56 @@ pub fn spawn_heartbeat_task(config: ServerHeartbeatConfig, query_sender: WebQuer
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+/// Heartbeats carry the shared secret, so they may go over https, or over http only to a
+/// private-network (NetBird/WireGuard/LAN) or loopback address.
+fn heartbeat_url_is_allowed(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => parsed.host_str().is_some_and(is_private_network_host),
+        _ => false,
+    }
+}
+
+fn is_private_network_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => {
+                let [first, second, ..] = v4.octets();
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    // Carrier-grade NAT range 100.64.0.0/10 (used by Tailscale/NetBird)
+                    || (first == 100 && (second & 0xc0) == 64)
+            }
+            IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                v6.is_loopback()
+                    // Unique local fc00::/7
+                    || (first & 0xfe00) == 0xfc00
+                    // Link-local fe80::/10
+                    || (first & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    let host = host.to_ascii_lowercase();
+    host.ends_with(".local")
+        || host.ends_with(".netbird.cloud")
+        || host.ends_with(".ts.net")
+        || !host.contains('.')
+}
+
+/// Redirects are not followed, so the shared secret is never re-sent to another destination.
+fn build_heartbeat_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("heartbeat HTTP client")
 }
 
 fn build_telemetry_snapshot(dashboard: &WebQueryResponse) -> TelemetrySnapshot {
@@ -263,5 +321,84 @@ fn build_sync_data(dashboard: &WebQueryResponse) -> ClientSyncData {
             .schedule
             .as_ref()
             .map_or(10.0, |s| s.target_soc_min),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_heartbeat_client, heartbeat_url_is_allowed};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn heartbeat_url_policy() {
+        let cases: &[(&str, bool)] = &[
+            // https is always allowed
+            (
+                "https://fluxion-server.example.com:8100/api/heartbeat",
+                true,
+            ),
+            ("https://8.8.8.8:8100/api/heartbeat", true),
+            // loopback
+            ("http://localhost:8100/api/heartbeat", true),
+            ("http://127.0.0.1:8100/api/heartbeat", true),
+            ("http://[::1]:8100/api/heartbeat", true),
+            // IPv4 private-network ranges
+            ("http://10.0.0.5:8100/api/heartbeat", true),
+            ("http://172.16.4.2:8100/api/heartbeat", true),
+            ("http://172.32.0.1:8100/api/heartbeat", false),
+            ("http://192.168.1.10:8100/api/heartbeat", true),
+            ("http://169.254.10.1:8100/api/heartbeat", true),
+            ("http://100.98.32.20:8100/api/heartbeat", true),
+            ("http://100.128.0.1:8100/api/heartbeat", false),
+            ("http://8.8.8.8:8100/api/heartbeat", false),
+            // IPv6 private-network ranges
+            ("http://[fd00::1]:8100/api/heartbeat", true),
+            ("http://[fe80::1]:8100/api/heartbeat", true),
+            ("http://[2001:db8::1]:8100/api/heartbeat", false),
+            // hostnames
+            ("http://fluxion-server:8100/api/heartbeat", true),
+            ("http://fluxion-server.local:8100/api/heartbeat", true),
+            ("http://site.netbird.cloud:8100/api/heartbeat", true),
+            ("http://fluxion.ts.net:8100/api/heartbeat", true),
+            ("http://10.evil.com:8100/api/heartbeat", false),
+            ("http://localhost.example.com:8100/api/heartbeat", false),
+            (
+                "http://fluxion-server.example.com:8100/api/heartbeat",
+                false,
+            ),
+            // other schemes and garbage
+            ("ftp://127.0.0.1/api/heartbeat", false),
+            ("not a url", false),
+            ("", false),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(heartbeat_url_is_allowed(url), *expected, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_client_does_not_follow_redirects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0_u8; 4096];
+            let _ = socket.read(&mut buf).await.expect("read request");
+            // Following this Location would fail with a connection error on a closed port.
+            let response = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/api/heartbeat\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let response = build_heartbeat_client()
+            .post(format!("http://127.0.0.1:{port}/api/heartbeat"))
+            .send()
+            .await
+            .expect("redirect response, not a followed request");
+        assert_eq!(response.status(), 302);
     }
 }
