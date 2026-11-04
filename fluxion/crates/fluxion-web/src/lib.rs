@@ -12,6 +12,7 @@
 
 mod backtest;
 mod config_api;
+mod peer_guard;
 mod plugin_api;
 pub mod remote_access;
 mod routes;
@@ -21,6 +22,7 @@ mod validation;
 
 pub use backtest::BacktestState;
 pub use config_api::ConfigApiState;
+pub use peer_guard::AccessMode;
 pub use plugin_api::PluginApiState;
 pub use remote_access::{
     MobileApiState, RemoteAccessApiState, mobile_api_routes, remote_access_routes,
@@ -46,6 +48,7 @@ use fluxion_types::UserControlState;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -248,7 +251,6 @@ fn extract_ingress_path(headers: &axum::http::HeaderMap) -> String {
 /// # Errors
 /// Returns error if server fails to bind or serve
 #[expect(clippy::too_many_arguments)]
-#[expect(clippy::too_many_lines)]
 pub async fn start_web_server(
     query_sender: WebQuerySender,
     i18n: Arc<I18n>,
@@ -260,12 +262,65 @@ pub async fn start_web_server(
     scheduled_export_config: Option<ScheduledExportConfig>,
     user_control_api_state: Option<UserControlApiState>,
     remote_access_state: Option<RemoteAccessApiState>,
+    access_mode: peer_guard::AccessMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn scheduled export task if configured
     if let Some(export_config) = scheduled_export_config {
         spawn_scheduled_export_task(query_sender.clone(), export_config);
     }
 
+    let app = build_router(
+        query_sender,
+        &i18n,
+        config_json,
+        config_update_sender,
+        backtest_state,
+        plugin_api_state,
+        user_control_api_state,
+        remote_access_state,
+        access_mode.clone(),
+    );
+    let bind_ip = peer_guard::bind_ip(
+        &access_mode,
+        std::env::var("FLUXION_BIND_ADDR").ok().as_deref(),
+    )?;
+    let addr = SocketAddr::new(bind_ip, port);
+    info!("🌐 Starting web server on {addr}");
+    match access_mode {
+        peer_guard::AccessMode::AddOn { .. } => info!(
+            "🔒 Add-on mode: only the HA ingress proxy, loopback and FLUXION_TRUSTED_PEERS may connect"
+        ),
+        peer_guard::AccessMode::Standalone => info!(
+            "📱 Standalone: http://localhost:{}/ (set FLUXION_BIND_ADDR to listen on other interfaces)",
+            port
+        ),
+    }
+    info!("🏠 HA Ingress: http://homeassistant:8123/api/hassio_ingress/fluxion/");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Build the listener's routes, then the peer guard. `start_web_server` serves the result.
+#[expect(clippy::too_many_arguments)]
+#[expect(clippy::too_many_lines)]
+pub(crate) fn build_router(
+    query_sender: WebQuerySender,
+    i18n: &Arc<I18n>,
+    config_json: serde_json::Value,
+    config_update_sender: Option<ConfigUpdateSender>,
+    backtest_state: Option<BacktestState>,
+    plugin_api_state: Option<PluginApiState>,
+    user_control_api_state: Option<UserControlApiState>,
+    remote_access_state: Option<RemoteAccessApiState>,
+    access_mode: peer_guard::AccessMode,
+) -> Router {
     // Extract user control state from API state for dashboard rendering
     let user_control_state = user_control_api_state
         .as_ref()
@@ -476,15 +531,12 @@ pub async fn start_web_server(
         app = app.merge(mobile_api_routes(mobile_state));
     }
 
-    let addr = format!("0.0.0.0:{port}");
-    info!("🌐 Starting web server on {addr}");
-    info!("📱 Standalone: http://localhost:{}/", port);
-    info!("🏠 HA Ingress: http://homeassistant:8123/api/hassio_ingress/fluxion/");
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    // Only the ingress proxy, loopback and trusted peers may reach the add-on (findings 4, 7, 19,
+    // 34, 36, 48). Standalone installs are not filtered, so they bind to loopback by default.
+    app.layer(axum::middleware::from_fn_with_state(
+        peer_guard::PeerGuard::new(access_mode),
+        peer_guard::enforce,
+    ))
 }
 
 /// Main dashboard page handler
@@ -1106,6 +1158,14 @@ mod tests {
 
     /// Start the real web server on a free local port and return that port
     async fn start_test_server(backtest_state: Option<BacktestState>) -> u16 {
+        start_test_server_with_mode(backtest_state, peer_guard::AccessMode::Standalone).await
+    }
+
+    /// Start the real web server in `access_mode` on a free local port and return that port
+    async fn start_test_server_with_mode(
+        backtest_state: Option<BacktestState>,
+        access_mode: peer_guard::AccessMode,
+    ) -> u16 {
         let port = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .unwrap()
@@ -1125,6 +1185,7 @@ mod tests {
                 None,
                 None,
                 None,
+                access_mode,
             )
             .await;
         });
@@ -1376,6 +1437,19 @@ mod tests {
     fn backtest_state(reader: Arc<dyn fluxion_core::backtest::HistoryReader>) -> BacktestState {
         BacktestState::new(reader, Ok(backtest_history::site()), i18n())
             .with_clock(backtest_history::now)
+    }
+
+    /// start_web_server serves the mode it is given: add-on mode refuses loopback config reads
+    #[tokio::test]
+    async fn web_server_serves_the_access_mode_it_is_given() {
+        let addon = peer_guard::AccessMode::AddOn {
+            trusted_peers: Vec::new(),
+        };
+        let port = start_test_server_with_mode(None, addon).await;
+        let config = http_get(port, "/api/config").await;
+        assert!(config.starts_with("HTTP/1.1 403"), "{config}");
+        let health = http_get(port, "/health").await;
+        assert!(!health.starts_with("HTTP/1.1 403"), "{health}");
     }
 
     #[tokio::test]
@@ -1752,8 +1826,11 @@ mod tests {
             .render()
             .unwrap();
         assert!(html.contains("price-feed-banner"));
-        assert!(html.contains("Tomorrow&#x27;s prices missing from sensor.current_spot_electricity_price_15min since 13:45 — using OTE fallback")
-            || html.contains(banner), "banner text on the page");
+        // The banner is escaped like every other template string, so the apostrophe is &#39;
+        assert!(
+            html.contains("Tomorrow&#39;s prices missing from sensor.current_spot_electricity_price_15min since 13:45 — using OTE fallback"),
+            "banner text on the page"
+        );
     }
 
     #[test]
@@ -1796,6 +1873,7 @@ mod tests {
             days_used: 7,
             measured_kwh: 812.3,
             forecast_kwh: 694.3,
+            forecast_error_pct: None,
         };
         response.solar_forecast = Some(fluxion_core::web_bridge::SolarForecastInfo {
             total_today_kwh: 40.0,
@@ -1899,5 +1977,82 @@ mod tests {
         assert_eq!(json["tariff_known"], true);
         assert_eq!(json["tariff_types"], serde_json::json!(["low", "high"]));
         assert_eq!(json["grid_fees"], serde_json::json!([0.0, 0.0]));
+    }
+
+    /// The listener's router in add-on mode, built the way start_web_server builds it
+    fn addon_router() -> Router {
+        // The receiver is dropped, so queries fail at once instead of waiting for ECS
+        let (query_sender, _) = WebQuerySender::new();
+        build_router(
+            query_sender,
+            &i18n(),
+            serde_json::json!({}),
+            None,
+            None,
+            None,
+            None,
+            None,
+            peer_guard::AccessMode::AddOn {
+                trusted_peers: Vec::new(),
+            },
+        )
+    }
+
+    /// Send one request to `app` as if it came from `peer` and return the status
+    async fn status_from_peer(
+        app: Router,
+        peer: &str,
+        method: &str,
+        path: &str,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                peer.parse().unwrap(),
+                40000,
+            )));
+        app.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn addon_router_refuses_other_peers_and_admits_the_ingress_proxy() {
+        let refused =
+            status_from_peer(addon_router(), "172.30.33.5", "POST", "/api/config/update").await;
+        assert_eq!(
+            refused,
+            axum::http::StatusCode::FORBIDDEN,
+            "other peer reached config update"
+        );
+
+        let ingress =
+            status_from_peer(addon_router(), "172.30.32.2", "POST", "/api/config/update").await;
+        assert_ne!(
+            ingress,
+            axum::http::StatusCode::FORBIDDEN,
+            "ingress proxy refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn addon_router_limits_loopback_to_the_health_and_upgrader_reads() {
+        let config = status_from_peer(addon_router(), "127.0.0.1", "GET", "/api/config").await;
+        assert_eq!(
+            config,
+            axum::http::StatusCode::FORBIDDEN,
+            "loopback read of /api/config"
+        );
+
+        let health = status_from_peer(addon_router(), "127.0.0.1", "GET", "/health").await;
+        assert_ne!(
+            health,
+            axum::http::StatusCode::FORBIDDEN,
+            "loopback refused /health"
+        );
     }
 }

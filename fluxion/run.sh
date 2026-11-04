@@ -30,6 +30,11 @@ export RUST_LOG="${LOG_LEVEL}"
 
 bashio::log.info "Log level: $LOG_LEVEL"
 
+# Peers allowed to call the web interface besides ingress and loopback (see DOCS.md)
+if [ -f "$CONFIG_PATH" ]; then
+  export FLUXION_TRUSTED_PEERS="$(jq -r '.system.trusted_peers // ""' "$CONFIG_PATH")"
+fi
+
 # Display configuration summary
 if [ -f "$CONFIG_PATH" ]; then
   DEBUG_MODE=$(jq -r '[.system.debug_mode, .debug_mode, true] | map(select(. != null)) | first' "$CONFIG_PATH")

@@ -11,6 +11,9 @@ port = 8100
 # Shared secret that all FluxION instances must provide in heartbeat requests.
 # Generate a strong random string, e.g.: openssl rand -hex 32
 shared_secret = "change-me-to-a-strong-random-secret"
+# Optional bearer token required to view the dashboard (Authorization: Bearer <token>).
+# Unset disables the dashboard (404).
+# dashboard_token = "change-me-to-a-dashboard-token"
 
 [heartbeat]
 # Expected interval (seconds) between heartbeats from each instance.

@@ -197,6 +197,13 @@ pub fn setup_async_workers(
         sender: pv_correction_tx,
         receiver: pv_correction_rx,
     });
+    // Cautious-PV signal: sent by the forecast accuracy monitor, stored in SolarForecastData by
+    // the HA plugin's poll system
+    let (cautious_pv_tx, cautious_pv_rx) = crossbeam_channel::bounded(4);
+    commands.insert_resource(CautiousPvChannel {
+        sender: cautious_pv_tx,
+        receiver: cautious_pv_rx,
+    });
 
     info!("🎉 All async workers initialized successfully");
 }
@@ -230,6 +237,10 @@ pub struct SolarForecastData {
     /// computed yet). The totals and `block_kwh` above stay raw; the planner reads them through
     /// the corrected accessors.
     pub correction: Option<crate::pv_correction::CorrectionResult>,
+
+    /// Cautious-PV signal from the solar forecast accuracy store; `None` = fewer than 3 measured
+    /// days (or not computed yet), so Winter Reserve uses its fallback months
+    pub cautious_pv: Option<fluxion_types::CautiousPvSignal>,
 }
 
 impl SolarForecastData {
@@ -265,6 +276,8 @@ pub struct PlannerSolarInputs {
     pub total_today_kwh: f32,
     pub remaining_today_kwh: f32,
     pub tomorrow_kwh: f32,
+    /// Cautious-PV signal for Winter Reserve (`SolarForecastData::cautious_pv`)
+    pub cautious_pv: Option<fluxion_types::CautiousPvSignal>,
 }
 
 /// The PV forecast the planner uses for `block_starts`, scaled by the correction in force
@@ -278,6 +291,7 @@ pub fn planner_solar_inputs(
         total_today_kwh: data.map_or(0.0, SolarForecastData::planner_total_today_kwh),
         remaining_today_kwh: data.map_or(0.0, SolarForecastData::planner_remaining_today_kwh),
         tomorrow_kwh: data.map_or(0.0, SolarForecastData::planner_tomorrow_kwh),
+        cautious_pv: data.and_then(|d| d.cautious_pv),
     }
 }
 
@@ -341,6 +355,7 @@ impl Default for SolarForecastData {
             block_kwh: Vec::new(),
             last_updated: Instant::now(),
             correction: None,
+            cautious_pv: None,
         }
     }
 }
@@ -356,6 +371,13 @@ pub struct SolarForecastUpdate {
 #[derive(Resource)]
 pub struct SolarForecastSender {
     pub sender: crossbeam_channel::Sender<SolarForecastUpdate>,
+}
+
+/// Cautious-PV signals from the solar forecast accuracy monitor; `None` = too few measured days
+#[derive(Resource, Clone)]
+pub struct CautiousPvChannel {
+    pub sender: crossbeam_channel::Sender<Option<fluxion_types::CautiousPvSignal>>,
+    pub receiver: crossbeam_channel::Receiver<Option<fluxion_types::CautiousPvSignal>>,
 }
 
 /// Correction factors from the PV forecast correction worker (brief H34)
@@ -437,6 +459,7 @@ mod solar_block_forecast_tests {
             days_used: 7,
             measured_kwh: 117.0,
             forecast_kwh: 100.0,
+            forecast_error_pct: None,
         }
     }
 
@@ -463,6 +486,24 @@ mod solar_block_forecast_tests {
         assert_eq!(raw, vec![Some(0.4), Some(0.2), None]);
         let covered = solar_block_forecast_covered(Some(&forecast), &starts).unwrap();
         assert!((covered[0].unwrap() - 0.468).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_planner_receives_the_cautious_pv_signal() {
+        let mut forecast = data(vec![(utc(10, 0), 0.4)]);
+        assert_eq!(
+            planner_solar_inputs(Some(&forecast), &[utc(10, 0)]).cautious_pv,
+            None
+        );
+        let signal = fluxion_types::CautiousPvSignal {
+            mae_pct: 39.0,
+            cautious: true,
+        };
+        forecast.cautious_pv = Some(signal);
+        let inputs = planner_solar_inputs(Some(&forecast), &[utc(10, 0)]);
+        assert_eq!(inputs.cautious_pv, Some(signal));
+        // The signal does not scale the forecast itself; Winter Reserve applies it
+        assert_eq!(inputs.per_block_kwh, Some(vec![0.4]));
     }
 
     #[test]

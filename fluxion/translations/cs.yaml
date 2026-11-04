@@ -8,6 +8,10 @@ configuration:
   log_level:
     name: Úroveň logování
     description: Množství informací, které bude add-on zaznamenávat.
+  trusted_peers:
+    name: Důvěryhodné adresy
+    description: >-
+      IP adresy oddělené čárkou, které mohou kromě proxy Home Assistant ingress volat FluxION. Nechte prázdné.
   inverters:
     name: Střídače
     description: Konfigurace vašich solárních střídačů.
@@ -36,6 +40,15 @@ configuration:
     description: >-
       Prefixy entit paralelních jednotek, jejichž FV výkon a vyrobená energie
       se přičtou k tomuto střídači. Pouze se čtou, nikdy se neřídí.
+  battery_extra_prefixes:
+    name: Další prefixy baterií (jen čtení)
+    description: >-
+      Prefixy entit paralelních jednotek, jejichž SOC baterie se spojí s SOC
+      tohoto střídače podle kapacity. Pouze se čtou, nikdy se neřídí.
+  battery_extra_capacities_kwh:
+    name: Kapacity dalších baterií (kWh)
+    description: >-
+      Použitelná kapacita (kWh) každého dalšího prefixu baterie, ve stejném pořadí (alespoň 0,1). Podíl mastera = control.battery_capacity_kwh minus tyto kapacity, takže ta musí být změřená celková kapacita dvojice. Když SOC jednotky nejde přečíst přes 10 min, FluxION drží poslední kombinovaný SOC a pak nepřebírá nový stav.
   min_battery_soc:
     name: Minimální SOC baterie
     description: >-
@@ -102,6 +115,10 @@ configuration:
     name: Řízení režimu
     description: >-
       Vypnuto = FluxION jen omezuje export (limit exportu 0 W při ceně na prahu omezení nebo pod ním, poté obnoví) a nikdy nemění pracovní režim, minimální SOC Back Up, HotStandBy ani probuzení baterie. Výchozí zapnuto.
+  hold_pv_to_battery:
+    name: EEPROM HOLD nabíjí nejdřív z FV
+    description: >-
+      Zapněte jen u místa, kde EEPROM HOLD („Stop Charge and Discharge“) posílá FV nejdřív do baterie a dům odebírá ze sítě (změřeno na SolaX Ultra). Vypnuto: při HOLD FV kryje dům, přebytek nabíjí baterii, zbytek jde do sítě. Při přímém řízení VPP se ignoruje. Výchozí vypnuto: nechte vypnuté, dokud replay na daném místě neukáže zisk (u Jakuba vyšel asi o 2 Kč/den hůř).
   update_interval_secs:
     name: Interval aktualizace (sekundy)
     description: >-

@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -204,6 +204,18 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_client_status(&self, instance_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let status = conn
+            .query_row(
+                "SELECT status FROM clients WHERE instance_id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(status)
+    }
+
     pub fn get_all_clients(&self) -> Result<Vec<ClientRecord>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn.prepare(
@@ -289,7 +301,9 @@ impl Database {
         snapshot: &TelemetrySnapshot,
     ) -> Result<i64> {
         let conn = self.conn.lock().expect("database mutex poisoned");
-        let timestamp = snapshot.collected_at.to_rfc3339();
+        // Retention is measured from this timestamp, so a future-dated report is clamped to server time
+        let max_timestamp = Utc::now() + chrono::Duration::minutes(5);
+        let timestamp = snapshot.collected_at.min(max_timestamp).to_rfc3339();
         let snapshot_json = serde_json::to_string(snapshot)?;
 
         // Extract key columns from first inverter for dashboard queries
@@ -352,13 +366,24 @@ impl Database {
     }
 
     pub fn cleanup_old_telemetry(&self, retention_days: u32) -> Result<u64> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
         let cutoff = Utc::now() - chrono::Duration::days(i64::from(retention_days));
         let cutoff_str = cutoff.to_rfc3339();
-        let deleted = conn.execute(
+        // Child rows go first, in the same transaction, so no dependent row can block the parent delete
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM schedule_blocks WHERE snapshot_id IN (SELECT id FROM telemetry_snapshots WHERE timestamp < ?1)",
+            params![cutoff_str],
+        )?;
+        tx.execute(
+            "DELETE FROM soc_predictions WHERE snapshot_id IN (SELECT id FROM telemetry_snapshots WHERE timestamp < ?1)",
+            params![cutoff_str],
+        )?;
+        let deleted = tx.execute(
             "DELETE FROM telemetry_snapshots WHERE timestamp < ?1",
             params![cutoff_str],
         )?;
+        tx.commit()?;
         Ok(deleted as u64)
     }
 
@@ -456,5 +481,146 @@ impl Database {
             params![cutoff_str],
         )?;
         Ok(deleted as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn snapshot_json(collected_at: DateTime<Utc>) -> serde_json::Value {
+        json!({
+            "collected_at": collected_at.to_rfc3339(),
+            "inverters": [],
+            "instance": {
+                "current_mode": "SelfUse",
+                "current_reason": "test",
+                "current_strategy": null,
+                "expected_profit": null,
+                "total_expected_profit": null,
+                "inverter_source": true,
+                "price_source": true,
+                "errors": [],
+                "consumption_ema_kwh": null,
+                "today_import_kwh": null,
+                "yesterday_import_kwh": null,
+                "solar_forecast_total_today_kwh": 0.0,
+                "solar_forecast_remaining_today_kwh": 0.0,
+                "solar_forecast_tomorrow_kwh": 0.0,
+                "solar_forecast_actual_today_kwh": null,
+                "solar_forecast_accuracy_percent": null,
+                "hdo_low_tariff_periods": [],
+                "hdo_low_tariff_czk": 0.0,
+                "hdo_high_tariff_czk": 0.0
+            }
+        })
+    }
+
+    fn client_db() -> Database {
+        let db = Database::open(":memory:").expect("in-memory database");
+        db.upsert_client("inst", None, None, None, None, None)
+            .expect("upsert client");
+        db
+    }
+
+    fn count_rows(db: &Database, table: &str) -> i64 {
+        let conn = db.conn.lock().expect("database mutex poisoned");
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("count query")
+    }
+
+    #[test]
+    fn cleanup_removes_expired_snapshot_with_child_rows() {
+        let db = client_db();
+        let mut json = snapshot_json(Utc::now() - chrono::Duration::days(60));
+        json["soc_predictions"] = json!([{
+            "timestamp": Utc::now().to_rfc3339(),
+            "predicted_soc": 50.0
+        }]);
+        let snapshot: TelemetrySnapshot = serde_json::from_value(json).expect("snapshot");
+        let snapshot_id = db
+            .insert_telemetry_snapshot("inst", &snapshot)
+            .expect("insert snapshot");
+        db.insert_soc_predictions(
+            "inst",
+            snapshot_id,
+            snapshot.soc_predictions.as_deref().unwrap_or_default(),
+        )
+        .expect("insert predictions");
+        assert_eq!(count_rows(&db, "soc_predictions"), 1);
+
+        let deleted = db.cleanup_old_telemetry(30).expect("cleanup");
+
+        assert_eq!(deleted, 1);
+        assert_eq!(count_rows(&db, "telemetry_snapshots"), 0);
+        assert_eq!(count_rows(&db, "soc_predictions"), 0);
+    }
+
+    #[test]
+    fn insert_clamps_future_dated_snapshot_timestamp() {
+        let db = client_db();
+        let far_future = Utc::now() + chrono::Duration::days(3650);
+        let snapshot: TelemetrySnapshot =
+            serde_json::from_value(snapshot_json(far_future)).expect("snapshot");
+        db.insert_telemetry_snapshot("inst", &snapshot)
+            .expect("insert snapshot");
+
+        let stored: String = {
+            let conn = db.conn.lock().expect("database mutex poisoned");
+            conn.query_row("SELECT timestamp FROM telemetry_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("timestamp")
+        };
+        let stored = DateTime::parse_from_rfc3339(&stored)
+            .expect("rfc3339")
+            .with_timezone(&Utc);
+        assert!(stored <= Utc::now() + chrono::Duration::minutes(5));
+    }
+
+    #[test]
+    fn insert_keeps_past_snapshot_timestamp() {
+        let db = client_db();
+        let past = Utc::now() - chrono::Duration::hours(2);
+        let snapshot: TelemetrySnapshot =
+            serde_json::from_value(snapshot_json(past)).expect("snapshot");
+        db.insert_telemetry_snapshot("inst", &snapshot)
+            .expect("insert snapshot");
+
+        let stored: String = {
+            let conn = db.conn.lock().expect("database mutex poisoned");
+            conn.query_row("SELECT timestamp FROM telemetry_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("timestamp")
+        };
+        assert_eq!(stored, past.to_rfc3339());
+    }
+
+    #[test]
+    fn client_status_lookup_returns_only_requested_instance() {
+        let db = client_db();
+        db.upsert_client("inst-a", None, None, None, None, None)
+            .expect("upsert a");
+        db.upsert_client("inst-b", None, None, None, None, None)
+            .expect("upsert b");
+        db.update_client_status("inst-a", "offline")
+            .expect("set offline");
+
+        assert_eq!(
+            db.get_client_status("inst-a").expect("status a").as_deref(),
+            Some("offline")
+        );
+        assert_eq!(
+            db.get_client_status("inst-b").expect("status b").as_deref(),
+            Some("online")
+        );
+        assert_eq!(
+            db.get_client_status("missing").expect("status missing"),
+            None
+        );
     }
 }

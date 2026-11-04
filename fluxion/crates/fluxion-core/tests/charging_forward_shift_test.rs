@@ -172,6 +172,7 @@ fn test_v2_prefers_later_cheaper_blocks_over_early_expensive() {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let eval = v2_strategy.evaluate(&context);
@@ -279,6 +280,7 @@ fn test_price_tolerance_filters_expensive_runs() {
         block_forecasts: None,
         timezone: None,
         user_levers: None,
+        cautious_pv: None,
     };
 
     let strict_eval = strict_strategy.evaluate(&context);

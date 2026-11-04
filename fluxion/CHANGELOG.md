@@ -10,6 +10,221 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.73] - 2026-11-03
+
+### Security
+
+- The dashboard price-feed banner is HTML-escaped; a CI check now flags a bare `|e` in the two
+  `escape = "none"` templates (review r1 N1).
+- Remote-access devices stored as read-only are migrated to full access when the device list loads,
+  and the pairing pages no longer label a device read-only (review r1 N6).
+- The add-on documentation for `system.trusted_peers` says that only containers on the Home
+  Assistant add-on network can reach port 8099 (review r1 N7).
+- The Home Assistant access token is sent over plaintext http only to LAN, loopback, overlay or
+  Supervisor hosts, for the REST client as well as the websocket (review r1 N4).
+- A Home Assistant URL with a user or password in it is refused, so the host check cannot be
+  bypassed by userinfo such as `ws://ha.local:8123@evil.com/` (review r1 N5).
+- External strategy plugin names are limited to 1-64 letters, digits, spaces, `.`, `_` or `-`, so a
+  name can no longer carry a `guard:` reason marker into the schedule (scan #35).
+
+## [0.2.72] - 2026-11-03
+
+### Security
+
+- Dashboard and remote-access pages no longer render slot notes, schedule reasons, strategy names or
+  device names as HTML or JavaScript; chart JSON is escaped before embedding in a script element
+  (scan #1, #3, #5, #6, #17, #18, #26, #33, #39, #43).
+- Refuse web API calls from peers other than the HA ingress proxy and `FLUXION_TRUSTED_PEERS` in the
+  add-on; loopback may only read `/api/upgrader/status` and `/health` and call `/mobile/*` (scan #4,
+  #7, #19, #34, #36, #48).
+- Register remote access (pairing and mobile API) only when `remote_access.enabled` is true (scan
+  #20).
+- Refuse read-only device pairing until mobile devices are authenticated (scan #2, #42).
+- Standalone web listener binds to 127.0.0.1 unless `FLUXION_BIND_ADDR` is set.
+- New add-on option `system.trusted_peers`: comma-separated IP addresses that may call FluxION
+  besides the HA ingress proxy (exported as `FLUXION_TRUSTED_PEERS`). Default empty.
+- Web config updates persist only keys of the typed config; `ha_base_url`, `ha_token` and
+  `server_heartbeat` are never written from the web API, and stored values of them are kept (scan
+  #37).
+- External strategy plugins can no longer forge block identity, learning-warm-up or guard markers,
+  and cannot register under a built-in strategy name (scan #9, #11, #16, #35)
+- Server dashboard requires `auth.dashboard_token` as a bearer token and returns 404 when unset
+  (scan #38)
+- Server telemetry retention deletes snapshot child rows in the same transaction as the snapshot
+  (scan #13)
+- Server clamps stored telemetry timestamps to server time plus 5 minutes (scan #32)
+- Server heartbeat recovery check looks up only the reporting instance instead of loading every
+  client (scan #22, #27)
+- Server logs escape instance IDs, versions and notification subjects supplied by reporters (scan
+  #24, #41)
+- Heartbeat client sends its shared secret only over HTTPS or to private-network/loopback addresses,
+  and does not follow redirects (scan #21)
+- `strategy_simulator` example: block aggregation jumps to the next record's block instead of
+  stepping through every empty quarter-hour (scan #8).
+- `fluxion-sim` batch: report file names are sanitized to `[A-Za-z0-9._-]` with no leading dot, so a
+  scenario name cannot escape the output directory (scan #14).
+- WinterReserve planner: SOC limits outside 0..=100 are an invalid battery config, and the SOC grid
+  is capped at 1000 steps; finer resolutions are coarsened to the cap (scan #23, #30).
+- Simulation engine: a prebuilt day must have 96 blocks, otherwise it is rejected (scan #40).
+- Replay: a planning horizon of more than 768 records (4 per block over two days) is rejected
+  instead of planned (scan #44).
+- Price entity blocks whose end is before their start (over 48 h once wrapped) are dropped with a
+  WARN before they reach the schedule or the fallback (scan #10).
+- A plaintext `ws://` connection carrying the HA access token is refused for public hosts; loopback,
+  LAN, `.local`, single-label, Supervisor, NetBird/Tailscale overlay (100.64.0.0/10,
+  `.netbird.cloud`, `.ts.net`) addresses stay allowed, and the error says to use https (scan #12,
+  #31).
+- Two inverters with the same id (trimmed) are refused when saved through the web UI and logged at
+  startup; the Supervisor overlay and the control map both use the last entry with that id (scan
+  #15).
+- HDO sensor state is logged escaped, so a newline in it cannot start a log line (scan #25).
+- `control.auto_unlock_inverter` cannot change at runtime: the config API refuses the update, as for
+  `mode_control_enabled` (scan #49). A changed `control.max_battery_soc` is accepted with a warning
+  that the Back Up reserve limit keeps its startup value until the add-on restarts (scan #46).
+
+## [0.2.71] - 2026-11-03
+
+### Added
+
+- `arbitrage_benchmark` example: replay fixture plus 6-day closed-loop synthetic runs (15-minute
+  replans, tomorrow's prices at 13:00, missing on 1 day in 6) for an owner-like and a Jakub-like
+  site, with and without force discharge. The planner sees the forecast while the battery runs on
+  actual PV and load (lognormal error σ 0.25, fixed seeds); `--perfect-foresight` turns the error
+  off, `--seed <n>` changes the noise and `--owner-replay <path>` adds a recorded replay.
+
+### Fixed
+
+- WinterReserve with `export_floor_until_cheap`: when tomorrow's morning is not in the horizon (for
+  example tomorrow's prices are missing) and no cheap block is ahead (a flat low-tariff tail after
+  the evening peak), the export reserve now ends at the first later block that buys at or below
+  `cheap_ref` and nets `min_arbitrage_profit_czk` against this block's sell (losses and wear
+  included). Before, the reserve stayed at the full battery and the evening peak did not export.
+
+## [0.2.70] - 2026-11-02
+
+### Added
+
+- Cautious PV for Winter Reserve: once the over-forecast error of the corrected PV forecast reaches
+  `strategies.winter_reserve.cautious_pv_mae_pct` (default 25 %) with at least 5 valid days, the
+  plan uses the forecast PV times `pv_confidence`, not the forecast itself. It stays on until the
+  error drops below `strategies.winter_reserve.cautious_pv_off_pct` (default 20 %), and the state
+  survives a restart. The error is Σ max(f − a, 0) / Σ max(f, a) (0–100 %): only sun that was
+  forecast but did not come counts. `f` is each day's forecast scaled by the H34 correction factor
+  the planner applied that day (now kept with the day's forecast snapshot; days without one, rebuilt
+  from HA history or recorded earlier, use the current factor), over the last 7 complete days, and
+  the hours and days the correction skips (missing data, curtailed PV, dim days) are left out. It is
+  shown as the `cautious_pv` and `cautious_pv_error_pct` attributes of
+  `sensor.fluxion_solar_forecast_bias`. With fewer than 5 valid days, or the correction off, the
+  local months in `strategies.winter_reserve.cautious_pv_fallback_months` (default
+  `[10, 11, 12, 1, 2, 3]`) decide. The night reserve still uses `pv_confidence` in every month. The
+  `WinterReserve horizon:` log line shows `cautious_pv=yes|no` with its reason (`mae=39.2%` or
+  `fallback month`), and `pv_expected_kwh` is the PV the plan used. The replay example takes
+  `--cautious-pv on|off|months`. Why: on 2026-11-02 Jakub's site produced about 30 kWh of a 132 kWh
+  forecast, and the plan had skipped the 7.7 CZK night charge. `cautious_pv_mae_pct: 100` with an
+  empty month list restores the old behaviour.
+
+## [0.2.69] - 2026-11-02
+
+### Changed
+
+- WinterReserve: in a block where a later allowed export sells above the block's buy price, the
+  house runs from the grid (Hold is the default mode instead of Self-Use) and the battery keeps its
+  energy for that export; Self-Use must beat Hold by `min_mode_benefit_czk`. Lever blocks (force
+  charge, no discharge) are unchanged (owner ruling 2026-11-02, rule 1b).
+
+### Fixed
+
+- Fixed buy prices (`pricing.use_spot_prices_to_buy: false`) keep the spot horizon: with spot sell,
+  the price blocks follow the spot timeline for today and tomorrow (buy = fixed price at the block's
+  local hour, sell = spot minus the fee); without spot data, fixed blocks cover today and tomorrow
+  in local time. Before, only today's blocks (UTC date) were built, so the WinterReserve horizon
+  ended at local midnight and the night floor held the whole battery.
+
+## [0.2.68] - 2026-10-29
+
+### Added
+
+- Export floor until the next cheap block: `strategies.winter_reserve.export_floor_until_cheap`
+  (default false). Export may go down to the reserve deficit until the next block whose buy is at or
+  below the horizon median and below the midpoint of the horizon's cheapest and dearest buy, instead
+  of until the next morning, when that block comes first (it also ends an open night). A dear
+  majority at the median or a flat horizon keeps the full floor. Needs
+  `control.force_discharge_enabled`.
+- Capacity-weighted SOC of a parallel pair: per-inverter `battery_extra_prefixes` and
+  `battery_extra_capacities_kwh` (each ≥ 0.1 kWh). The SOC an inverter reports is the
+  capacity-weighted mean of its own battery and the read-only parallel units' batteries (own
+  capacity = `control.battery_capacity_kwh` minus the extras, so that must be the pair's measured
+  total). A unit whose SOC is unreadable or that is not live: the last combined SOC is held for up
+  to 10 min, then the state read fails instead of using the master's own SOC (−7 to +6 kWh off on
+  Jakub's pair).
+- Replay example: `--hold-pv-to-battery`, `--plan-hold-to-house`, `--plan-capacity`,
+  `--plan-efficiency`; `--param` takes 1/0 for boolean parameters.
+- Learning house load: while a configured house-load or consumption history has fewer than 3 days of
+  profile (or none), every planned block is the default mode (Self-Use) instead of the planner's
+  moves, so a new site runs on its default until the profile is usable. Without a history source
+  nothing changes.
+
+### Changed
+
+- HOLD means the house is not served from the battery: the planner models it as PV → house → battery
+  → grid with no discharge (direct VPP mode 7), instead of an idle battery that exports the PV
+  surplus. In a sunny block the planner now plans Export to sell PV, where it used to rely on HOLD
+  exporting the surplus. Export runs as Force Discharge, so above the night floor it also discharges
+  the battery. At the floor plus the guard margin it runs as Self-Use, both live and in the replay.
+- `control.hold_pv_to_battery` (default false) describes an EEPROM HOLD ("Stop Charge and
+  Discharge") that sends PV into the battery first while the house imports, as measured on Jakub's
+  SolaX Ultra pair; the planner then models HOLD that way. To be ignored with direct VPP control
+  (#648). Keep it false unless a replay on the site shows a gain: on Jakub's site it replayed about
+  2 CZK/day worse. A negative PV forecast counts as no PV.
+- The add-on options `control.hold_pv_to_battery`,
+  `strategies.winter_reserve.export_floor_until_cheap` and `inverters[].battery_extra_*` apply over
+  a configuration saved by the web UI.
+- Replay `--pv-noise` also perturbs the current block's PV forecast. The replay applies the live
+  Export head guard (Self-Use at the night floor plus margin).
+- No planned inverter mode write (schedule, drift re-apply, VPR, fixed slots) after more than 120 s
+  without new data: the state's time is the master's newest heartbeat `last_updated`, and a failed
+  read keeps the previous state, so SOC and mode may be frozen. One good read in the window counts
+  as fresh. A running ForceCharge, ForceDischarge or HOLD is ended once with the default mode
+  (Self-Use, or Back Up in the Back Up default), because the EEPROM modes do not lapse. A forced
+  mode is re-entered only after 60 s of good reads (at least two), and the 300 s mode-change
+  debounce still applies, so reads recovering just past 120 s do not flap the inverter. After 2
+  stale exits within 60 min the inverter stays in the default basic mode until its state has been
+  fresh for 10 min (WARN once, INFO on the end), so reads that keep recovering between longer stalls
+  do not cost EEPROM writes. Each exit decides the back-off afresh: an exit with no other in the
+  last 60 min waits only the 60 s. WARN once on entry, INFO once on recovery; the kill switch and
+  mode-control-off are not gated.
+- Liveness per inverter (master or pair unit): live while any heartbeat sensor
+  (`<prefix>_grid_voltage*`, `_grid_frequency*`, `_measured_power`, `_inverter_power`,
+  `_house_load`, `_pv_power_total`, `_battery_power_charge`) was updated (`last_updated`) within 120
+  s; found once from `/api/states` and logged, no age check without any. A master that is not live
+  fails the state read; a unit that is not live makes its SOC unreadable, unless it is in standby
+  (battery and PV power both within 50 W of 0, so its SOC cannot move: Jakub's slave at its 10 %
+  floor at night) while the master shows at most 200 W of PV and is not charging. A failing
+  `/api/states` fails the read (WARN once) instead of skipping the check. `last_reported` is not
+  used: HA's REST API does not advance it while a value is flat. A unit outage outside standby
+  changes modes at the latest 120 s + 10 min (SOC hold) + 120 s after its last heartbeat; a unit
+  that fails in standby is found once the master shows over 200 W of PV or charges (by the next
+  morning at the latest), then 10 min + 120 s.
+- Invalid `inverters[].battery_extra_*` (lengths differ, capacity under 0.1 kWh, own prefix, no
+  capacity left for the master) are ignored with a WARN instead of stopping the add-on.
+- Replay on Jakub's site, 2026-10-16 03:15Z → end (10.69 days), 80 kWh, end-SOC adjusted: the live
+  configuration 147.1 CZK/day (raw 1687.74 CZK against 1676.24 actual, +0.7 %); as released (EEPROM
+  HOLD on the site, default HOLD model planned) 130.4; with `hold_pv_to_battery` 132.4; plus force
+  discharge, `export_floor_until_cheap`, profit gap 0.5 and wear 0.03: 102.4 as released (102.6 with
+  PV noise, 101.6 with a 20 % under-forecast), 104.6 with `hold_pv_to_battery`, 101.9 with
+  direct-VPP HOLD. Variants spread a few CZK/day either way (PV noise and the under-forecast move
+  these by −5.6 to +1.0), so these are estimates, not upper bounds.
+
+### Fixed
+
+- A matching initial sync (or one skipped for SOC) now records the hardware mode as the current
+  mode. After a restart in the middle of ForceCharge, the kill switch compared Self-Use with
+  Self-Use and wrote nothing.
+- The kill switch sets the default basic mode: Back Up Mode with the user's minimum SOC in the Back
+  Up default, not always Self-Use.
+- Mode drift re-apply ignores read-backs from before a mode write and forgets earlier mismatches, so
+  a resumed mode is not re-sent 5 s later.
+
 ## [0.2.67] - 2026-10-21
 
 ### Added

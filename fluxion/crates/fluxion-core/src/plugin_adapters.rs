@@ -122,6 +122,7 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
                 .as_deref()
                 .and_then(|tz| tz.parse::<chrono_tz::Tz>().ok()),
             user_levers: request.user_levers.as_ref(),
+            cautious_pv: request.cautious_pv,
         };
 
         let eval = self.strategy.evaluate(&context);
@@ -451,6 +452,8 @@ pub fn init_plugin_manager(
         min_mode_benefit_czk: wr_core.min_mode_benefit_czk,
         mode_switch_min_benefit_czk: wr_core.mode_switch_min_benefit_czk,
         soc_resolution_pct: wr_core.soc_resolution_pct,
+        export_floor_until_cheap: wr_core.export_floor_until_cheap,
+        cautious_pv_fallback_months: wr_core.cautious_pv_fallback_months.clone(),
     };
     manager.register(Arc::new(StrategyPlugin::new(
         WinterReserveStrategy::new(wr_core.enabled, wr_params),
@@ -572,5 +575,62 @@ mod winter_reserve_registration_tests {
             .find(|(name, _, _)| *name == "Winter-Reserve")
             .expect("Winter-Reserve plugin should be registered");
         assert_eq!(wr.1, 120);
+    }
+
+    /// Records the cautious-PV signal of the context it is given
+    struct RecordingStrategy(std::sync::Mutex<Option<Option<fluxion_types::CautiousPvSignal>>>);
+
+    impl EconomicStrategy for RecordingStrategy {
+        fn name(&self) -> &str {
+            "Recording"
+        }
+
+        fn evaluate(&self, context: &EvaluationContext) -> crate::strategy::BlockEvaluation {
+            *self.0.lock().unwrap() = Some(context.cautious_pv);
+            crate::strategy::BlockEvaluation::new(
+                context.price_block.block_start,
+                context.price_block.duration_minutes,
+                fluxion_types::inverter::InverterOperationMode::SelfUse,
+                "Recording".to_owned(),
+            )
+        }
+    }
+
+    #[test]
+    fn test_request_cautious_pv_reaches_the_strategy_context() {
+        let block = serde_json::json!({
+            "block_start": "2026-11-02T17:00:00Z",
+            "duration_minutes": 15,
+            "price_czk_per_kwh": 3.0,
+            "effective_price_czk_per_kwh": 7.7,
+        });
+        let request: EvaluationRequest = serde_json::from_value(serde_json::json!({
+            "block": block,
+            "battery": {
+                "current_soc_percent": 17.0, "capacity_kwh": 96.0, "max_charge_rate_kw": 30.0,
+                "min_soc_percent": 10.0, "max_soc_percent": 100.0, "efficiency": 0.9,
+                "wear_cost_czk_per_kwh": 0.125,
+            },
+            "forecast": {"solar_kwh": 0.0, "consumption_kwh": 0.6, "grid_export_price_czk_per_kwh": 1.0},
+            "all_blocks": [block],
+            "historical": {"grid_import_today_kwh": null, "consumption_today_kwh": null},
+            "backup_discharge_min_soc": 10.0,
+            "cautious_pv": {"mae_pct": 39.0, "cautious": true},
+        }))
+        .unwrap();
+        let plugin = StrategyPlugin::new(
+            RecordingStrategy(std::sync::Mutex::new(None)),
+            100,
+            ControlConfig::default(),
+        );
+        plugin.evaluate(&request).unwrap();
+        let seen = plugin.strategy.0.lock().unwrap().expect("evaluated");
+        assert_eq!(
+            seen,
+            Some(fluxion_types::CautiousPvSignal {
+                mae_pct: 39.0,
+                cautious: true,
+            })
+        );
     }
 }

@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use bevy_ecs::prelude::*;
 use fluxion_i18n::Language;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Main application configuration - FluxION MVP
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +125,15 @@ pub struct InverterConfig {
     /// them, and battery, house-load and mode reads stay this inverter's own.
     #[serde(default)]
     pub pv_extra_prefixes: Vec<String>,
+
+    /// Read-only entity prefixes of parallel units whose battery SOC is combined with this
+    /// inverter's SOC, weighted by usable capacity. Empty = this inverter's SOC alone.
+    #[serde(default)]
+    pub battery_extra_prefixes: Vec<String>,
+
+    /// Usable capacity (kWh) of each `battery_extra_prefixes` unit, same order and length
+    #[serde(default)]
+    pub battery_extra_capacities_kwh: Vec<f32>,
 }
 
 impl InverterConfig {
@@ -302,6 +311,11 @@ pub struct ControlConfig {
     /// per-site export limit exists. Default: false
     #[serde(default)]
     pub force_discharge_enabled: bool,
+
+    /// This site's EEPROM HOLD sends PV into the battery first and the house imports; the
+    /// planner models HOLD that way. False: PV → house → battery → grid. Default: false
+    #[serde(default)]
+    pub hold_pv_to_battery: bool,
 
     /// SolaX only: unlock a "Locked" inverter before a write (never in debug mode).
     /// Default: true (matches Node-RED); when false the write is skipped and only notifies.
@@ -1099,6 +1113,10 @@ pub struct WinterReserveConfig {
     pub min_mode_benefit_czk: f32,
     pub mode_switch_min_benefit_czk: f32,
     pub soc_resolution_pct: f32,
+    pub export_floor_until_cheap: bool,
+    pub cautious_pv_mae_pct: f32,
+    pub cautious_pv_off_pct: f32,
+    pub cautious_pv_fallback_months: Vec<u32>,
 }
 
 impl Default for WinterReserveConfig {
@@ -1115,6 +1133,10 @@ impl Default for WinterReserveConfig {
             min_mode_benefit_czk: core.min_mode_benefit_czk,
             mode_switch_min_benefit_czk: core.mode_switch_min_benefit_czk,
             soc_resolution_pct: core.soc_resolution_pct,
+            export_floor_until_cheap: core.export_floor_until_cheap,
+            cautious_pv_mae_pct: core.cautious_pv_mae_pct,
+            cautious_pv_off_pct: core.cautious_pv_off_pct,
+            cautious_pv_fallback_months: core.cautious_pv_fallback_months,
         }
     }
 }
@@ -1618,6 +1640,8 @@ impl Default for AppConfig {
                 slaves: None,
                 master: None,
                 pv_extra_prefixes: Vec::new(),
+                battery_extra_prefixes: Vec::new(),
+                battery_extra_capacities_kwh: Vec::new(),
             }],
             pricing: PricingConfig {
                 spot_price_entity: "sensor.current_spot_electricity_price_15min".to_string(),
@@ -1657,6 +1681,7 @@ impl Default for AppConfig {
                 export_limit_hard_cap_w: None,
                 export_limit_min_w: default_export_limit_min_w(),
                 force_discharge_enabled: false,
+                hold_pv_to_battery: false,
                 auto_unlock_inverter: true,
                 hot_standby_entity: None,
                 ensure_hot_standby: true,
@@ -1689,27 +1714,25 @@ impl AppConfig {
     pub fn load() -> Result<Self> {
         // Try HA addon options first (/data/options.json)
         if let Ok(options_str) = std::fs::read_to_string("/data/options.json") {
-            let config: AppConfig =
-                serde_json::from_str(&options_str).context("Failed to parse HA addon options")?;
-            info!("✅ Loaded configuration from HA addon options");
-            config.validate()?;
-            return Ok(config);
+            return Self::from_addon_options_str(&options_str);
         }
 
         // Try config.toml for development
         if let Ok(config_str) = std::fs::read_to_string("config.toml") {
-            let config: AppConfig =
+            let mut config: AppConfig =
                 toml::from_str(&config_str).context("Failed to parse config.toml")?;
             info!("✅ Loaded configuration from config.toml");
+            config.drop_invalid_battery_extras();
             config.validate()?;
             return Ok(config);
         }
 
         // Try config.json for development
         if let Ok(config_str) = std::fs::read_to_string("config.json") {
-            let config: AppConfig =
+            let mut config: AppConfig =
                 serde_json::from_str(&config_str).context("Failed to parse config.json")?;
             info!("✅ Loaded configuration from config.json");
+            config.drop_invalid_battery_extras();
             config.validate()?;
             return Ok(config);
         }
@@ -1717,6 +1740,17 @@ impl AppConfig {
         // Fall back to defaults with environment variable overrides
         warn!("No configuration file found, using defaults with environment overrides");
         let config = Self::from_env();
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// The configuration of the HA add-on options JSON (`/data/options.json`). Invalid
+    /// `battery_extra_*` are dropped with a WARN rather than stop the add-on (PR #647 N5).
+    pub fn from_addon_options_str(options_str: &str) -> Result<Self> {
+        let mut config: AppConfig =
+            serde_json::from_str(options_str).context("Failed to parse HA addon options")?;
+        info!("✅ Loaded configuration from HA addon options");
+        config.drop_invalid_battery_extras();
         config.validate()?;
         Ok(config)
     }
@@ -1791,6 +1825,140 @@ impl AppConfig {
             .collect()
     }
 
+    /// Why a `battery_extra_prefixes` entry is not allowed, if it is not: it must not name a
+    /// configured inverter (that inverter's battery is already its own SOC).
+    fn battery_extra_prefix_error(&self, extra: &str) -> Option<String> {
+        self.inverters
+            .iter()
+            .find(|inv| inv.id == extra || inv.entity_prefix == extra)
+            .map(|inv| {
+                format!(
+                    "Battery extra prefix '{extra}' is the configured inverter '{}'; its battery is already counted as that inverter's own",
+                    inv.id
+                )
+            })
+    }
+
+    /// Trimmed `battery_extra_prefixes` paired with their capacities. An empty prefix is dropped
+    /// together with its capacity.
+    fn battery_extra_pairs(inverter: &InverterConfig) -> Vec<(String, f32)> {
+        inverter
+            .battery_extra_prefixes
+            .iter()
+            .zip(&inverter.battery_extra_capacities_kwh)
+            .map(|(prefix, kwh)| (prefix.trim().to_owned(), *kwh))
+            .filter(|(prefix, _)| !prefix.is_empty())
+            .collect()
+    }
+
+    /// Capacity weights for the SOC an inverter reports: its own battery (control capacity minus
+    /// the extras) and each read-only parallel unit's battery. `None` when it has no extras.
+    #[must_use]
+    pub fn battery_soc_weights(
+        &self,
+        inverter: &InverterConfig,
+    ) -> Option<fluxion_adapters::ha::adapters::BatterySocWeights> {
+        let extras = Self::battery_extra_pairs(inverter);
+        if extras.is_empty() {
+            return None;
+        }
+        let extras_kwh: f32 = extras.iter().map(|(_, kwh)| kwh).sum();
+        Some(fluxion_adapters::ha::adapters::BatterySocWeights {
+            own_kwh: self.control.battery_capacity_kwh - extras_kwh,
+            extras,
+        })
+    }
+
+    /// Problems with an inverter's `battery_extra_*` settings, as (field, message)
+    fn battery_extra_errors(&self, inverter: &InverterConfig) -> Vec<(&'static str, String)> {
+        let mut errors = Vec::new();
+        let prefixes = inverter.battery_extra_prefixes.len();
+        let capacities = inverter.battery_extra_capacities_kwh.len();
+        if prefixes != capacities {
+            errors.push((
+                "battery_extra_capacities_kwh",
+                format!(
+                    "battery_extra_prefixes has {prefixes} entries but battery_extra_capacities_kwh has {capacities}; they must match"
+                ),
+            ));
+            return errors;
+        }
+
+        let extras = Self::battery_extra_pairs(inverter);
+        let mut capacities_valid = true;
+        for (extra, kwh) in &extras {
+            if let Some(error) = self.battery_extra_prefix_error(extra) {
+                errors.push(("battery_extra_prefixes", error));
+            }
+            // Same minimum as the add-on schema (`float(0.1,)`)
+            if !kwh.is_finite() || *kwh < 0.1 {
+                capacities_valid = false;
+                errors.push((
+                    "battery_extra_capacities_kwh",
+                    format!("Battery capacity of '{extra}' must be at least 0.1 kWh, got {kwh}"),
+                ));
+            }
+        }
+
+        if capacities_valid && !extras.is_empty() {
+            let extras_kwh: f32 = extras.iter().map(|(_, kwh)| kwh).sum();
+            let own_kwh = self.control.battery_capacity_kwh - extras_kwh;
+            if own_kwh <= 0.0 {
+                errors.push((
+                    "battery_extra_capacities_kwh",
+                    format!(
+                        "The extra batteries ({extras_kwh} kWh) must be smaller than control.battery_capacity_kwh ({} kWh)",
+                        self.control.battery_capacity_kwh
+                    ),
+                ));
+            }
+        }
+        errors
+    }
+
+    /// Clear an inverter's `battery_extra_*` settings that do not validate, with a WARN, so the
+    /// add-on starts on the master's own SOC instead of failing (PR #647 N5). Returns the ids of
+    /// the inverters whose extras were dropped.
+    pub fn drop_invalid_battery_extras(&mut self) -> Vec<String> {
+        let invalid: Vec<(usize, Vec<String>)> = self
+            .inverters
+            .iter()
+            .enumerate()
+            .map(|(idx, inverter)| {
+                let errors = self.battery_extra_errors(inverter);
+                (idx, errors.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
+            })
+            .filter(|(_, errors)| !errors.is_empty())
+            .collect();
+        let mut dropped = Vec::new();
+        for (idx, errors) in invalid {
+            let inverter = &mut self.inverters[idx];
+            warn!(
+                "Inverter '{}': battery_extra_prefixes / battery_extra_capacities_kwh ignored, the SOC is the inverter's own: {}",
+                inverter.id,
+                errors.join("; ")
+            );
+            inverter.battery_extra_prefixes.clear();
+            inverter.battery_extra_capacities_kwh.clear();
+            dropped.push(inverter.id.clone());
+        }
+        dropped
+    }
+
+    /// The first inverter id that another inverter also has, compared trimmed as the control
+    /// map keys them (scan #15): the later entry would otherwise win the control prefix
+    fn duplicate_inverter_id(&self) -> Option<String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for inverter in &self.inverters {
+            let id = inverter.id.trim();
+            if seen.contains(&id) {
+                return Some(id.to_owned());
+            }
+            seen.push(id);
+        }
+        None
+    }
+
     pub fn validate_detailed(&self) -> ValidationResult {
         let mut result = ValidationResult::success();
 
@@ -1801,6 +1969,12 @@ impl AppConfig {
                 "Configuration must include at least one inverter",
             );
             return result; // Early return if no inverters
+        }
+        if let Some(id) = self.duplicate_inverter_id() {
+            result.add_error(
+                "inverters",
+                format!("Inverter id '{id}' is used by more than one inverter"),
+            );
         }
 
         for (idx, inverter) in self.inverters.iter().enumerate() {
@@ -1819,6 +1993,9 @@ impl AppConfig {
                 if let Some(error) = self.pv_extra_prefix_error(&extra) {
                     result.add_error(format!("{prefix}.pv_extra_prefixes"), error);
                 }
+            }
+            for (field, error) in self.battery_extra_errors(inverter) {
+                result.add_error(format!("{prefix}.{field}"), error);
             }
 
             // Validate topology relationships
@@ -1991,6 +2168,15 @@ impl AppConfig {
             anyhow::bail!("Configuration must include at least one inverter");
         }
 
+        // Startup keeps running (scan #15): the add-on overlay and the control map both use the
+        // last entry with this id, so they agree; the web UI refuses a duplicate on save
+        if let Some(id) = self.duplicate_inverter_id() {
+            error!(
+                "Inverter id {:?} is used by more than one inverter; the last entry with it is used",
+                id
+            );
+        }
+
         // Validate inverter configs
         for (idx, inverter) in self.inverters.iter().enumerate() {
             if inverter.id.is_empty() {
@@ -2003,6 +2189,9 @@ impl AppConfig {
                 if let Some(error) = self.pv_extra_prefix_error(&extra) {
                     anyhow::bail!("Inverter '{}': {}", inverter.id, error);
                 }
+            }
+            if let Some((_, error)) = self.battery_extra_errors(inverter).into_iter().next() {
+                anyhow::bail!("Inverter '{}': {}", inverter.id, error);
             }
 
             // Validate topology relationships
@@ -2283,6 +2472,7 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                 export_limit_hard_cap_w: app_config.control.export_limit_hard_cap_w,
                 export_limit_min_w: app_config.control.export_limit_min_w,
                 force_discharge_enabled: app_config.control.force_discharge_enabled,
+                hold_pv_to_battery: app_config.control.hold_pv_to_battery,
                 auto_unlock_inverter: app_config.control.auto_unlock_inverter,
                 hot_standby_entity: app_config
                     .control
@@ -2629,6 +2819,17 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .winter_reserve
                         .mode_switch_min_benefit_czk,
                     soc_resolution_pct: app_config.strategies.winter_reserve.soc_resolution_pct,
+                    export_floor_until_cheap: app_config
+                        .strategies
+                        .winter_reserve
+                        .export_floor_until_cheap,
+                    cautious_pv_mae_pct: app_config.strategies.winter_reserve.cautious_pv_mae_pct,
+                    cautious_pv_off_pct: app_config.strategies.winter_reserve.cautious_pv_off_pct,
+                    cautious_pv_fallback_months: app_config
+                        .strategies
+                        .winter_reserve
+                        .cautious_pv_fallback_months
+                        .clone(),
                 },
                 winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v10.enabled,
@@ -2915,6 +3116,32 @@ mod tests {
         );
     }
 
+    /// Scan #15: two inverters with one id (the control map trims ids, so " main" counts too).
+    /// The web validation refuses it (`validate_detailed`); startup `validate()` only logs it,
+    /// so the add-on still starts (see the persistence tests for which entry wins)
+    #[test]
+    fn test_validate_duplicate_inverter_ids() {
+        let mut config = AppConfig::default();
+        let mut second = config.inverters[0].clone();
+        second.id = " main_inverter".to_owned();
+        second.entity_prefix = "solax_2".to_owned();
+        config.inverters.push(second);
+
+        assert!(config.validate().is_ok());
+        let detailed = config.validate_detailed();
+        assert!(!detailed.valid);
+        assert!(
+            detailed
+                .errors
+                .iter()
+                .any(|e| e.message
+                    == "Inverter id 'main_inverter' is used by more than one inverter"),
+        );
+
+        config.inverters[1].id = "second_inverter".to_owned();
+        assert!(config.validate_detailed().valid);
+    }
+
     #[test]
     fn test_validate_master_without_slaves() {
         let mut config = AppConfig::default();
@@ -3076,6 +3303,8 @@ mod tests {
                     slaves: Some(vec!["slave_1".to_string()]),
                     master: None,
                     pv_extra_prefixes: Vec::new(),
+                    battery_extra_prefixes: Vec::new(),
+                    battery_extra_capacities_kwh: Vec::new(),
                 },
                 InverterConfig {
                     id: "slave_1".to_string(),
@@ -3086,6 +3315,8 @@ mod tests {
                     slaves: None,
                     master: Some("master".to_string()),
                     pv_extra_prefixes: Vec::new(),
+                    battery_extra_prefixes: Vec::new(),
+                    battery_extra_capacities_kwh: Vec::new(),
                 },
             ],
             ..AppConfig::default()
@@ -3774,6 +4005,260 @@ mod tests {
         assert!(config.validate().is_err());
         assert!(!config.validate_detailed().valid);
     }
+
+    /// Default config with an 80 kWh control capacity and the given battery extras
+    fn config_with_battery_extras(prefixes: &[&str], capacities: &[f32]) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.control.battery_capacity_kwh = 80.0;
+        config.inverters[0].battery_extra_prefixes =
+            prefixes.iter().map(|p| (*p).to_owned()).collect();
+        config.inverters[0].battery_extra_capacities_kwh = capacities.to_vec();
+        config
+    }
+
+    /// Brief: add-on options with a 30 kWh parallel battery on an 80 kWh site resolve to 50 / 30
+    #[test]
+    fn test_ha_addon_battery_extra_soc_weights() {
+        let ha_addon_json = r#"{
+            "inverters": [
+                {
+                    "id": "solax_80",
+                    "vendor": "solax-ultra",
+                    "entity_prefix": "solax_80",
+                    "topology": "independent",
+                    "battery_extra_prefixes": ["solax_81"],
+                    "battery_extra_capacities_kwh": [30.0]
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.price",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            },
+            "control": {
+                "maximum_export_power_w": 5000,
+                "force_charge_hours": 2,
+                "force_discharge_hours": 1,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 80.0
+            },
+            "system": {
+                "debug_mode": true,
+                "log_level": "info",
+                "update_interval_secs": 60
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(ha_addon_json).expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(config.validate_detailed().valid);
+
+        let weights = config
+            .battery_soc_weights(&config.inverters[0])
+            .expect("extras configured");
+        assert_eq!(
+            weights,
+            fluxion_adapters::ha::adapters::BatterySocWeights {
+                own_kwh: 50.0,
+                extras: vec![("solax_81".to_owned(), 30.0)],
+            }
+        );
+    }
+
+    thread_local! {
+        static CAPTURED_LOGS: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Writes an event into this thread's capture buffer, if one is open
+    struct ThreadLogWriter;
+
+    impl std::io::Write for ThreadLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOGS.with(|logs| {
+                if let Some(logs) = logs.borrow_mut().as_mut() {
+                    logs.extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Log lines (INFO and above) emitted on this thread while `f` runs. One global test
+    /// subscriber writes each event to its own thread's buffer: a scoped subscriber loses events
+    /// when a parallel test thread caches the callsite interest without one.
+    pub(crate) fn captured_logs(f: impl FnOnce()) -> String {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLogWriter)
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURED_LOGS.with(|logs| *logs.borrow_mut() = Some(Vec::new()));
+        f();
+        let logs = CAPTURED_LOGS.with(|logs| logs.borrow_mut().take().unwrap_or_default());
+        String::from_utf8_lossy(&logs).into_owned()
+    }
+
+    /// PR #647 N5 / R3-4: add-on options with an invalid extra capacity load (the add-on
+    /// starts), the extras are dropped, and one WARN names the inverter
+    #[test]
+    fn test_addon_options_with_invalid_battery_extras_load_without_them() {
+        let options = r#"{
+            "inverters": [
+                {
+                    "id": "solax_80",
+                    "vendor": "solax-ultra",
+                    "entity_prefix": "solax_80",
+                    "topology": "independent",
+                    "battery_extra_prefixes": ["solax_81"],
+                    "battery_extra_capacities_kwh": [0.05]
+                }
+            ],
+            "pricing": {
+                "spot_price_entity": "sensor.price",
+                "use_spot_prices_to_buy": true,
+                "use_spot_prices_to_sell": true,
+                "fixed_buy_prices": [],
+                "fixed_sell_prices": []
+            },
+            "control": {
+                "maximum_export_power_w": 5000,
+                "force_charge_hours": 2,
+                "force_discharge_hours": 1,
+                "min_battery_soc": 10,
+                "max_battery_soc": 100,
+                "battery_capacity_kwh": 80.0
+            },
+            "system": {"debug_mode": true, "log_level": "info", "update_interval_secs": 60}
+        }"#;
+        let mut loaded = None;
+        let logs = captured_logs(|| loaded = Some(AppConfig::from_addon_options_str(options)));
+        let config = loaded.unwrap().expect("the add-on starts");
+        assert!(config.inverters[0].battery_extra_prefixes.is_empty());
+        assert!(config.inverters[0].battery_extra_capacities_kwh.is_empty());
+        assert!(config.battery_soc_weights(&config.inverters[0]).is_none());
+        assert_eq!(logs.matches(" WARN ").count(), 1, "{logs}");
+        assert!(
+            logs.contains(
+                "Inverter 'solax_80': battery_extra_prefixes / battery_extra_capacities_kwh ignored"
+            ),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn test_battery_soc_weights_default_none() {
+        let config = AppConfig::default();
+        assert!(config.inverters[0].battery_extra_prefixes.is_empty());
+        assert!(config.battery_soc_weights(&config.inverters[0]).is_none());
+    }
+
+    /// PR #647 N5: invalid extras from the add-on options are dropped with a WARN, so the config
+    /// validates and the add-on starts on the master's own SOC; valid extras are kept.
+    #[test]
+    fn test_invalid_battery_extras_are_dropped_not_fatal() {
+        for (prefixes, capacities) in [
+            (&["solax_81"][..], &[][..]),
+            (&["solax_81"][..], &[0.05][..]),
+            (&["solax_81"][..], &[500.0][..]),
+        ] {
+            let mut config = config_with_battery_extras(prefixes, capacities);
+            assert!(config.validate().is_err());
+            assert_eq!(
+                config.drop_invalid_battery_extras(),
+                vec!["main_inverter".to_string()]
+            );
+            assert!(config.validate().is_ok());
+            assert!(config.inverters[0].battery_extra_prefixes.is_empty());
+            assert!(config.inverters[0].battery_extra_capacities_kwh.is_empty());
+            assert!(config.battery_soc_weights(&config.inverters[0]).is_none());
+        }
+        let mut valid = config_with_battery_extras(&["solax_81"], &[30.0]);
+        assert!(valid.drop_invalid_battery_extras().is_empty());
+        assert_eq!(valid.inverters[0].battery_extra_prefixes, vec!["solax_81"]);
+    }
+
+    #[test]
+    fn test_battery_extra_empty_prefix_dropped_with_its_capacity() {
+        let config = config_with_battery_extras(&[" ", "solax_81"], &[5.0, 30.0]);
+        assert!(config.validate().is_ok());
+        assert!(config.validate_detailed().valid);
+        let weights = config
+            .battery_soc_weights(&config.inverters[0])
+            .expect("one extra left");
+        assert_eq!(weights.own_kwh, 50.0);
+        assert_eq!(weights.extras, vec![("solax_81".to_owned(), 30.0)]);
+    }
+
+    #[test]
+    fn test_battery_extra_lengths_must_match() {
+        let config = config_with_battery_extras(&["solax_81"], &[]);
+        let result = config.validate_detailed();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "inverters[0].battery_extra_capacities_kwh")
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_battery_extra_capacity_must_be_positive_and_finite() {
+        for kwh in [0.0_f32, -3.0, f32::NAN, f32::INFINITY] {
+            let config = config_with_battery_extras(&["solax_81"], &[kwh]);
+            let result = config.validate_detailed();
+            assert!(!result.valid, "capacity {kwh} must be rejected");
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.field == "inverters[0].battery_extra_capacities_kwh")
+            );
+            assert!(config.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn test_battery_extra_may_not_name_a_configured_inverter() {
+        let mut config = config_with_battery_extras(&[], &[]);
+        let own_prefix = config.inverters[0].entity_prefix.clone();
+        config.inverters[0].battery_extra_prefixes = vec![own_prefix];
+        config.inverters[0].battery_extra_capacities_kwh = vec![30.0];
+        let result = config.validate_detailed();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "inverters[0].battery_extra_prefixes")
+        );
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_battery_extras_must_leave_own_capacity() {
+        let config = config_with_battery_extras(&["solax_81"], &[80.0]);
+        let result = config.validate_detailed();
+        assert!(!result.valid);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field == "inverters[0].battery_extra_capacities_kwh")
+        );
+        assert!(config.validate().is_err());
+    }
 }
 
 #[cfg(test)]
@@ -3796,6 +4281,50 @@ mod winter_reserve_config_tests {
         assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
         assert!((wr.mode_switch_min_benefit_czk - 1.0).abs() < 1e-6);
         assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
+        assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
+        assert!((wr.cautious_pv_off_pct - 20.0).abs() < 1e-6);
+        assert_eq!(wr.cautious_pv_fallback_months, vec![10, 11, 12, 1, 2, 3]);
+    }
+
+    /// Cautious PV options: defaults, explicit values, an empty month list, and the add-on schema
+    #[test]
+    fn test_winter_reserve_cautious_pv_options() {
+        let parse = |wr: &str| -> WinterReserveConfig {
+            let json = format!(r#"{{"winter_reserve": {{{wr}}}}}"#);
+            serde_json::from_str::<StrategiesConfig>(&json)
+                .unwrap()
+                .winter_reserve
+        };
+        let wr = parse(
+            r#""cautious_pv_mae_pct": 30.0, "cautious_pv_off_pct": 18.0, "cautious_pv_fallback_months": [11, 12]"#,
+        );
+        assert!((wr.cautious_pv_mae_pct - 30.0).abs() < 1e-6);
+        assert!((wr.cautious_pv_off_pct - 18.0).abs() < 1e-6);
+        assert_eq!(wr.cautious_pv_fallback_months, vec![11, 12]);
+        let wr = parse(r#""cautious_pv_fallback_months": []"#);
+        assert!(wr.cautious_pv_fallback_months.is_empty());
+        assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
+
+        // The options reach the core config and the planner parameters
+        let mut app = AppConfig::default();
+        app.strategies.winter_reserve.cautious_pv_mae_pct = 40.0;
+        app.strategies.winter_reserve.cautious_pv_off_pct = 30.0;
+        app.strategies.winter_reserve.cautious_pv_fallback_months = Vec::new();
+        let system: fluxion_core::SystemConfig = app.into();
+        let core = &system.strategies_config.winter_reserve;
+        assert!((core.cautious_pv_mae_pct - 40.0).abs() < 1e-6);
+        assert!((core.cautious_pv_off_pct - 30.0).abs() < 1e-6);
+        assert!(core.cautious_pv_fallback_months.is_empty());
+        let params = fluxion_core::backtest::winter_reserve_params(core);
+        assert!(params.cautious_pv_fallback_months.is_empty());
+
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("      cautious_pv_mae_pct: 25.0\n"));
+        assert!(addon.contains("      cautious_pv_fallback_months: [10, 11, 12, 1, 2, 3]\n"));
+        assert!(addon.contains("      cautious_pv_mae_pct: float(0,100)?\n"));
+        assert!(addon.contains("      cautious_pv_off_pct: 20.0\n"));
+        assert!(addon.contains("      cautious_pv_off_pct: float(0,100)?\n"));
+        assert!(addon.contains("      cautious_pv_fallback_months:\n        - int(1,12)?\n"));
     }
 
     #[test]
@@ -3942,6 +4471,35 @@ mod addon_schema_tests {
             winter_reserve_checked >= 6,
             "winter_reserve numeric options were not all checked"
         );
+    }
+
+    /// The add-on schema takes months 1-12 only (Supervisor rejects 13), and the default list fits
+    #[test]
+    fn test_addon_cautious_pv_months_schema_rejects_13() {
+        let yaml = include_str!("../../../fluxion/config.yaml");
+        let (options, schema) = yaml.split_once("\nschema:").expect("schema section");
+        let item = schema
+            .split_once("      cautious_pv_fallback_months:\n")
+            .expect("months in the schema")
+            .1
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .strip_prefix("- ")
+            .expect("months schema is a list");
+        let (lo, hi) = parse_numeric_range(item).expect("numeric item");
+        let accepts = |m: f64| lo.is_none_or(|l| m >= l) && hi.is_none_or(|h| m <= h);
+        assert!(item.starts_with("int("), "{item}");
+        assert!(!accepts(13.0) && !accepts(0.0), "{item}");
+        assert!(accepts(1.0) && accepts(12.0), "{item}");
+
+        let defaults =
+            read_scalars(options)["options.strategies.winter_reserve.cautious_pv_fallback_months"]
+                .clone();
+        let months: Vec<u32> = serde_json::from_str(&defaults).expect("default month list");
+        assert_eq!(months, vec![10, 11, 12, 1, 2, 3]);
+        assert!(months.iter().all(|m| accepts(f64::from(*m))));
     }
 
     #[test]

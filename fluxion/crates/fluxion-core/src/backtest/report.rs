@@ -32,6 +32,8 @@ pub fn winter_reserve_params(config: &WinterReserveConfigCore) -> WinterReserveP
         min_mode_benefit_czk: config.min_mode_benefit_czk,
         mode_switch_min_benefit_czk: config.mode_switch_min_benefit_czk,
         soc_resolution_pct: config.soc_resolution_pct,
+        export_floor_until_cheap: config.export_floor_until_cheap,
+        cautious_pv_fallback_months: config.cautious_pv_fallback_months.clone(),
     }
 }
 
@@ -285,7 +287,7 @@ pub fn build_report(
         "none (high tariff)".to_owned()
     };
 
-    let mut options = ReplayOptions::new(site.timezone, battery, params);
+    let mut options = ReplayOptions::new(site.timezone, battery, params.clone());
     options.planner_load_margin = site.control.planner_load_margin;
     options.profile = ProfileSource::House;
     options.from = Some(loaded.day_start);

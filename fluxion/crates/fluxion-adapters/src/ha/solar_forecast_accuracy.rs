@@ -21,6 +21,7 @@ use crate::ha::client::HomeAssistantClient;
 use crate::ha::ws::{HaWsSession, websocket_url};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
+use fluxion_types::CautiousPvSignal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -158,9 +159,11 @@ pub fn bias_notice_due(
         && last_notified != Some(today)
 }
 
-/// State and attributes of `sensor.fluxion_solar_forecast_bias`
+/// State and attributes of `sensor.fluxion_solar_forecast_bias`. `cautious_pv` is the planner's
+/// cautious-PV state from the PV forecast correction's error (`cautious_pv_error_pct`), null while
+/// it is unknown and the fallback months decide.
 #[must_use]
-pub fn bias_payload(days: &[DayRecord]) -> (String, Value) {
+pub fn bias_payload(days: &[DayRecord], cautious: Option<CautiousPvSignal>) -> (String, Value) {
     let summary = bias_summary(days);
     let state = summary
         .as_ref()
@@ -172,6 +175,8 @@ pub fn bias_payload(days: &[DayRecord]) -> (String, Value) {
             "window_days": BIAS_WINDOW_DAYS,
             "days": s.days,
             "mean_abs_error_pct": s.mean_abs_error_pct.map(round1),
+            "cautious_pv": cautious.map(|c| c.cautious),
+            "cautious_pv_error_pct": cautious.map(|c| round1(c.mae_pct)),
             "rows": s.rows.iter().map(|r| json!({
                 "date": r.date.to_string(),
                 "forecast_kwh": round1(r.forecast_kwh),
@@ -184,6 +189,8 @@ pub fn bias_payload(days: &[DayRecord]) -> (String, Value) {
             "friendly_name": "FluxION solar forecast bias",
             "window_days": BIAS_WINDOW_DAYS,
             "days": 0,
+            "cautious_pv": cautious.map(|c| c.cautious),
+            "cautious_pv_error_pct": cautious.map(|c| round1(c.mae_pct)),
             "rows": [],
         }),
     };
@@ -371,7 +378,13 @@ pub struct AccuracyMonitor {
     last_actual_try: Option<Instant>,
     /// Last published body and when it was sent
     last_publish: Option<(String, Instant)>,
+    /// The cautious-PV signal of the PV forecast correction, shown as sensor attributes
+    cautious_pv: Option<SharedCautiousPv>,
 }
+
+/// The last cautious-PV signal, shared by the PV forecast correction worker (writer) and the
+/// accuracy monitor (bias sensor attributes)
+pub type SharedCautiousPv = std::sync::Arc<std::sync::Mutex<Option<CautiousPvSignal>>>;
 
 impl AccuracyMonitor {
     #[must_use]
@@ -384,7 +397,15 @@ impl AccuracyMonitor {
             store,
             last_actual_try: None,
             last_publish: None,
+            cautious_pv: None,
         }
+    }
+
+    /// Show the cautious-PV signal in `view` on the bias sensor
+    #[must_use]
+    pub fn with_cautious_pv(mut self, view: SharedCautiousPv) -> Self {
+        self.cautious_pv = Some(view);
+        self
     }
 
     /// One fetch cycle: record the morning forecast, read evening measurements, publish the bias
@@ -423,7 +444,11 @@ impl AccuracyMonitor {
             }
         }
 
-        self.publish(client).await;
+        let cautious = self
+            .cautious_pv
+            .as_ref()
+            .and_then(|v| *v.lock().unwrap_or_else(|e| e.into_inner()));
+        self.publish(client, cautious).await;
 
         let summary = bias_summary(&self.store.days);
         if bias_notice_due(summary.as_ref(), today, self.store.last_notified)
@@ -500,8 +525,8 @@ impl AccuracyMonitor {
         finished
     }
 
-    async fn publish(&mut self, client: &HomeAssistantClient) {
-        let (state, attributes) = bias_payload(&self.store.days);
+    async fn publish(&mut self, client: &HomeAssistantClient, cautious: Option<CautiousPvSignal>) {
+        let (state, attributes) = bias_payload(&self.store.days, cautious);
         let body = json!({ "state": state, "attributes": attributes }).to_string();
         let now = Instant::now();
         let last = self.last_publish.as_ref().map(|(b, t)| (b.as_str(), *t));
@@ -640,9 +665,9 @@ mod tests {
 
     #[test]
     fn payload_state_is_unknown_without_data_and_rounded_otherwise() {
-        let (state, _) = bias_payload(&[]);
+        let (state, _) = bias_payload(&[], None);
         assert_eq!(state, "unknown");
-        let (state, attributes) = bias_payload(&[measured(1, 12.0, 10.0)]);
+        let (state, attributes) = bias_payload(&[measured(1, 12.0, 10.0)], None);
         assert_eq!(state, "20.0");
         assert_eq!(attributes["days"], 1);
     }
@@ -803,5 +828,19 @@ mod tests {
         assert_eq!(AccuracyStore::load(&path), store);
         let _ = std::fs::remove_file(&path);
         assert_eq!(AccuracyStore::load(&path), AccuracyStore::default());
+    }
+
+    #[test]
+    fn bias_sensor_shows_the_cautious_state() {
+        let days = [measured(1, 12.0, 10.0)];
+        let signal = CautiousPvSignal {
+            mae_pct: 39.04,
+            cautious: true,
+        };
+        let (_, attributes) = bias_payload(&days, Some(signal));
+        assert_eq!(attributes["cautious_pv"], json!(true));
+        assert_eq!(attributes["cautious_pv_error_pct"], json!(39.0));
+        let (_, attributes) = bias_payload(&days, None);
+        assert_eq!(attributes["cautious_pv"], Value::Null);
     }
 }

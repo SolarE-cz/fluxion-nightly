@@ -20,7 +20,9 @@ use crate::{
     components::*,
     pricing::analyze_prices,
     resources::SystemConfig,
-    scheduling::{ScheduleConfig, active_user_levers, generate_schedule_with_optimizer},
+    scheduling::{
+        ScheduleConfig, active_user_levers, apply_learning_warmup, generate_schedule_with_optimizer,
+    },
     strategy::winter_reserve::planner_levers,
 };
 use fluxion_types::UserLevers;
@@ -233,6 +235,42 @@ fn first_schedule_waits(
     hdo || profile
 }
 
+/// Brief H38: the once-logs of the learning warm-up. INFO when it starts or its day count changes,
+/// and once when the house-load profile is ready. Each system that builds a schedule keeps its own.
+#[derive(Default)]
+pub struct LearningWarmupLog {
+    warming_days: Option<usize>,
+}
+
+impl LearningWarmupLog {
+    /// Returns the days of profile when the warm-up holds the default mode, None when the planner runs.
+    pub fn observe(
+        &mut self,
+        history_configured: bool,
+        profile: Option<&HourlyConsumptionProfile>,
+    ) -> Option<usize> {
+        let profile_days = profile.map(|p| p.days_averaged);
+        if !learning_warmup_active(history_configured, profile_days) {
+            if self.warming_days.take().is_some() && history_configured {
+                info!(
+                    "House-load profile ready ({} days): planner active",
+                    profile_days.unwrap_or(0)
+                );
+            }
+            return None;
+        }
+        let days = profile_days.unwrap_or(0);
+        if self.warming_days != Some(days) {
+            info!(
+                "Learning house load: {}/{} days of history, holding the default mode (no planner moves) until then",
+                days, MIN_HOUSE_LOAD_DAYS
+            );
+            self.warming_days = Some(days);
+        }
+        Some(days)
+    }
+}
+
 /// Simplified system that updates prices using direct cache access
 /// Replaces the complex channel polling with on-demand fetching
 #[allow(clippy::too_many_arguments)]
@@ -253,12 +291,20 @@ pub fn update_prices_system(
     plugin_manager_res: Res<PluginManagerResource>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
     solar_forecast: Option<Res<super::SolarForecastData>>,
-    (timezone_config, user_levers, mut last_planner_levers, mut startup_waits, cost_basis): (
+    (
+        timezone_config,
+        user_levers,
+        mut last_planner_levers,
+        mut startup_waits,
+        cost_basis,
+        mut warmup_log,
+    ): (
         Option<Res<crate::resources::TimezoneConfig>>,
         Option<Res<crate::resources::UserLeversResource>>,
         Local<Option<UserLevers>>,
         Local<StartupWaits>,
         Option<Res<crate::battery_cost_basis::BatteryCostTracker>>,
+        Local<LearningWarmupLog>,
     ),
 ) {
     // A change of the planner levers regenerates the schedule even when prices are fresh
@@ -284,12 +330,7 @@ pub fn update_prices_system(
     let hdo_ready = hdo_cache
         .as_ref()
         .is_some_and(|cache| cache.is_low_tariff(chrono::Utc::now()).is_some());
-    let profile_configured = !config.history.consumption_entity.trim().is_empty()
-        || config
-            .history
-            .house_load_power_entity
-            .as_deref()
-            .is_some_and(|entity| !entity.trim().is_empty());
+    let profile_configured = history_profile_configured(&config.history);
     let profile_ready =
         consumption_history.hourly_profile().is_some() || consumption_history.fetch_received();
     if first_schedule_waits(
@@ -440,7 +481,7 @@ pub fn update_prices_system(
     // Corrected by the PV forecast correction factor (brief H34) when it is in force
     let solar = super::planner_solar_inputs(solar_forecast.as_deref(), &block_starts);
 
-    let new_schedule = generate_schedule_with_optimizer(
+    let mut new_schedule = generate_schedule_with_optimizer(
         &new_prices.time_block_prices,
         &config.control_config,
         &schedule_config,
@@ -466,7 +507,15 @@ pub fn update_prices_system(
             .and_then(|tz| tz.timezone.as_deref()),
         active_user_levers(user_levers.as_deref()),
         cost_basis.as_ref().and_then(|t| t.cost_czk_per_kwh()),
+        solar.cautious_pv,
     );
+    // Brief H38: no planner moves until the house-load profile has MIN_HOUSE_LOAD_DAYS
+    if let Some(days) = warmup_log.observe(
+        history_profile_configured(&config.history),
+        consumption_history.hourly_profile(),
+    ) {
+        apply_learning_warmup(&mut new_schedule, days, MIN_HOUSE_LOAD_DAYS);
+    }
 
     // Update or create PriceAnalysis entity
     if let Ok((_, mut price_analysis)) = price_analysis_query.single_mut() {
@@ -923,6 +972,50 @@ mod hdo_startup_tests {
         assert!(has_schedule(&mut world));
     }
 
+    /// Brief H38: a configured history with a 1-day profile holds the default mode; with 3 days the
+    /// planner runs.
+    #[test]
+    fn learning_warmup_holds_default_mode_until_three_days_of_house_load() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let profile_days = |days_averaged| crate::async_tasks::ConsumptionHistoryUpdate {
+            daily_summaries: Vec::new(),
+            hourly_profile: Some(HourlyConsumptionProfile {
+                hourly_avg_kwh: [3.5; 24],
+                days_averaged,
+                hourly_p75_kwh: None,
+            }),
+        };
+        let warmup_uid = Some("warmup:learning_house_load".to_string());
+
+        let (mut world, mut schedule, history) = world("", "sensor.house_load");
+        history.send(profile_days(1)).unwrap();
+        schedule.run(&mut world);
+        let blocks = &world
+            .query::<&OperationSchedule>()
+            .single(&world)
+            .unwrap()
+            .scheduled_blocks;
+        assert!(!blocks.is_empty());
+        for block in blocks {
+            assert_eq!(
+                block.mode,
+                fluxion_types::inverter::InverterOperationMode::SelfUse
+            );
+            assert_eq!(block.decision_uid, warmup_uid);
+        }
+
+        let (mut world, mut schedule, history) = self::world("", "sensor.house_load");
+        history.send(profile_days(3)).unwrap();
+        schedule.run(&mut world);
+        let blocks = &world
+            .query::<&OperationSchedule>()
+            .single(&world)
+            .unwrap()
+            .scheduled_blocks;
+        assert!(blocks.iter().all(|b| b.decision_uid != warmup_uid));
+    }
+
     #[test]
     fn restart_waits_for_both_hdo_and_profile() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -956,5 +1049,103 @@ mod hdo_startup_tests {
         world2.resource_mut::<HdoScheduleData>().raw_data = Some(hdo_all_low());
         schedule2.run(&mut world2);
         assert!(has_schedule(&mut world2));
+    }
+
+    /// Brief H38 review: a 1-day profile on a configured history; the schedule the handler builds
+    /// holds the default mode on the user-control and the config recalculation paths.
+    fn one_day_profile(world: &mut World) {
+        world
+            .resource_mut::<ConsumptionHistory>()
+            .set_hourly_profile(HourlyConsumptionProfile {
+                hourly_avg_kwh: [3.5; 24],
+                days_averaged: 1,
+                hourly_p75_kwh: None,
+            });
+    }
+
+    fn flat_spot_prices() -> SpotPriceData {
+        let start = Utc::now()
+            .duration_trunc(chrono::Duration::minutes(15))
+            .unwrap();
+        SpotPriceData {
+            time_block_prices: (0..96)
+                .map(|i| TimeBlockPrice {
+                    block_start: start + chrono::Duration::minutes(15 * i),
+                    duration_minutes: 15,
+                    price_czk_per_kwh: 3.0,
+                    effective_price_czk_per_kwh: 3.0,
+                    spot_sell_price_czk_per_kwh: Some(2.0),
+                    buy_price_czk_per_kwh: None,
+                })
+                .collect(),
+            block_duration_minutes: 15,
+            fetched_at: Utc::now(),
+            ha_last_updated: Utc::now(),
+            fallback_block_starts: Vec::new(),
+        }
+    }
+
+    fn assert_only_warmup_blocks(world: &mut World) {
+        let schedule = world.query::<&OperationSchedule>().single(world).unwrap();
+        assert!(!schedule.scheduled_blocks.is_empty());
+        assert!(
+            schedule
+                .scheduled_blocks
+                .iter()
+                .all(|b| b.decision_uid.as_deref() == Some("warmup:learning_house_load"))
+        );
+    }
+
+    #[test]
+    fn user_control_rebuild_applies_the_learning_warmup() {
+        use crate::config_events::UserControlUpdateEvent;
+        use crate::resources::UserControlResource;
+        use crate::web_bridge::UserControlUpdateChannel;
+        use bevy_ecs::system::RunSystemOnce;
+        use fluxion_types::user_control::UserControlState;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, _schedule, _history) = world("", "sensor.house_load");
+        one_day_profile(&mut world);
+        world.spawn(flat_spot_prices());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(UserControlUpdateEvent::restrictions_changed(
+            UserControlState::default(),
+        ))
+        .unwrap();
+        world.insert_resource(UserControlUpdateChannel { receiver: rx });
+        world.insert_resource(UserControlResource::new(UserControlState::default()));
+        world
+            .run_system_once(crate::async_systems::user_control_event_handler)
+            .unwrap();
+        assert_only_warmup_blocks(&mut world);
+    }
+
+    #[test]
+    fn config_recalculation_applies_the_learning_warmup() {
+        use crate::config_events::{ConfigSection, ConfigUpdateEvent};
+        use crate::debug::DebugModeConfig;
+        use crate::web_bridge::ConfigUpdateChannel;
+        use bevy_ecs::system::RunSystemOnce;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (mut world, _schedule, _history) = world("", "sensor.house_load");
+        one_day_profile(&mut world);
+        world.spawn(flat_spot_prices());
+        let new_config = serde_json::to_value(world.resource::<SystemConfig>()).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ConfigUpdateEvent {
+            new_config,
+            changed_sections: std::collections::HashSet::from([ConfigSection::Control]),
+        })
+        .unwrap();
+        world.insert_resource(ConfigUpdateChannel { receiver: rx });
+        world.insert_resource(DebugModeConfig::default());
+        world
+            .run_system_once(crate::async_systems::config_event_handler)
+            .unwrap();
+        assert_only_warmup_blocks(&mut world);
     }
 }

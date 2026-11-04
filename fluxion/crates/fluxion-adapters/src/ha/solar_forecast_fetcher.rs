@@ -13,15 +13,17 @@
 use crate::ha::HaClientResource;
 use crate::ha::client::HomeAssistantClient;
 use crate::ha::hot_standby::{RegistryEntry, fetch_registry};
-use crate::ha::pv_forecast_correction::{CorrectionWorker, SharedForecastStore, SharedSensorList};
-use crate::ha::solar_forecast_accuracy::{AccuracyMonitor, BIAS_STATE_PATH};
+use crate::ha::pv_forecast_correction::{
+    CautiousPvOutput, CorrectionWorker, SharedForecastStore, SharedSensorList,
+};
+use crate::ha::solar_forecast_accuracy::{AccuracyMonitor, BIAS_STATE_PATH, SharedCautiousPv};
 use crate::ha::types::HaEntityState;
 use crate::ha::ws::websocket_url;
 use bevy_ecs::prelude::*;
 use chrono::{DateTime, Utc};
 use fluxion_core::async_systems::{
-    PvCorrectionChannel, SolarForecastChannel, SolarForecastData, SolarForecastSender,
-    SolarForecastUpdate, correction_to_apply,
+    CautiousPvChannel, PvCorrectionChannel, SolarForecastChannel, SolarForecastData,
+    SolarForecastSender, SolarForecastUpdate, correction_to_apply,
 };
 use fluxion_core::pv_correction::{ForecastStore, PvCorrectionSiteResource, SNAPSHOT_PATH};
 use fluxion_core::{SystemConfig, TimezoneConfig};
@@ -57,6 +59,7 @@ pub fn spawn_solar_forecast_fetcher(
         Option<Res<PvCorrectionSiteResource>>,
         Option<Res<PvCorrectionChannel>>,
     ),
+    cautious_pv: Option<Res<CautiousPvChannel>>,
 ) {
     let Some(client_res) = ha_client else {
         tracing::warn!("⚠️ HaClientResource not available, cannot fetch solar forecast");
@@ -93,6 +96,14 @@ pub fn spawn_solar_forecast_fetcher(
         .collect();
     let actual_entities = actual_pv_entities(&config.actual_pv_power_entities, &prefixes);
     let mut accuracy = AccuracyMonitor::new(PathBuf::from(BIAS_STATE_PATH), tz, actual_entities);
+    // Cautious PV for Winter Reserve: the PV forecast correction computes the forecast error and
+    // keeps the hysteresis state in its store; the bias sensor shows it. The threshold is read
+    // here, at startup (an options change restarts the add-on).
+    let cautious_view: SharedCautiousPv = Arc::new(std::sync::Mutex::new(None));
+    accuracy = accuracy.with_cautious_pv(cautious_view.clone());
+    let cautious_sender = cautious_pv.map(|channel| channel.sender.clone());
+    let cautious_thresholds =
+        cautious_pv_thresholds(&system_config.strategies_config.winter_reserve);
 
     // PV forecast correction (brief H34): daily snapshots of the planner's forecast here, the
     // factor in its own task once the sensors are discovered
@@ -134,6 +145,11 @@ pub fn spawn_solar_forecast_fetcher(
                 path: PathBuf::from(SNAPSHOT_PATH),
                 forecast_entities,
                 sender: setup.sender.clone(),
+                cautious_pv: cautious_sender.map(|sender| CautiousPvOutput {
+                    thresholds: cautious_thresholds,
+                    sender,
+                    view: cautious_view,
+                }),
             };
             tokio::spawn(worker.run());
         }
@@ -153,6 +169,16 @@ pub fn spawn_solar_forecast_fetcher(
                 .await;
         }
     });
+}
+
+/// Cautious-PV thresholds the correction worker uses, from `strategies.winter_reserve`
+fn cautious_pv_thresholds(
+    wr: &fluxion_types::config::WinterReserveConfigCore,
+) -> fluxion_core::strategy::winter_reserve::CautiousPvThresholds {
+    fluxion_core::strategy::winter_reserve::CautiousPvThresholds {
+        on_pct: wr.cautious_pv_mae_pct,
+        off_pct: wr.cautious_pv_off_pct,
+    }
 }
 
 /// What the PV forecast correction needs in the fetcher task
@@ -745,6 +771,23 @@ pub fn poll_solar_forecast_channel(
     }
 }
 
+/// Update system: store the newest cautious-PV signal from the accuracy monitor
+pub fn poll_cautious_pv_channel(
+    channel: Option<Res<CautiousPvChannel>>,
+    mut forecast_data: Option<ResMut<SolarForecastData>>,
+) {
+    let Some(channel) = channel else {
+        return;
+    };
+    while let Ok(signal) = channel.receiver.try_recv() {
+        if let Some(data) = forecast_data.as_mut()
+            && data.cautious_pv != signal
+        {
+            data.cautious_pv = signal;
+        }
+    }
+}
+
 /// Update system: apply the PV forecast correction factor (brief H34) to the forecast data.
 /// The option is checked here too, so with it off the factor is 1.0 whatever arrives.
 pub fn poll_pv_correction_channel(
@@ -775,6 +818,22 @@ fn apply_correction(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custom_cautious_pv_thresholds_reach_the_worker() {
+        let wr = fluxion_types::config::WinterReserveConfigCore {
+            cautious_pv_mae_pct: 30.0,
+            cautious_pv_off_pct: 18.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            cautious_pv_thresholds(&wr),
+            fluxion_core::strategy::winter_reserve::CautiousPvThresholds {
+                on_pct: 30.0,
+                off_pct: 18.0,
+            }
+        );
+    }
+
     use super::*;
     use fluxion_core::pv_correction::CorrectionResult;
 
@@ -784,7 +843,34 @@ mod tests {
             days_used: 7,
             measured_kwh: 117.0,
             forecast_kwh: 100.0,
+            forecast_error_pct: None,
         }
+    }
+
+    #[test]
+    fn cautious_pv_signal_reaches_the_forecast_data() {
+        use bevy_ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        world.insert_resource(CautiousPvChannel {
+            sender: tx.clone(),
+            receiver: rx,
+        });
+        world.init_resource::<SolarForecastData>();
+        let signal = fluxion_types::CautiousPvSignal {
+            mae_pct: 39.0,
+            cautious: true,
+        };
+        tx.send(Some(signal)).unwrap();
+        world.run_system_once(poll_cautious_pv_channel).unwrap();
+        assert_eq!(
+            world.resource::<SolarForecastData>().cautious_pv,
+            Some(signal)
+        );
+        // Too few days again: back to the fallback months
+        tx.send(None).unwrap();
+        world.run_system_once(poll_cautious_pv_channel).unwrap();
+        assert_eq!(world.resource::<SolarForecastData>().cautious_pv, None);
     }
 
     #[test]

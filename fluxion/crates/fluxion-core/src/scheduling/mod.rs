@@ -24,7 +24,7 @@ use fluxion_types::config::{ControlConfig, Currency, PricingConfig};
 use fluxion_types::inverter::InverterOperationMode;
 use fluxion_types::pricing::{PriceAnalysis, TimeBlockPrice};
 use fluxion_types::scheduling::{OperationSchedule, ScheduledMode};
-use fluxion_types::{UserControlState, UserLevers};
+use fluxion_types::{CautiousPvSignal, UserControlState, UserLevers};
 use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
@@ -188,6 +188,23 @@ impl Default for ScheduleConfig {
     }
 }
 
+/// Brief H38: while the house-load profile is still learning, every planned block is the default
+/// mode (Self-Use; the executor maps it to Back Up when the user's default is Back Up). Times, targets
+/// and prices stay as planned. User fixed-time slots (`user_override:` uid) are an explicit choice
+/// and stay as they are.
+pub fn apply_learning_warmup(schedule: &mut OperationSchedule, days: usize, needed: usize) {
+    for block in schedule.scheduled_blocks.iter_mut().filter(|b| {
+        !b.decision_uid
+            .as_deref()
+            .is_some_and(|uid| uid.starts_with("user_override:"))
+    }) {
+        block.mode = InverterOperationMode::SelfUse;
+        block.reason = format!("Learning house load ({days}/{needed} days) - default mode");
+        block.decision_uid = Some("warmup:learning_house_load".to_string());
+        block.debug_info = None;
+    }
+}
+
 /// Force discharge stays off until a capped discharge method exists (`control.force_discharge_enabled`):
 /// ForceDischarge blocks become Self-Use. Returns how many blocks were converted.
 pub fn gate_force_discharge(blocks: &mut [ScheduledMode], enabled: bool) -> usize {
@@ -283,6 +300,7 @@ pub fn generate_schedule_with_optimizer(
     timezone: Option<&str>,
     user_levers: Option<&UserLevers>,
     battery_charge_cost_czk_per_kwh: Option<f32>,
+    cautious_pv: Option<CautiousPvSignal>,
 ) -> OperationSchedule {
     if time_block_prices.is_empty() {
         info!("Cannot generate schedule from empty price data");
@@ -400,6 +418,7 @@ pub fn generate_schedule_with_optimizer(
             user_levers,
             planner_min_soc_pct,
             battery_charge_cost_czk_per_kwh,
+            cautious_pv,
         );
 
         let decision = plugin_manager.evaluate(&request);
@@ -548,6 +567,7 @@ pub fn generate_schedule_with_optimizer(
             user_levers,
             planner_min_soc_pct,
             battery_charge_cost_czk_per_kwh,
+            cautious_pv,
         );
 
         // Get decision from plugin manager
@@ -1087,6 +1107,7 @@ fn create_evaluation_request(
     user_levers: Option<&UserLevers>,
     planner_min_soc_pct: Option<f32>,
     battery_charge_cost_czk_per_kwh: Option<f32>,
+    cautious_pv: Option<CautiousPvSignal>,
 ) -> EvaluationRequest {
     EvaluationRequest {
         block: PriceBlock {
@@ -1137,6 +1158,7 @@ fn create_evaluation_request(
         timezone: timezone.map(str::to_owned),
         user_levers: user_levers.copied(),
         planner_min_soc_pct,
+        cautious_pv,
     }
 }
 
@@ -1296,11 +1318,17 @@ mod tests {
             Some("Europe/Prague"),
             None,
             None,
+            Some(fluxion_types::CautiousPvSignal {
+                mae_pct: 39.0,
+                cautious: true,
+            }),
         );
 
         let requests = plugin.requests.lock().unwrap();
         assert!(!requests.is_empty());
         for request in requests.iter() {
+            // The cautious-PV signal reaches every request
+            assert_eq!(request.cautious_pv.map(|c| c.cautious), Some(true));
             assert_eq!(request.block_forecasts.len(), request.all_blocks.len());
             assert_eq!(request.timezone.as_deref(), Some("Europe/Prague"));
 
@@ -1576,6 +1604,7 @@ mod tests {
                 None,
                 active_user_levers(res),
                 None,
+                None,
             );
             plugin
         };
@@ -1662,5 +1691,67 @@ mod backup_floor_tests {
             ..Default::default()
         };
         assert_eq!(backup_planner_floor(Some(&state), 10.0, 100.0), Some(95.0));
+    }
+}
+
+#[cfg(test)]
+mod learning_warmup_tests {
+    use super::*;
+
+    fn block(start_min: i64, mode: InverterOperationMode) -> ScheduledMode {
+        ScheduledMode {
+            block_start: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap()
+                + chrono::Duration::minutes(start_min),
+            duration_minutes: 15,
+            target_inverters: Some(vec!["inv_1".to_string()]),
+            mode,
+            reason: "plan".to_string(),
+            decision_uid: Some("winter_adaptive_v3:force_charge".to_string()),
+            debug_info: None,
+        }
+    }
+
+    #[test]
+    fn warmup_turns_every_block_into_self_use_and_keeps_timing_and_targets() {
+        let user_slot = ScheduledMode {
+            decision_uid: Some("user_override:slot-1".to_string()),
+            reason: "Keep grid charge".to_string(),
+            ..block(60, InverterOperationMode::ForceCharge)
+        };
+        let mut schedule = OperationSchedule {
+            scheduled_blocks: vec![
+                block(0, InverterOperationMode::ForceCharge),
+                block(15, InverterOperationMode::ForceDischarge),
+                block(30, InverterOperationMode::NoChargeNoDischarge),
+                block(45, InverterOperationMode::SelfUse),
+                user_slot.clone(),
+            ],
+            ..Default::default()
+        };
+        let before = schedule.scheduled_blocks.clone();
+
+        apply_learning_warmup(&mut schedule, 1, 3);
+
+        assert_eq!(schedule.scheduled_blocks.len(), before.len());
+        // The user's fixed slot is untouched: mode, reason and uid
+        let kept = &schedule.scheduled_blocks[4];
+        assert_eq!(kept.mode, InverterOperationMode::ForceCharge);
+        assert_eq!(kept.reason, user_slot.reason);
+        assert_eq!(kept.decision_uid, user_slot.decision_uid);
+        for (after, before) in schedule.scheduled_blocks.iter().zip(&before).take(4) {
+            assert_eq!(after.mode, InverterOperationMode::SelfUse);
+            assert_eq!(
+                after.reason,
+                "Learning house load (1/3 days) - default mode"
+            );
+            assert_eq!(
+                after.decision_uid.as_deref(),
+                Some("warmup:learning_house_load")
+            );
+            assert_eq!(after.block_start, before.block_start);
+            assert_eq!(after.duration_minutes, before.duration_minutes);
+            assert_eq!(after.target_inverters, before.target_inverters);
+            assert!(after.debug_info.is_none());
+        }
     }
 }

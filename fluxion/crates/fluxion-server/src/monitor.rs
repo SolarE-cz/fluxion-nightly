@@ -55,12 +55,12 @@ pub fn spawn_monitor(
                 if elapsed > threshold_secs && client.status != "offline" {
                     // Transition to offline
                     if let Err(e) = db.update_client_status(&client.instance_id, "offline") {
-                        error!(error = %e, instance_id = %client.instance_id, "Failed to update status to offline");
+                        error!(error = %e, instance_id = ?client.instance_id, "Failed to update status to offline");
                         continue;
                     }
 
                     warn!(
-                        instance_id = %client.instance_id,
+                        instance_id = ?client.instance_id,
                         elapsed_secs = elapsed,
                         threshold_secs = threshold_secs,
                         "Client marked offline"
@@ -96,10 +96,10 @@ pub fn spawn_monitor(
                 } else if elapsed > warning_secs && client.status == "online" {
                     // Transition to warning
                     if let Err(e) = db.update_client_status(&client.instance_id, "warning") {
-                        error!(error = %e, instance_id = %client.instance_id, "Failed to update status to warning");
+                        error!(error = %e, instance_id = ?client.instance_id, "Failed to update status to warning");
                     } else {
                         info!(
-                            instance_id = %client.instance_id,
+                            instance_id = ?client.instance_id,
                             elapsed_secs = elapsed,
                             "Client status changed to warning"
                         );

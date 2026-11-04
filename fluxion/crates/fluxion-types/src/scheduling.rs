@@ -169,3 +169,17 @@ pub struct ScheduleData {
     pub schedule_generated_at: DateTime<Utc>, // When schedule was created
     pub schedule_ends_at: Option<DateTime<Utc>>, // When schedule data ends
 }
+
+/// Cautious-PV signal from the PV forecast correction (brief H34). Sent only when at least 3 valid
+/// days of its 7-day window give a forecast error; otherwise the planner falls back to
+/// `cautious_pv_fallback_months`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CautiousPvSignal {
+    /// Over-forecast error (%) of the forecast the planner had (each day's forecast × the H34
+    /// factor in force that day) over the window's valid days: Σ max(f − a, 0) / Σ max(f, a) ×
+    /// 100, always 0-100
+    pub mae_pct: f32,
+    /// Cautious PV on: the error reached `cautious_pv_mae_pct`, held until it drops below
+    /// `cautious_pv_off_pct`
+    pub cautious: bool,
+}

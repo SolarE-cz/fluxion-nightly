@@ -97,6 +97,13 @@ pub struct DayForecast {
     /// field existed, so a complete snapshot replaces them)
     #[serde(default)]
     pub sensors: usize,
+    /// H34 factor the planner scaled this day's forecast by: the factor applied when the
+    /// snapshot was taken, replaced by the factor of the day's recompute once the planner applies
+    /// it (`ForecastStore::record_applied_factor`). `None` for days rebuilt from HA history and
+    /// for records written before this field existed; the forecast error then uses the current
+    /// factor for them.
+    #[serde(default)]
+    pub planner_factor: Option<f32>,
 }
 
 impl DayForecast {
@@ -122,6 +129,10 @@ pub struct CorrectionResult {
     pub measured_kwh: f32,
     /// Σ forecast PV over the same hours (kWh)
     pub forecast_kwh: f32,
+    /// Forecast error of the corrected forecast over the same days (`forecast_error_pct`, 0-100);
+    /// `None` with fewer than `MIN_VALID_DAYS` valid days. Drives cautious PV.
+    #[serde(default)]
+    pub forecast_error_pct: Option<f32>,
 }
 
 impl CorrectionResult {
@@ -133,6 +144,7 @@ impl CorrectionResult {
             days_used: 0,
             measured_kwh: 0.0,
             forecast_kwh: 0.0,
+            forecast_error_pct: None,
         }
     }
 }
@@ -172,6 +184,14 @@ pub struct StoredCorrection {
     pub result: CorrectionResult,
 }
 
+impl StoredCorrection {
+    /// The stored factor still applies on `today`: computed today or yesterday
+    #[must_use]
+    pub fn usable_on(&self, today: NaiveDate) -> bool {
+        self.computed_on <= today && (today - self.computed_on).num_days() <= 1
+    }
+}
+
 /// Persisted snapshots
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ForecastStore {
@@ -182,6 +202,15 @@ pub struct ForecastStore {
     pub peak_hour_kwh: f32,
     #[serde(default)]
     pub last: Option<StoredCorrection>,
+    /// Cautious PV is on (the hysteresis state of `cautious_pv_signal`), kept across restarts.
+    /// Cleared whenever the forecast error is unknown (fewer than 3 valid days).
+    #[serde(default)]
+    pub cautious_pv: bool,
+    /// The factor this process last sent to the planner, which keeps it until the next one
+    /// (no expiry); `None` = none sent yet, the planner runs on 1.0. Not persisted: after a
+    /// restart the planner starts without a factor too.
+    #[serde(skip)]
+    pub applied_factor: Option<f32>,
 }
 
 impl ForecastStore {
@@ -205,6 +234,23 @@ impl ForecastStore {
     #[must_use]
     pub fn day(&self, date: NaiveDate) -> Option<&DayForecast> {
         self.days.iter().find(|d| d.date == date)
+    }
+
+    /// The H34 factor the planner applies now (`applied_factor`, 1.0 before the first)
+    #[must_use]
+    pub fn factor_in_force(&self) -> f32 {
+        self.applied_factor.unwrap_or(1.0)
+    }
+
+    /// The planner applies `factor` from now on (sent on local day `today`): remember it, and
+    /// make today's snapshot carry it, so the day is scored with the factor the planner used for
+    /// it. The snapshot is taken by the first fetch after midnight, before the day's recompute,
+    /// so without this it would keep the day before's factor.
+    pub fn record_applied_factor(&mut self, today: NaiveDate, factor: f32) {
+        self.applied_factor = Some(factor);
+        if let Some(day) = self.days.iter_mut().find(|d| d.date == today) {
+            day.planner_factor = Some(factor);
+        }
     }
 
     /// Add a day's forecast unless the day already has one from at least as many sensors (a
@@ -260,12 +306,14 @@ impl ForecastStore {
         if !hours.iter().any(|h| h.kwh > 0.0) {
             return false;
         }
+        let planner_factor = Some(self.factor_in_force());
         self.insert(DayForecast {
             date,
             taken_at: now,
             source: ForecastSource::Snapshot,
             hours,
             sensors,
+            planner_factor,
         })
     }
 
@@ -424,6 +472,7 @@ pub fn day_forecast_from_history(
         source: ForecastSource::HaHistory,
         hours,
         sensors: per_sensor.len(),
+        planner_factor: None,
     })
 }
 
@@ -567,6 +616,17 @@ pub struct HourInput {
 pub struct DayInput {
     pub date: NaiveDate,
     pub hours: Vec<HourInput>,
+    /// H34 factor the planner used on the day (`DayForecast::planner_factor`)
+    pub planner_factor: Option<f32>,
+}
+
+/// A day that counts for the correction: Σ forecast and Σ measured over its valid hours
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CountedDay {
+    pub forecast_kwh: f32,
+    pub measured_kwh: f32,
+    /// H34 factor the planner used on the day, when known
+    pub planner_factor: Option<f32>,
 }
 
 impl DayInput {
@@ -583,23 +643,63 @@ impl DayInput {
     }
 }
 
+/// The days that count, with Σ forecast and Σ measured over their valid hours: a day counts when
+/// its valid forecast is at least `MIN_DAY_KWH_PER_KWP` × `kwp_equivalent` (dim days, missing and
+/// curtailed hours are left out)
+#[must_use]
+pub fn counted_days(days: &[DayInput], kwp_equivalent: f32) -> Vec<CountedDay> {
+    let min_day_kwh = MIN_DAY_KWH_PER_KWP * kwp_equivalent;
+    days.iter()
+        .map(|day| {
+            let (forecast_kwh, measured_kwh) = day.valid_totals();
+            CountedDay {
+                forecast_kwh,
+                measured_kwh,
+                planner_factor: day.planner_factor,
+            }
+        })
+        .filter(|d| kwp_equivalent > 0.0 && d.forecast_kwh > 0.0 && d.forecast_kwh >= min_day_kwh)
+        .collect()
+}
+
+/// Over-forecast error (%) of the forecast the planner had: each day's forecast scaled by the H34
+/// factor the planner used on that day (`CountedDay::planner_factor`; `current_factor` for a day
+/// without one), Σ max(f × k − a, 0) / Σ max(f × k, a) × 100, always within 0-100.
+/// The per-day factor matters: the current factor is fitted to these same days, so it would
+/// remove the very bias that misled the plan (review #652 round 3). Only sun that was forecast
+/// but did not come counts: an under-forecast is not the risk cautious PV guards against
+/// (review #652 D-4). `None` without energy.
+#[must_use]
+pub fn forecast_error_pct(days: &[CountedDay], current_factor: f32) -> Option<f32> {
+    let (miss, scale) = days.iter().fold((0.0_f32, 0.0_f32), |(miss, scale), d| {
+        let k = d
+            .planner_factor
+            .filter(|k| k.is_finite() && (FACTOR_MIN..=FACTOR_MAX).contains(k))
+            .unwrap_or(current_factor);
+        let f = d.forecast_kwh * k;
+        let a = d.measured_kwh;
+        (miss + (f - a).max(0.0), scale + f.max(a))
+    });
+    (scale > 0.0).then(|| (miss / scale * 100.0).clamp(0.0, 100.0))
+}
+
 /// Correction factor over the days: Σ measured / Σ forecast over the valid hours of the days
 /// whose valid forecast is at least `MIN_DAY_KWH_PER_KWP` × `kwp_equivalent`. Fewer than
 /// `MIN_VALID_DAYS` such days give 1.0; the factor is clamped to [`FACTOR_MIN`, `FACTOR_MAX`].
+/// With enough days the result also carries the over-forecast error of the forecast the planner
+/// had on the same days (`forecast_error_pct`, per-day factor, this factor for days without one).
 #[must_use]
 pub fn correction_factor(days: &[DayInput], kwp_equivalent: f32) -> CorrectionResult {
-    let min_day_kwh = MIN_DAY_KWH_PER_KWP * kwp_equivalent;
+    let counted = counted_days(days, kwp_equivalent);
     let mut result = CorrectionResult::neutral();
-    for day in days {
-        let (forecast, measured) = day.valid_totals();
-        if kwp_equivalent > 0.0 && forecast > 0.0 && forecast >= min_day_kwh {
-            result.days_used += 1;
-            result.forecast_kwh += forecast;
-            result.measured_kwh += measured;
-        }
+    for d in &counted {
+        result.days_used += 1;
+        result.forecast_kwh += d.forecast_kwh;
+        result.measured_kwh += d.measured_kwh;
     }
     if result.days_used >= MIN_VALID_DAYS && result.forecast_kwh > 0.0 {
         result.factor = (result.measured_kwh / result.forecast_kwh).clamp(FACTOR_MIN, FACTOR_MAX);
+        result.forecast_error_pct = forecast_error_pct(&counted, result.factor);
     }
     result
 }
@@ -675,7 +775,11 @@ pub fn build_day_inputs(
                     }
                 })
                 .collect();
-            DayInput { date, hours }
+            DayInput {
+                date,
+                hours,
+                planner_factor: forecast.and_then(|f| f.planner_factor),
+            }
         })
         .collect()
 }
@@ -774,7 +878,11 @@ mod tests {
                 }
             })
             .collect();
-        DayInput { date, hours }
+        DayInput {
+            date,
+            hours,
+            planner_factor: None,
+        }
     }
 
     fn week(ratio: f32) -> Vec<DayInput> {
@@ -902,6 +1010,7 @@ mod tests {
             days_used,
             measured_kwh: 1.0,
             forecast_kwh: 1.0,
+            forecast_error_pct: None,
         };
         assert_eq!(r(1.17, 7).sanitized().factor, 1.17);
         assert_eq!(r(FACTOR_MIN, 7).sanitized().factor, FACTOR_MIN);
@@ -1078,6 +1187,59 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_keeps_the_factor_the_planner_uses_and_the_day_input_carries_it() {
+        let blocks: Vec<(DateTime<Utc>, f32)> = day_block_starts(date(20), TZ)
+            .into_iter()
+            .map(|t| (t, shape(t.with_timezone(&TZ).hour()) / 4.0))
+            .collect();
+        let at = local_midnight_utc(date(20), TZ) + Duration::minutes(5);
+        // The planner applies 0.84 (sent before midnight)
+        let mut store = ForecastStore::default();
+        store.record_applied_factor(date(19), 0.84);
+        assert!(store.record_snapshot(at, TZ, std::slice::from_ref(&blocks), 1));
+        assert_eq!(store.day(date(20)).unwrap().planner_factor, Some(0.84));
+        let inputs = build_day_inputs(
+            &[date(20)],
+            TZ,
+            &store,
+            |s| {
+                vec![
+                    BlockObservation {
+                        pv_kwh: Some(0.0),
+                        soc_pct: Some(50.0),
+                        export_kwh: Some(0.0),
+                        export_limit_w: None,
+                    };
+                    s.len()
+                ]
+            },
+            &limits(),
+        );
+        assert_eq!(inputs[0].planner_factor, Some(0.84));
+        // The day's recompute replaces it with the factor the planner applies from then on
+        store.record_applied_factor(date(20), 0.7);
+        assert_eq!(store.day(date(20)).unwrap().planner_factor, Some(0.7));
+        // No factor sent yet: the planner runs on 1.0
+        let mut store = ForecastStore::default();
+        assert!(store.record_snapshot(at, TZ, std::slice::from_ref(&blocks), 1));
+        assert_eq!(store.day(date(20)).unwrap().planner_factor, Some(1.0));
+        // A record written before the field existed has none: the current factor scores it
+        let json = serde_json::to_string(&store).unwrap();
+        let old = json.replace(r#","planner_factor":1.0"#, "");
+        assert!(!json.contains("applied_factor"), "{json}");
+        assert_ne!(old, json);
+        let loaded: ForecastStore = serde_json::from_str(&old).unwrap();
+        assert_eq!(loaded.days[0].planner_factor, None);
+        let day = |k| CountedDay {
+            forecast_kwh: 100.0,
+            measured_kwh: 50.0,
+            planner_factor: k,
+        };
+        assert!((forecast_error_pct(&[day(None)], 0.5).unwrap() - 0.0).abs() < 1e-3);
+        assert!((forecast_error_pct(&[day(Some(0.8))], 0.5).unwrap() - 37.5).abs() < 1e-3);
+    }
+
+    #[test]
     fn snapshot_is_taken_once_after_midnight() {
         let mut store = ForecastStore::default();
         let day_blocks: Vec<(DateTime<Utc>, f32)> = day_block_starts(date(14), TZ)
@@ -1130,6 +1292,7 @@ mod tests {
                     kwh: d as f32,
                 }],
                 sensors: 1,
+                planner_factor: None,
             });
         }
         assert_eq!(store.days.len(), KEEP_DAYS);
@@ -1142,6 +1305,7 @@ mod tests {
                 days_used: 7,
                 measured_kwh: 117.0,
                 forecast_kwh: 100.0,
+                forecast_error_pct: None,
             },
         });
         let dir = tempfile::tempdir().unwrap();

@@ -27,6 +27,7 @@ use fluxion_server::heartbeat::{self, HeartbeatState};
 use fluxion_server::notifications::EmailNotifier;
 
 const TEST_SECRET: &str = "test-secret-for-integration-tests";
+const TEST_DASHBOARD_TOKEN: &str = "test-dashboard-token";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -40,6 +41,7 @@ fn test_config() -> ServerConfig {
         },
         auth: AuthSettings {
             shared_secret: TEST_SECRET.to_owned(),
+            dashboard_token: Some(TEST_DASHBOARD_TOKEN.to_owned()),
         },
         heartbeat: HeartbeatSettings::default(),
         email: EmailSettings {
@@ -63,7 +65,13 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
-        let config = Arc::new(test_config());
+        Self::start_with_dashboard_token(Some(TEST_DASHBOARD_TOKEN.to_owned())).await
+    }
+
+    async fn start_with_dashboard_token(dashboard_token: Option<String>) -> Self {
+        let mut test_config = test_config();
+        test_config.auth.dashboard_token = dashboard_token;
+        let config = Arc::new(test_config);
         let db = Arc::new(Database::open(":memory:").expect("Failed to open in-memory database"));
         let notifier =
             Arc::new(EmailNotifier::new(&config.email).expect("Failed to create test notifier"));
@@ -76,6 +84,7 @@ impl TestServer {
 
         let dashboard_state = DashboardState {
             db: Arc::clone(&db),
+            dashboard_token: config.auth.dashboard_token.clone(),
         };
 
         let app = Router::new()
@@ -116,11 +125,16 @@ impl TestServer {
     }
 
     async fn get_dashboard(&self) -> reqwest::Response {
-        self.client
-            .get(self.url("/"))
-            .send()
+        self.get_dashboard_with_bearer(Some(TEST_DASHBOARD_TOKEN))
             .await
-            .expect("Failed to fetch dashboard")
+    }
+
+    async fn get_dashboard_with_bearer(&self, token: Option<&str>) -> reqwest::Response {
+        let mut request = self.client.get(self.url("/"));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.expect("Failed to fetch dashboard")
     }
 }
 
@@ -540,6 +554,31 @@ async fn heartbeat_without_optional_status_fields() {
 // ---------------------------------------------------------------------------
 // Dashboard — rendering
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn dashboard_without_token_returns_401() {
+    let server = TestServer::start().await;
+    let resp = server.get_dashboard_with_bearer(None).await;
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn dashboard_with_wrong_token_returns_401() {
+    let server = TestServer::start().await;
+    let resp = server
+        .get_dashboard_with_bearer(Some("wrong-dashboard-token"))
+        .await;
+    assert_eq!(resp.status(), 401);
+}
+
+#[tokio::test]
+async fn dashboard_disabled_returns_404() {
+    let server = TestServer::start_with_dashboard_token(None).await;
+    let resp = server
+        .get_dashboard_with_bearer(Some(TEST_DASHBOARD_TOKEN))
+        .await;
+    assert_eq!(resp.status(), 404);
+}
 
 #[tokio::test]
 async fn dashboard_renders_empty_state() {

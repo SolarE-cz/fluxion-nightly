@@ -23,8 +23,8 @@ use crate::components::{
 };
 use crate::savings::RecordedBlock;
 use crate::strategy::winter_reserve::{
-    BatteryParams, BlockOutcome, PlanBlock, PlanMode, WinterReserveParams, cheap_reference,
-    plan_from, simulate_block,
+    BatteryParams, BlockOutcome, PlanBlock, PlanMode, WinterReserveParams, cautious_pv_at,
+    cheap_reference, export_guard_holds, plan_from, simulate_block,
 };
 use crate::traits::HistoryDataPoint;
 
@@ -50,7 +50,7 @@ pub struct ReplayRow {
 }
 
 /// Replay settings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReplayOptions {
     pub tz: Tz,
     pub battery: BatteryParams,
@@ -60,7 +60,7 @@ pub struct ReplayOptions {
     pub profile: ProfileSource,
     /// Multiplies the forecast PV the planner sees (the simulated reality uses actual PV)
     pub pv_forecast_bias: f32,
-    /// Future PV forecasts times a deterministic factor in [0.5, 1.3]
+    /// PV forecasts (the current block's included) times a deterministic factor in [0.5, 1.3]
     pub pv_noise: bool,
     /// Run self-use only
     pub baseline_only: bool,
@@ -71,6 +71,16 @@ pub struct ReplayOptions {
     /// Track the cost of charge of the simulated Winter Reserve battery and plan with it
     /// (brief H33). Off: the planner sees "cost unknown", as the backtest page does.
     pub track_cost_basis: bool,
+    /// What the planner assumes when it differs from the simulated battery, e.g. the live
+    /// config's capacity and efficiency, or the default HOLD model while the simulated inverter
+    /// runs EEPROM SolaX Stop Charge and Discharge (calibration against the meter). None = the
+    /// simulated battery's value.
+    pub plan_capacity_kwh: Option<f32>,
+    pub plan_efficiency: Option<f32>,
+    pub plan_hold_pv_to_battery: Option<bool>,
+    /// Cautious-PV signal the planner gets, as live (`EvaluationContext::cautious_pv`): `None` =
+    /// the fallback months of `params` decide per block, as live with too few measured days
+    pub cautious_pv: Option<fluxion_types::CautiousPvSignal>,
 }
 
 impl ReplayOptions {
@@ -89,8 +99,26 @@ impl ReplayOptions {
             from: None,
             until: None,
             track_cost_basis: false,
+            plan_capacity_kwh: None,
+            plan_efficiency: None,
+            plan_hold_pv_to_battery: None,
+            cautious_pv: None,
         }
     }
+}
+
+/// Planned and reserve PV (kWh) of a horizon block whose forecast is `forecast_pv`, as live:
+/// cautious PV plans on the reserve view; the reserve is always the forecast × `pv_confidence`.
+pub(crate) fn plan_pv(forecast_pv: f32, start: DateTime<Utc>, opts: &ReplayOptions) -> (f32, f32) {
+    let params = &opts.params;
+    let reserve = forecast_pv * params.pv_confidence;
+    let cautious = cautious_pv_at(
+        start,
+        opts.cautious_pv,
+        &params.cautious_pv_fallback_months,
+        opts.tz,
+    );
+    (if cautious { reserve } else { forecast_pv }, reserve)
 }
 
 /// Grid and battery result of one strategy on one block.
@@ -292,6 +320,10 @@ fn add_outcome(acc: &mut RunTotals, out: &BlockOutcome, block: &RecordedBlock, w
     acc.export_kwh += out.grid_export_kwh;
 }
 
+/// Most records one planning horizon may hold: two local days of 96 blocks at 4 records per block.
+/// A denser dataset is rejected rather than planned.
+const MAX_HORIZON_RECORDS: usize = 2 * 96 * 4;
+
 /// Replay `rows` (usable blocks in time order; missing blocks are left out and flagged with
 /// `gap_after` on the row before them). Both runs start from the recorded SOC of the first
 /// simulated block, clamped to the battery bounds.
@@ -302,7 +334,7 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
     }
     let tz = opts.tz;
     let battery = opts.battery;
-    let params = opts.params;
+    let params = &opts.params;
     let capacity = battery.capacity_kwh;
     let e_min = battery.min_soc_pct / 100.0 * capacity;
     let e_max = battery.max_soc_pct / 100.0 * capacity;
@@ -471,12 +503,20 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                     ),
                     None => (load_fc, load_fc * params.load_safety_factor),
                 };
-                let noise = if opts.pv_noise && j > i {
+                // The current block's PV forecast takes the same noise as later blocks
+                let noise = if opts.pv_noise {
                     pv_noise_factor(j)
                 } else {
                     1.0
                 };
-                let pv_kwh = later_input.block.pv_kwh * opts.pv_forecast_bias * noise;
+                let forecast_pv = later_input.block.pv_kwh * opts.pv_forecast_bias * noise;
+                let (pv_kwh, reserve_pv_kwh) = plan_pv(forecast_pv, later.start, opts);
+                if horizon.len() >= MAX_HORIZON_RECORDS {
+                    return Err(format!(
+                        "dataset too dense: more than {MAX_HORIZON_RECORDS} records in one planning horizon, near {}",
+                        later.start
+                    ));
+                }
                 horizon.push(PlanBlock {
                     start: later.start,
                     duration_minutes: 15,
@@ -485,7 +525,7 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                     load_kwh,
                     pv_kwh,
                     reserve_load_kwh,
-                    reserve_pv_kwh: pv_kwh * params.pv_confidence,
+                    reserve_pv_kwh,
                     force_charge: false,
                     no_discharge: false,
                     force_charge_at_or_below_czk: None,
@@ -498,6 +538,15 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
             }
 
             let mut plan_battery = battery;
+            if let Some(capacity) = opts.plan_capacity_kwh {
+                plan_battery.capacity_kwh = capacity;
+            }
+            if let Some(efficiency) = opts.plan_efficiency {
+                plan_battery.efficiency = efficiency;
+            }
+            if let Some(to_battery) = opts.plan_hold_pv_to_battery {
+                plan_battery.hold_pv_to_battery = to_battery;
+            }
             if opts.track_cost_basis {
                 let basis = cost_basis.get_or_insert_with(|| {
                     // Start without a saved cost: unknown until the battery reaches the minimum.
@@ -507,14 +556,26 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                 });
                 plan_battery.charge_cost_czk_per_kwh = basis.cost_czk_per_kwh;
             }
-            let result = plan_from(&horizon, soc_now, tz, &plan_battery, &params, applied);
+            let result = plan_from(&horizon, soc_now, tz, &plan_battery, params, applied);
             let first = result
                 .blocks
                 .first()
                 .ok_or("planner returned an empty plan")?;
             planned_blocks += 1;
             applied = Some(first.mode);
-            (first.mode, first.floor_kwh, first.reason.clone())
+            // The live head guard: an Export at the night floor runs as SelfUse
+            let live_kwh = soc_now / 100.0 * plan_battery.capacity_kwh;
+            if first.mode == PlanMode::Export
+                && export_guard_holds(live_kwh, first.floor_kwh, &plan_battery)
+            {
+                (
+                    PlanMode::SelfUse,
+                    first.floor_kwh,
+                    format!("{} | guard: export held at night floor", first.reason),
+                )
+            } else {
+                (first.mode, first.floor_kwh, first.reason.clone())
+            }
         };
         acc.modes[mode_index(mode)] += 1;
         let wr_out = simulate_block(mode, e_wr, &actual_block, floor_kwh, &battery);

@@ -297,22 +297,49 @@ let slots = [];
 function renderSlots(slotData) {
   slots = slotData || [];
   const container = document.getElementById('slots-container');
+  container.innerHTML = '';
   if (!slots.length) {
-    container.innerHTML = '<div class="label">No fixed time slots</div>';
+    const empty = document.createElement('div');
+    empty.className = 'label';
+    empty.textContent = 'No fixed time slots';
+    container.appendChild(empty);
     return;
   }
-  container.innerHTML = slots.map((s, i) => `
-    <div class="slot-row">
-      <input type="time" class="slot-input" value="${s.start}" onchange="updateSlot(${i},'start',this.value)">
-      <input type="time" class="slot-input" value="${s.end}" onchange="updateSlot(${i},'end',this.value)">
-      <select class="slot-input" onchange="updateSlot(${i},'mode',this.value)">
-        <option value="ForceCharge" ${s.mode==='ForceCharge'?'selected':''}>Charge</option>
-        <option value="ForceDischarge" ${s.mode==='ForceDischarge'?'selected':''}>Discharge</option>
-        <option value="SelfUse" ${s.mode==='SelfUse'?'selected':''}>Self Use</option>
-      </select>
-      <button class="btn-sm btn-remove" onclick="removeSlot(${i})">X</button>
-    </div>
-  `).join('');
+  slots.forEach((s, i) => {
+    const row = document.createElement('div');
+    row.className = 'slot-row';
+
+    const start = document.createElement('input');
+    start.type = 'time';
+    start.className = 'slot-input';
+    start.value = s.start;
+    start.addEventListener('change', () => updateSlot(i, 'start', start.value));
+
+    const end = document.createElement('input');
+    end.type = 'time';
+    end.className = 'slot-input';
+    end.value = s.end;
+    end.addEventListener('change', () => updateSlot(i, 'end', end.value));
+
+    const mode = document.createElement('select');
+    mode.className = 'slot-input';
+    [['ForceCharge', 'Charge'], ['ForceDischarge', 'Discharge'], ['SelfUse', 'Self Use']].forEach(([value, label]) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      option.selected = s.mode === value;
+      mode.appendChild(option);
+    });
+    mode.addEventListener('change', () => updateSlot(i, 'mode', mode.value));
+
+    const remove = document.createElement('button');
+    remove.className = 'btn-sm btn-remove';
+    remove.textContent = 'X';
+    remove.addEventListener('click', () => removeSlot(i));
+
+    row.append(start, end, mode, remove);
+    container.appendChild(row);
+  });
 }
 
 function addSlot() {

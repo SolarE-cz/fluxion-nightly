@@ -19,8 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ha::client::HomeAssistantClient;
+use crate::ha::errors::HaResult;
 use crate::ha::levers;
 use crate::ha::solar_forecast_fetcher;
+use crate::ha::transport::ensure_token_transport;
 
 /// Resource: configuration for Home Assistant API access
 #[derive(Resource, Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,7 @@ impl Plugin for HaPlugin {
             .add_systems(Update, super::actuation::prewake_system)
             .add_systems(Update, solar_forecast_fetcher::poll_solar_forecast_channel)
             .add_systems(Update, solar_forecast_fetcher::poll_pv_correction_channel)
+            .add_systems(Update, solar_forecast_fetcher::poll_cautious_pv_channel)
             .add_systems(
                 Update,
                 (
@@ -181,6 +184,34 @@ fn ha_init_config_system(mut cfg: ResMut<HaConfig>) {
     }
 }
 
+/// GET one entity state from HA. The token is not sent to a base URL the transport policy forbids.
+async fn get_entity_state(base: &str, token: &str, entity_id: &str) -> HaResult<reqwest::Response> {
+    ensure_token_transport(base)?;
+    let url = format!("{}/api/states/{}", base.trim_end_matches('/'), entity_id);
+    let client = reqwest::Client::new();
+    Ok(client.get(url).bearer_auth(token).send().await?)
+}
+
+/// POST `select_option` to HA. The token is not sent to a base URL the transport policy forbids.
+async fn post_select_option(
+    base: &str,
+    token: &str,
+    payload: &serde_json::Value,
+) -> HaResult<reqwest::Response> {
+    ensure_token_transport(base)?;
+    let url = format!(
+        "{}/api/services/select/select_option",
+        base.trim_end_matches('/')
+    );
+    let client = reqwest::Client::new();
+    Ok(client
+        .post(url)
+        .bearer_auth(token)
+        .json(payload)
+        .send()
+        .await?)
+}
+
 /// System: periodically read the value of select.solax_manual_mode_select
 fn ha_poll_select_manual_mode_system(
     mut ticker: ResMut<HaPollTicker>,
@@ -210,18 +241,14 @@ fn ha_poll_select_manual_mode_system(
         if let Some(token) = cfg.token.clone() {
             let base = cfg.base_url.clone();
             tokio::spawn(async move {
-                let url = format!("{}/api/states/{}", base.trim_end_matches('/'), entity_id);
-                let client = reqwest::Client::new();
-                let res = client.get(url).bearer_auth(token).send().await;
-                if let Ok(resp) = res {
-                    match resp.text().await {
+                match get_entity_state(&base, &token, &entity_id).await {
+                    Ok(resp) => match resp.text().await {
                         Ok(body) => {
                             tracing::info!("HA state {}: {}", entity_id, body);
                         }
                         Err(e) => tracing::warn!("HA read body error: {}", e),
-                    }
-                } else if let Err(e) = res {
-                    tracing::warn!("HA read error: {}", e);
+                    },
+                    Err(e) => tracing::warn!("HA read error: {}", e),
                 }
             });
         } else {
@@ -312,21 +339,11 @@ fn ha_write_select_system(mut ev: MessageReader<HaSelectWrite>, cfg: Res<HaConfi
             let entity_id = format!("select.{}_{}", inverter_entity_prefix, select_suffix);
             tokio::spawn(async move {
                 // Call Home Assistant service to set select option
-                let url = format!(
-                    "{}/api/services/select/select_option",
-                    base.trim_end_matches('/')
-                );
                 let payload = serde_json::json!({
                     "entity_id": entity_id,
                     "option": value,
                 });
-                let client = reqwest::Client::new();
-                let res = client
-                    .post(url)
-                    .bearer_auth(token)
-                    .json(&payload)
-                    .send()
-                    .await;
+                let res = post_select_option(&base, &token, &payload).await;
                 match res {
                     Ok(resp) => {
                         if !resp.status().is_success() {
@@ -681,12 +698,12 @@ async fn fetch_and_send_hdo(
 
             if low_tariff_periods.is_empty() {
                 tracing::warn!(
-                    "⚠️ HDO schedule fetched but NO low tariff periods found! Sensor state: '{}'. Check sensor attributes format.",
+                    "⚠️ HDO schedule fetched but NO low tariff periods found! Sensor state: {:?}. Check sensor attributes format.",
                     state.state
                 );
             } else {
                 tracing::info!(
-                    "✅ HDO schedule fetched: {} low tariff periods for today (sensor state: '{}')",
+                    "✅ HDO schedule fetched: {} low tariff periods for today (sensor state: {:?})",
                     low_tariff_periods.len(),
                     state.state
                 );
@@ -910,6 +927,71 @@ pub fn poll_hdo_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ha::errors::HaError;
+
+    /// Thread-local log sink for the HDO test (`#[tokio::test]` runs on one thread)
+    #[derive(Clone, Default)]
+    struct LogSink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> LogSink {
+            self.clone()
+        }
+    }
+
+    /// Scan #25: an HDO state with a newline must not start a log line of its own; the state
+    /// text is logged with `{:?}`, which escapes it
+    #[tokio::test]
+    async fn hdo_state_text_is_logged_escaped() {
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut server = mockito::Server::new_async().await;
+        let states = serde_json::json!([{
+            "entity_id": "sensor.hdo_tariff",
+            "state": "x\nINFO forged record",
+            "attributes": {},
+            "last_changed": "2026-11-03T10:00:00+00:00",
+            "last_updated": "2026-11-03T10:00:00+00:00"
+        }]);
+        server
+            .mock("GET", "/api/states")
+            .with_body(states.to_string())
+            .create_async()
+            .await;
+        let client = HomeAssistantClient::new(server.url(), "test_token").unwrap();
+        let (sender, _receiver) = crossbeam_channel::unbounded();
+        let mut discovery = HdoDiscovery::default();
+
+        fetch_and_send_hdo(&client, "sensor.hdo_tariff", &sender, &mut discovery).await;
+
+        let logs = String::from_utf8_lossy(&sink.0.lock()).into_owned();
+        assert!(logs.contains("NO low tariff periods found"), "{logs}");
+        assert!(
+            logs.contains(r#"Sensor state: "x\nINFO forged record""#),
+            "{logs}"
+        );
+        assert!(
+            !logs.lines().any(|line| line.starts_with("INFO forged")),
+            "{logs}"
+        );
+    }
 
     /// Brief H36: the lock and manual-mode polls use the control prefix, else the entity prefix
     #[test]
@@ -1171,5 +1253,55 @@ mod tests {
         let periods = parse_hdo_periods_from_state(&state);
 
         assert!(periods.is_empty(), "Expected no periods for non-HDO sensor");
+    }
+
+    /// Scan N4 follow-up: neither plugin path sends the token to a public plaintext base URL.
+    /// The policy error comes back before any request, so no connect attempt can fail first.
+    #[tokio::test]
+    async fn plugin_refuses_token_to_public_plaintext_base() {
+        let base = "http://203.0.113.10:8123";
+        let payload = serde_json::json!({"entity_id": "select.x", "option": "Hold"});
+
+        let read = get_entity_state(base, "t", "select.x").await;
+        assert!(
+            matches!(&read, Err(HaError::ConfigError(msg)) if msg.contains("use an https:// Home Assistant URL")),
+            "{read:?}"
+        );
+        let write = post_select_option(base, "t", &payload).await;
+        assert!(
+            matches!(&write, Err(HaError::ConfigError(msg)) if msg.contains("use an https:// Home Assistant URL")),
+            "{write:?}"
+        );
+    }
+
+    /// LAN plaintext (127.0.0.1 here) still sends the token on both plugin paths
+    #[tokio::test]
+    async fn plugin_sends_token_to_allowed_base() {
+        let mut server = mockito::Server::new_async().await;
+        let get = server
+            .mock("GET", "/api/states/select.x")
+            .match_header("authorization", "Bearer t")
+            .with_status(200)
+            .with_body("Hold")
+            .create_async()
+            .await;
+        let post = server
+            .mock("POST", "/api/services/select/select_option")
+            .match_header("authorization", "Bearer t")
+            .with_status(200)
+            .create_async()
+            .await;
+        let payload = serde_json::json!({"entity_id": "select.x", "option": "Hold"});
+
+        let read = get_entity_state(&server.url(), "t", "select.x")
+            .await
+            .expect("read allowed");
+        assert_eq!(read.text().await.expect("body"), "Hold");
+        let write = post_select_option(&server.url(), "t", &payload)
+            .await
+            .expect("write allowed");
+        assert!(write.status().is_success());
+        get.assert_async().await;
+        post.assert_async().await;
     }
 }

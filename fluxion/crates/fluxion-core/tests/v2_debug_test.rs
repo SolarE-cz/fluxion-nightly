@@ -175,6 +175,7 @@ fn debug_v2_charge_scheduling() {
             block_forecasts: None,
             timezone: None,
             user_levers: None,
+            cautious_pv: None,
         };
 
         let eval = v2_strategy.evaluate(&context);

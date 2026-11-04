@@ -244,6 +244,14 @@ pub struct ControlConfig {
     #[serde(default)]
     pub force_discharge_enabled: bool,
 
+    /// HOLD means the house is not served from the battery: PV serves the house, the surplus
+    /// charges the battery, the rest is exported (default, false). True: this site's EEPROM HOLD
+    /// ("Stop Charge and Discharge") sends PV into the battery first and the house imports
+    /// (measured on Jakub's SolaX Ultra, 2026-10-26); the planner then models HOLD that way.
+    /// Ignored with direct VPP control, whose HOLD runs the default model. Default: false
+    #[serde(default)]
+    pub hold_pv_to_battery: bool,
+
     /// SolaX only: before a write, a "Locked" inverter is unlocked (never in debug mode).
     /// Default: true (matches Node-RED). When false the write is skipped and only a notification
     /// is created.
@@ -351,6 +359,7 @@ impl Default for ControlConfig {
             export_limit_hard_cap_w: None,
             export_limit_min_w: 0,
             force_discharge_enabled: false,
+            hold_pv_to_battery: false,
             auto_unlock_inverter: true,
             hot_standby_entity: None,
             ensure_hot_standby: true,
@@ -1094,6 +1103,26 @@ pub struct WinterReserveConfigCore {
     /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
     #[serde(default = "default_wr_soc_resolution_pct")]
     pub soc_resolution_pct: f32,
+    /// Export may go down to the deficit until the next cheap block (buy at or below the horizon
+    /// median) instead of the deficit until the next morning, when that block comes first.
+    /// Default: false
+    #[serde(default)]
+    pub export_floor_until_cheap: bool,
+    /// Cautious PV: the plan uses forecast PV times `pv_confidence` once the over-forecast error
+    /// of the forecast the planner had (× the H34 factor in force each day) over the last 7
+    /// complete days
+    /// (Σ max(f−a, 0) / Σ max(f, a), 0-100 %, at least 5 valid days) reaches this.
+    /// 100 = off. Read at startup. (default: 25.0)
+    #[serde(default = "default_wr_cautious_pv_mae_pct")]
+    pub cautious_pv_mae_pct: f32,
+    /// Cautious PV, once on, stays on while that error is at or above this (%). Read at startup.
+    /// (default: 20.0)
+    #[serde(default = "default_wr_cautious_pv_off_pct")]
+    pub cautious_pv_off_pct: f32,
+    /// Local months (1-12) with cautious PV while fewer than 3 measured days exist; empty = none
+    /// (default: [10, 11, 12, 1, 2, 3])
+    #[serde(default = "default_wr_cautious_pv_fallback_months")]
+    pub cautious_pv_fallback_months: Vec<u32>,
 }
 
 fn default_winter_reserve_priority() -> u8 {
@@ -1123,6 +1152,15 @@ fn default_wr_mode_switch_min_benefit() -> f32 {
 fn default_wr_soc_resolution_pct() -> f32 {
     0.5
 }
+fn default_wr_cautious_pv_mae_pct() -> f32 {
+    25.0
+}
+fn default_wr_cautious_pv_off_pct() -> f32 {
+    20.0
+}
+fn default_wr_cautious_pv_fallback_months() -> Vec<u32> {
+    vec![10, 11, 12, 1, 2, 3]
+}
 
 impl Default for WinterReserveConfigCore {
     fn default() -> Self {
@@ -1137,6 +1175,10 @@ impl Default for WinterReserveConfigCore {
             min_mode_benefit_czk: default_wr_min_mode_benefit(),
             mode_switch_min_benefit_czk: default_wr_mode_switch_min_benefit(),
             soc_resolution_pct: default_wr_soc_resolution_pct(),
+            export_floor_until_cheap: false,
+            cautious_pv_mae_pct: default_wr_cautious_pv_mae_pct(),
+            cautious_pv_off_pct: default_wr_cautious_pv_off_pct(),
+            cautious_pv_fallback_months: default_wr_cautious_pv_fallback_months(),
         }
     }
 }

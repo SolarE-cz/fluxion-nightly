@@ -35,6 +35,21 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
+    // ============= Inverters =============
+    // Scan #15: ids are compared trimmed, as the control map keys them; a duplicate is refused here
+    let mut ids: Vec<&str> = Vec::new();
+    for inverter in &config.inverters {
+        let id = inverter.id.trim();
+        if ids.contains(&id) {
+            errors.push(ValidationIssue {
+                field: "inverters".to_owned(),
+                message: format!("Inverter id '{id}' is used by more than one inverter"),
+                severity: "error".to_owned(),
+            });
+        }
+        ids.push(id);
+    }
+
     // ============= System Settings =============
     if config.system_config.update_interval_secs < 5 {
         errors.push(ValidationIssue {
@@ -282,6 +297,31 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
             severity: "error".to_owned(),
         });
     }
+    if !(wr.cautious_pv_mae_pct > 0.0 && wr.cautious_pv_mae_pct <= 100.0) {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cautious_pv_mae_pct".to_owned(),
+            message: "Cautious PV forecast error must be in (0, 100] percent".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+    if !(0.0..=wr.cautious_pv_mae_pct).contains(&wr.cautious_pv_off_pct) {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cautious_pv_off_pct".to_owned(),
+            message: "Cautious PV off threshold must be between 0 and the on threshold".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
+    if wr
+        .cautious_pv_fallback_months
+        .iter()
+        .any(|m| !(1..=12).contains(m))
+    {
+        errors.push(ValidationIssue {
+            field: "strategies.winter_reserve.cautious_pv_fallback_months".to_owned(),
+            message: "Months must be between 1 and 12".to_owned(),
+            severity: "error".to_owned(),
+        });
+    }
     if wr.min_arbitrage_profit_czk < 0.0 {
         errors.push(ValidationIssue {
             field: "strategies.winter_reserve.min_arbitrage_profit_czk".to_owned(),
@@ -294,7 +334,7 @@ pub fn validate_config(config: &SystemConfig) -> (Vec<ValidationIssue>, Vec<Vali
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use fluxion_core::resources::{
         ConsumptionHistoryConfig, ControlConfig, PricingConfig, StrategiesConfigCore, SystemConfig,
@@ -302,7 +342,7 @@ mod tests {
     };
     use fluxion_types::config::{NotificationsConfigCore, RemoteAccessConfigCore};
 
-    fn default_config() -> SystemConfig {
+    pub(crate) fn default_config() -> SystemConfig {
         SystemConfig {
             inverters: vec![],
             pricing_config: PricingConfig {
@@ -346,6 +386,42 @@ mod tests {
             warnings
                 .iter()
                 .any(|w| w.field == "control.force_discharge_enabled")
+        );
+    }
+
+    #[test]
+    fn cautious_pv_months_outside_1_to_12_and_bad_threshold_are_errors() {
+        let mut config = default_config();
+        config
+            .strategies_config
+            .winter_reserve
+            .cautious_pv_fallback_months = Vec::new();
+        assert!(validate_config(&config).0.is_empty());
+        config
+            .strategies_config
+            .winter_reserve
+            .cautious_pv_fallback_months = vec![11, 13];
+        config.strategies_config.winter_reserve.cautious_pv_mae_pct = 0.0;
+        let fields: Vec<String> = validate_config(&config)
+            .0
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert!(
+            fields.contains(&"strategies.winter_reserve.cautious_pv_fallback_months".to_owned())
+        );
+        assert!(fields.contains(&"strategies.winter_reserve.cautious_pv_mae_pct".to_owned()));
+        // The off threshold must not exceed the on threshold
+        let mut config = default_config();
+        config.strategies_config.winter_reserve.cautious_pv_off_pct = 30.0;
+        let fields: Vec<String> = validate_config(&config)
+            .0
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["strategies.winter_reserve.cautious_pv_off_pct".to_owned()]
         );
     }
 
@@ -484,6 +560,30 @@ mod tests {
             !errors
                 .iter()
                 .any(|e| e.field == "strategies.winter_reserve.min_arbitrage_profit_czk")
+        );
+    }
+
+    /// Scan #15: the web save refuses two inverters with one id (trimmed, as the control map keys them)
+    #[test]
+    fn duplicate_inverter_id_is_an_error() {
+        let inverter = |id: &str| -> fluxion_types::config::InverterConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "inverter_type": "solax",
+                "entity_prefix": "solax",
+                "topology": "independent",
+            }))
+            .unwrap()
+        };
+        let mut config = default_config();
+        config.inverters = vec![inverter("main"), inverter(" main")];
+
+        let (errors, _) = validate_config(&config);
+        assert!(
+            errors.iter().any(|e| e.field == "inverters"
+                && e.message == "Inverter id 'main' is used by more than one inverter"),
+            "{:?}",
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
 }

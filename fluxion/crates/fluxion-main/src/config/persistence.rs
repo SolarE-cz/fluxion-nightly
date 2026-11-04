@@ -146,11 +146,9 @@ pub fn load_config_with_fallback() -> Result<AppConfig> {
     // Try web UI persistent config first
     if persistence.exists() {
         match persistence.load() {
-            Ok(mut persisted) => {
+            Ok(persisted) => {
                 info!("✅ Loaded configuration from web UI persistent storage");
-                overlay_addon_options_file(&mut persisted.config, Path::new(HA_OPTIONS_PATH));
-                persisted.config.validate()?;
-                return Ok(persisted.config);
+                return with_addon_options(persisted.config, Path::new(HA_OPTIONS_PATH));
             }
             Err(e) => {
                 warn!("Failed to load web UI config, trying HA options: {e}");
@@ -172,25 +170,75 @@ pub fn load_config_with_fallback() -> Result<AppConfig> {
     Ok(config)
 }
 
+/// A web-UI-saved configuration with the add-on-only options of `options_path` laid over it.
+/// Invalid `battery_extra_*` are dropped with a WARN rather than stop the add-on (PR #647 N5).
+pub fn with_addon_options(mut config: AppConfig, options_path: &Path) -> Result<AppConfig> {
+    overlay_addon_options_file(&mut config, options_path);
+    config.drop_invalid_battery_extras();
+    config.validate()?;
+    Ok(config)
+}
+
 /// The add-on options written by the HA Supervisor
 pub const HA_OPTIONS_PATH: &str = "/data/options.json";
 
 /// Add-on options that only the add-on UI sets (the web UI has no field for them). On an existing
 /// install `/data/config.json` wins over `options.json`, so without this overlay a change of
-/// these in the add-on UI would never apply (H33, H34, H35, H37).
-pub const ADDON_ONLY_OPTIONS: &[(&str, &str)] = &[
-    ("control", "battery_wear_cost_czk_per_kwh"),
-    ("control", "battery_efficiency"),
-    ("solar_forecast", "pv_forecast_correction_enabled"),
-    ("pricing", "ote_fallback_enabled"),
-    ("pricing", "price_alert_notification"),
-    ("pricing", "tomorrow_prices_check_time"),
-    ("control", "mode_control_enabled"),
+/// these in the add-on UI would never apply (H33, H34, H35, H37, EEPROM HOLD routing, peak export
+/// floor). Each entry is the key's path from the root of the options.
+pub const ADDON_ONLY_OPTIONS: &[&[&str]] = &[
+    &["control", "battery_wear_cost_czk_per_kwh"],
+    &["control", "battery_efficiency"],
+    &["solar_forecast", "pv_forecast_correction_enabled"],
+    &["pricing", "ote_fallback_enabled"],
+    &["pricing", "price_alert_notification"],
+    &["pricing", "tomorrow_prices_check_time"],
+    &["control", "mode_control_enabled"],
+    &["control", "hold_pv_to_battery"],
+    &["strategies", "winter_reserve", "export_floor_until_cheap"],
 ];
 
-/// Per-inverter add-on-only options (brief H36), applied to the inverter of `config.json` with
-/// the same `id` as the add-on option's inverter
-pub const ADDON_ONLY_INVERTER_OPTIONS: &[&str] = &["control_entity_prefix"];
+/// Per-inverter add-on-only options (brief H36, pair SOC), applied to the inverter of
+/// `config.json` with the same `id` as the add-on option's inverter, with the value a missing key
+/// stands for (the Supervisor drops an empty `str?` or list)
+pub const ADDON_ONLY_INVERTER_OPTIONS: &[(&str, EmptyAs)] = &[
+    ("control_entity_prefix", EmptyAs::String),
+    ("battery_extra_prefixes", EmptyAs::List),
+    ("battery_extra_capacities_kwh", EmptyAs::List),
+];
+
+/// The value of a per-inverter add-on option the Supervisor dropped because it was empty
+#[derive(Debug, Clone, Copy)]
+pub enum EmptyAs {
+    String,
+    List,
+}
+
+impl EmptyAs {
+    fn value(self) -> serde_json::Value {
+        match self {
+            EmptyAs::String => serde_json::Value::String(String::new()),
+            EmptyAs::List => serde_json::Value::Array(Vec::new()),
+        }
+    }
+
+    /// The add-on option sets something: a non-blank string or a non-empty list
+    fn is_set(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(s) => !s.trim().is_empty(),
+            serde_json::Value::Array(items) => !items.is_empty(),
+            _ => false,
+        }
+    }
+}
+
+fn inverter_option_names() -> String {
+    ADDON_ONLY_INVERTER_OPTIONS
+        .iter()
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Apply the add-on-only options of `path` (HA `options.json`) over `config`; a missing or
 /// unreadable file changes nothing
@@ -222,16 +270,16 @@ pub fn overlay_addon_options(config: &mut AppConfig, options: &serde_json::Value
         }
     };
     let mut changed = Vec::new();
-    for (section, key) in ADDON_ONLY_OPTIONS {
-        let Some(value) = options.get(section).and_then(|s| s.get(key)) else {
+    for path in ADDON_ONLY_OPTIONS {
+        let Some(value) = path.iter().try_fold(options, |v, key| v.get(key)) else {
             continue;
         };
-        let Some(slot) = current.get_mut(section).and_then(|s| s.get_mut(key)) else {
+        let Some(slot) = path.iter().try_fold(&mut current, |v, key| v.get_mut(key)) else {
             continue;
         };
         if slot != value {
             *slot = value.clone();
-            changed.push(format!("{section}.{key}"));
+            changed.push(path.join("."));
         }
     }
     for warning in overlay_inverter_options(&mut current, options, &mut changed) {
@@ -257,8 +305,8 @@ pub fn overlay_addon_options(config: &mut AppConfig, options: &serde_json::Value
 }
 
 /// Set each of [`ADDON_ONLY_INVERTER_OPTIONS`] of the add-on's inverters on the `config` inverter
-/// with the same `id`. A key missing from a matched add-on inverter resets to `""`: the
-/// Supervisor drops empty `str?` keys, so that is how clearing it in the add-on UI arrives.
+/// with the same `id`. A key missing from a matched add-on inverter resets to `""` or `[]`: the
+/// Supervisor drops empty `str?` keys and lists, so that is how clearing it in the add-on UI arrives.
 /// An add-on inverter without a match in `config.json` is left alone; when it sets a non-empty
 /// key, the returned warnings name it and the ids that `config.json` has.
 fn overlay_inverter_options(
@@ -281,19 +329,24 @@ fn overlay_inverter_options(
             .iter()
             .filter_map(|inv| inv.get("id").and_then(|v| v.as_str()).map(str::to_owned))
             .collect();
+        // The last entry with this id, compared trimmed: the control map takes the last one too,
+        // so both consumers agree when ids repeat (scan #15)
         let Some(inverter) = inverters
             .iter_mut()
-            .find(|inv| inv.get("id").and_then(|v| v.as_str()) == Some(id))
+            .rev()
+            .find(|inv| {
+                inv.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .is_some_and(|config_id| config_id == id.trim())
+            })
             .and_then(|inv| inv.as_object_mut())
         else {
             // Only an add-on inverter that sets one of the keys (non-empty) has something that
             // is not applied; one without them is the usual add-on default and stays quiet
-            let sets_a_key = ADDON_ONLY_INVERTER_OPTIONS.iter().any(|key| {
-                option_inverter
-                    .get(*key)
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| !v.trim().is_empty())
-            });
+            let sets_a_key = ADDON_ONLY_INVERTER_OPTIONS
+                .iter()
+                .any(|(key, _)| option_inverter.get(*key).is_some_and(EmptyAs::is_set));
             if !sets_a_key {
                 continue;
             }
@@ -301,15 +354,15 @@ fn overlay_inverter_options(
                 "Add-on inverter '{}' has no match in the web UI config (inverter ids there: {}); its {} not applied",
                 id,
                 config_ids.join(", "),
-                ADDON_ONLY_INVERTER_OPTIONS.join(", ")
+                inverter_option_names()
             ));
             continue;
         };
-        for key in ADDON_ONLY_INVERTER_OPTIONS {
+        for (key, empty) in ADDON_ONLY_INVERTER_OPTIONS {
             let value = option_inverter
                 .get(*key)
                 .cloned()
-                .unwrap_or_else(|| serde_json::Value::String(String::new()));
+                .unwrap_or_else(|| empty.value());
             if inverter.get(*key) != Some(&value) {
                 inverter.insert((*key).to_owned(), value);
                 changed.push(format!("inverters[{id}].{key}"));
@@ -370,7 +423,8 @@ mod tests {
                 "control": {
                     "battery_wear_cost_czk_per_kwh": 0.42,
                     "battery_efficiency": 0.9,
-                    "min_battery_soc": 55.0
+                    "min_battery_soc": 55.0,
+                    "hold_pv_to_battery": true
                 },
                 "solar_forecast": {"pv_forecast_correction_enabled": false}
             })
@@ -384,6 +438,7 @@ mod tests {
         assert_eq!(config.pricing.tomorrow_prices_check_time, "15:10");
         assert!((config.control.battery_wear_cost_czk_per_kwh - 0.42).abs() < 1e-6);
         assert!((config.control.battery_efficiency - 0.9).abs() < 1e-6);
+        assert!(config.control.hold_pv_to_battery);
         assert!(!config.solar_forecast.pv_forecast_correction_enabled);
         // Other keys: config.json still wins
         assert_eq!(config.pricing.spot_price_entity, "sensor.from_web_ui");
@@ -484,6 +539,143 @@ mod tests {
         assert_eq!(config.inverters[0].control_prefix_override(), None);
     }
 
+    /// Review F1 of #647: the nested `strategies.winter_reserve.export_floor_until_cheap` and the
+    /// per-inverter pair-SOC lists from the add-on UI apply over `config.json`
+    #[test]
+    fn addon_peak_export_and_pair_soc_options_override_the_web_ui_config() {
+        let (persistence, dir) = create_test_persistence();
+        let mut saved = AppConfig::default();
+        saved.control.battery_capacity_kwh = 80.0;
+        persistence.save(&saved, "web_ui").unwrap();
+        let mut config = persistence.load().unwrap().config;
+        assert!(!config.strategies.winter_reserve.export_floor_until_cheap);
+        let id = config.inverters[0].id.clone();
+
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({
+                "strategies": {"winter_reserve": {"export_floor_until_cheap": true}},
+                "inverters": [
+                    {"id": id, "vendor": "solax", "entity_prefix": "from_addon",
+                     "topology": "independent",
+                     "battery_extra_prefixes": ["solax_81"],
+                     "battery_extra_capacities_kwh": [30.0]}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        overlay_addon_options_file(&mut config, &options);
+
+        assert!(config.strategies.winter_reserve.export_floor_until_cheap);
+        assert_eq!(config.inverters[0].battery_extra_prefixes, vec!["solax_81"]);
+        assert_eq!(config.inverters[0].battery_extra_capacities_kwh, vec![30.0]);
+        // Other inverter keys: config.json still wins
+        assert_eq!(
+            config.inverters[0].entity_prefix,
+            saved.inverters[0].entity_prefix
+        );
+        config.validate().unwrap();
+
+        // Cleared in the add-on UI: the Supervisor drops the lists, and they clear here too
+        let changed =
+            overlay_addon_options(&mut config, &serde_json::json!({"inverters": [{"id": id}]}));
+        assert!(changed.contains(&format!("inverters[{id}].battery_extra_prefixes")));
+        assert!(config.inverters[0].battery_extra_prefixes.is_empty());
+        assert!(config.inverters[0].battery_extra_capacities_kwh.is_empty());
+        // A missing nested key leaves the saved value alone
+        assert!(config.strategies.winter_reserve.export_floor_until_cheap);
+    }
+
+    /// PR #647 N5 / R3-4: on an install with a web-UI config, add-on options with invalid
+    /// extras (lengths differ) load: the extras are dropped with one WARN, the rest applies
+    #[test]
+    fn addon_options_with_invalid_battery_extras_start_without_them() {
+        let (persistence, dir) = create_test_persistence();
+        let mut saved = AppConfig::default();
+        saved.control.battery_capacity_kwh = 80.0;
+        persistence.save(&saved, "web_ui").unwrap();
+        let config = persistence.load().unwrap().config;
+        let id = config.inverters[0].id.clone();
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({
+                "strategies": {"winter_reserve": {"export_floor_until_cheap": true}},
+                "inverters": [
+                    {"id": id, "battery_extra_prefixes": ["solax_81"],
+                     "battery_extra_capacities_kwh": []}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut loaded = None;
+        let logs = crate::config::tests::captured_logs(|| {
+            loaded = Some(with_addon_options(config, &options));
+        });
+        let config = loaded.unwrap().expect("the add-on starts");
+        assert!(config.inverters[0].battery_extra_prefixes.is_empty());
+        assert!(config.strategies.winter_reserve.export_floor_until_cheap);
+        assert_eq!(
+            logs.matches("ignored, the SOC is the inverter's own")
+                .count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    /// Scan #15: two inverters with one id (the second written with a space): the add-on overlay
+    /// and the control map both use the last entry, and startup validation logs and carries on
+    #[test]
+    fn duplicate_inverter_ids_overlay_and_control_map_pick_the_same_entry() {
+        let mut config = AppConfig::default();
+        config.inverters[0].control_entity_prefix = "solax_first".to_owned();
+        let mut second = config.inverters[0].clone();
+        second.id = format!(" {}", second.id);
+        second.control_entity_prefix = "solax_second".to_owned();
+        config.inverters.push(second);
+        let id = config.inverters[0].id.clone();
+        let options = serde_json::json!({
+            "inverters": [{"id": id, "control_entity_prefix": "solax_addon"}]
+        });
+
+        let mut overlaid = config.clone();
+        overlay_addon_options(&mut overlaid, &options);
+
+        assert_eq!(overlaid.inverters[0].control_entity_prefix, "solax_first");
+        assert_eq!(overlaid.inverters[1].control_entity_prefix, "solax_addon");
+        assert_eq!(overlaid.control_prefixes().resolve(&id), "solax_addon");
+    }
+
+    /// Scan #15: startup with duplicate ids logs the id and still starts
+    #[test]
+    fn duplicate_inverter_ids_do_not_stop_startup() {
+        let dir = TempDir::new().unwrap();
+        let options = dir.path().join("options.json");
+        fs::write(&options, "{}").unwrap();
+        let mut config = AppConfig::default();
+        let mut second = config.inverters[0].clone();
+        second.id = config.inverters[0].id.clone();
+        config.inverters.push(second);
+        let id = config.inverters[0].id.clone();
+
+        let mut loaded = None;
+        let logs = crate::config::tests::captured_logs(|| {
+            loaded = Some(with_addon_options(config, &options));
+        });
+
+        assert!(loaded.unwrap().is_ok());
+        assert!(
+            logs.contains(&format!(
+                "Inverter id \"{id}\" is used by more than one inverter"
+            )),
+            "{logs}"
+        );
+    }
+
     /// Review nit 2: an add-on inverter whose id is not in config.json changes nothing
     #[test]
     fn addon_inverter_without_a_match_changes_nothing() {
@@ -499,8 +691,9 @@ mod tests {
         assert_eq!(
             warnings,
             vec![format!(
-                "Add-on inverter 'renamed' has no match in the web UI config (inverter ids there: {}); its control_entity_prefix not applied",
-                config.inverters[0].id
+                "Add-on inverter 'renamed' has no match in the web UI config (inverter ids there: {}); its {} not applied",
+                config.inverters[0].id,
+                inverter_option_names()
             )]
         );
         assert!(changed.is_empty());

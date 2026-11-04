@@ -36,6 +36,8 @@ pub struct ServerSettings {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthSettings {
     pub shared_secret: String,
+    /// Bearer token for the dashboard. Unset disables the dashboard.
+    pub dashboard_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +70,7 @@ pub struct DatabaseSettings {
 }
 
 fn default_bind_address() -> String {
+    // bind-reviewed: fleet ingest is public; heartbeats need auth.shared_secret, dashboard needs auth.dashboard_token (404 when unset)
     "0.0.0.0".to_owned()
 }
 
@@ -133,6 +136,9 @@ impl ServerConfig {
         {
             bail!("auth.shared_secret must be set to a strong random value");
         }
+        if self.auth.dashboard_token.as_deref() == Some("") {
+            bail!("auth.dashboard_token must not be empty when set");
+        }
         if self.email.smtp_host.is_empty() {
             bail!("email.smtp_host must be set");
         }
@@ -140,5 +146,40 @@ impl ServerConfig {
             bail!("email.admin_recipients must contain at least one address");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(auth_extra: &str) -> ServerConfig {
+        toml::from_str(&format!(
+            "[server]\n[auth]\nshared_secret = \"strong-test-secret\"\n{auth_extra}\n\
+             [email]\nsmtp_host = \"smtp.example.com\"\nsmtp_username = \"u\"\n\
+             smtp_password = \"p\"\nfrom_address = \"f@example.com\"\n\
+             admin_recipients = [\"admin@example.com\"]\n"
+        ))
+        .expect("test config parses")
+    }
+
+    #[test]
+    fn dashboard_token_is_optional() {
+        let config = parse("");
+        assert!(config.auth.dashboard_token.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_dashboard_token_is_rejected() {
+        let config = parse("dashboard_token = \"\"");
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn set_dashboard_token_is_accepted() {
+        let config = parse("dashboard_token = \"dash-token\"");
+        assert_eq!(config.auth.dashboard_token.as_deref(), Some("dash-token"));
+        assert!(config.validate().is_ok());
     }
 }

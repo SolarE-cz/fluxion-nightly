@@ -181,6 +181,23 @@ fn pv_correction_site(
     })
 }
 
+/// Remote access state (pairing and the Tor-served mobile API) exists only when the owner enabled
+/// remote access. Without it the pairing and mobile routes are not registered at all.
+fn remote_access_state_if_enabled(
+    enabled: bool,
+    data_dir: &std::path::Path,
+) -> Option<RemoteAccessApiState> {
+    enabled.then(|| RemoteAccessApiState::new(data_dir, 8099, "FluxION".to_string()))
+}
+
+/// Remote access state for the configuration the add-on runs with
+fn remote_access_state_for_config(
+    config: &config::AppConfig,
+    data_dir: &std::path::Path,
+) -> Option<RemoteAccessApiState> {
+    remote_access_state_if_enabled(config.remote_access.enabled, data_dir)
+}
+
 fn initialize_and_run() -> Result<()> {
     // Initialize tracing with env filter support
     // Respects RUST_LOG environment variable
@@ -307,9 +324,25 @@ fn initialize_and_run() -> Result<()> {
             id, extras
         );
     }
+    // Read-only battery of parallel units, combined into their inverter's SOC by capacity
+    let battery_soc_weights: std::collections::HashMap<
+        String,
+        fluxion_adapters::ha::adapters::BatterySocWeights,
+    > = config
+        .inverters
+        .iter()
+        .filter_map(|inv| config.battery_soc_weights(inv).map(|w| (inv.id.clone(), w)))
+        .collect();
+    for (id, weights) in &battery_soc_weights {
+        info!(
+            "🔋 Inverter {} SOC is capacity-weighted: own {:.1} kWh, parallel units {:?}",
+            id, weights.own_kwh, weights.extras
+        );
+    }
     let inverter_adapter = HomeAssistantInverterAdapter::new(ha_client.clone(), mapper)
         .with_guard(actuation_guard)
-        .with_pv_extra_prefixes(pv_extra_prefixes);
+        .with_pv_extra_prefixes(pv_extra_prefixes)
+        .with_battery_soc_weights(battery_soc_weights);
     // Shared with the pre-wake system, so both use one awaken rate limit
     let actuation_state =
         fluxion_adapters::ha::actuation::ActuationStateResource(inverter_adapter.actuation_state());
@@ -524,7 +557,7 @@ fn initialize_and_run() -> Result<()> {
     .with_user_control(Arc::clone(&user_control_api_state.state));
     let plugin_api_state = PluginApiState::new(plugin_manager.clone());
     let remote_access_state =
-        RemoteAccessApiState::new(std::path::Path::new("./data"), 8099, "FluxION".to_string());
+        remote_access_state_for_config(&config, std::path::Path::new("./data"));
     tokio::spawn(async move {
         if let Err(e) = fluxion_web::start_web_server(
             query_sender,
@@ -536,7 +569,8 @@ fn initialize_and_run() -> Result<()> {
             Some(plugin_api_state), // Plugin API with shared PluginManager
             Some(fluxion_web::ScheduledExportConfig::default()), // Daily export at 23:55 for debugging
             Some(user_control_api_state),                        // User control API state
-            Some(remote_access_state),                           // Remote access pairing API
+            remote_access_state,                                 // Remote access pairing API
+            fluxion_web::AccessMode::from_env(),                 // Peer guard: add-on or standalone
         )
         .await
         {
@@ -617,4 +651,32 @@ fn initialize_and_run() -> Result<()> {
     app.run();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_access_is_not_registered_while_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remote_access_state_if_enabled(false, dir.path()).is_none());
+        assert!(!dir.path().join("tor").exists());
+    }
+
+    #[test]
+    fn remote_access_is_registered_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remote_access_state_if_enabled(true, dir.path()).is_some());
+    }
+
+    #[test]
+    fn remote_access_state_follows_the_config_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config::AppConfig::default();
+        config.remote_access.enabled = false;
+        assert!(remote_access_state_for_config(&config, dir.path()).is_none());
+        config.remote_access.enabled = true;
+        assert!(remote_access_state_for_config(&config, dir.path()).is_some());
+    }
 }

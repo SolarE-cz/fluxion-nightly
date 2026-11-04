@@ -496,6 +496,22 @@ impl InverterStateReader {
     }
 }
 
+/// Wall clock of the state reader and the executor. Absent means `Utc::now`; tests insert one
+/// to step time at the real 5 s read cadence.
+#[derive(Resource, Clone)]
+pub struct ClockResource(pub Arc<dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync>);
+
+impl ClockResource {
+    pub fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        (self.0)()
+    }
+}
+
+/// The time from `clock`, or `Utc::now` without one
+pub fn clock_now(clock: Option<&ClockResource>) -> chrono::DateTime<chrono::Utc> {
+    clock.map_or_else(chrono::Utc::now, ClockResource::now)
+}
+
 /// Timer resource for controlling state read frequency
 #[derive(Resource)]
 pub struct StateReadTimer {

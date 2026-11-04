@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::State;
-use axum::response::{Html, IntoResponse};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use chrono::Utc;
 use tracing::error;
 
@@ -24,6 +25,8 @@ use fluxion_shared::telemetry::TelemetrySnapshot;
 #[derive(Debug, Clone)]
 pub struct DashboardState {
     pub db: Arc<Database>,
+    /// Bearer token required for the dashboard. `None` disables the dashboard (404).
+    pub dashboard_token: Option<String>,
 }
 
 #[derive(Debug, Template)]
@@ -131,15 +134,44 @@ fn format_relative_time(seconds: i64) -> String {
     }
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn bearer_token_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+}
+
 #[expect(clippy::unused_async, reason = "axum handler must be async")]
-pub async fn dashboard_handler(State(state): State<DashboardState>) -> impl IntoResponse {
+pub async fn dashboard_handler(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(expected) = state.dashboard_token.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !bearer_token_matches(&headers, expected) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
+    }
+
     let now = Utc::now();
 
     let clients = match state.db.get_all_clients() {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "Failed to fetch clients for dashboard");
-            return Html("<h1>Error loading dashboard</h1>".to_owned());
+            return Html("<h1>Error loading dashboard</h1>".to_owned()).into_response();
         }
     };
 
@@ -188,10 +220,10 @@ pub async fn dashboard_handler(State(state): State<DashboardState>) -> impl Into
     };
 
     match template.render() {
-        Ok(html) => Html(html),
+        Ok(html) => Html(html).into_response(),
         Err(e) => {
             error!(error = %e, "Template render error");
-            Html(format!("<h1>Error rendering dashboard: {e}</h1>"))
+            Html(format!("<h1>Error rendering dashboard: {e}</h1>")).into_response()
         }
     }
 }

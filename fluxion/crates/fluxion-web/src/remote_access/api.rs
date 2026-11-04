@@ -105,6 +105,18 @@ async fn pair_handler(
     State(state): State<RemoteAccessApiState>,
     Json(req): Json<PairRequest>,
 ) -> impl IntoResponse {
+    // The mobile control API does not identify the caller, so a read-only device would still be
+    // able to change state (findings 2, 42). Refuse read-only pairing until devices are authenticated.
+    if req.mode == "readonly" {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "read-only pairing is not supported yet; every paired device has full control"
+            })),
+        )
+            .into_response();
+    }
+
     let mode = match req.mode.as_str() {
         "full" | "readonly" => req.mode.clone(),
         _ => {
@@ -279,6 +291,23 @@ mod tests {
         let svg = render_qr_svg(payload);
         assert!(svg.contains("<svg"));
         assert!(svg.contains("</svg>"));
+    }
+
+    #[tokio::test]
+    async fn pair_refuses_readonly_and_registers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = RemoteAccessApiState::new(dir.path(), 8099, "FluxION".to_owned());
+        let response = pair_handler(
+            State(state.clone()),
+            Json(PairRequest {
+                name: "phone".to_owned(),
+                mode: "readonly".to_owned(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(state.device_store.load_devices().is_empty());
     }
 
     #[test]

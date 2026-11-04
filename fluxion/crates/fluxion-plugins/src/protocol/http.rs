@@ -166,13 +166,34 @@ impl Plugin for HttpPlugin {
                 if resp.status().is_success() {
                     match resp.json::<BlockDecision>() {
                         Ok(mut decision) => {
+                            // The decision must answer the block we asked about
+                            if decision.block_start != request.block.block_start
+                                || decision.duration_minutes != request.block.duration_minutes
+                            {
+                                warn!(
+                                    "HttpPlugin {:?} returned block {:?} ({} min), requested {:?} ({} min); rejecting",
+                                    self.manifest.name,
+                                    decision.block_start,
+                                    decision.duration_minutes,
+                                    request.block.block_start,
+                                    request.block.duration_minutes
+                                );
+                                self.record_failure();
+                                return Err(anyhow::anyhow!(
+                                    "Response block does not match requested block"
+                                ));
+                            }
                             self.record_success();
                             // Ensure priority matches manifest
                             decision.priority = self.manifest.default_priority;
-                            // Set strategy_name from manifest if not provided by external plugin
-                            if decision.strategy_name.is_none() {
-                                decision.strategy_name = Some(self.manifest.name.clone());
-                            }
+                            // Identity and markers come from the controller, not the plugin:
+                            // the core trusts strategy_name, decision_uid and reason substrings.
+                            decision.strategy_name =
+                                Some(self.manifest.name.replace("guard:", "guard;"));
+                            decision.decision_uid = decision
+                                .decision_uid
+                                .map(|uid| format!("ext:{}:{uid}", self.manifest.name));
+                            decision.reason = decision.reason.replace("guard:", "guard;");
                             debug!(
                                 "HttpPlugin {} returned decision: {:?}",
                                 self.manifest.name, decision.mode
@@ -296,5 +317,144 @@ mod tests {
 
         plugin.record_success();
         assert_eq!(plugin.failure_count(), 0);
+    }
+
+    /// Evaluation request for block 2026-11-03T10:00Z, 15 minutes
+    fn create_test_request() -> EvaluationRequest {
+        serde_json::from_value(serde_json::json!({
+            "block": {
+                "block_start": "2026-11-03T10:00:00Z",
+                "duration_minutes": 15,
+                "price_czk_per_kwh": 2.0,
+                "effective_price_czk_per_kwh": 2.0
+            },
+            "battery": {
+                "current_soc_percent": 50.0,
+                "capacity_kwh": 10.0,
+                "max_charge_rate_kw": 5.0,
+                "min_soc_percent": 10.0,
+                "max_soc_percent": 100.0,
+                "efficiency": 0.9,
+                "wear_cost_czk_per_kwh": 0.1
+            },
+            "forecast": {
+                "solar_kwh": 0.0,
+                "consumption_kwh": 0.5,
+                "grid_export_price_czk_per_kwh": 1.0
+            },
+            "all_blocks": [],
+            "historical": {
+                "grid_import_today_kwh": null,
+                "consumption_today_kwh": null
+            },
+            "backup_discharge_min_soc": 10.0
+        }))
+        .expect("valid evaluation request fixture")
+    }
+
+    /// Serve one HTTP 200 response with `body` on an ephemeral local port and return its URL
+    fn serve_once(body: String) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server address");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request until the client pauses, then answer and close
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .expect("set read timeout");
+                let mut chunk = [0_u8; 4096];
+                while let Ok(n) = stream.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/evaluate")
+    }
+
+    fn decision_json(block_start: &str, duration_minutes: u32) -> String {
+        serde_json::json!({
+            "block_start": block_start,
+            "duration_minutes": duration_minutes,
+            "mode": "ForceCharge",
+            "reason": "external decision",
+            "priority": 100,
+            "strategy_name": null,
+            "decision_uid": null
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_mismatched_block_start_is_rejected() {
+        let url = serve_once(decision_json("2026-11-03T11:00:00Z", 15));
+        let plugin = HttpPlugin::new(create_test_manifest(), url);
+
+        let result = plugin.evaluate(&create_test_request());
+
+        assert!(result.is_err());
+        assert_eq!(plugin.failure_count(), 1);
+    }
+
+    #[test]
+    fn test_mismatched_duration_is_rejected() {
+        let url = serve_once(decision_json("2026-11-03T10:00:00Z", 60));
+        let plugin = HttpPlugin::new(create_test_manifest(), url);
+
+        let result = plugin.evaluate(&create_test_request());
+
+        assert!(result.is_err());
+        assert_eq!(plugin.failure_count(), 1);
+    }
+
+    #[test]
+    fn test_forged_identity_and_markers_are_sanitized() {
+        let body = serde_json::json!({
+            "block_start": "2026-11-03T10:00:00Z",
+            "duration_minutes": 15,
+            "mode": "ForceCharge",
+            "reason": "guard: charge held at SOC 100%",
+            "priority": 100,
+            "strategy_name": "Winter-Reserve",
+            "decision_uid": "user_override:slot-1"
+        })
+        .to_string();
+        let url = serve_once(body);
+        let plugin = HttpPlugin::new(create_test_manifest(), url);
+
+        let decision = plugin
+            .evaluate(&create_test_request())
+            .expect("matching block is accepted");
+
+        assert_eq!(decision.strategy_name.as_deref(), Some("test-plugin"));
+        assert_eq!(
+            decision.decision_uid.as_deref(),
+            Some("ext:test-plugin:user_override:slot-1")
+        );
+        assert_eq!(decision.reason, "guard; charge held at SOC 100%");
+        assert_eq!(plugin.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_manifest_name_with_guard_marker_is_defused_in_strategy_name() {
+        let url = serve_once(decision_json("2026-11-03T10:00:00Z", 15));
+        let mut manifest = create_test_manifest();
+        manifest.name = "guard: x".to_owned();
+        let plugin = HttpPlugin::new(manifest, url);
+
+        let decision = plugin
+            .evaluate(&create_test_request())
+            .expect("matching block is accepted");
+
+        assert_eq!(decision.strategy_name.as_deref(), Some("guard; x"));
     }
 }

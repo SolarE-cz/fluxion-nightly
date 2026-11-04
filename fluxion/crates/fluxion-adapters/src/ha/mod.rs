@@ -22,6 +22,7 @@ pub mod plugin;
 pub mod pv_forecast_correction;
 pub mod solar_forecast_accuracy;
 pub mod solar_forecast_fetcher;
+pub mod transport;
 pub mod types;
 pub mod ws;
 

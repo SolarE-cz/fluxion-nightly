@@ -147,6 +147,10 @@ pub struct EvaluationRequest {
     /// Planner minimum SOC (%) when the default mode is Back Up; `None` keeps the control minimum
     #[serde(default)]
     pub planner_min_soc_pct: Option<f32>,
+
+    /// Cautious-PV signal from the solar forecast error; `None` = fewer than 3 measured days
+    #[serde(default)]
+    pub cautious_pv: Option<fluxion_types::CautiousPvSignal>,
 }
 
 /// Operation mode decision

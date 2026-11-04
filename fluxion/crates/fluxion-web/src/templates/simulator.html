@@ -959,11 +959,16 @@ function updateDecisions(data) {
 
         const item = document.createElement('div');
         item.className = 'decision-item';
-        item.innerHTML = `
-            <span class="decision-strategy">${STRATEGY_NAMES[strategyId] || strategyId}</span>
-            <span class="decision-mode ${modeClass}">${mode}</span>
-            <span class="decision-reason">${reason}</span>
-        `;
+        const strategyEl = document.createElement('span');
+        strategyEl.className = 'decision-strategy';
+        strategyEl.textContent = STRATEGY_NAMES[strategyId] || strategyId;
+        const modeEl = document.createElement('span');
+        modeEl.className = `decision-mode ${modeClass}`;
+        modeEl.textContent = mode;
+        const reasonEl = document.createElement('span');
+        reasonEl.className = 'decision-reason';
+        reasonEl.textContent = reason;
+        item.append(strategyEl, modeEl, reasonEl);
         list.appendChild(item);
     }
 }
@@ -1015,19 +1020,27 @@ function updateResultsTable(data) {
     // Sort by net cost
     rows.sort((a, b) => a.netCost - b.netCost);
 
-    tbody.innerHTML = rows.map(row => `
-        <tr class="${row.isBest ? 'best' : ''}">
-            <td>${row.name}</td>
-            <td class="num">${row.netCost.toFixed(2)} CZK</td>
-            <td class="num">${row.gridImport.toFixed(1)} kWh</td>
-            <td class="num">${row.gridExport.toFixed(1)} kWh</td>
-            <td class="num">${row.cycles}</td>
-            <td class="num ${row.strategyId === 'no_battery' ? '' : 'positive'}">${row.savings}%</td>
-            <td class="num ${row.vsNoBattery > 0 ? 'positive' : row.vsNoBattery < 0 ? 'negative' : ''}">
-                ${row.strategyId === 'no_battery' ? '-' : (row.vsNoBattery > 0 ? '+' : '') + row.vsNoBattery.toFixed(2)}
-            </td>
-        </tr>
-    `).join('');
+    tbody.innerHTML = '';
+    rows.forEach(row => {
+        const tr = document.createElement('tr');
+        tr.className = row.isBest ? 'best' : '';
+
+        const cell = (text, className = null) => {
+            const td = document.createElement('td');
+            if (className !== null) td.className = className;
+            td.textContent = text;
+            tr.appendChild(td);
+        };
+        cell(row.name);
+        cell(`${row.netCost.toFixed(2)} CZK`, 'num');
+        cell(`${row.gridImport.toFixed(1)} kWh`, 'num');
+        cell(`${row.gridExport.toFixed(1)} kWh`, 'num');
+        cell(row.cycles, 'num');
+        cell(`${row.savings}%`, `num ${row.strategyId === 'no_battery' ? '' : 'positive'}`);
+        cell(row.strategyId === 'no_battery' ? '-' : (row.vsNoBattery > 0 ? '+' : '') + row.vsNoBattery.toFixed(2),
+            `num ${row.vsNoBattery > 0 ? 'positive' : row.vsNoBattery < 0 ? 'negative' : ''}`);
+        tbody.appendChild(tr);
+    });
 }
 
 // Chart functions
@@ -1223,7 +1236,8 @@ function updateCharts(data) {
         socChart.data.labels = labels;
         socChart.data.datasets = [];
 
-        const legendHtml = [];
+        const legend = document.getElementById('soc-legend');
+        legend.innerHTML = '';
         for (const [strategyId, result] of Object.entries(data.strategy_results)) {
             if (strategyId === 'no_battery') continue;
 
@@ -1238,15 +1252,14 @@ function updateCharts(data) {
                 tension: 0.1
             });
 
-            legendHtml.push(`
-                <span class="legend-item">
-                    <span class="legend-color" style="background: ${colors.border}"></span>
-                    ${STRATEGY_NAMES[strategyId] || strategyId}
-                </span>
-            `);
+            const item = document.createElement('span');
+            item.className = 'legend-item';
+            const swatch = document.createElement('span');
+            swatch.className = 'legend-color';
+            swatch.style.background = colors.border;
+            item.append(swatch, ' ', STRATEGY_NAMES[strategyId] || strategyId);
+            legend.appendChild(item);
         }
-
-        document.getElementById('soc-legend').innerHTML = legendHtml.join('');
         socChart.options.plugins.annotation.annotations.currentBlock.xMin = currentBlock;
         socChart.options.plugins.annotation.annotations.currentBlock.xMax = currentBlock;
         socChart.update('none');
@@ -1258,7 +1271,8 @@ function updateCharts(data) {
         costChart.data.labels = labels;
         costChart.data.datasets = [];
 
-        const legendHtml = [];
+        const legend = document.getElementById('cost-legend');
+        legend.innerHTML = '';
         for (const [strategyId, result] of Object.entries(data.strategy_results)) {
             const colors = STRATEGY_COLORS[strategyId] || { border: '#999', bg: 'rgba(153,153,153,0.2)' };
             costChart.data.datasets.push({
@@ -1271,15 +1285,14 @@ function updateCharts(data) {
                 tension: 0.1
             });
 
-            legendHtml.push(`
-                <span class="legend-item">
-                    <span class="legend-color" style="background: ${colors.border}"></span>
-                    ${STRATEGY_NAMES[strategyId] || strategyId}
-                </span>
-            `);
+            const item = document.createElement('span');
+            item.className = 'legend-item';
+            const swatch = document.createElement('span');
+            swatch.className = 'legend-color';
+            swatch.style.background = colors.border;
+            item.append(swatch, ' ', STRATEGY_NAMES[strategyId] || strategyId);
+            legend.appendChild(item);
         }
-
-        document.getElementById('cost-legend').innerHTML = legendHtml.join('');
         costChart.options.plugins.annotation.annotations.currentBlock.xMin = currentBlock;
         costChart.options.plugins.annotation.annotations.currentBlock.xMax = currentBlock;
         costChart.update('none');

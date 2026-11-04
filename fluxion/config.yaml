@@ -33,6 +33,7 @@ options:
     force_charge_hours: 4
     force_discharge_enabled: false
     force_discharge_hours: 2
+    hold_pv_to_battery: false
     hot_standby_entity: ''
     max_battery_charge_rate_kw: 5.0
     max_battery_soc: 100
@@ -205,8 +206,18 @@ options:
       solar_window_end_hour: 14
       solar_window_start_hour: 10
     winter_reserve:
+      cautious_pv_fallback_months:
+      - 10
+      - 11
+      - 12
+      - 1
+      - 2
+      - 3
+      cautious_pv_mae_pct: 25.0
+      cautious_pv_off_pct: 20.0
       cheap_percentile: 0.2
       enabled: true
+      export_floor_until_cheap: false
       insane_price_multiplier: 3.0
       load_safety_factor: 1.1
       min_arbitrage_profit_czk: 2.0
@@ -218,6 +229,7 @@ options:
   system:
     debug_mode: true
     log_level: info
+    trusted_peers: ''
     update_interval_secs: 60
 panel_icon: mdi:solar-power
 schema:
@@ -236,6 +248,7 @@ schema:
     force_charge_hours: int(0,24)?
     force_discharge_enabled: bool?
     force_discharge_hours: int(0,24)?
+    hold_pv_to_battery: bool?
     hot_standby_entity: str?
     max_battery_charge_rate_kw: float(0,)?
     max_battery_soc: float(0,100)?
@@ -248,7 +261,11 @@ schema:
     house_load_power_entity: str?
     solar_production_entity: str?
   inverters:
-  - control_entity_prefix: str?
+  - battery_extra_capacities_kwh:
+    - float(0.1,)?
+    battery_extra_prefixes:
+    - str?
+    control_entity_prefix: str?
     entity_prefix: str
     id: str
     master_id: str?
@@ -464,8 +481,13 @@ schema:
       solar_window_end_hour: int(0,23)?
       solar_window_start_hour: int(0,23)?
     winter_reserve:
+      cautious_pv_fallback_months:
+      - int(1,12)?
+      cautious_pv_mae_pct: float(0,100)?
+      cautious_pv_off_pct: float(0,100)?
       cheap_percentile: float(0,0.5)?
       enabled: bool?
+      export_floor_until_cheap: bool?
       insane_price_multiplier: float(0,10)?
       load_safety_factor: float(0,10)?
       min_arbitrage_profit_czk: float(0,)?
@@ -478,8 +500,9 @@ schema:
     debug_mode: bool?
     display_timezone: str?
     log_level: list(trace|debug|info|warning|error)?
+    trusted_peers: str?
     update_interval_secs: int(10,3600)?
 slug: fluxion
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: "0.2.67"
+version: "0.2.73"
