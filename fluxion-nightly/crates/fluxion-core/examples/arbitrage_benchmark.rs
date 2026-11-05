@@ -622,6 +622,7 @@ fn run_synthetic_closed_loop(
             consumption_forecast_kwh: slice_forecasts[in_slice_idx].consumption_kwh,
             grid_export_price_czk_per_kwh: ctl.grid_export_fee_czk_per_kwh,
             all_price_blocks: Some(slice_prices),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: ctl.min_battery_soc,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,

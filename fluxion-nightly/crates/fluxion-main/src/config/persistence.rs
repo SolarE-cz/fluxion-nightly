@@ -201,6 +201,13 @@ pub const ADDON_ONLY_OPTIONS: &[&[&str]] = &[
         "winter_reserve",
         "direction_reversal_cost_czk",
     ],
+    &[
+        "strategies",
+        "winter_reserve",
+        "export_window_continuity_pct",
+    ],
+    &["strategies", "winter_reserve", "export_selection"],
+    &["strategies", "winter_reserve", "daily_export_hours"],
     &["control", "vpp_direct_enabled"],
 ];
 
@@ -414,6 +421,8 @@ mod tests {
         saved.pricing.spot_price_entity = "sensor.from_web_ui".to_owned();
         saved.pricing.buy_price_entity = Some("sensor.buy_from_web_ui".to_owned());
         saved.strategies.winter_reserve.direction_reversal_cost_czk = 0.5;
+        saved.strategies.winter_reserve.export_window_continuity_pct = 1.0;
+        saved.strategies.winter_reserve.daily_export_hours = 3;
         saved.strategies.winter_reserve.mode_switch_min_benefit_czk = 1.5;
         persistence.save(&saved, "web_ui").unwrap();
         let mut config = persistence.load().unwrap().config;
@@ -424,6 +433,9 @@ mod tests {
             serde_json::json!({
                 "strategies": {"winter_reserve": {
                     "direction_reversal_cost_czk": 3.5,
+                    "export_window_continuity_pct": 10.0,
+                    "export_selection": "daily_top_n",
+                    "daily_export_hours": 8,
                     "mode_switch_min_benefit_czk": 1.0
                 }},
                 "pricing": {
@@ -453,6 +465,20 @@ mod tests {
         assert!(config.control.hold_pv_to_battery);
         assert!(!config.solar_forecast.pv_forecast_correction_enabled);
         assert!((config.strategies.winter_reserve.direction_reversal_cost_czk - 3.5).abs() < 1e-6);
+        assert!(
+            (config
+                .strategies
+                .winter_reserve
+                .export_window_continuity_pct
+                - 10.0)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(
+            config.strategies.winter_reserve.export_selection,
+            fluxion_core::ExportSelection::DailyTopN
+        );
+        assert_eq!(config.strategies.winter_reserve.daily_export_hours, 8);
         // Other keys: config.json still wins, also beside an add-on-only key of the same section
         assert!((config.strategies.winter_reserve.mode_switch_min_benefit_czk - 1.5).abs() < 1e-6);
         assert_eq!(config.pricing.spot_price_entity, "sensor.from_web_ui");

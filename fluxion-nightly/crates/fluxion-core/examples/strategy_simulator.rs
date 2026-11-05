@@ -413,6 +413,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 consumption_forecast_kwh: block.consumption_kwh,
                 grid_export_price_czk_per_kwh: spot_price, // Export at spot price (no grid fee)
                 all_price_blocks: Some(&all_price_blocks),
+                ranking_price_blocks: None,
                 backup_discharge_min_soc: config.hardware_min_battery_soc,
                 grid_import_today_kwh: None, // Not tracked in simulation
                 consumption_today_kwh: None, // Not tracked in simulation

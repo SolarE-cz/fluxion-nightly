@@ -685,6 +685,12 @@ struct ChartDataJson {
     battery_cost_basis: Option<fluxion_core::web_bridge::BatteryCostBasisInfo>,
     /// Price source per block when not the HA price entity (`"ote_fallback"`, brief H35)
     price_sources: Vec<Option<String>>,
+    /// Market spot price per block (spot sell price plus fee under fixed buy), aligned with `labels`
+    market_spot_prices: Vec<Option<f32>>,
+    /// Fixed buy pricing: the bars show `market_spot_prices`, the fixed buy price is a line
+    fixed_buy: bool,
+    /// Spot sell fee (CZK/kWh), for the fixed buy tooltip
+    sell_fee_czk: f32,
     /// Health of the spot price feed and the OTE fallback (brief H35)
     #[serde(skip_serializing_if = "Option::is_none")]
     price_feed: Option<fluxion_core::price_feed::PriceFeedStatus>,
@@ -755,6 +761,9 @@ fn build_chart_data_json(response: &WebQueryResponse, i18n: Arc<I18n>) -> Option
         utc_offset_minutes,
         battery_cost_basis: response.battery_cost_basis,
         price_sources: chart.price_sources,
+        market_spot_prices: chart.market_spot_prices,
+        fixed_buy: chart.fixed_buy,
+        sell_fee_czk: chart.sell_fee_czk,
         price_feed: response.price_feed.clone(),
     })
 }
@@ -1029,8 +1038,8 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
     use fluxion_core::web_bridge::{
-        ConsumptionStats, HdoScheduleInfo, PriceBlockData, PriceData, SystemHealthData,
-        TimezoneSource,
+        ConsumptionStats, HdoScheduleInfo, PriceBlockData, PriceData, PricingFees,
+        SystemHealthData, TimezoneSource,
     };
 
     fn block(ts: &str, solar_forecast_kw: Option<f32>) -> PriceBlockData {
@@ -1051,6 +1060,7 @@ mod tests {
             solar_forecast_raw_kw: None,
             backup_min_soc_pct: None,
             price_source: None,
+            market_spot_price: None,
         }
     }
 
@@ -1956,6 +1966,97 @@ mod tests {
         assert!(html.contains(r#"id="toggleSolarForecast""#));
         assert!(html.contains(r#"id="toggleConsumptionProfile""#));
         assert!(html.contains(r#""solar_forecast_kw":[1.0]"#));
+    }
+
+    #[test]
+    fn chart_json_fixed_buy_bars_show_the_market_spot_price() {
+        let mut fixed_blocks = vec![
+            block("2026-10-16T09:45:00Z", None),
+            block("2026-10-16T10:00:00Z", None),
+        ];
+        for (b, spot) in fixed_blocks.iter_mut().zip([1.5, 0.5]) {
+            // Fixed buy block price, the market spot next to it
+            b.price = 2.85;
+            b.market_spot_price = Some(spot);
+        }
+        let mut resp = response(fixed_blocks, None);
+        resp.pricing_fees = Some(PricingFees {
+            buy_fee_czk: 0.0,
+            sell_fee_czk: 0.2,
+            fixed_buy: true,
+        });
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+
+        assert_eq!(json["fixed_buy"], true);
+        assert_eq!(json["sell_fee_czk"], serde_json::json!(0.2_f32));
+        assert_eq!(
+            json["market_spot_prices"],
+            serde_json::json!([1.5_f32, 0.5_f32])
+        );
+        assert_eq!(json["spot_prices"], serde_json::json!([2.85_f32, 2.85_f32]));
+        assert_eq!(json["prices"], serde_json::json!([2.85_f32, 2.85_f32]));
+    }
+
+    #[test]
+    fn chart_json_spot_buy_bars_are_the_spot_prices() {
+        let blocks = vec![block("2026-10-16T10:00:00Z", None)];
+        let mut resp = response(blocks, None);
+        resp.pricing_fees = Some(PricingFees {
+            buy_fee_czk: 0.0,
+            sell_fee_czk: 0.0,
+            fixed_buy: false,
+        });
+        // Spot buy: the block price is the spot price
+        resp.prices.as_mut().unwrap().blocks[0].market_spot_price = Some(2.0);
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+
+        assert_eq!(json["fixed_buy"], false);
+        assert_eq!(json["market_spot_prices"], json["spot_prices"]);
+        assert_eq!(json["market_spot_prices"], serde_json::json!([2.0]));
+    }
+
+    #[test]
+    fn chart_json_fixed_buy_with_fixed_sell_has_no_market_spot() {
+        let blocks = vec![block("2026-10-16T10:00:00Z", None)];
+        let mut resp = response(blocks, None);
+        resp.pricing_fees = Some(PricingFees {
+            buy_fee_czk: 0.0,
+            sell_fee_czk: 0.0,
+            fixed_buy: true,
+        });
+        let json = serde_json::to_value(build_chart_data_json(&resp, i18n()).unwrap()).unwrap();
+
+        assert_eq!(json["fixed_buy"], true);
+        assert_eq!(json["market_spot_prices"], serde_json::json!([null]));
+    }
+
+    #[test]
+    fn dashboard_renders_fixed_buy_market_spot_line() {
+        let mut fixed = block("2026-10-16T10:00:00Z", None);
+        fixed.market_spot_price = Some(1.2);
+        let mut resp = response(vec![fixed], None);
+        resp.pricing_fees = Some(PricingFees {
+            buy_fee_czk: 0.0,
+            sell_fee_czk: 0.0,
+            fixed_buy: true,
+        });
+        let html = DashboardTemplate::from_query_response(resp, i18n(), String::new(), None)
+            .render()
+            .unwrap();
+        assert!(html.contains("Fixed buy (incl. HDO)"));
+        assert!(html.contains("market_spot_prices"));
+        // Both y-scale callbacks keep the market spot bars inside the range, and a block with no
+        // known spot price (a 0 bar) does not pull the minimum down
+        let max_over_bars =
+            "Math.max(...priceData, ...window.FluxionChartSeries.scaleData(chartData))";
+        assert_eq!(html.matches(max_over_bars).count(), 2);
+        let min_over_known = "Math.min(...window.FluxionChartSeries.scaleData(chartData))";
+        assert_eq!(html.matches(min_over_known).count(), 2);
+        assert!(html.contains("d.market_spot_prices.filter(v => v !== null && v !== undefined)"));
+        // The fixed buy line stays inside the range when every spot price is above it
+        assert!(html.contains(
+            ".concat((d.effective_prices || []).filter(v => v !== null && v !== undefined))"
+        ));
     }
 
     #[test]

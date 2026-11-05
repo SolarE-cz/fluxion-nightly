@@ -486,8 +486,9 @@ Default value: `60`
 
 ### Option Group: `strategies.winter_reserve`
 
-Only the cautious-PV options and the direction-reversal cost are described here; the other Winter
-Reserve options keep their defaults unless a replay shows a gain.
+Only the cautious-PV options, the direction-reversal cost, the discharge-window continuity and the
+export block selection are described here; the other Winter Reserve options keep their defaults
+unless a replay shows a gain.
 
 #### Option: `strategies.winter_reserve.direction_reversal_cost_czk`
 
@@ -501,6 +502,66 @@ profit. It is a difference, not a price threshold. `0` turns it off (the plan be
 This option applies over a saved web UI configuration (`/data/config.json`).
 
 Default value: `2.0`
+
+#### Option: `strategies.winter_reserve.export_window_continuity_pct`
+
+Run continuity of the morning and evening discharge-hour levers ("Počet ranních/večerních hodin
+pro vybíjení"), in percent. The lever allows Export only in its best-selling blocks of the window,
+so a block that sells a little below the cut-off splits an export run into Export, Hold, Export.
+After the lever has chosen its blocks, a block it left out may export too when it lies in a gap
+between two chosen blocks of the same window and day and sells at most this percentage below a
+chosen neighbour (a higher price always qualifies):
+
+- a one-block gap fills when its sell price is at most this percentage below the chosen block
+  before it or the one after it;
+- a two-block gap fills only as a whole, when each block sells at most this percentage below the
+  chosen block it touches;
+- longer gaps, and blocks before the first or after the last chosen block, stay as the lever chose.
+
+Only the lever's own blocks count as neighbours, so filled blocks never chain. The maximum
+discharge percentage, floors, the export guard and caps are unchanged; the planner still decides
+whether an allowed block exports. `0` turns it off (the lever before this option). This option
+applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `5.0`
+
+#### Option: `strategies.winter_reserve.export_selection`
+
+Which blocks the planner may export the battery in:
+
+- `windows` (default): the morning and evening discharge-hour levers ("Počet ranních/večerních
+  hodin pro vybíjení") pick their best-selling blocks, as before this option.
+- `daily_top_n`: the best-selling `daily_export_hours` of each local calendar day (00:00–24:00),
+  wherever they fall, ranked by sell price (ties: the earlier block). The continuity gap fills of
+  `export_window_continuity_pct` apply on top, across the whole day. This replaces the morning and
+  evening windows: the discharge-hour levers are ignored (logged once at INFO); the maximum
+  discharge percentage levers still apply (the higher of the two set values). With both lever
+  entities unavailable there is no such limit, and export runs down to the planner minimum SOC
+  (as in `windows` without levers). A block forced to charge or barred from discharging by the
+  price levers takes no slot.
+
+Both selections rank the whole local day, the hours already passed included: the planner plans
+only from the current block on, but it gets today's earlier prices for ranking, so the export
+blocks do not move as the day passes. A future day the price feed has published only in part is
+ranked over its known blocks; with `daily_top_n` it gets the same share of its known time:
+known × `daily_export_hours` / 24 h, rounded up to a block, at most `daily_export_hours`. A DST
+day of 23 or 25 hours is complete and gets the full `daily_export_hours`.
+
+Within the allowed blocks the planner still decides by money (minimum arbitrage profit, losses,
+wear, later blocks), and a grid charge for a sale later the same day is allowed. Floors,
+`export_floor_until_cheap`, the export guard, caps and the direction-reversal cost are unchanged.
+This option applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `windows`
+
+#### Option: `strategies.winter_reserve.daily_export_hours`
+
+With `export_selection: daily_top_n`, the number of hours of each local day in which export is
+allowed, before the continuity gap fills (counted by block length: 4 quarter-hour blocks or 1
+hourly block per hour). Range 1–24. Ignored with `windows`. This
+option applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `6`
 
 #### Option: `strategies.winter_reserve.cautious_pv_mae_pct`
 

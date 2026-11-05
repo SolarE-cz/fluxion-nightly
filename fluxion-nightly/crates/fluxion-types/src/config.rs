@@ -1128,6 +1128,21 @@ pub struct WinterReserveConfigCore {
     /// price threshold; 0 = off (default: 2.0)
     #[serde(default = "default_wr_direction_reversal_cost")]
     pub direction_reversal_cost_czk: f32,
+    /// Run continuity of the discharge-window levers (%): after a window's best-selling blocks are
+    /// chosen, a block between two chosen blocks of the same window and day may export too when
+    /// its sell price is at least the lowest chosen price minus this percentage. It fills gaps,
+    /// never extends a run outward; 0 = off (default: 5.0)
+    #[serde(default = "default_wr_export_window_continuity_pct")]
+    pub export_window_continuity_pct: f32,
+    /// How the blocks Export may run in are chosen: `windows` (the morning/evening discharge-hour
+    /// levers) or `daily_top_n` (the best `daily_export_hours` of each local day, levers' hours
+    /// ignored). Default: windows
+    #[serde(default)]
+    pub export_selection: ExportSelection,
+    /// `daily_top_n`: hours (×4 blocks) of each local day 00-24, ranked by sell price, in which
+    /// Export may run, plus the continuity gap fills (1-24, default: 6)
+    #[serde(default = "default_wr_daily_export_hours")]
+    pub daily_export_hours: u8,
     /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
     #[serde(default = "default_wr_soc_resolution_pct")]
     pub soc_resolution_pct: f32,
@@ -1180,6 +1195,12 @@ fn default_wr_mode_switch_min_benefit() -> f32 {
 fn default_wr_direction_reversal_cost() -> f32 {
     2.0
 }
+fn default_wr_export_window_continuity_pct() -> f32 {
+    5.0
+}
+fn default_wr_daily_export_hours() -> u8 {
+    6
+}
 fn default_wr_soc_resolution_pct() -> f32 {
     0.5
 }
@@ -1206,6 +1227,9 @@ impl Default for WinterReserveConfigCore {
             min_mode_benefit_czk: default_wr_min_mode_benefit(),
             mode_switch_min_benefit_czk: default_wr_mode_switch_min_benefit(),
             direction_reversal_cost_czk: default_wr_direction_reversal_cost(),
+            export_window_continuity_pct: default_wr_export_window_continuity_pct(),
+            export_selection: ExportSelection::default(),
+            daily_export_hours: default_wr_daily_export_hours(),
             soc_resolution_pct: default_wr_soc_resolution_pct(),
             export_floor_until_cheap: false,
             cautious_pv_mae_pct: default_wr_cautious_pv_mae_pct(),
@@ -1213,6 +1237,18 @@ impl Default for WinterReserveConfigCore {
             cautious_pv_fallback_months: default_wr_cautious_pv_fallback_months(),
         }
     }
+}
+
+/// How Winter Reserve chooses the blocks Export may run in
+/// (`strategies.winter_reserve.export_selection`, owner 2026-11-05).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportSelection {
+    /// The morning and evening discharge-hour levers (the planner before this option)
+    #[default]
+    Windows,
+    /// The best `daily_export_hours` of each local day 00-24 by sell price, wherever they fall
+    DailyTopN,
 }
 
 /// Winter Adaptive V9 configuration - Solar-Aware Morning Peak Optimizer

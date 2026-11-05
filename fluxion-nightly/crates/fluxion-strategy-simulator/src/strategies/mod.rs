@@ -534,6 +534,7 @@ mod tests {
             consumption_forecast_kwh: consumption,
             grid_export_price_czk_per_kwh: price_block.price_czk_per_kwh * 0.8,
             all_price_blocks: None,
+            ranking_price_blocks: None,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,

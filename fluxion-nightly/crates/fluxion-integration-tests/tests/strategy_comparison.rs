@@ -245,6 +245,7 @@ fn compare_strategies() {
             consumption_forecast_kwh: load_kw * duration_h,
             grid_export_price_czk_per_kwh: price_sell,
             all_price_blocks: Some(&data.prices),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: Some(cumulative_consumption_kwh),

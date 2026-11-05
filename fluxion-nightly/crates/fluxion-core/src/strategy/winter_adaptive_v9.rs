@@ -1783,6 +1783,7 @@ mod tests {
         let context = EvaluationContext {
             price_block: &blocks[0],
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             control_config: &control_config,
             current_battery_soc: 95.0, // At target
             solar_forecast_kwh: 0.0,
@@ -1835,6 +1836,7 @@ mod tests {
         let context = EvaluationContext {
             price_block: &blocks[0],
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             control_config: &control_config,
             current_battery_soc: 30.0, // Below target
             solar_forecast_kwh: 0.0,
@@ -1914,6 +1916,7 @@ mod tests {
         let context = EvaluationContext {
             price_block: &blocks[block_index],
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             control_config: &control_config,
             current_battery_soc: 95.0, // At target
             solar_forecast_kwh: 0.0,
@@ -2371,6 +2374,7 @@ mod tests {
             let context = EvaluationContext {
                 price_block: &blocks[idx],
                 all_price_blocks: Some(&blocks),
+                ranking_price_blocks: None,
                 control_config: &control_config,
                 current_battery_soc: 30.0,
                 solar_forecast_kwh: 0.0,

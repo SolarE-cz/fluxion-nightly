@@ -395,6 +395,7 @@ pub fn generate_schedule_with_optimizer(
         let request = create_evaluation_request(
             price_block,
             &remaining_blocks,
+            time_block_prices,
             control_config,
             temp_predicted_soc,
             solar_kwh,
@@ -544,6 +545,7 @@ pub fn generate_schedule_with_optimizer(
         let request = create_evaluation_request(
             price_block,
             &remaining_blocks,
+            time_block_prices,
             control_config,
             soc_for_evaluation,
             solar_kwh,
@@ -1083,11 +1085,35 @@ fn remaining_block_forecasts(
         .collect()
 }
 
+fn price_block_of(b: &TimeBlockPrice) -> PriceBlock {
+    PriceBlock {
+        block_start: b.block_start,
+        duration_minutes: b.duration_minutes,
+        price_czk_per_kwh: b.price_czk_per_kwh,
+        effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
+        spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
+    }
+}
+
+/// The known blocks of the 24 h before `block_start`, for ranking only (`EvaluationRequest::
+/// ranking_blocks`). The scheduler plans only from `now − 15 min`, so without them a per-day
+/// export selection would rank today's remaining hours instead of the whole local day.
+fn ranking_blocks(
+    known_blocks: &[TimeBlockPrice],
+    block_start: DateTime<Utc>,
+) -> impl Iterator<Item = &TimeBlockPrice> {
+    let from = block_start - chrono::Duration::hours(24);
+    known_blocks
+        .iter()
+        .filter(move |b| b.block_start >= from && b.block_start < block_start)
+}
+
 /// Create an evaluation request for the plugin manager
 #[expect(clippy::too_many_arguments)]
 fn create_evaluation_request(
     price_block: &TimeBlockPrice,
     remaining_blocks: &[TimeBlockPrice],
+    known_blocks: &[TimeBlockPrice],
     control_config: &ControlConfig,
     current_soc: f32,
     solar_kwh: f32,
@@ -1131,15 +1157,9 @@ fn create_evaluation_request(
             consumption_kwh,
             grid_export_price_czk_per_kwh: export_price,
         },
-        all_blocks: remaining_blocks
-            .iter()
-            .map(|b| PriceBlock {
-                block_start: b.block_start,
-                duration_minutes: b.duration_minutes,
-                price_czk_per_kwh: b.price_czk_per_kwh,
-                effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
-                spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
-            })
+        all_blocks: remaining_blocks.iter().map(price_block_of).collect(),
+        ranking_blocks: ranking_blocks(known_blocks, price_block.block_start)
+            .map(price_block_of)
             .collect(),
         historical: HistoricalData {
             grid_import_today_kwh,
@@ -1341,6 +1361,79 @@ mod tests {
                 assert_eq!(forecast.solar_kwh, solar[first_idx + j]);
                 assert_eq!(forecast.consumption_kwh, consumption[first_idx + j]);
             }
+        }
+    }
+
+    /// Review F1 of legacy/daily-top-n-ship: the scheduler plans only from now − 15 min; every
+    /// request carries the known blocks of the 24 h before its block as ranking context
+    #[test]
+    fn test_schedule_request_carries_started_blocks_for_ranking() {
+        let now = Utc::now();
+        // 30 h before now to 2 h after: the started ones are dropped from planning
+        let blocks: Vec<TimeBlockPrice> = (-120..8)
+            .map(|i| TimeBlockPrice {
+                buy_price_czk_per_kwh: None,
+                block_start: now + ChronoDuration::minutes(15 * i),
+                duration_minutes: 15,
+                price_czk_per_kwh: 3.0,
+                effective_price_czk_per_kwh: 3.5,
+                spot_sell_price_czk_per_kwh: Some(2.0 + i as f32 / 100.0),
+            })
+            .collect();
+        let plugin = Arc::new(RecordingPlugin {
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut manager = PluginManager::new();
+        manager.register(plugin.clone());
+        generate_schedule_with_optimizer(
+            &blocks,
+            &ControlConfig::default(),
+            &ScheduleConfig::default(),
+            50.0,
+            None,
+            None,
+            10.0,
+            None,
+            &manager,
+            None,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            Some("Europe/Prague"),
+            None,
+            None,
+            None,
+        );
+        let requests = plugin.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        for request in requests.iter() {
+            let first = request.all_blocks[0].block_start;
+            let expected: Vec<DateTime<Utc>> = blocks
+                .iter()
+                .map(|b| b.block_start)
+                .filter(|&t| t < first && t >= first - ChronoDuration::hours(24))
+                .collect();
+            let got: Vec<DateTime<Utc>> = request
+                .ranking_blocks
+                .iter()
+                .map(|b| b.block_start)
+                .collect();
+            assert_eq!(got.len(), 96, "{first}");
+            assert_eq!(got, expected, "{first}");
+            let sells: Vec<Option<f32>> = request
+                .ranking_blocks
+                .iter()
+                .map(|b| b.spot_sell_price_czk_per_kwh)
+                .collect();
+            let known: Vec<Option<f32>> = blocks
+                .iter()
+                .filter(|b| expected.contains(&b.block_start))
+                .map(|b| b.spot_sell_price_czk_per_kwh)
+                .collect();
+            assert_eq!(sells, known);
         }
     }
 

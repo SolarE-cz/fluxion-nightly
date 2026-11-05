@@ -51,6 +51,12 @@
 //! such as `export_floor_until_cheap` takes 1 or 0. `--param direction_reversal_cost_czk=0` plans
 //! without the Charge/Export reversal cost (default 2.0); the `flows:` line counts the reversals
 //! (Charge after Export or Export after Charge, other modes between them) of the applied modes.
+//! `--param export_window_continuity_pct=X` is accepted like any planner parameter, but the replay
+//! passes no user levers, so it changes no replayed plan; the lever-continuity day grid runs in
+//! `strategy::winter_reserve::continuity_tests::closed_loop_grid` (an ignored test).
+//! `--param export_selection=daily_top_n` and `--param daily_export_hours=N` are accepted too, but
+//! the shared replay (`backtest::replay`) builds its blocks without the export rules, so they change
+//! no replayed plan either.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -95,9 +101,6 @@ fn set_param(params: &mut WinterReserveParams, assignment: &str) -> Result<(), S
     let (key, value) = assignment
         .split_once('=')
         .ok_or_else(|| format!("--param expects key=value, got {assignment}"))?;
-    let value: f32 = value
-        .parse()
-        .map_err(|_| format!("--param {key}: not a number: {value}"))?;
     let mut map = match serde_json::to_value(&*params) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => return Err("cannot serialise WinterReserveParams".into()),
@@ -105,11 +108,21 @@ fn set_param(params: &mut WinterReserveParams, assignment: &str) -> Result<(), S
     if !map.contains_key(key) {
         return Err(format!("unknown parameter {key}"));
     }
-    // Boolean parameters take 1 (true) or 0 (false)
-    let json = if map[key].is_boolean() {
-        serde_json::json!(value != 0.0)
-    } else {
+    // Text parameters (export_selection) take their value as written
+    let json = if map[key].is_string() {
         serde_json::json!(value)
+    } else {
+        let number: f32 = value
+            .parse()
+            .map_err(|_| format!("--param {key}: not a number: {value}"))?;
+        // Boolean parameters take 1 (true) or 0 (false); whole-number ones a whole number
+        if map[key].is_boolean() {
+            serde_json::json!(number != 0.0)
+        } else if map[key].is_u64() {
+            serde_json::json!(number as u64)
+        } else {
+            serde_json::json!(number)
+        }
     };
     map.insert(key.to_string(), json);
     *params = serde_json::from_value(serde_json::Value::Object(map))

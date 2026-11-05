@@ -10,6 +10,42 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.75] - 2026-11-06
+
+### Added
+
+- Winter Reserve discharge-window continuity: `strategies.winter_reserve.export_window_continuity_pct`
+  (default 5.0 %, 0 = off). After the morning/evening discharge-hour lever picks its best-selling
+  blocks, a left-out block in a one-block gap between two picked blocks may export when it sells
+  at most 5 % below either picked neighbour; a two-block gap fills only when each block sells at
+  most 5 % below the picked block it touches. Runs are never extended outward (owner 2026-11-05: at 4 h the
+  owner's 18:15 and 18:45 fell just below the cut-off and the evening read E H E H E E).
+  Add-on-only: the add-on value applies over a saved web UI config.
+- Winter Reserve export block selection, opt-in per site: `strategies.winter_reserve.export_selection`
+  = `windows` (default, the morning/evening discharge-hour levers, unchanged) or `daily_top_n`
+  (owner 2026-11-05): export is allowed in the best `strategies.winter_reserve.daily_export_hours`
+  (default 6, range 1–24) of each local day 00–24 by sell price, wherever they fall, the hours
+  already passed included, plus the continuity gap fills. A future day the price feed has published
+  only in part gets the same share of its known time: known × hours / 24 h, rounded up to a block,
+  at most the full hours (a DST day of 23 or 25 h is complete). The discharge-hour levers are then ignored (INFO once); the max-discharge % lever still
+  applies (with both lever entities unavailable, export runs down to the planner minimum SOC).
+  The planner still decides by money within those blocks. Add-on-only: the add-on values apply
+  over a saved web UI config.
+
+### Changed
+
+- Winter Reserve discharge-window levers count their hours by block duration: with hourly prices
+  a 1 h lever allows 1 block (0.2.74 allowed 4, since it assumed 15-minute blocks).
+- Winter Reserve discharge-window levers rank the whole local day, the hours already passed
+  included: the scheduler sends today's started blocks to the planner for ranking only, so the
+  lever's export blocks no longer move as the day passes (0.2.74 ranked only from the current
+  block, so after the morning peak the morning lever chose its remaining hours instead). A plan made
+  at 00:00 is unchanged.
+
+### Fixed
+
+- Dashboard price chart under fixed buy with spot sell: the bars show the market spot price again (they showed the fixed buy price), the HDO fee is no longer stacked on them, and the fixed buy price (energy + HDO) is a magenta stepped line, "Fixed buy (incl. HDO)", with its own tooltip breakdown. Spot-buy and fixed-sell sites render as before.
+
 ## [0.2.74] - 2026-11-05
 
 ### Added

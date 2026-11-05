@@ -17,8 +17,9 @@ use std::sync::{
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
-use fluxion_types::config::ControlConfig;
+use fluxion_types::config::{ControlConfig, ExportSelection};
 use fluxion_types::inverter::InverterOperationMode;
+use fluxion_types::pricing::TimeBlockPrice;
 use fluxion_types::{CautiousPvSignal, DischargeWindowLimit, UserLevers};
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,21 @@ pub struct WinterReserveParams {
     /// charge and export into runs and is never part of the plan cost; 0 = off (owner 2026-11-05)
     #[serde(default = "default_direction_reversal_cost_czk")]
     pub direction_reversal_cost_czk: f32,
+    /// Run continuity of the discharge-window levers (%, owner 2026-11-05): a block the lever left
+    /// out, in a gap of one or two blocks between two chosen blocks of the same window and day,
+    /// may export when it sells at most this percentage below its chosen neighbour (see
+    /// `fill_export_gaps`). It fills gaps only, never extends a run outward; 0 = off
+    #[serde(default = "default_export_window_continuity_pct")]
+    pub export_window_continuity_pct: f32,
+    /// How the blocks Export may run in are chosen (owner 2026-11-05): `Windows` = the morning and
+    /// evening discharge-hour levers; `DailyTopN` = the best `daily_export_hours` of each local
+    /// day 00-24 by sell price, plus the continuity gap fills (`apply_daily_top_n`). The levers'
+    /// hours are then ignored; their max-discharge % still applies.
+    #[serde(default)]
+    pub export_selection: ExportSelection,
+    /// `DailyTopN`: export hours per local day (×4 blocks), 1-24
+    #[serde(default = "default_daily_export_hours")]
+    pub daily_export_hours: u8,
     pub soc_resolution_pct: f32,
     /// Export floor: the reserve deficit only until the next cheap block (buy at or below the
     /// horizon median) when it comes before the next morning (`night_floors`)
@@ -101,6 +117,14 @@ fn default_cautious_pv_fallback_months() -> Vec<u32> {
 
 fn default_direction_reversal_cost_czk() -> f32 {
     2.0
+}
+
+fn default_export_window_continuity_pct() -> f32 {
+    5.0
+}
+
+fn default_daily_export_hours() -> u8 {
+    6
 }
 
 /// Fewest valid days in the 7-day window before the forecast error decides cautious PV; with
@@ -180,6 +204,9 @@ impl Default for WinterReserveParams {
             min_mode_benefit_czk: 0.10,
             mode_switch_min_benefit_czk: 1.0,
             direction_reversal_cost_czk: default_direction_reversal_cost_czk(),
+            export_window_continuity_pct: default_export_window_continuity_pct(),
+            export_selection: ExportSelection::Windows,
+            daily_export_hours: default_daily_export_hours(),
             soc_resolution_pct: 0.5,
             export_floor_until_cheap: false,
             cautious_pv_fallback_months: default_cautious_pv_fallback_months(),
@@ -1619,6 +1646,8 @@ pub struct WinterReserveStrategy {
     cache: Mutex<Option<CachedPlan>>,
     /// Number of planner runs (tests check that cached calls do not re-plan).
     plan_count: AtomicUsize,
+    /// The INFO that `daily_top_n` ignores the discharge-hour levers was logged
+    top_n_levers_logged: std::sync::atomic::AtomicBool,
 }
 
 impl WinterReserveStrategy {
@@ -1631,6 +1660,7 @@ impl WinterReserveStrategy {
             clock: Utc::now,
             cache: Mutex::new(None),
             plan_count: AtomicUsize::new(0),
+            top_n_levers_logged: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1720,15 +1750,71 @@ fn in_evening_window(hour: u32) -> bool {
     hour >= 12
 }
 
-/// Indices of the blocks in `in_window` that are among the `quota` highest sell prices of their
-/// local day (ties: earlier block first). Blocks that are forced to charge or must not discharge
-/// cannot export, so they take no slot. `blocks` is every known block, not only the horizon.
+/// How much export time a local day gets in `export_eligible`, counted in block minutes (so
+/// hourly prices take `hours` blocks, quarter-hour prices `hours` × 4).
+#[derive(Clone, Copy, Debug)]
+enum DayBudget {
+    /// `hours` per window and day (the discharge-window levers)
+    Hours(u8),
+    /// `hours` of each complete local day 00-24 (`daily_top_n`; a DST day of 23 or 25 h is
+    /// complete too). A partial day (known blocks shorter than the local day) gets its share:
+    /// min(`hours`, ceil(known × `hours` / 24 h)), with no jump at any threshold (coordinator
+    /// 2026-11-05). Today is complete with the ranking context, so a partial day is a future day
+    /// the price feed has only partly published.
+    ShareOfDay(u8),
+}
+
+impl DayBudget {
+    /// (numerator, denominator) in minutes: a block is taken while `taken × den < num`, so the
+    /// last block may cross a fractional budget (the ceil). `day_minutes` is the local day's
+    /// length.
+    fn minutes(self, known_minutes: u32, day_minutes: u32) -> (u32, u32) {
+        match self {
+            DayBudget::Hours(hours) => (u32::from(hours) * 60, 1),
+            DayBudget::ShareOfDay(hours) => {
+                let full = u32::from(hours) * 60;
+                if known_minutes >= day_minutes {
+                    (full, 1)
+                } else {
+                    ((known_minutes * u32::from(hours)).min(full * 24), 24)
+                }
+            }
+        }
+    }
+}
+
+/// Length of the local day `date` in minutes (1380 or 1500 on a DST change day)
+fn local_day_minutes(date: NaiveDate, tz: Tz) -> u32 {
+    use chrono::TimeZone;
+    let midnight = |d: NaiveDate| {
+        tz.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap_or_default())
+            .earliest()
+    };
+    match (midnight(date), date.succ_opt().and_then(midnight)) {
+        (Some(start), Some(end)) => u32::try_from((end - start).num_minutes()).unwrap_or(1440),
+        _ => 1440,
+    }
+}
+
+/// Indices of the blocks in `in_window` that are among the highest sell prices of their local day
+/// (ties: earlier block first) up to the day's `budget`, plus the gap blocks `fill_export_gaps`
+/// adds for `continuity_pct`. Blocks that are forced to charge or must not discharge cannot
+/// export, so they take no slot. `blocks` is every known block, not only the horizon: the
+/// started blocks of today come in as ranking context (`EvaluationContext::ranking_price_blocks`).
 fn export_eligible(
     blocks: &[PlanBlock],
     tz: Tz,
     in_window: fn(u32) -> bool,
-    quota: usize,
+    budget: DayBudget,
+    continuity_pct: f32,
 ) -> Vec<usize> {
+    let mut known_minutes: std::collections::HashMap<NaiveDate, u32> =
+        std::collections::HashMap::new();
+    for b in blocks {
+        *known_minutes
+            .entry(b.start.with_timezone(&tz).date_naive())
+            .or_default() += b.duration_minutes;
+    }
     let mut ranked: Vec<(NaiveDate, usize)> = blocks
         .iter()
         .enumerate()
@@ -1747,17 +1833,84 @@ fn export_eligible(
     let mut eligible = Vec::new();
     let mut day = None;
     let mut taken = 0;
+    let mut limit = (0, 1);
     for (date, i) in ranked {
         if day != Some(date) {
             day = Some(date);
             taken = 0;
+            limit = budget.minutes(
+                known_minutes.get(&date).copied().unwrap_or(0),
+                local_day_minutes(date, tz),
+            );
         }
-        if taken < quota {
+        if taken * limit.1 < limit.0 {
             eligible.push(i);
-            taken += 1;
+            taken += blocks[i].duration_minutes;
         }
     }
+    if continuity_pct > 0.0 && continuity_pct.is_finite() {
+        let filled = fill_export_gaps(blocks, tz, in_window, &eligible, continuity_pct);
+        eligible.extend(filled);
+    }
     eligible
+}
+
+/// Run continuity of a discharge window (owner 2026-11-05: "continuity can be accepted within
+/// 5 % margin"; a Hold now and then is fine, an Export/Hold flip on every block is not). Returns
+/// the blocks that fill a gap of one or two blocks between two `chosen` blocks of the same window
+/// and local day, so a run is never extended outward:
+/// - a one-block gap fills when its sell price is at most `pct` % below the sell price of the
+///   chosen block before it or of the one after it (either neighbour);
+/// - a two-block gap fills only as a whole, when each block sells at most `pct` % below the
+///   chosen block it touches;
+/// - longer gaps stay as the lever chose: a longer pause in a run is not a flip-flop.
+///
+/// Only the lever's own choice counts as a neighbour, so filled blocks never chain into further
+/// gaps. A gap block must be able to export (no forced charge, no no-discharge rule). The margin
+/// is `|neighbour| × pct / 100` below the neighbour, so a negative price is never loosened past
+/// itself the wrong way.
+fn fill_export_gaps(
+    blocks: &[PlanBlock],
+    tz: Tz,
+    in_window: fn(u32) -> bool,
+    chosen: &[usize],
+    pct: f32,
+) -> Vec<usize> {
+    let mut sorted = chosen.to_vec();
+    sorted.sort_unstable();
+    let local = |i: usize| blocks[i].start.with_timezone(&tz);
+    let within = |gap: usize, neighbour: usize| {
+        let reference = blocks[neighbour].sell_czk;
+        blocks[gap].sell_czk >= reference - reference.abs() * pct / 100.0
+    };
+    let can_fill = |i: usize, date: NaiveDate| {
+        let b = &blocks[i];
+        let at = local(i);
+        !b.force_charge && !b.no_discharge && in_window(at.hour()) && at.date_naive() == date
+    };
+    let mut filled = Vec::new();
+    for pair in sorted.windows(2) {
+        let (before, after) = (pair[0], pair[1]);
+        let gap = after - before - 1;
+        let date = local(before).date_naive();
+        if !(1..=2).contains(&gap) || local(after).date_naive() != date {
+            continue;
+        }
+        let gap_blocks: Vec<usize> = (before + 1..after).collect();
+        if !gap_blocks.iter().all(|&i| can_fill(i, date)) {
+            continue;
+        }
+        let fills = match gap_blocks[..] {
+            [only] => within(only, before) || within(only, after),
+            [first, second] => within(first, before) && within(second, after),
+            // Longer gaps are skipped above
+            _ => false,
+        };
+        if fills {
+            filled.extend(gap_blocks);
+        }
+    }
+    filled
 }
 
 /// A discharge window: its lever limit and its local-hour test.
@@ -1766,18 +1919,14 @@ type DischargeWindow = (Option<DischargeWindowLimit>, fn(u32) -> bool);
 /// Price and discharge rules of the user levers (CONTRACT "Price levers", "Discharge levers").
 /// `None` levers, or levers with no rule set, leave the blocks as the plain planner has them.
 /// Discharge windows need a timezone; without one, export is unrestricted.
-fn apply_user_levers(blocks: &mut [PlanBlock], levers: Option<&UserLevers>, tz: Option<Tz>) {
+fn apply_user_levers(
+    blocks: &mut [PlanBlock],
+    levers: Option<&UserLevers>,
+    tz: Option<Tz>,
+    continuity_pct: f32,
+) {
     let Some(levers) = levers else { return };
-    for block in blocks.iter_mut() {
-        block.force_charge_at_or_below_czk = levers.force_charge_at_or_below_czk;
-        block.force_charge = levers
-            .force_charge_at_or_below_czk
-            .is_some_and(|at_or_below| block.buy_czk <= at_or_below);
-        block.no_discharge = !block.force_charge
-            && levers
-                .no_discharge_at_or_below_czk
-                .is_some_and(|at_or_below| block.buy_czk <= at_or_below);
-    }
+    apply_price_levers(blocks, levers);
 
     let windows: [DischargeWindow; 2] = [
         (levers.morning_discharge, in_morning_window),
@@ -1794,7 +1943,8 @@ fn apply_user_levers(blocks: &mut [PlanBlock], levers: Option<&UserLevers>, tz: 
     }
     for (limit, in_window) in windows {
         let Some(limit) = limit else { continue };
-        for i in export_eligible(blocks, tz, in_window, usize::from(limit.hours) * 4) {
+        let budget = DayBudget::Hours(limit.hours);
+        for i in export_eligible(blocks, tz, in_window, budget, continuity_pct) {
             let block = &mut blocks[i];
             block.export_allowed = true;
             block.export_min_soc_pct = Some(
@@ -1803,6 +1953,139 @@ fn apply_user_levers(blocks: &mut [PlanBlock], levers: Option<&UserLevers>, tz: 
                     .map_or(limit.min_soc_pct, |pct| pct.max(limit.min_soc_pct)),
             );
         }
+    }
+}
+
+/// Any local hour: the `daily_top_n` export selection ranks the whole local day 00-24.
+fn any_hour(_hour: u32) -> bool {
+    true
+}
+
+/// Export selection `daily_top_n` (owner 2026-11-05): Export may run only in the best-selling
+/// `hours` of each local day 00-24 (`hours` × 4 quarter-hour blocks), wherever they fall
+/// (`export_eligible` over the whole day, started blocks included, ties to the earlier block),
+/// plus the continuity gap fills. A partly published future day gets its share
+/// (`DayBudget::ShareOfDay`). The price levers apply as
+/// in `apply_user_levers`; a forced-charge or no-discharge block takes no slot. The morning and
+/// evening discharge-hour levers are ignored; their max-discharge % is honoured: allowed blocks
+/// never export below the higher SOC limit of the set windows. With neither window lever set (both
+/// lever entities unavailable) there is no such limit and Export runs down to the planner minimum
+/// SOC, as the windows mode does without levers. Without a timezone export is
+/// unrestricted, as with the window levers. The DP still decides by money within these blocks.
+fn apply_daily_top_n(
+    blocks: &mut [PlanBlock],
+    levers: Option<&UserLevers>,
+    tz: Option<Tz>,
+    hours: u8,
+    continuity_pct: f32,
+) {
+    if let Some(levers) = levers {
+        apply_price_levers(blocks, levers);
+    }
+    let Some(tz) = tz else { return };
+    let min_soc_pct = levers.and_then(|l| {
+        [l.morning_discharge, l.evening_discharge]
+            .into_iter()
+            .flatten()
+            .map(|limit| limit.min_soc_pct)
+            .reduce(f32::max)
+    });
+    for block in blocks.iter_mut() {
+        block.export_allowed = false;
+        block.export_min_soc_pct = None;
+    }
+    let budget = DayBudget::ShareOfDay(hours.clamp(1, 24));
+    for i in export_eligible(blocks, tz, any_hour, budget, continuity_pct) {
+        blocks[i].export_allowed = true;
+        blocks[i].export_min_soc_pct = min_soc_pct;
+    }
+}
+
+/// The export rules of `params.export_selection`: the window levers (`apply_user_levers`) or the
+/// daily top N (`apply_daily_top_n`).
+fn apply_export_rules(
+    blocks: &mut [PlanBlock],
+    levers: Option<&UserLevers>,
+    tz: Option<Tz>,
+    params: &WinterReserveParams,
+) {
+    match params.export_selection {
+        ExportSelection::Windows => {
+            apply_user_levers(blocks, levers, tz, params.export_window_continuity_pct);
+        }
+        ExportSelection::DailyTopN => apply_daily_top_n(
+            blocks,
+            levers,
+            tz,
+            params.daily_export_hours,
+            params.export_window_continuity_pct,
+        ),
+    }
+}
+
+/// Ranking-only blocks for the export rules: the `ranking` blocks before `first` on the local day
+/// of `first`, oldest first. They carry prices only; `apply_export_rules_ranked` drops them after
+/// ranking, so they are never planned.
+fn ranking_prefix(
+    ranking: &[TimeBlockPrice],
+    first: DateTime<Utc>,
+    tz: Tz,
+    export_fee_czk: f32,
+) -> Vec<PlanBlock> {
+    let day = first.with_timezone(&tz).date_naive();
+    let mut prefix: Vec<PlanBlock> = ranking
+        .iter()
+        .filter(|b| b.block_start < first && b.block_start.with_timezone(&tz).date_naive() == day)
+        .map(|b| PlanBlock {
+            start: b.block_start,
+            duration_minutes: b.duration_minutes,
+            buy_czk: b.effective_price_czk_per_kwh,
+            sell_czk: b.spot_sell_price_czk_per_kwh.unwrap_or(export_fee_czk),
+            load_kwh: 0.0,
+            pv_kwh: 0.0,
+            reserve_load_kwh: 0.0,
+            reserve_pv_kwh: 0.0,
+            force_charge: false,
+            no_discharge: false,
+            force_charge_at_or_below_czk: None,
+            export_min_soc_pct: None,
+            export_allowed: true,
+        })
+        .collect();
+    prefix.sort_by_key(|b| b.start);
+    prefix.dedup_by_key(|b| b.start);
+    prefix
+}
+
+/// `apply_export_rules` over `prefix` followed by `blocks`; returns `blocks` only. `prefix` is
+/// today's started blocks (`ranking_prefix`): the per-day ranking sees the whole local day, so the
+/// export set does not move as the day passes.
+fn apply_export_rules_ranked(
+    blocks: Vec<PlanBlock>,
+    prefix: Vec<PlanBlock>,
+    levers: Option<&UserLevers>,
+    tz: Option<Tz>,
+    params: &WinterReserveParams,
+) -> Vec<PlanBlock> {
+    let known = prefix.len();
+    let mut all = prefix;
+    all.extend(blocks);
+    apply_export_rules(&mut all, levers, tz, params);
+    all.split_off(known)
+}
+
+/// The price levers (CONTRACT "Price levers"): force charge at or below one buy price, no
+/// discharge at or below another.
+fn apply_price_levers(blocks: &mut [PlanBlock], levers: &UserLevers) {
+    for block in blocks.iter_mut() {
+        block.force_charge_at_or_below_czk = levers.force_charge_at_or_below_czk;
+        block.force_charge = levers
+            .force_charge_at_or_below_czk
+            .is_some_and(|at_or_below| block.buy_czk <= at_or_below);
+        block.no_discharge = !block.force_charge
+            && levers
+                .no_discharge_at_or_below_czk
+                .is_some_and(|at_or_below| block.buy_czk <= at_or_below);
     }
 }
 
@@ -1841,7 +2124,7 @@ impl WinterReserveStrategy {
             .filter(|p| p.iter().sum::<f32>() > 0.0);
         let p75 = context.hourly_consumption_p75.filter(|_| profile.is_some());
         let tz = planner_tz(context);
-        let mut blocks: Vec<PlanBlock> = all
+        let blocks: Vec<PlanBlock> = all
             .iter()
             .enumerate()
             .map(|(i, b)| {
@@ -1901,8 +2184,36 @@ impl WinterReserveStrategy {
                 }
             })
             .collect();
-        // Levers rank over every known block, so the export set does not move as the evening passes.
-        apply_user_levers(&mut blocks, context.user_levers, context.timezone);
+        // Levers rank over every known block of the day, the started ones included, so the export
+        // set does not move as the day passes.
+        if self.params.export_selection == ExportSelection::DailyTopN
+            && context
+                .user_levers
+                .is_some_and(|l| l.morning_discharge.is_some() || l.evening_discharge.is_some())
+            && !self.top_n_levers_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::info!(
+                "WinterReserve: export_selection daily_top_n: the morning and evening discharge-hour levers are ignored, Export may run in the best {} h of each local day; the max-discharge % lever still applies",
+                self.params.daily_export_hours.clamp(1, 24)
+            );
+        }
+        let prefix = match (context.timezone, context.ranking_price_blocks, all.first()) {
+            (Some(tz), Some(ranking), Some(first)) => ranking_prefix(
+                ranking,
+                first.block_start,
+                tz,
+                control.grid_export_fee_czk_per_kwh,
+            ),
+            _ => Vec::new(),
+        };
+        let mut blocks = apply_export_rules_ranked(
+            blocks,
+            prefix,
+            context.user_levers,
+            context.timezone,
+            &self.params,
+        );
+
         blocks.split_off(start)
     }
 
@@ -3126,6 +3437,7 @@ mod tests {
             consumption_forecast_kwh: 0.25,
             grid_export_price_czk_per_kwh: 0.5,
             all_price_blocks: Some(blocks),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,
@@ -5906,7 +6218,7 @@ mod owner_fixed_buy_tests {
         price: impl Fn(u32) -> (f32, f32),
     ) -> (Vec<PlanBlock>, Plan) {
         let mut blocks = blocks_with(skip, price);
-        apply_user_levers(&mut blocks, Some(&levers()), Some(Prague));
+        apply_user_levers(&mut blocks, Some(&levers()), Some(Prague), 0.0);
         let plan = plan_from(&blocks, soc, Prague, &battery(cost), &params(), None);
         (blocks, plan)
     }
@@ -6268,6 +6580,7 @@ mod cautious_pv_tests {
             consumption_forecast_kwh: 0.0,
             grid_export_price_czk_per_kwh: 0.5,
             all_price_blocks: Some(blocks),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,
@@ -7100,5 +7413,1564 @@ mod reversal_tests {
         assert_eq!(json["current"], "Hold");
         assert_eq!(json["start_direction"], "Exporting");
         assert_eq!(json["blocks"].as_array().unwrap().len(), horizon.len());
+    }
+}
+
+/// Run continuity of the discharge-window levers (owner 2026-11-05: "continuity can be accepted
+/// within 5 % margin"; the margin compares a gap block with its chosen neighbours)
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    const TZ: Tz = chrono_tz::Europe::Prague;
+
+    // Owner site live horizon at 2026-11-05 12:45Z (13:45 local; fixture of
+    // legacy/exp-mode-change-cost 2198ab30, which reproduces the live plan letter for letter), the head replan logged as
+    // `n=137 ... load_expected_kwh=93.63 pv_expected_kwh=19.19 ... soc_pct=99.0 current=Some(Hold)
+    // start_direction=None` on 0.2.74: buy = `/chart-data` effective price, sell = spot − 0.35,
+    // load = the UTC-hour profile / 4, PV = `solar_forecast_kw` / 4 × 0.9 (cautious PV). The
+    // arrays start at 11:00Z (12:00 local, the evening lever window) so the levers rank the
+    // whole window; the horizon starts at `LIVE_HEAD`.
+    const LIVE_BUY: [f32; 144] = [
+        3.224, 3.224, 3.224, 3.224, 4.146, 4.146, 4.146, 4.146, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 4.146, 4.146, 4.146, 4.146, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 4.146, 4.146, 4.146, 4.146, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 4.146, 4.146, 4.146, 4.146, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 4.146, 4.146, 4.146, 4.146,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 4.146, 4.146, 4.146, 4.146, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224, 3.224,
+        3.224,
+    ];
+    const LIVE_SELL: [f32; 144] = [
+        5.1477, 4.9493, 5.0040, 4.9321, 5.2304, 5.1567, 5.0770, 5.0719, 4.6652, 4.9316, 5.6354,
+        7.0405, 6.5776, 7.7912, 8.6420, 8.8516, 8.5098, 8.0036, 8.1913, 8.5173, 8.2341, 8.3795,
+        7.9871, 7.9669, 8.1271, 7.8289, 8.0063, 7.7938, 8.4568, 8.2844, 7.8116, 7.8488, 8.1417,
+        7.8855, 7.2192, 6.6999, 7.4878, 6.8229, 6.4053, 6.0836, 6.5156, 6.4155, 6.6625, 6.2854,
+        6.3160, 6.0173, 5.8393, 5.3077, 5.8464, 5.4752, 5.4650, 5.4360, 5.7759, 5.5111, 5.4829,
+        5.5080, 5.5114, 5.3709, 5.3774, 5.3281, 5.3828, 5.3942, 5.3128, 5.3526, 5.3563, 5.4812,
+        5.5578, 5.6371, 5.6145, 5.5092, 5.6040, 5.4764, 5.6767, 7.0592, 7.7314, 7.5760, 7.6772,
+        7.5726, 7.5442, 7.4384, 7.8945, 7.5816, 7.2887, 6.8100, 7.2104, 6.6999, 6.4792, 5.7294,
+        6.5144, 5.8391, 5.5634, 5.3631, 5.5471, 5.4951, 5.3876, 5.4941, 5.5087, 5.3577, 5.4956,
+        5.2919, 5.4275, 5.3993, 5.5544, 5.5457, 5.4110, 5.6918, 6.3965, 7.4946, 7.0857, 7.9886,
+        8.6095, 9.3322, 8.8166, 8.8115, 8.8968, 8.9444, 8.2409, 8.6520, 8.8178, 8.7704, 8.8416,
+        8.6180, 8.7055, 8.3192, 8.4247, 8.1583, 7.9310, 8.1201, 8.4055, 8.1070, 7.5865, 7.1419,
+        7.1027, 6.9552, 6.3518, 5.8887, 6.5380, 6.1702, 6.2465, 6.0601, 6.2930, 5.8388, 5.6609,
+        5.3684,
+    ];
+    const LIVE_LOAD: [f32; 144] = [
+        0.4339, 0.4339, 0.4339, 0.4339, 1.2261, 1.2261, 1.2261, 1.2261, 0.4348, 0.4348, 0.4348,
+        0.4348, 0.6619, 0.6619, 0.6619, 0.6619, 1.0963, 1.0963, 1.0963, 1.0963, 0.8112, 0.8112,
+        0.8112, 0.8112, 0.7426, 0.7426, 0.7426, 0.7426, 0.7888, 0.7888, 0.7888, 0.7888, 0.6657,
+        0.6657, 0.6657, 0.6657, 0.5318, 0.5318, 0.5318, 0.5318, 0.7339, 0.7339, 0.7339, 0.7339,
+        0.4219, 0.4219, 0.4219, 0.4219, 0.4585, 0.4585, 0.4585, 0.4585, 0.4400, 0.4400, 0.4400,
+        0.4400, 0.3419, 0.3419, 0.3419, 0.3419, 0.3316, 0.3316, 0.3316, 0.3316, 0.2357, 0.2357,
+        0.2357, 0.2357, 0.4293, 0.4293, 0.4293, 0.4293, 0.9282, 0.9282, 0.9282, 0.9282, 0.8392,
+        0.8392, 0.8392, 0.8392, 0.9930, 0.9930, 0.9930, 0.9930, 1.0913, 1.0913, 1.0913, 1.0913,
+        0.7935, 0.7935, 0.7935, 0.7935, 0.7796, 0.7796, 0.7796, 0.7796, 0.4339, 0.4339, 0.4339,
+        0.4339, 1.2261, 1.2261, 1.2261, 1.2261, 0.4348, 0.4348, 0.4348, 0.4348, 0.6619, 0.6619,
+        0.6619, 0.6619, 1.0963, 1.0963, 1.0963, 1.0963, 0.8112, 0.8112, 0.8112, 0.8112, 0.7426,
+        0.7426, 0.7426, 0.7426, 0.7888, 0.7888, 0.7888, 0.7888, 0.6657, 0.6657, 0.6657, 0.6657,
+        0.5318, 0.5318, 0.5318, 0.5318, 0.7339, 0.7339, 0.7339, 0.7339, 0.4219, 0.4219, 0.4219,
+        0.4219,
+    ];
+    const LIVE_PV: [f32; 144] = [
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.5035, 0.4557, 0.4044, 0.3553,
+        0.3040, 0.2480, 0.1933, 0.1311, 0.0689, 0.0225, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0478,
+        0.0610, 0.1154, 0.1665, 0.2207, 0.2758, 0.3207, 0.3708, 0.4262, 0.4871, 0.5502, 0.5923,
+        0.6322, 0.6636, 0.6927, 0.7155, 0.7313, 0.7408, 0.7423, 0.7372, 0.7266, 0.7104, 0.6892,
+        0.6609, 0.6294, 0.5938, 0.5511, 0.5032, 0.4571, 0.4030, 0.3533, 0.3001, 0.2447, 0.1866,
+        0.1247, 0.0630, 0.0152, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+        0.0000,
+    ];
+    /// The live plan of that replan (`fluxion-ro plan owner`, read 12:47Z)
+    const LIVE_PLAN: &str = "HHHHHHHEEEEEECCCCEHEHEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS";
+    /// 18:00-19:15 local in `LIVE_PLAN` (`EHEHEE`)
+    const LIVE_ZIGZAG: std::ops::Range<usize> = 17..23;
+    /// 12:45Z in the `LIVE_*` arrays
+    const LIVE_HEAD: usize = 7;
+    /// Reserve load over expected load of that replan (125.68 / 93.63; p75 profile not read)
+    const LIVE_RESERVE_FACTOR: f32 = 125.68 / 93.63;
+
+    /// The owner's discharge-window levers: morning 4 h, evening `evening_hours`, both at
+    /// `min_soc_pct` (`fluxion_max_*_vybiti_baterie`)
+    fn owner_levers(evening_hours: u8, min_soc_pct: f32) -> UserLevers {
+        UserLevers {
+            morning_discharge: Some(DischargeWindowLimit {
+                hours: 4,
+                min_soc_pct,
+            }),
+            evening_discharge: Some(DischargeWindowLimit {
+                hours: evening_hours,
+                min_soc_pct,
+            }),
+            ..UserLevers::default()
+        }
+    }
+
+    fn block_at(start: DateTime<Utc>, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
+        PlanBlock {
+            start,
+            duration_minutes: 15,
+            buy_czk: buy,
+            sell_czk: sell,
+            load_kwh: load,
+            pv_kwh: pv,
+            reserve_load_kwh: load,
+            reserve_pv_kwh: pv,
+            force_charge: false,
+            no_discharge: false,
+            force_charge_at_or_below_czk: None,
+            export_min_soc_pct: None,
+            export_allowed: true,
+        }
+    }
+
+    /// The `LIVE_*` blocks from 11:00Z, before the levers
+    fn live_blocks() -> Vec<PlanBlock> {
+        let start = Utc.with_ymd_and_hms(2026, 11, 5, 11, 0, 0).unwrap();
+        (0..LIVE_BUY.len())
+            .map(|i| PlanBlock {
+                reserve_load_kwh: LIVE_LOAD[i] * LIVE_RESERVE_FACTOR,
+                ..block_at(
+                    start + Duration::minutes(15 * i as i64),
+                    LIVE_BUY[i],
+                    LIVE_SELL[i],
+                    LIVE_LOAD[i],
+                    LIVE_PV[i],
+                )
+            })
+            .collect()
+    }
+
+    /// The owner's battery of that replan: 23 kWh, 10 kW, export 9 kW, Back Up floor 25 %, cost
+    /// of charge 4.58 (`battery_cost_basis`)
+    fn owner_battery() -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 25.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.95,
+            wear_cost_czk_per_kwh: 0.1,
+            max_export_kw: 9.0,
+            export_guard_margin_kwh: 10.0 * 300.0 / 3600.0,
+            force_discharge_enabled: true,
+            hold_pv_to_battery: false,
+            min_charge_kwh: min_charge_kwh(10.0, 300),
+            charge_cost_czk_per_kwh: Some(4.58),
+        }
+    }
+
+    /// The owner's add-on options (0.2.74) with `continuity_pct` and `reversal_czk`
+    fn owner_params(continuity_pct: f32, reversal_czk: f32) -> WinterReserveParams {
+        WinterReserveParams {
+            min_arbitrage_profit_czk: 1.5,
+            insane_price_multiplier: 3.0,
+            cheap_percentile: 0.2,
+            load_safety_factor: 1.1,
+            pv_confidence: 0.9,
+            min_mode_benefit_czk: 0.1,
+            mode_switch_min_benefit_czk: 1.0,
+            direction_reversal_cost_czk: reversal_czk,
+            export_window_continuity_pct: continuity_pct,
+            export_selection: ExportSelection::Windows,
+            daily_export_hours: 6,
+            soc_resolution_pct: 0.5,
+            export_floor_until_cheap: true,
+            cautious_pv_fallback_months: vec![10, 11, 12, 1, 2, 3],
+        }
+    }
+
+    /// The owner's live horizon at 12:45Z with the levers at `evening_hours` and `continuity_pct`
+    fn owner_live_horizon(evening_hours: u8, continuity_pct: f32) -> Vec<PlanBlock> {
+        let mut blocks = live_blocks();
+        apply_user_levers(
+            &mut blocks,
+            Some(&owner_levers(evening_hours, 25.0)),
+            Some(TZ),
+            continuity_pct,
+        );
+        blocks.split_off(LIVE_HEAD)
+    }
+
+    fn letters(modes: impl IntoIterator<Item = PlanMode>) -> String {
+        modes
+            .into_iter()
+            .map(|m| match m {
+                PlanMode::SelfUse => 'S',
+                PlanMode::Charge => 'C',
+                PlanMode::Hold => 'H',
+                PlanMode::Export => 'E',
+                PlanMode::NoDischarge => 'N',
+            })
+            .collect()
+    }
+
+    fn plan_letters(plan: &Plan) -> String {
+        letters(plan.blocks.iter().map(|b| b.mode))
+    }
+
+    fn allowed(blocks: &[PlanBlock]) -> String {
+        blocks
+            .iter()
+            .map(|b| if b.export_allowed { '1' } else { '0' })
+            .collect()
+    }
+
+    fn live_plan(evening_hours: u8, continuity_pct: f32) -> Plan {
+        let blocks = owner_live_horizon(evening_hours, continuity_pct);
+        plan_from(
+            &blocks,
+            99.0,
+            TZ,
+            &owner_battery(),
+            &owner_params(continuity_pct, 2.0),
+            Some(PlanMode::Hold),
+        )
+    }
+
+    /// Index of the local time `hh:mm` on 2026-11-05 in the horizon of `owner_live_horizon`
+    fn at(hh: u32, mm: u32) -> usize {
+        let local = TZ.with_ymd_and_hms(2026, 11, 5, hh, mm, 0).unwrap();
+        let first = Utc.with_ymd_and_hms(2026, 11, 5, 12, 45, 0).unwrap();
+        usize::try_from((local.with_timezone(&Utc) - first).num_minutes() / 15).unwrap()
+    }
+
+    /// Prints the golden of `zero_continuity_matches_0_2_74` (pct 0) and the plans with
+    /// continuity (`--ignored --nocapture`)
+    #[test]
+    #[ignore = "golden printer, run by hand"]
+    fn print_golden() {
+        for pct in [0.0f32, 2.5, 5.0, 10.0] {
+            for hours in [4u8, 5, 6] {
+                let blocks = owner_live_horizon(hours, pct);
+                let plan = live_plan(hours, pct);
+                println!(
+                    "golden|{hours}|{}|{}|{:#010x}|pct {pct}|17:00-21:45 {}",
+                    allowed(&blocks),
+                    plan_letters(&plan),
+                    plan.expected_cost_czk.to_bits(),
+                    &plan_letters(&plan)[at(17, 0)..at(22, 0)]
+                );
+            }
+        }
+    }
+    /// 0.2.74 (e13f01a3) on `owner_live_horizon`: evening hours, export-allowed mask, plan
+    /// letters and `expected_cost_czk` bits, printed by `print_golden` on that commit
+    const GOLDEN_0_2_74: [(u8, &str, &str, u32); 3] = [
+        (
+            4,
+            "10000001111111111101011001100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
+            "HHHHHHHEEEEEECCCCEHEHEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+            0xc289db47,
+        ),
+        (
+            5,
+            "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111011100000000000000",
+            "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+            0xc2bc15ff,
+        ),
+        (
+            6,
+            "10001011111111111111111111110100000000000000000000000000000000000011111111111111011000000000000000001011111111111111111111111000000000000",
+            "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+            0xc2fb469a,
+        ),
+    ];
+
+    #[test]
+    fn zero_continuity_matches_0_2_74() {
+        for (hours, mask, plan_letters_0_2_74, cost_bits) in GOLDEN_0_2_74 {
+            let blocks = owner_live_horizon(hours, 0.0);
+            assert_eq!(allowed(&blocks), mask, "{hours} h export mask");
+            let plan = live_plan(hours, 0.0);
+            assert_eq!(plan_letters(&plan), plan_letters_0_2_74, "{hours} h plan");
+            assert_eq!(
+                plan.expected_cost_czk.to_bits(),
+                cost_bits,
+                "{hours} h cost"
+            );
+        }
+        // The 4 h plan is the live one
+        assert_eq!(plan_letters(&live_plan(4, 0.0)), LIVE_PLAN);
+    }
+
+    /// The owner's evening at 4 h: 18:15 (7.83) and 18:45 (7.79) fell just below the lever's
+    /// cut-off, so the live plan read E H E H E E at 18:00-19:15. Within 5 % of a chosen
+    /// neighbour (18:15 vs 18:00 8.13 / 18:30 8.01; 18:45 vs 18:30 8.01 / 19:00 8.46) they join
+    /// the run.
+    #[test]
+    fn gap_fill_joins_the_owner_evening_at_4h() {
+        let evening = at(18, 0)..=at(19, 15);
+        let off = owner_live_horizon(4, 0.0);
+        let on = owner_live_horizon(4, 5.0);
+        for (hh, mm) in [(18, 15), (18, 45)] {
+            assert!(
+                !off[at(hh, mm)].export_allowed,
+                "{hh}:{mm} without continuity"
+            );
+            assert!(on[at(hh, mm)].export_allowed, "{hh}:{mm} with 5 %");
+        }
+        for (hh, mm) in [(18, 0), (18, 30), (19, 0), (19, 15)] {
+            assert!(
+                off[at(hh, mm)].export_allowed,
+                "{hh}:{mm} chosen by the lever"
+            );
+        }
+        let before = plan_letters(&live_plan(4, 0.0))[evening.clone()].to_string();
+        assert_eq!(before, &LIVE_PLAN[LIVE_ZIGZAG]);
+        assert!(before.contains("EHEH"), "{before}");
+        let after = plan_letters(&live_plan(4, 5.0))[evening].to_string();
+        assert!(!after.contains("EHEH"), "18:00-19:15 at 5 %: {after}");
+        assert!(!after.contains('H'), "18:00-19:15 at 5 %: {after}");
+    }
+
+    /// 2026-11-05 local blocks with sell 5.0, except `sells` at local (hh, mm)
+    fn day_with(sells: &[((u32, u32), f32)]) -> Vec<PlanBlock> {
+        let first = TZ.with_ymd_and_hms(2026, 11, 5, 0, 0, 0).unwrap();
+        (0..96)
+            .map(|i| {
+                let start = first.with_timezone(&Utc) + Duration::minutes(15 * i);
+                let local = start.with_timezone(&TZ);
+                let sell = sells
+                    .iter()
+                    .find(|((hh, mm), _)| local.hour() == *hh && local.minute() == *mm)
+                    .map_or(5.0, |(_, s)| *s);
+                block_at(start, 3.22, sell, 0.5, 0.0)
+            })
+            .collect()
+    }
+
+    /// Local times of the evening blocks `export_eligible` returns for 1 h (4 blocks)
+    fn evening_eligible(blocks: &[PlanBlock], pct: f32) -> Vec<(u32, u32)> {
+        let mut chosen = export_eligible(blocks, TZ, in_evening_window, DayBudget::Hours(1), pct);
+        chosen.sort_unstable();
+        chosen
+            .into_iter()
+            .map(|i| {
+                let local = blocks[i].start.with_timezone(&TZ);
+                (local.hour(), local.minute())
+            })
+            .collect()
+    }
+
+    /// One-block gaps: in within `pct` of either chosen neighbour, out when more than `pct` below
+    /// both
+    #[test]
+    fn a_gap_block_more_than_pct_below_both_neighbours_stays_out() {
+        // Chosen: 18:00, 18:30, 19:15 at 9.0 and 19:00 at 8.9. 18:15 is 5.6 % below both of its
+        // neighbours; 18:45 is 5.6 % below 18:30 but 4.5 % below 19:00.
+        let blocks = day_with(&[
+            ((18, 0), 9.0),
+            ((18, 15), 8.5),
+            ((18, 30), 9.0),
+            ((18, 45), 8.5),
+            ((19, 0), 8.9),
+            ((19, 15), 9.0),
+        ]);
+        let lever = vec![(18, 0), (18, 30), (19, 0), (19, 15)];
+        assert_eq!(evening_eligible(&blocks, 0.0), lever);
+        assert_eq!(
+            evening_eligible(&blocks, 5.0),
+            vec![(18, 0), (18, 30), (18, 45), (19, 0), (19, 15)],
+            "18:15 out (5.6 % below both), 18:45 in (4.5 % below 19:00)"
+        );
+        assert_eq!(evening_eligible(&blocks, 4.0), lever);
+        assert_eq!(
+            evening_eligible(&blocks, 6.0),
+            vec![(18, 0), (18, 15), (18, 30), (18, 45), (19, 0), (19, 15)]
+        );
+    }
+
+    /// Continuity fills gaps of one or two blocks between chosen blocks only: never before the
+    /// first or after the last chosen block, never a gap of three, and a two-block gap only whole
+    #[test]
+    fn continuity_never_extends_a_run_outward() {
+        // Chosen: 18:00, 18:15, 19:00, 19:15 at 9.0; 17:45 and 19:30 at 8.99 sit just outside.
+        let two_block_gap = |second: f32| {
+            day_with(&[
+                ((17, 45), 8.99),
+                ((18, 0), 9.0),
+                ((18, 15), 9.0),
+                ((18, 30), 8.8),
+                ((18, 45), second),
+                ((19, 0), 9.0),
+                ((19, 15), 9.0),
+                ((19, 30), 8.99),
+            ])
+        };
+        assert_eq!(
+            evening_eligible(&two_block_gap(8.8), 5.0),
+            vec![(18, 0), (18, 15), (18, 30), (18, 45), (19, 0), (19, 15)]
+        );
+        // 18:45 is 11 % below 19:00: the whole two-block gap stays out, 18:30 too
+        assert_eq!(
+            evening_eligible(&two_block_gap(8.0), 10.0),
+            vec![(18, 0), (18, 15), (19, 0), (19, 15)]
+        );
+        // A three-block gap stays as the lever chose
+        let three_block_gap = day_with(&[
+            ((18, 0), 9.0),
+            ((18, 15), 9.0),
+            ((18, 30), 8.9),
+            ((18, 45), 8.9),
+            ((19, 0), 8.9),
+            ((19, 15), 9.0),
+            ((19, 30), 9.0),
+        ]);
+        assert_eq!(
+            evening_eligible(&three_block_gap, 10.0),
+            vec![(18, 0), (18, 15), (19, 15), (19, 30)]
+        );
+        // A gap block that must not discharge is not filled
+        let mut blocks = two_block_gap(8.8);
+        let i = blocks
+            .iter()
+            .position(|b| b.start.with_timezone(&TZ).hour() == 18 && b.start.minute() == 30)
+            .unwrap();
+        blocks[i].no_discharge = true;
+        assert_eq!(
+            evening_eligible(&blocks, 5.0),
+            vec![(18, 0), (18, 15), (19, 0), (19, 15)]
+        );
+    }
+
+    #[test]
+    fn continuity_defaults_to_5_pct() {
+        assert!((WinterReserveParams::default().export_window_continuity_pct - 5.0).abs() < 1e-6);
+        let mut json = serde_json::to_value(WinterReserveParams::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("export_window_continuity_pct");
+        let parsed: WinterReserveParams = serde_json::from_value(json).unwrap();
+        assert!((parsed.export_window_continuity_pct - 5.0).abs() < 1e-6);
+        let core = fluxion_types::config::WinterReserveConfigCore::default();
+        assert!((core.export_window_continuity_pct - 5.0).abs() < 1e-6);
+    }
+
+    /// One cell of the closed-loop day grid
+    struct Cell {
+        label: &'static str,
+        evening_hours: u8,
+        min_soc_pct: f32,
+        continuity_pct: f32,
+        reversal_czk: f32,
+        levers: bool,
+    }
+
+    /// A day to simulate: blocks (expected load and PV as the planner sees them), the simulated
+    /// range, the start state and whether tomorrow's prices are known only after 13:00 local
+    struct SimDay {
+        name: String,
+        blocks: Vec<PlanBlock>,
+        from: usize,
+        to: usize,
+        soc_pct: f32,
+        current: Option<PlanMode>,
+        tomorrow_after_13: bool,
+    }
+
+    fn sim_day_from_json(path: &str) -> SimDay {
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let num = |v: &serde_json::Value| v.as_f64().unwrap() as f32;
+        let blocks = json["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                let start = DateTime::parse_from_rfc3339(b["start"].as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let load = num(&b["load"]);
+                PlanBlock {
+                    reserve_load_kwh: load * LIVE_RESERVE_FACTOR,
+                    ..block_at(start, num(&b["buy"]), num(&b["sell"]), load, num(&b["pv"]))
+                }
+            })
+            .collect();
+        SimDay {
+            name: json["name"].as_str().unwrap().to_string(),
+            blocks,
+            from: json["sim_from"].as_u64().unwrap() as usize,
+            to: json["sim_to"].as_u64().unwrap() as usize,
+            soc_pct: num(&json["soc_pct"]),
+            current: None,
+            tomorrow_after_13: true,
+        }
+    }
+
+    /// Today's remaining horizon: the live fixture from 12:45Z to the end of the local day
+    fn sim_day_live() -> SimDay {
+        let blocks = live_blocks();
+        let end = Utc.with_ymd_and_hms(2026, 11, 5, 23, 0, 0).unwrap();
+        let to = blocks.iter().position(|b| b.start >= end).unwrap();
+        SimDay {
+            name: "2026-11-05 from 13:45".into(),
+            blocks,
+            from: LIVE_HEAD,
+            to,
+            soc_pct: 99.0,
+            current: Some(PlanMode::Hold),
+            tomorrow_after_13: false,
+        }
+    }
+
+    /// Closed loop as the replay runs it: replan every block from the realised SOC, apply the
+    /// head (export guard as live) to the block with PV × `pv_factor` and load × `load_factor`
+    fn simulate(day: &SimDay, cell: &Cell, pv_factor: f32, load_factor: f32) -> String {
+        let battery = owner_battery();
+        let params = owner_params(cell.continuity_pct, cell.reversal_czk);
+        let mut blocks = day.blocks.clone();
+        let levers = owner_levers(cell.evening_hours, cell.min_soc_pct);
+        apply_user_levers(
+            &mut blocks,
+            cell.levers.then_some(&levers),
+            Some(TZ),
+            cell.continuity_pct,
+        );
+        let cap = battery.capacity_kwh;
+        let mut energy = (day.soc_pct / 100.0 * cap).clamp(
+            battery.min_soc_pct / 100.0 * cap,
+            battery.max_soc_pct / 100.0 * cap,
+        );
+        let mut applied = day.current;
+        let mut direction = ForceDirection::of(day.current);
+        let (mut cost, mut wear, mut exported) = (0.0f32, 0.0f32, 0.0f32);
+        let mut executed = Vec::new();
+        let mut evening = String::new();
+        let mut evening_allowed = String::new();
+        for k in day.from..day.to {
+            let local = blocks[k].start.with_timezone(&TZ);
+            let horizon_day = if !day.tomorrow_after_13 || local.hour() >= 13 {
+                local.date_naive().succ_opt().unwrap()
+            } else {
+                local.date_naive()
+            };
+            let end = blocks
+                .iter()
+                .position(|b| b.start.with_timezone(&TZ).date_naive() > horizon_day)
+                .unwrap_or(blocks.len());
+            let plan = plan_from_direction(
+                &blocks[k..end],
+                energy / cap * 100.0,
+                TZ,
+                &battery,
+                &params,
+                applied,
+                direction,
+            );
+            let head = &plan.blocks[0];
+            applied = Some(head.mode);
+            direction = direction.after(head.mode);
+            let mode = if head.mode == PlanMode::Export
+                && export_guard_holds(energy, head.floor_kwh, &battery)
+            {
+                PlanMode::SelfUse
+            } else {
+                head.mode
+            };
+            let b = &blocks[k];
+            let actual = block_at(
+                b.start,
+                b.buy_czk,
+                b.sell_czk,
+                b.load_kwh * load_factor,
+                b.pv_kwh * pv_factor,
+            );
+            let out = simulate_block(mode, energy, &actual, head.floor_kwh, &battery);
+            cost += out.grid_import_kwh * b.buy_czk - out.grid_export_kwh * b.sell_czk;
+            wear += out.battery_discharge_kwh * battery.wear_cost_czk_per_kwh;
+            exported += out.grid_export_kwh;
+            energy = out.energy_end_kwh;
+            executed.push(mode);
+            if (15..22).contains(&local.hour()) {
+                evening.push_str(&letters([mode]));
+                evening_allowed.push(if b.export_allowed { '1' } else { '0' });
+            }
+        }
+        let changes = executed.windows(2).filter(|w| w[0] != w[1]).count();
+        let mut dir = ForceDirection::None;
+        let mut reversals = 0;
+        for &m in &executed {
+            if dir.reversed_by(m) {
+                reversals += 1;
+            }
+            dir = dir.after(m);
+        }
+        let runs = executed
+            .iter()
+            .enumerate()
+            .filter(|&(i, &m)| m == PlanMode::Export && (i == 0 || executed[i - 1] != m))
+            .count();
+        let buys: Vec<f32> = blocks[day.from..day.to].iter().map(|b| b.buy_czk).collect();
+        let cheap_ref = cheap_reference(&buys, params.cheap_percentile);
+        let end_value = energy * cheap_ref * battery.efficiency;
+        let net = cost + wear - end_value;
+        format!(
+            "sim|{}|pv{pv_factor}/load{load_factor}|{}|{}|{}|{}|{}|net {net:.2}|grid {cost:.2}|wear {wear:.2}|end {:.1}% value {end_value:.2}|exported {exported:.2}|changes {changes}|reversals {reversals}|runs {runs}|15-22 {evening}|allowed {evening_allowed}",
+            day.name,
+            cell.label,
+            if cell.levers {
+                cell.evening_hours.to_string()
+            } else {
+                "-".into()
+            },
+            cell.min_soc_pct,
+            cell.continuity_pct,
+            cell.reversal_czk,
+            energy / cap * 100.0,
+        )
+    }
+
+    /// Closed-loop day grid (brief "find the optimal setup"). `CONTINUITY_SIM_DAY` = path of a
+    /// day JSON (`.local/work/continuity/tools/build_inputs.py`), or unset for the live fixture.
+    /// Run in release with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "simulation grid, run by hand"]
+    fn closed_loop_grid() {
+        let day = match std::env::var("CONTINUITY_SIM_DAY") {
+            Ok(path) => sim_day_from_json(&path),
+            Err(_) => sim_day_live(),
+        };
+        let mut cells = Vec::new();
+        for evening_hours in [4u8, 5, 6] {
+            for continuity_pct in [0.0f32, 2.5, 5.0, 10.0] {
+                for reversal_czk in [2.0f32, 4.0] {
+                    cells.push(Cell {
+                        label: "grid",
+                        evening_hours,
+                        min_soc_pct: 25.0,
+                        continuity_pct,
+                        reversal_czk,
+                        levers: true,
+                    });
+                }
+            }
+        }
+        for reversal_czk in [2.0f32, 4.0] {
+            cells.push(Cell {
+                label: "max0",
+                evening_hours: 6,
+                min_soc_pct: 0.0,
+                continuity_pct: 5.0,
+                reversal_czk,
+                levers: true,
+            });
+            cells.push(Cell {
+                label: "nolever",
+                evening_hours: 0,
+                min_soc_pct: 0.0,
+                continuity_pct: 0.0,
+                reversal_czk,
+                levers: false,
+            });
+        }
+        let lines: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = cells
+                .iter()
+                .flat_map(|cell| {
+                    let day = &day;
+                    [(1.0f32, 1.0f32), (0.8, 1.2)]
+                        .map(|(pv, load)| scope.spawn(move || simulate(day, cell, pv, load)))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for line in lines {
+            println!("{line}");
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OwnerDayBlock {
+        start: DateTime<Utc>,
+        buy: f32,
+        sell: f32,
+        load: f32,
+        pv: f32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OwnerDays {
+        blocks: Vec<OwnerDayBlock>,
+    }
+
+    /// The owner's 2026-11-04 and 2026-11-05 local, 192 blocks from 00:00 local (sell =
+    /// spot − 0.35, equal to `LIVE_SELL` where they overlap)
+    fn owner_days() -> Vec<OwnerDayBlock> {
+        serde_json::from_str::<OwnerDays>(include_str!(
+            "../../tests/fixtures/winter_reserve_owner_2026_11_04_05.json"
+        ))
+        .expect("owner days fixture parses")
+        .blocks
+    }
+
+    fn price_of(b: &OwnerDayBlock) -> TimeBlockPrice {
+        TimeBlockPrice {
+            buy_price_czk_per_kwh: None,
+            block_start: b.start,
+            duration_minutes: 15,
+            price_czk_per_kwh: b.buy,
+            effective_price_czk_per_kwh: b.buy,
+            spot_sell_price_czk_per_kwh: Some(b.sell),
+        }
+    }
+
+    /// 2026-11-05 00:00-11:45 local of `owner_days`: the started blocks the scheduler drops
+    /// before `live_blocks`, as ranking context
+    fn live_morning_ranking() -> Vec<TimeBlockPrice> {
+        let first = live_blocks()[0].start;
+        owner_days()
+            .iter()
+            .filter(|b| {
+                b.start < first
+                    && b.start.with_timezone(&TZ).date_naive()
+                        == first.with_timezone(&TZ).date_naive()
+            })
+            .map(price_of)
+            .collect()
+    }
+
+    /// Daily top-N export selection (owner 2026-11-05)
+    mod daily_top_n_tests {
+        use super::*;
+
+        /// `print_golden` on 3a984783 (legacy/lever-continuity, before the export selection):
+        /// continuity %, evening hours, export-allowed mask, plan letters, `expected_cost_czk` bits
+        /// (`.local/work/daily-topn/golden_3a984783.txt`)
+        const GOLDEN_3A984783: [(f32, u8, &str, &str, u32); 9] = [
+            (
+                2.5,
+                4,
+                "10000001111111111111011001100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
+                "HHHHHHHEEEEEECCCCEEECEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+                0xc298b189,
+            ),
+            (
+                2.5,
+                5,
+                "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111111100000000000000",
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+                0xc2bc15ff,
+            ),
+            (
+                2.5,
+                6,
+                "10001011111111111111111111110100000000000000000000000000000000000011111111111111011000000000000000001011111111111111111111111000000000000",
+                "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+                0xc2fb469a,
+            ),
+            (
+                5.0,
+                4,
+                "10000001111111111111111001100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+                0xc29785a1,
+            ),
+            (
+                5.0,
+                5,
+                "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111111100000000000000",
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+                0xc2bc15ff,
+            ),
+            (
+                5.0,
+                6,
+                "10001011111111111111111111110100000000000000000000000000000000000011111111111111011000000000000000001011111111111111111111111000000000000",
+                "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+                0xc2fb469a,
+            ),
+            (
+                10.0,
+                4,
+                "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+                0xc29785a1,
+            ),
+            (
+                10.0,
+                5,
+                "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111111100000000000000",
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+                0xc2bc15ff,
+            ),
+            (
+                10.0,
+                6,
+                "10001111111111111111111111111100000000000000000000000000000000000011111111111111011000000000000000001111111111111111111111111000000000000",
+                "HHHHEECCEEEEEECCCCCCEEECCEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+                0xc2fc5488,
+            ),
+        ];
+
+        fn params(
+            selection: ExportSelection,
+            hours: u8,
+            continuity_pct: f32,
+        ) -> WinterReserveParams {
+            WinterReserveParams {
+                export_selection: selection,
+                daily_export_hours: hours,
+                ..owner_params(continuity_pct, 2.0)
+            }
+        }
+
+        /// The owner's live horizon at 12:45Z with the export rules of `params` and the owner's
+        /// levers (morning 4 h, evening `evening_hours`, 25 %)
+        fn horizon(params: &WinterReserveParams, evening_hours: u8) -> Vec<PlanBlock> {
+            let mut blocks = live_blocks();
+            apply_export_rules(
+                &mut blocks,
+                Some(&owner_levers(evening_hours, 25.0)),
+                Some(TZ),
+                params,
+            );
+            blocks.split_off(LIVE_HEAD)
+        }
+
+        /// `horizon` with today's started blocks (00:00-11:45 local) as ranking context, as the
+        /// scheduler sends them since review F1
+        fn horizon_ranked(params: &WinterReserveParams, evening_hours: u8) -> Vec<PlanBlock> {
+            let blocks = live_blocks();
+            let prefix = ranking_prefix(&live_morning_ranking(), blocks[0].start, TZ, 0.0);
+            assert_eq!(prefix.len(), 48);
+            let mut blocks = apply_export_rules_ranked(
+                blocks,
+                prefix,
+                Some(&owner_levers(evening_hours, 25.0)),
+                Some(TZ),
+                params,
+            );
+            blocks.split_off(LIVE_HEAD)
+        }
+
+        /// Prints `GOLDEN_RANKED` (`--ignored --nocapture`)
+        #[test]
+        #[ignore = "golden printer, run by hand"]
+        fn print_ranked_golden() {
+            for (pct, hours, ..) in GOLDEN_3A984783 {
+                let p = params(ExportSelection::Windows, 6, pct);
+                let blocks = horizon_ranked(&p, hours);
+                let plan = plan_from(
+                    &blocks,
+                    99.0,
+                    TZ,
+                    &owner_battery(),
+                    &p,
+                    Some(PlanMode::Hold),
+                );
+                println!(
+                    "ranked|{pct}|{hours}|{}|{}|{:#010x}",
+                    allowed(&blocks),
+                    plan_letters(&plan),
+                    plan.expected_cost_czk.to_bits()
+                );
+            }
+        }
+
+        /// `windows` (the default) plans as 3a984783 did, bit for bit, whatever
+        /// `daily_export_hours` says, on the same blocks (the list from 12:00 local, no ranking
+        /// context). With today's started blocks as ranking context (review F1) the golden moves
+        /// deliberately in one place: 13:45, the last morning-window block, is no longer among the
+        /// best 4 h of 04:00-14:00 (the 06:00-10:00 peak is), so its export bit clears. The plan
+        /// letters and the cost stay bit-exact: that replan held at 13:45 anyway.
+        #[test]
+        fn windows_mode_is_bit_exact_against_3a984783() {
+            assert_eq!(
+                WinterReserveParams::default().export_selection,
+                ExportSelection::Windows
+            );
+            for (pct, hours, mask, golden_letters, cost_bits) in GOLDEN_3A984783 {
+                for top_n_hours in [6u8, 1] {
+                    let p = params(ExportSelection::Windows, top_n_hours, pct);
+                    let blocks = horizon(&p, hours);
+                    assert_eq!(allowed(&blocks), mask, "{hours} h, {pct} % mask");
+                    let plan = plan_from(
+                        &blocks,
+                        99.0,
+                        TZ,
+                        &owner_battery(),
+                        &p,
+                        Some(PlanMode::Hold),
+                    );
+                    assert_eq!(plan_letters(&plan), golden_letters, "{hours} h, {pct} %");
+                    assert_eq!(
+                        plan.expected_cost_czk.to_bits(),
+                        cost_bits,
+                        "{hours} h, {pct} % cost"
+                    );
+
+                    let ranked = horizon_ranked(&p, hours);
+                    let moved = format!("0{}", &mask[1..]);
+                    assert!(mask.starts_with('1'), "13:45 was allowed on 3a984783");
+                    assert_eq!(allowed(&ranked), moved, "{hours} h, {pct} % ranked mask");
+                    let plan = plan_from(
+                        &ranked,
+                        99.0,
+                        TZ,
+                        &owner_battery(),
+                        &p,
+                        Some(PlanMode::Hold),
+                    );
+                    assert_eq!(
+                        plan_letters(&plan),
+                        golden_letters,
+                        "{hours} h, {pct} % ranked"
+                    );
+                    assert_eq!(
+                        plan.expected_cost_czk.to_bits(),
+                        cost_bits,
+                        "{hours} h, {pct} % ranked cost"
+                    );
+                }
+            }
+        }
+
+        /// 2026-11-05: 06:00-10:45 sell 7.0 except 08:00 at 6.8; a midday peak 12:00-12:45 at
+        /// 9.0; 21:00 at 8.5; a mediocre evening 19:00 at 6.0; the rest 5.0. The best 6 h (24
+        /// blocks): the midday peak, 21:00 and the 19 morning blocks at 7.0.
+        fn ranking_day() -> Vec<PlanBlock> {
+            let mut sells = vec![((12, 0), 9.0), ((12, 15), 9.0), ((12, 30), 9.0)];
+            sells.extend([((12, 45), 9.0), ((21, 0), 8.5), ((19, 0), 6.0)]);
+            for hh in 6..11 {
+                for mm in [0, 15, 30, 45] {
+                    sells.push(((hh, mm), if (hh, mm) == (8, 0) { 6.8 } else { 7.0 }));
+                }
+            }
+            day_with(&sells)
+        }
+
+        fn eligible_times(blocks: &[PlanBlock]) -> Vec<(u32, u32)> {
+            blocks
+                .iter()
+                .filter(|b| b.export_allowed)
+                .map(|b| {
+                    let local = b.start.with_timezone(&TZ);
+                    (local.hour(), local.minute())
+                })
+                .collect()
+        }
+
+        fn ranked(
+            levers: Option<&UserLevers>,
+            selection: ExportSelection,
+            pct: f32,
+        ) -> Vec<PlanBlock> {
+            let mut blocks = ranking_day();
+            apply_export_rules(&mut blocks, levers, Some(TZ), &params(selection, 6, pct));
+            blocks
+        }
+
+        #[test]
+        fn daily_top_n_ranks_the_whole_local_day_and_ignores_the_hour_levers() {
+            // Evening 1 h and morning 4 h at 30 %: in windows mode they decide the blocks
+            let levers = owner_levers(1, 30.0);
+            let top = ranked(Some(&levers), ExportSelection::DailyTopN, 0.0);
+            let times = eligible_times(&top);
+            assert_eq!(times.len(), 24, "{times:?}");
+            assert!(
+                times.contains(&(12, 0)) && times.contains(&(12, 45)),
+                "midday peak"
+            );
+            assert!(times.contains(&(21, 0)), "evening peak");
+            assert!(!times.contains(&(19, 0)), "mediocre evening block");
+            assert!(
+                !times.contains(&(8, 0)),
+                "below the cut-off without continuity"
+            );
+            // Continuity fills the one-block gap at 08:00 (6.8 within 5 % of 7.0), nothing else
+            let filled = eligible_times(&ranked(Some(&levers), ExportSelection::DailyTopN, 5.0));
+            let mut expected = times.clone();
+            expected.push((8, 0));
+            expected.sort_unstable();
+            assert_eq!(filled, expected);
+            // The levers' hours change nothing; their max-discharge % applies
+            for other in [None, Some(owner_levers(6, 30.0))] {
+                assert_eq!(
+                    eligible_times(&ranked(other.as_ref(), ExportSelection::DailyTopN, 5.0)),
+                    filled
+                );
+            }
+            for b in ranked(Some(&levers), ExportSelection::DailyTopN, 5.0) {
+                let soc = if b.export_allowed { Some(30.0) } else { None };
+                assert_eq!(b.export_min_soc_pct, soc, "{}", b.start);
+            }
+            // Windows mode with the same levers does not take 21:00
+            let windows = eligible_times(&ranked(Some(&levers), ExportSelection::Windows, 5.0));
+            assert!(!windows.contains(&(21, 0)), "{windows:?}");
+            // The DP sells the midday peak, not the mediocre evening block
+            let blocks = ranked(Some(&levers), ExportSelection::DailyTopN, 5.0);
+            let plan = plan(
+                &blocks,
+                80.0,
+                TZ,
+                &owner_battery(),
+                &params(ExportSelection::DailyTopN, 6, 5.0),
+            );
+            let mode_at = |hh: u32, mm: u32| {
+                plan.blocks
+                    .iter()
+                    .find(|b| {
+                        let l = b.start.with_timezone(&TZ);
+                        (l.hour(), l.minute()) == (hh, mm)
+                    })
+                    .unwrap()
+                    .mode
+            };
+            assert_eq!(mode_at(12, 0), PlanMode::Export);
+            assert_ne!(mode_at(19, 0), PlanMode::Export);
+        }
+
+        /// Exactly hours × 4 blocks per complete local day before the gap fills, on both days of
+        /// the owner's horizon (11-05 completed by its morning) and for every N
+        #[test]
+        fn daily_top_n_takes_exactly_n_hours_per_local_day() {
+            for hours in [1u8, 4, 6, 8, 24] {
+                let p = params(ExportSelection::DailyTopN, hours, 0.0);
+                let live = live_blocks();
+                let mut blocks = ranking_prefix(&live_morning_ranking(), live[0].start, TZ, 0.0);
+                blocks.extend(live);
+                assert_eq!(blocks.len(), 192);
+                apply_export_rules(&mut blocks, None, Some(TZ), &p);
+                let mut per_day: std::collections::BTreeMap<NaiveDate, (usize, usize)> =
+                    std::collections::BTreeMap::new();
+                for b in &blocks {
+                    let e = per_day
+                        .entry(b.start.with_timezone(&TZ).date_naive())
+                        .or_default();
+                    e.0 += 1;
+                    e.1 += usize::from(b.export_allowed);
+                }
+                for (day, (known, allowed)) in per_day {
+                    assert_eq!(
+                        allowed,
+                        usize::from(hours) * 4,
+                        "{hours} h {day}, {known} known"
+                    );
+                }
+            }
+        }
+
+        /// One row of the daily top-N day grid
+        struct Row {
+            label: String,
+            params: WinterReserveParams,
+            levers: Option<UserLevers>,
+        }
+
+        /// Closed loop as `simulate`, sliced as the live scheduler slices (review F1): every
+        /// replan applies the export rules of `row.params` to the remaining blocks only, with the
+        /// blocks before them as ranking context (`ranking_prefix`, `apply_export_rules_ranked`,
+        /// as `horizon_blocks` does). `discharged_before_kwh` is the battery discharge of the first
+        /// simulated local day before `day.from` (reported only; no cap on this branch).
+        fn simulate_row(
+            day: &SimDay,
+            row: &Row,
+            pv_factor: f32,
+            load_factor: f32,
+            discharged_before_kwh: f32,
+        ) -> String {
+            let battery = owner_battery();
+            let params = &row.params;
+            let blocks = &day.blocks;
+            let prices: Vec<TimeBlockPrice> = blocks
+                .iter()
+                .map(|b| TimeBlockPrice {
+                    buy_price_czk_per_kwh: None,
+                    block_start: b.start,
+                    duration_minutes: b.duration_minutes,
+                    price_czk_per_kwh: b.buy_czk,
+                    effective_price_czk_per_kwh: b.buy_czk,
+                    spot_sell_price_czk_per_kwh: Some(b.sell_czk),
+                })
+                .collect();
+            let cap = battery.capacity_kwh;
+            let mut energy = (day.soc_pct / 100.0 * cap).clamp(
+                battery.min_soc_pct / 100.0 * cap,
+                battery.max_soc_pct / 100.0 * cap,
+            );
+            let mut applied = day.current;
+            let mut direction = ForceDirection::of(day.current);
+            let (mut cost, mut wear, mut exported, mut discharged) = (0.0f32, 0.0f32, 0.0, 0.0);
+            let mut executed = Vec::new();
+            let mut letters_5_22 = String::new();
+            let mut allowed_5_22 = String::new();
+            let first_local = blocks[day.from].start.with_timezone(&TZ);
+            for k in 0..day.to {
+                let local = blocks[k].start.with_timezone(&TZ);
+                if k < day.from {
+                    if local.date_naive() == first_local.date_naive()
+                        && (5..22).contains(&local.hour())
+                    {
+                        letters_5_22.push('.');
+                        allowed_5_22.push('.');
+                    }
+                    continue;
+                }
+                let horizon_day = if !day.tomorrow_after_13 || local.hour() >= 13 {
+                    local.date_naive().succ_opt().unwrap()
+                } else {
+                    local.date_naive()
+                };
+                let end = blocks
+                    .iter()
+                    .position(|b| b.start.with_timezone(&TZ).date_naive() > horizon_day)
+                    .unwrap_or(blocks.len());
+                // The scheduler sends the 24 h before the block as ranking context
+                let from = blocks[..k]
+                    .iter()
+                    .position(|b| b.start >= blocks[k].start - Duration::hours(24))
+                    .unwrap_or(k);
+                // `DAILY_TOPN_NO_RANKING` set: no ranking context, as 91c344e7 ran live
+                let prefix = if std::env::var_os("DAILY_TOPN_NO_RANKING").is_some() {
+                    Vec::new()
+                } else {
+                    ranking_prefix(&prices[from..k], blocks[k].start, TZ, 0.0)
+                };
+                let horizon = apply_export_rules_ranked(
+                    blocks[k..end].to_vec(),
+                    prefix,
+                    row.levers.as_ref(),
+                    Some(TZ),
+                    params,
+                );
+                let plan = plan_from_direction(
+                    &horizon,
+                    energy / cap * 100.0,
+                    TZ,
+                    &battery,
+                    params,
+                    applied,
+                    direction,
+                );
+                let head = &plan.blocks[0];
+                applied = Some(head.mode);
+                direction = direction.after(head.mode);
+                let mode = if head.mode == PlanMode::Export
+                    && export_guard_holds(energy, head.floor_kwh, &battery)
+                {
+                    PlanMode::SelfUse
+                } else {
+                    head.mode
+                };
+                let b = &blocks[k];
+                let actual = block_at(
+                    b.start,
+                    b.buy_czk,
+                    b.sell_czk,
+                    b.load_kwh * load_factor,
+                    b.pv_kwh * pv_factor,
+                );
+                let out = simulate_block(mode, energy, &actual, head.floor_kwh, &battery);
+                cost += out.grid_import_kwh * b.buy_czk - out.grid_export_kwh * b.sell_czk;
+                wear += out.battery_discharge_kwh * battery.wear_cost_czk_per_kwh;
+                exported += out.grid_export_kwh;
+                discharged += out.battery_discharge_kwh;
+                energy = out.energy_end_kwh;
+                executed.push(mode);
+                if (5..22).contains(&local.hour()) {
+                    letters_5_22.push_str(&letters([mode]));
+                    allowed_5_22.push(if horizon[0].export_allowed { '1' } else { '0' });
+                }
+            }
+            let changes = executed.windows(2).filter(|w| w[0] != w[1]).count();
+            let mut dir = ForceDirection::None;
+            let mut reversals = 0;
+            for &m in &executed {
+                if dir.reversed_by(m) {
+                    reversals += 1;
+                }
+                dir = dir.after(m);
+            }
+            let runs = executed
+                .iter()
+                .enumerate()
+                .filter(|&(i, &m)| m == PlanMode::Export && (i == 0 || executed[i - 1] != m))
+                .count();
+            let buys: Vec<f32> = blocks[day.from..day.to].iter().map(|b| b.buy_czk).collect();
+            let cheap_ref = cheap_reference(&buys, params.cheap_percentile);
+            let end_value = energy * cheap_ref * battery.efficiency;
+            let net = cost + wear - end_value;
+            format!(
+                "row|{}|pv{pv_factor}/load{load_factor}|{}|net {net:.2}|grid {cost:.2}|wear {wear:.2}|end {:.1}% value {end_value:.2}|exported {exported:.2}|discharged {discharged:.2}|before {discharged_before_kwh:.2}|cycles {:.2}|day cycles {:.2}|changes {changes}|reversals {reversals}|runs {runs}|05-22 {letters_5_22}|allowed {allowed_5_22}",
+                day.name,
+                row.label,
+                energy / cap * 100.0,
+                discharged / cap,
+                (discharged + discharged_before_kwh) / cap,
+            )
+        }
+
+        /// Daily top-N day grid with live slicing (review F1). `CONTINUITY_SIM_DAY` = path of a
+        /// day JSON, or unset for 2026-11-05 from 13:45 (27.6 kWh discharged before, the owner's
+        /// `sensor.solax_battery_output_energy_today` at 12:45Z). `DAILY_TOPN_MORNING` = a day
+        /// JSON whose blocks of the same local day before the fixture's first block are
+        /// prepended (ranking context only: the simulation starts at the same block).
+        /// `DAILY_TOPN_HOURS` = the N rows (default 8,10,12; no cap on this branch).
+        /// `DAILY_TOPN_NO_RANKING` = replan without the ranking context (the bug of review F1). Run in
+        /// release with `--ignored --nocapture`.
+        #[test]
+        #[ignore = "simulation grid, run by hand"]
+        fn daily_top_n_grid() {
+            let (mut day, before) = match std::env::var("CONTINUITY_SIM_DAY") {
+                Ok(path) => (sim_day_from_json(&path), 0.0),
+                Err(_) => (sim_day_live(), 27.6),
+            };
+            if let Ok(path) = std::env::var("DAILY_TOPN_MORNING") {
+                let first = day.blocks[0].start;
+                let date = first.with_timezone(&TZ).date_naive();
+                let morning: Vec<PlanBlock> = sim_day_from_json(&path)
+                    .blocks
+                    .into_iter()
+                    .filter(|b| b.start < first && b.start.with_timezone(&TZ).date_naive() == date)
+                    .collect();
+                day.from += morning.len();
+                day.to += morning.len();
+                day.blocks.splice(0..0, morning);
+                day.name.push_str(" (+morning)");
+            }
+            let owner = owner_levers(6, 25.0);
+            let mut rows = vec![
+                Row {
+                    label: "live|windows|6h eve/4h morn".into(),
+                    params: params(ExportSelection::Windows, 6, 5.0),
+                    levers: Some(owner),
+                },
+                Row {
+                    label: "nolever|windows|-".into(),
+                    params: params(ExportSelection::Windows, 6, 5.0),
+                    levers: None,
+                },
+            ];
+            let hours: Vec<u8> = std::env::var("DAILY_TOPN_HOURS")
+                .map(|v| v.split(',').filter_map(|h| h.trim().parse().ok()).collect())
+                .unwrap_or_else(|_| vec![8, 10, 12]);
+            for n in hours {
+                rows.push(Row {
+                    label: format!("top{n}|daily_top_n|{n}h"),
+                    params: params(ExportSelection::DailyTopN, n, 5.0),
+                    levers: Some(owner),
+                });
+            }
+            let lines: Vec<String> = std::thread::scope(|scope| {
+                let handles: Vec<_> = rows
+                    .iter()
+                    .flat_map(|row| {
+                        let day = &day;
+                        [(1.0f32, 1.0f32), (0.8, 1.2)].map(|(pv, load)| {
+                            scope.spawn(move || simulate_row(day, row, pv, load, before))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for line in lines {
+                println!("{line}");
+            }
+        }
+
+        #[test]
+        fn new_options_default_to_windows_and_6_h() {
+            let d = WinterReserveParams::default();
+            assert_eq!(d.export_selection, ExportSelection::Windows);
+            assert_eq!(d.daily_export_hours, 6);
+            let mut json = serde_json::to_value(WinterReserveParams::default()).unwrap();
+            for key in ["export_selection", "daily_export_hours"] {
+                json.as_object_mut().unwrap().remove(key);
+            }
+            let parsed: WinterReserveParams = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed, d);
+            let core = fluxion_types::config::WinterReserveConfigCore::default();
+            assert_eq!(core.export_selection, ExportSelection::Windows);
+            assert_eq!(core.daily_export_hours, 6);
+            let wire: ExportSelection = serde_json::from_str("\"daily_top_n\"").unwrap();
+            assert_eq!(wire, ExportSelection::DailyTopN);
+            assert_eq!(
+                serde_json::to_string(&ExportSelection::Windows).unwrap(),
+                "\"windows\""
+            );
+        }
+    }
+
+    /// Review F1 of legacy/daily-top-n-ship: the scheduler plans only from now − 15 min, so the
+    /// per-day ranking gets today's started blocks as ranking context
+    mod ranking_context_tests {
+        use super::*;
+
+        /// v0.2.74 (e13f01a3) from 00:00 local on `owner_days` (192 blocks, SOC 37 %, no current
+        /// mode, reserve load = load × 1.1): morning and evening hours at 25 %, export-allowed mask,
+        /// plan letters, `expected_cost_czk` bits; printed by a one-off test on v0.2.74
+        /// (`.local/work/daily-topn/golden_midnight_0_2_74.txt`)
+        const GOLDEN_MIDNIGHT_0_2_74: [(u8, u8, &str, &str, u32); 4] = [
+            (
+                4,
+                4,
+                "000000000000000000000001011111111111111010000000000000000000000101011111111111111000000000000000000000000000000000000100011111111111111010000000000000000000001111111111101011001100000000000000",
+                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEESECCCCCCCHHHHSSSSHHHHHHCEHEHEEECCCCCEEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCEHEHEECCEESSSSSSSSSSSSSS",
+                0xbf559900,
+            ),
+            (
+                4,
+                5,
+                "000000000000000000000001011111111111111010000000000000000000000111111111111111111110000000000000000000000000000000000100011111111111111010000000000000000000001111111111111111111100000000000000",
+                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEESECCCCCCCHHHHSSSSHHHHHHCEEEEECCCCCEEEEECCEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHSSSSHHHHHCEEEEEECCCCCEEEEECCEESSSSSSSSSSSSSS",
+                0xc1bc09a0,
+            ),
+            (
+                4,
+                6,
+                "000000000000000000000001011111111111111010000000000000000001001111111111111111111111100000000000000000000000000000000100011111111111111010000000000000000001011111111111111111111110100000000000",
+                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEESECCCCCCCHHHHSSSSSSSECCEEHEEECCCCCEEEECCCEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHSSSSSSCECEEEEHEECCCCCCEEEECCEEEHESSSSSSSSSSS",
+                0xc265001a,
+            ),
+            (
+                2,
+                3,
+                "000000000000000000000000001111111100000000000000000000000000000100001111011111101000000000000000000000000000000000000000001111101110000000000000000000000000001110111100101011001000000000000000",
+                "HHHHHHHHHHHHHHHHHHCCCCCCHHEEEEECEEHCSSSSSCCCCCCCHHHHSSSSHHHHHHCEHHHHEECCCEEEEEECEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEECEEECSSSSSCCCCCCCHHHHSSSSSSSSSCEEEHHEEECCCCEHEEHHESSSSSSSSSSSSSSS",
+                0x425c7e76,
+            ),
+        ];
+
+        fn levers(morning: u8, evening: u8) -> UserLevers {
+            UserLevers {
+                morning_discharge: Some(DischargeWindowLimit {
+                    hours: morning,
+                    min_soc_pct: 25.0,
+                }),
+                evening_discharge: Some(DischargeWindowLimit {
+                    hours: evening,
+                    min_soc_pct: 25.0,
+                }),
+                ..UserLevers::default()
+            }
+        }
+
+        /// A lever site at 00:00 knows the whole day: the windows mode with continuity 0 plans as
+        /// 0.2.74, bit for bit, with yesterday's blocks as ranking context (another local day)
+        #[test]
+        fn lever_site_at_midnight_is_bit_exact_against_0_2_74() {
+            let days = owner_days();
+            let yesterday: Vec<TimeBlockPrice> = days[..96]
+                .iter()
+                .map(|b| TimeBlockPrice {
+                    block_start: b.start - Duration::days(1),
+                    ..price_of(b)
+                })
+                .collect();
+            let p = owner_params(0.0, 2.0);
+            for (morning, evening, mask, golden_letters, cost_bits) in GOLDEN_MIDNIGHT_0_2_74 {
+                let blocks: Vec<PlanBlock> = days
+                    .iter()
+                    .map(|b| PlanBlock {
+                        reserve_load_kwh: b.load * 1.1,
+                        ..block_at(b.start, b.buy, b.sell, b.load, b.pv)
+                    })
+                    .collect();
+                let prefix = ranking_prefix(&yesterday, blocks[0].start, TZ, 0.0);
+                let blocks = apply_export_rules_ranked(
+                    blocks,
+                    prefix,
+                    Some(&levers(morning, evening)),
+                    Some(TZ),
+                    &p,
+                );
+                assert_eq!(allowed(&blocks), mask, "{morning}/{evening} h mask");
+                let plan = plan_from(&blocks, 37.0, TZ, &owner_battery(), &p, None);
+                assert_eq!(plan_letters(&plan), golden_letters, "{morning}/{evening} h");
+                assert_eq!(
+                    plan.expected_cost_czk.to_bits(),
+                    cost_bits,
+                    "{morning}/{evening} h cost"
+                );
+            }
+        }
+
+        /// (start, export allowed, export min SOC) of the horizon `horizon_blocks` builds from
+        /// local `hh`:00 on 2026-11-05: the known prices from then on as `all_price_blocks`, the
+        /// 24 h before as `ranking_price_blocks`, as the scheduler sends them
+        fn horizon_from(
+            hh: u32,
+            params: &WinterReserveParams,
+            levers: &UserLevers,
+        ) -> Vec<(DateTime<Utc>, bool, Option<f32>)> {
+            let prices: Vec<TimeBlockPrice> = owner_days().iter().map(price_of).collect();
+            let at = 96 + hh as usize * 4;
+            let control = ControlConfig::default();
+            let context = super::super::super::EvaluationContext {
+                price_block: &prices[at],
+                control_config: &control,
+                current_battery_soc: 60.0,
+                solar_forecast_kwh: 0.0,
+                consumption_forecast_kwh: 0.25,
+                grid_export_price_czk_per_kwh: 0.5,
+                all_price_blocks: Some(&prices[at..]),
+                ranking_price_blocks: Some(&prices[at - 96..at]),
+                backup_discharge_min_soc: 10.0,
+                grid_import_today_kwh: None,
+                consumption_today_kwh: None,
+                solar_forecast_total_today_kwh: 0.0,
+                solar_forecast_remaining_today_kwh: 0.0,
+                solar_forecast_tomorrow_kwh: 0.0,
+                battery_avg_charge_price_czk_per_kwh: 3.0,
+                battery_charge_cost_czk_per_kwh: None,
+                hourly_consumption_profile: None,
+                hourly_consumption_p75: None,
+                block_forecasts: None,
+                timezone: Some(TZ),
+                user_levers: Some(levers),
+                cautious_pv: None,
+            };
+            WinterReserveStrategy::new(true, params.clone())
+                .horizon_blocks(&context)
+                .iter()
+                .map(|b| (b.start, b.export_allowed, b.export_min_soc_pct))
+                .collect()
+        }
+
+        /// Price lists that start at 08:00, 12:00, 14:00 and 18:00 local give the same export
+        /// set as the one at 00:00, in both export selections
+        #[test]
+        fn mid_day_horizons_keep_the_midnight_export_set() {
+            let mut cases: Vec<(String, WinterReserveParams)> =
+                vec![("windows 4/4 h, 5 %".to_owned(), owner_params(5.0, 2.0))];
+            for n in [6u8, 8, 10, 12] {
+                cases.push((
+                    format!("daily_top_n {n} h, 5 %"),
+                    WinterReserveParams {
+                        export_selection: ExportSelection::DailyTopN,
+                        daily_export_hours: n,
+                        ..owner_params(5.0, 2.0)
+                    },
+                ));
+            }
+            let levers = levers(4, 4);
+            for (name, params) in cases {
+                let midnight = horizon_from(0, &params, &levers);
+                assert_eq!(midnight.len(), 96);
+                for hh in [8u32, 12, 14, 18] {
+                    let later = horizon_from(hh, &params, &levers);
+                    let expected = &midnight[hh as usize * 4..];
+                    assert_eq!(later.as_slice(), expected, "{name} from {hh}:00");
+                }
+            }
+        }
+
+        /// Hourly prices: the budget counts block minutes, so 6 h is 6 hourly blocks, not 24
+        #[test]
+        fn daily_top_n_counts_hourly_blocks_by_duration() {
+            let first = TZ
+                .with_ymd_and_hms(2026, 11, 5, 0, 0, 0)
+                .unwrap()
+                .with_timezone(&Utc);
+            let mut blocks: Vec<PlanBlock> = (0..24)
+                .map(|h| PlanBlock {
+                    duration_minutes: 60,
+                    ..block_at(
+                        first + Duration::hours(h),
+                        3.0,
+                        5.0 + h as f32 * 0.1,
+                        0.5,
+                        0.0,
+                    )
+                })
+                .collect();
+            let p = WinterReserveParams {
+                export_selection: ExportSelection::DailyTopN,
+                daily_export_hours: 6,
+                ..owner_params(0.0, 2.0)
+            };
+            apply_export_rules(&mut blocks, None, Some(TZ), &p);
+            let allowed: Vec<usize> = (0..24).filter(|&i| blocks[i].export_allowed).collect();
+            assert_eq!(allowed, vec![18, 19, 20, 21, 22, 23]);
+        }
+
+        /// A future day the feed has published only in part: its known blocks are ranked, and it
+        /// gets min(N h, ceil(known × N / 24 h)), with no jump at a threshold (coordinator
+        /// 2026-11-05); the complete day before it keeps N h
+        #[test]
+        fn daily_top_n_partial_day_gets_its_share() {
+            let days = owner_days();
+            for (n, known, expected) in [
+                (8u8, 20usize, 7usize),
+                (8, 32, 11),
+                (8, 33, 11),
+                (8, 40, 14),
+                (8, 95, 32),
+                (8, 96, 32),
+                (6, 24, 6),
+                (6, 10, 3),
+                (24, 40, 40),
+            ] {
+                let mut blocks: Vec<PlanBlock> = days[..96 + known]
+                    .iter()
+                    .map(|b| block_at(b.start, b.buy, b.sell, b.load, b.pv))
+                    .collect();
+                let p = WinterReserveParams {
+                    export_selection: ExportSelection::DailyTopN,
+                    daily_export_hours: n,
+                    ..owner_params(0.0, 2.0)
+                };
+                apply_export_rules(&mut blocks, None, Some(TZ), &p);
+                let today = blocks[..96].iter().filter(|b| b.export_allowed).count();
+                let partial = blocks[96..].iter().filter(|b| b.export_allowed).count();
+                assert_eq!(today, usize::from(n) * 4, "N {n} full day");
+                assert_eq!(partial, expected, "N {n}, {known} blocks known");
+            }
+        }
+
+        /// A complete local day is not partial: N h on the 23-hour DST day (2026-03-29) and on the
+        /// 25-hour one (2026-10-25), as on a normal day
+        #[test]
+        fn daily_top_n_complete_dst_days_get_n_hours() {
+            for (date, len) in [
+                ((2026, 3, 29), 92i64),
+                ((2026, 10, 25), 100),
+                ((2026, 11, 5), 96),
+            ] {
+                let first = TZ
+                    .with_ymd_and_hms(date.0, date.1, date.2, 0, 0, 0)
+                    .unwrap()
+                    .with_timezone(&Utc);
+                let mut blocks: Vec<PlanBlock> = (0..len)
+                    .map(|i| {
+                        block_at(
+                            first + Duration::minutes(15 * i),
+                            3.0,
+                            5.0 + i as f32 * 0.01,
+                            0.5,
+                            0.0,
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    local_day_minutes(first.with_timezone(&TZ).date_naive(), TZ),
+                    u32::try_from(len * 15).unwrap()
+                );
+                let p = WinterReserveParams {
+                    export_selection: ExportSelection::DailyTopN,
+                    daily_export_hours: 8,
+                    ..owner_params(0.0, 2.0)
+                };
+                apply_export_rules(&mut blocks, None, Some(TZ), &p);
+                let allowed = blocks.iter().filter(|b| b.export_allowed).count();
+                assert_eq!(allowed, 32, "{date:?}");
+            }
+        }
     }
 }

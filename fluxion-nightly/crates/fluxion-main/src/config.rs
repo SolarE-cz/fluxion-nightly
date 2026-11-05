@@ -1128,6 +1128,9 @@ pub struct WinterReserveConfig {
     pub min_mode_benefit_czk: f32,
     pub mode_switch_min_benefit_czk: f32,
     pub direction_reversal_cost_czk: f32,
+    pub export_window_continuity_pct: f32,
+    pub export_selection: fluxion_core::ExportSelection,
+    pub daily_export_hours: u8,
     pub soc_resolution_pct: f32,
     pub export_floor_until_cheap: bool,
     pub cautious_pv_mae_pct: f32,
@@ -1149,6 +1152,9 @@ impl Default for WinterReserveConfig {
             min_mode_benefit_czk: core.min_mode_benefit_czk,
             mode_switch_min_benefit_czk: core.mode_switch_min_benefit_czk,
             direction_reversal_cost_czk: core.direction_reversal_cost_czk,
+            export_window_continuity_pct: core.export_window_continuity_pct,
+            export_selection: core.export_selection,
+            daily_export_hours: core.daily_export_hours,
             soc_resolution_pct: core.soc_resolution_pct,
             export_floor_until_cheap: core.export_floor_until_cheap,
             cautious_pv_mae_pct: core.cautious_pv_mae_pct,
@@ -2845,6 +2851,12 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .strategies
                         .winter_reserve
                         .direction_reversal_cost_czk,
+                    export_window_continuity_pct: app_config
+                        .strategies
+                        .winter_reserve
+                        .export_window_continuity_pct,
+                    export_selection: app_config.strategies.winter_reserve.export_selection,
+                    daily_export_hours: app_config.strategies.winter_reserve.daily_export_hours,
                     soc_resolution_pct: app_config.strategies.winter_reserve.soc_resolution_pct,
                     export_floor_until_cheap: app_config
                         .strategies
@@ -4363,6 +4375,9 @@ mod winter_reserve_config_tests {
         assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
         assert!((wr.mode_switch_min_benefit_czk - 1.0).abs() < 1e-6);
         assert!((wr.direction_reversal_cost_czk - 2.0).abs() < 1e-6);
+        assert!((wr.export_window_continuity_pct - 5.0).abs() < 1e-6);
+        assert_eq!(wr.export_selection, fluxion_core::ExportSelection::Windows);
+        assert_eq!(wr.daily_export_hours, 6);
         assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
         assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
         assert!((wr.cautious_pv_off_pct - 20.0).abs() < 1e-6);
@@ -4410,6 +4425,12 @@ mod winter_reserve_config_tests {
         assert!(addon.contains("      cautious_pv_fallback_months:\n        - int(1,12)?\n"));
         assert!(addon.contains("      direction_reversal_cost_czk: 2.0\n"));
         assert!(addon.contains("      direction_reversal_cost_czk: float(0,)?\n"));
+        assert!(addon.contains("      export_window_continuity_pct: 5.0\n"));
+        assert!(addon.contains("      export_window_continuity_pct: float(0,100)?\n"));
+        assert!(addon.contains("      export_selection: windows\n"));
+        assert!(addon.contains("      export_selection: list(windows|daily_top_n)?\n"));
+        assert!(addon.contains("      daily_export_hours: 6\n"));
+        assert!(addon.contains("      daily_export_hours: int(1,24)?\n"));
     }
 
     #[test]
@@ -4426,6 +4447,9 @@ mod winter_reserve_config_tests {
                 "min_mode_benefit_czk": 0.25,
                 "mode_switch_min_benefit_czk": 2.5,
                 "direction_reversal_cost_czk": 4.0,
+                "export_window_continuity_pct": 7.5,
+                "export_selection": "daily_top_n",
+                "daily_export_hours": 8,
                 "soc_resolution_pct": 1.0
             }
         }"#;
@@ -4443,14 +4467,24 @@ mod winter_reserve_config_tests {
         assert!((wr.mode_switch_min_benefit_czk - 2.5).abs() < 1e-6);
         assert!((wr.soc_resolution_pct - 1.0).abs() < 1e-6);
         assert!((wr.direction_reversal_cost_czk - 4.0).abs() < 1e-6);
+        assert!((wr.export_window_continuity_pct - 7.5).abs() < 1e-6);
+        let top_n = fluxion_core::ExportSelection::DailyTopN;
+        assert_eq!(wr.export_selection, top_n);
+        assert_eq!(wr.daily_export_hours, 8);
         // The value reaches the core config and the planner parameters
         let mut app = AppConfig::default();
         app.strategies.winter_reserve = wr.clone();
         let system: fluxion_core::SystemConfig = app.into();
         let core = &system.strategies_config.winter_reserve;
         assert!((core.direction_reversal_cost_czk - 4.0).abs() < 1e-6);
+        assert!((core.export_window_continuity_pct - 7.5).abs() < 1e-6);
         let params = fluxion_core::backtest::winter_reserve_params(core);
         assert!((params.direction_reversal_cost_czk - 4.0).abs() < 1e-6);
+        assert!((params.export_window_continuity_pct - 7.5).abs() < 1e-6);
+        assert_eq!(core.export_selection, top_n);
+        assert_eq!(core.daily_export_hours, 8);
+        assert_eq!(params.export_selection, top_n);
+        assert_eq!(params.daily_export_hours, 8);
     }
 
     #[test]

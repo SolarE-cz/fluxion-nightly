@@ -1505,7 +1505,8 @@
                 pv: 'PV Generation (kW)',
                 forecast: 'Solar Forecast (kW)',
                 forecastRaw: 'Solar Forecast raw (kW)',
-                consumption: 'Avg Consumption (kW)'
+                consumption: 'Avg Consumption (kW)',
+                fixedBuy: 'Fixed buy (incl. HDO)'
             };
             const PREFS = {
                 forecast: { key: 'fluxion-chart-show-solar-forecast', fallback: true },
@@ -1733,6 +1734,7 @@
             // update, add (when missing at first render) or remove each one.
             function sync(chart, d) {
                 syncCorrectionLabel(d);
+                syncFixedBuy(chart, d);
                 NAMES.forEach(name => {
                     const data = seriesData(name, d);
                     const idx = chart.data.datasets.findIndex(ds => ds.label === LABELS[name]);
@@ -1826,10 +1828,103 @@
                 return type === 'low' ? '🟡 Low' : '🔴 High';
             }
 
+            // Fixed buy with a known market spot price: the bars show the spot price and the fixed
+            // buy price (energy + HDO) is a line; the HDO fee is not stacked on the bars
+            function fixedBuyActive(d) {
+                return !!(d && d.fixed_buy && Array.isArray(d.market_spot_prices)
+                    && d.market_spot_prices.some(v => v !== null && v !== undefined));
+            }
+
+            // Values of the Spot Price bars: the market spot price under fixed buy, else the spot price
+            function barData(d) {
+                if (fixedBuyActive(d)) {
+                    return d.market_spot_prices.map(v => (v === null || v === undefined ? 0 : v));
+                }
+                return (d.spot_prices && d.spot_prices.length > 0) ? d.spot_prices : d.prices;
+            }
+
+            // Values the price axis must cover: the bars, without the zeros barData() puts in
+            // for blocks with no known spot price, and under fixed buy the fixed buy line too
+            function scaleData(d) {
+                if (fixedBuyActive(d)) {
+                    return d.market_spot_prices.filter(v => v !== null && v !== undefined)
+                        .concat((d.effective_prices || []).filter(v => v !== null && v !== undefined));
+                }
+                return barData(d);
+            }
+
+            function isPastBlock(i) {
+                const cur = window.priceChartData;
+                return !!(cur && cur.is_historical && cur.is_historical[i]);
+            }
+
+            function fixedBuyDataset(d) {
+                return {
+                    label: LABELS.fixedBuy,
+                    data: d.effective_prices,
+                    type: 'line',
+                    stepped: true,
+                    borderColor: 'rgba(233, 30, 99, 1)',
+                    backgroundColor: 'rgba(233, 30, 99, 0.0)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    pointHoverRadius: 0,
+                    fill: false,
+                    segment: {
+                        borderColor: ctx => (isPastBlock(ctx.p1DataIndex) ? 'rgba(233, 30, 99, 0.4)' : undefined)
+                    },
+                    order: 1
+                };
+            }
+
+            // HDO grid fee bars stacked on the spot price (yellow for low tariff, red for high)
+            function gridFeeDataset(d) {
+                const gridFeeColors = d.tariff_types.map((type, idx) => {
+                    const isHistorical = d.is_historical && d.is_historical[idx];
+                    const opacity = isHistorical ? 0.4 : 0.8;
+                    return type === 'low'
+                        ? `rgba(255, 235, 59, ${opacity})`   // Yellow for low tariff
+                        : `rgba(244, 67, 54, ${opacity})`;   // Red for high tariff
+                });
+
+                return {
+                    label: 'Grid Fee (HDO)',
+                    data: d.grid_fees,
+                    backgroundColor: gridFeeColors,
+                    borderColor: gridFeeColors.map(c => c.replace(/[\d.]+\)$/, '1)')),
+                    borderWidth: 1,
+                    stack: 'price',
+                    order: 3
+                };
+            }
+
+            // Fixed buy view of an existing chart, from fresh chart data: the fixed buy line and
+            // no grid fee stack when it applies, the stacked grid fee bars when it does not
+            function syncFixedBuy(chart, d) {
+                const lineIdx = chart.data.datasets.findIndex(ds => ds.label === LABELS.fixedBuy);
+                const feeIdx = chart.data.datasets.findIndex(ds => ds.label === 'Grid Fee (HDO)');
+                if (fixedBuyActive(d)) {
+                    if (feeIdx >= 0) chart.data.datasets.splice(feeIdx, 1);
+                    if (lineIdx >= 0) {
+                        chart.data.datasets[lineIdx].data = d.effective_prices;
+                    } else {
+                        chart.data.datasets.push(fixedBuyDataset(d));
+                    }
+                    const legend = chart.options.plugins && chart.options.plugins.legend;
+                    if (legend) legend.display = true;
+                    return;
+                }
+                if (lineIdx >= 0) chart.data.datasets.splice(lineIdx, 1);
+                const stacked = d.spot_prices && d.spot_prices.length > 0;
+                if (feeIdx < 0 && stacked && d.grid_fees && d.grid_fees.length > 0) {
+                    chart.data.datasets.push(gridFeeDataset(d));
+                }
+            }
+
             return {
                 LABELS, HDO_STRIP_HEIGHT, datasets, sync, y2VisibleFor, wireCheckboxes, legendToggled,
                 consumptionData, pvData, forecastData, forecastRawData, correctionText, hdoStripData,
-                tariffColor, tariffLabel,
+                tariffColor, tariffLabel, fixedBuyActive, barData, scaleData, fixedBuyDataset, gridFeeDataset,
                 readPref, writePref
             };
         })();
@@ -1871,12 +1966,13 @@
 
                 // Prepare datasets - use stacked bars if price breakdown available
                 const hasStackedData = chartData.spot_prices && chartData.spot_prices.length > 0;
+                const fixedBuy = window.FluxionChartSeries.fixedBuyActive(chartData);
                 const datasets = [];
 
-                // Base dataset: Spot Price (mode-colored bars)
+                // Base dataset: Spot Price (mode-colored bars; the market spot price under fixed buy)
                 datasets.push({
                     label: 'Spot Price',
-                    data: hasStackedData ? chartData.spot_prices : chartData.prices,
+                    data: window.FluxionChartSeries.barData(chartData),
                     backgroundColor: colors,
                     borderColor: borderColors,
                     borderWidth: 1,
@@ -1887,25 +1983,14 @@
                     order: 2
                 });
 
-                // HDO Grid Fee dataset (yellow for low tariff, red for high tariff)
-                if (hasStackedData && chartData.grid_fees && chartData.grid_fees.length > 0) {
-                    const gridFeeColors = chartData.tariff_types.map((type, idx) => {
-                        const isHistorical = chartData.is_historical && chartData.is_historical[idx];
-                        const opacity = isHistorical ? 0.4 : 0.8;
-                        return type === 'low'
-                            ? `rgba(255, 235, 59, ${opacity})`   // Yellow for low tariff
-                            : `rgba(244, 67, 54, ${opacity})`;   // Red for high tariff
-                    });
+                // HDO Grid Fee dataset (yellow for low tariff, red for high tariff); not under fixed buy
+                if (hasStackedData && !fixedBuy && chartData.grid_fees && chartData.grid_fees.length > 0) {
+                    datasets.push(window.FluxionChartSeries.gridFeeDataset(chartData));
+                }
 
-                    datasets.push({
-                        label: 'Grid Fee (HDO)',
-                        data: chartData.grid_fees,
-                        backgroundColor: gridFeeColors,
-                        borderColor: gridFeeColors.map(c => c.replace(/[\d.]+\)$/, '1)')),
-                        borderWidth: 1,
-                        stack: 'price',
-                        order: 3
-                    });
+                // Fixed buy price line (energy + HDO) next to the market spot price bars
+                if (fixedBuy) {
+                    datasets.push(window.FluxionChartSeries.fixedBuyDataset(chartData));
                 }
 
                 // Buy/Distribution Fees dataset removed - now included in HDO grid fee display
@@ -2036,13 +2121,13 @@
                         },
                         plugins: {
                             legend: {
-                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || hasPowerSeries,
+                                display: (chartData.battery_soc_history && chartData.battery_soc_history.length > 0) || (chartData.battery_soc_prediction && chartData.battery_soc_prediction.length > 0) || currentBatterySoc !== null || hasPowerSeries || fixedBuy,
                                 position: 'top',
                                 labels: {
                                     color: '#999',
                                     filter: function(item) {
                                         // Show battery, PV, and consumption related legends
-                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV') || item.text.includes('Consumption') || item.text.includes('Forecast');
+                                        return item.text.includes('Battery') || item.text.includes('SOC') || item.text.includes('Predicted') || item.text.includes('PV') || item.text.includes('Consumption') || item.text.includes('Forecast') || item.text.includes('Fixed buy');
                                     }
                                 },
                                 onClick: function(e, item, legend) {
@@ -2064,7 +2149,7 @@
                                         // Latest data (refreshes merge into it), first render as fallback
                                         const chartData = window.priceChartData || initialChartData;
                                         // Skip HDO grid fee dataset and tariff strip in tooltip (shown in main price tooltip)
-                                        if (context.dataset.label === 'Grid Fee (HDO)' || context.dataset.label === window.FluxionChartSeries.LABELS.hdoStrip) {
+                                        if (context.dataset.label === 'Grid Fee (HDO)' || context.dataset.label === window.FluxionChartSeries.LABELS.hdoStrip || context.dataset.label === window.FluxionChartSeries.LABELS.fixedBuy) {
                                             return null; // Will be shown in the main price tooltip
                                         }
                                         if (context.dataset.type === 'line' && (context.parsed.y === null || context.parsed.y === undefined || isNaN(context.parsed.y))) {
@@ -2100,7 +2185,20 @@
                                         }
 
                                         // Show price breakdown if stacked data available
-                                        if (chartData.spot_prices && chartData.spot_prices.length > 0) {
+                                        if (window.FluxionChartSeries.fixedBuyActive(chartData)) {
+                                            const marketSpot = chartData.market_spot_prices[idx];
+                                            const energyPrice = chartData.prices[idx];
+                                            const gridFee = chartData.grid_fees ? chartData.grid_fees[idx] : 0;
+                                            const totalPrice = chartData.effective_prices[idx];
+
+                                            lines.push('═══ Price Breakdown ═══');
+                                            if (marketSpot !== null && marketSpot !== undefined) {
+                                                lines.push(`  Spot: ${marketSpot.toFixed(3)} Kč`);
+                                                lines.push(`  Sell (spot − fee): ${(marketSpot - chartData.sell_fee_czk).toFixed(3)} Kč`);
+                                            }
+                                            lines.push(`  Fixed buy: energy ${energyPrice.toFixed(3)} + HDO ${gridFee.toFixed(2)} = ${totalPrice.toFixed(3)} Kč/kWh`);
+                                            lines.push('');
+                                        } else if (chartData.spot_prices && chartData.spot_prices.length > 0) {
                                             const spotPrice = chartData.spot_prices[idx];
                                             const gridFee = chartData.grid_fees ? chartData.grid_fees[idx] : 0;
                                             const buyFee = chartData.buy_fees ? chartData.buy_fees[idx] : 0;
@@ -2198,8 +2296,8 @@
                                     const priceData = (chartData.effective_prices && chartData.effective_prices.length > 0)
                                         ? chartData.effective_prices
                                         : chartData.prices;
-                                    const minPrice = Math.min(...chartData.prices); // Use spot prices for min
-                                    const maxPrice = Math.max(...priceData);
+                                    const minPrice = Math.min(...window.FluxionChartSeries.scaleData(chartData)); // Use spot prices for min
+                                    const maxPrice = Math.max(...priceData, ...window.FluxionChartSeries.scaleData(chartData));
                                     const priceRange = maxPrice - minPrice;
                                     return minPrice - priceRange * 0.1;
                                 })(),
@@ -2208,8 +2306,8 @@
                                     const priceData = (chartData.effective_prices && chartData.effective_prices.length > 0)
                                         ? chartData.effective_prices
                                         : chartData.prices;
-                                    const minPrice = Math.min(...chartData.prices);
-                                    const maxPrice = Math.max(...priceData);
+                                    const minPrice = Math.min(...window.FluxionChartSeries.scaleData(chartData));
+                                    const maxPrice = Math.max(...priceData, ...window.FluxionChartSeries.scaleData(chartData));
                                     const priceRange = maxPrice - minPrice;
                                     return maxPrice + priceRange * 0.1;
                                 })(),
@@ -2319,8 +2417,7 @@
                         // Update Spot Price dataset (base bars) - use spot_prices when stacked data available
                         const spotDataset = findDataset('Spot Price');
                         if (spotDataset) {
-                            const hasStackedData = data.spot_prices && data.spot_prices.length > 0;
-                            spotDataset.data = hasStackedData ? data.spot_prices : data.prices;
+                            spotDataset.data = window.FluxionChartSeries.barData(data);
 
                             // Update colors based on mode
                             if (data.modes) {
@@ -3456,8 +3553,7 @@ document.getElementById('config-form').addEventListener('submit', async (e) => {
                         // Update Spot Price dataset (base bars) - use spot_prices when stacked data available
                         const spotDataset = findDataset('Spot Price');
                         if (spotDataset) {
-                            const hasStackedData = chartData.spot_prices && chartData.spot_prices.length > 0;
-                            spotDataset.data = hasStackedData ? chartData.spot_prices : chartData.prices;
+                            spotDataset.data = window.FluxionChartSeries.barData(chartData);
 
                             // Update colors based on mode
                             if (chartData.modes) {

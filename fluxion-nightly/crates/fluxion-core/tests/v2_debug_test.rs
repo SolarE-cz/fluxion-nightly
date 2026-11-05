@@ -162,6 +162,7 @@ fn debug_v2_charge_scheduling() {
             consumption_forecast_kwh: 0.5,
             grid_export_price_czk_per_kwh: 0.1,
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: Some(5.0),
             consumption_today_kwh: Some(8.0),

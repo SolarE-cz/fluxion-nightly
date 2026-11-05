@@ -217,9 +217,12 @@ options:
       cautious_pv_mae_pct: 25.0
       cautious_pv_off_pct: 20.0
       cheap_percentile: 0.2
+      daily_export_hours: 6
       direction_reversal_cost_czk: 2.0
       enabled: true
       export_floor_until_cheap: false
+      export_selection: windows
+      export_window_continuity_pct: 5.0
       insane_price_multiplier: 3.0
       load_safety_factor: 1.1
       min_arbitrage_profit_czk: 2.0
@@ -489,9 +492,12 @@ schema:
       cautious_pv_mae_pct: float(0,100)?
       cautious_pv_off_pct: float(0,100)?
       cheap_percentile: float(0,0.5)?
+      daily_export_hours: int(1,24)?
       direction_reversal_cost_czk: float(0,)?
       enabled: bool?
       export_floor_until_cheap: bool?
+      export_selection: list(windows|daily_top_n)?
+      export_window_continuity_pct: float(0,100)?
       insane_price_multiplier: float(0,10)?
       load_safety_factor: float(0,10)?
       min_arbitrage_profit_czk: float(0,)?
@@ -509,4 +515,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.74
+version: 0.2.75
