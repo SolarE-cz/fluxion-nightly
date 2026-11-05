@@ -84,6 +84,9 @@ pub struct GenericInverterState {
     /// state reader takes it as the read time, so a frozen source counts as stale from when it
     /// froze, not from its last successful read (PR #647 R5-2).
     pub data_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Direct VPP power control mode read back from `sensor.<prefix>_modbus_power_control`
+    /// (input 0x100); read only with `control.vpp_direct_enabled`, `None` when unknown
+    pub vpp_mode: Option<u8>,
 
     // ============= Load & Grid Detailed (Optional) =============
     /// House/load consumption (W)

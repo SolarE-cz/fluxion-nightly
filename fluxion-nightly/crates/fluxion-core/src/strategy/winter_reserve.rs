@@ -79,6 +79,11 @@ pub struct WinterReserveParams {
     /// Extra benefit (CZK) a SelfUse/Hold switch needs before a kept mode is dropped, counted
     /// over the whole run of blocks the switch is made for (brief H25)
     pub mode_switch_min_benefit_czk: f32,
+    /// Planning cost (CZK) of a force-direction reversal: a Charge after an Export or an Export
+    /// after a Charge, with any non-force blocks between them (see `ForceDirection`). It groups
+    /// charge and export into runs and is never part of the plan cost; 0 = off (owner 2026-11-05)
+    #[serde(default = "default_direction_reversal_cost_czk")]
+    pub direction_reversal_cost_czk: f32,
     pub soc_resolution_pct: f32,
     /// Export floor: the reserve deficit only until the next cheap block (buy at or below the
     /// horizon median) when it comes before the next morning (`night_floors`)
@@ -92,6 +97,10 @@ pub struct WinterReserveParams {
 
 fn default_cautious_pv_fallback_months() -> Vec<u32> {
     vec![10, 11, 12, 1, 2, 3]
+}
+
+fn default_direction_reversal_cost_czk() -> f32 {
+    2.0
 }
 
 /// Fewest valid days in the 7-day window before the forecast error decides cautious PV; with
@@ -170,6 +179,7 @@ impl Default for WinterReserveParams {
             pv_confidence: 0.70,
             min_mode_benefit_czk: 0.10,
             mode_switch_min_benefit_czk: 1.0,
+            direction_reversal_cost_czk: default_direction_reversal_cost_czk(),
             soc_resolution_pct: 0.5,
             export_floor_until_cheap: false,
             cautious_pv_fallback_months: default_cautious_pv_fallback_months(),
@@ -227,6 +237,49 @@ pub enum PlanMode {
     Export,
     /// Battery never discharges (price lever); PV surplus still charges it.
     NoDischarge,
+}
+
+/// The last force direction of the battery: a grid Charge or an Export (Force Discharge). Other
+/// modes keep it, so Charge, SelfUse, Export is one reversal. The DP plans each direction as its
+/// own state and charges `direction_reversal_cost_czk` for a reversal (owner 2026-11-05: no
+/// Charge/Export flip-flop, sell in the best contiguous blocks).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ForceDirection {
+    #[default]
+    None,
+    Charging,
+    Exporting,
+}
+
+impl ForceDirection {
+    /// The directions the DP keeps a value table for. A start with no direction plans from the
+    /// one of them that values the start best: its first force mode is then free, as from none.
+    const TABLES: [Self; 2] = [Self::Charging, Self::Exporting];
+
+    /// The direction of an applied mode (`None` = unknown, or not a force mode).
+    #[must_use]
+    pub fn of(mode: Option<PlanMode>) -> Self {
+        mode.map_or(Self::None, |m| Self::None.after(m))
+    }
+
+    /// The direction after a block in `mode`.
+    #[must_use]
+    pub fn after(self, mode: PlanMode) -> Self {
+        match mode {
+            PlanMode::Charge => Self::Charging,
+            PlanMode::Export => Self::Exporting,
+            PlanMode::SelfUse | PlanMode::Hold | PlanMode::NoDischarge => self,
+        }
+    }
+
+    /// A block in `mode` reverses this direction.
+    #[must_use]
+    pub fn reversed_by(self, mode: PlanMode) -> bool {
+        matches!(
+            (self, mode),
+            (Self::Charging, PlanMode::Export) | (Self::Exporting, PlanMode::Charge)
+        )
+    }
 }
 
 /// Energy flows of one simulated block (kWh, all non-negative).
@@ -324,7 +377,13 @@ struct DpStep<'a> {
     charge_cap_kwh: f32,
     battery: &'a BatteryParams,
     grid: &'a [f32],
-    next_values: &'a [f32],
+    /// Value of the following step per force direction (`ForceDirection::index`), or a single
+    /// entry when reversals are free
+    next_values: &'a [Vec<f32>],
+    /// Force direction before this block
+    direction: ForceDirection,
+    /// Planning cost of a reversal (0 when `next_values` has a single entry)
+    reversal_cost: f32,
 }
 
 impl DpStep<'_> {
@@ -346,8 +405,9 @@ impl DpStep<'_> {
         before_guard + 1e-6 < b.min_charge_kwh.min(block_stored)
     }
 
-    /// Block cost of `mode` from `energy_kwh`, plus the interpolated value of the energy it leaves.
-    fn value(&self, mode: PlanMode, energy_kwh: f32) -> (f32, BlockOutcome) {
+    /// Simulated outcome of `mode` from `energy_kwh` and its block cost (the same in every
+    /// force direction).
+    fn block_cost(&self, mode: PlanMode, energy_kwh: f32) -> (f32, BlockOutcome) {
         let outcome = simulate_block_capped(
             mode,
             energy_kwh,
@@ -357,9 +417,46 @@ impl DpStep<'_> {
             self.charge_cap_kwh,
         );
         let cost = outcome_cost(&outcome, self.block, self.battery.wear_cost_czk_per_kwh);
-        let future = interpolate(self.grid, self.next_values, outcome.energy_end_kwh);
-        (cost + future, outcome)
+        (cost, outcome)
     }
+
+    /// `cost` plus the value of the energy `outcome` leaves, in the direction after `mode`, plus
+    /// the reversal cost when `mode` reverses `direction`.
+    fn value_after(
+        &self,
+        direction: ForceDirection,
+        mode: PlanMode,
+        cost: f32,
+        outcome: &BlockOutcome,
+    ) -> f32 {
+        self.with_reversal(
+            direction,
+            mode,
+            cost + self.future(direction.after(mode), outcome),
+        )
+    }
+
+    /// Value of the energy `outcome` leaves, in the force direction `after` the block.
+    fn future(&self, after: ForceDirection, outcome: &BlockOutcome) -> f32 {
+        let next = &self.next_values[direction_slot(self.next_values.len(), after)];
+        interpolate(self.grid, next, outcome.energy_end_kwh)
+    }
+
+    /// `value` plus the reversal cost when `mode` reverses `direction`. Steers the plan only:
+    /// `outcome_cost` (the plan cost) never includes it.
+    fn with_reversal(&self, direction: ForceDirection, mode: PlanMode, value: f32) -> f32 {
+        if self.next_values.len() > 1 && direction.reversed_by(mode) {
+            value + self.reversal_cost
+        } else {
+            value
+        }
+    }
+}
+
+/// Slot of `direction` in a value table with `slots` directions (1 = reversals are free; else
+/// `ForceDirection::TABLES`, never planned from `None`).
+fn direction_slot(slots: usize, direction: ForceDirection) -> usize {
+    usize::from(slots > 1 && direction == ForceDirection::Exporting)
 }
 
 /// Modes allowed in a block. SelfUse comes first, then Hold < Charge < Export (tie-break order).
@@ -535,14 +632,33 @@ fn evaluate_modes(
     modes: &[PlanMode],
     energy_kwh: f32,
 ) -> Vec<(PlanMode, f32, BlockOutcome)> {
+    block_costs(dp, modes, energy_kwh)
+        .into_iter()
+        .map(|(mode, cost, outcome)| {
+            (
+                mode,
+                dp.value_after(dp.direction, mode, cost, &outcome),
+                outcome,
+            )
+        })
+        .collect()
+}
+
+/// Block cost and outcome of every candidate mode from `energy_kwh` (the candidates of
+/// `evaluate_modes`), before the value of the energy left.
+fn block_costs(
+    dp: &DpStep,
+    modes: &[PlanMode],
+    energy_kwh: f32,
+) -> Vec<(PlanMode, f32, BlockOutcome)> {
     modes
         .iter()
         .filter(|&&mode| {
             mode != PlanMode::Charge || dp.block.force_charge || !dp.charge_too_small(energy_kwh)
         })
         .map(|&mode| {
-            let (value, outcome) = dp.value(mode, energy_kwh);
-            (mode, value, outcome)
+            let (cost, outcome) = dp.block_cost(mode, energy_kwh);
+            (mode, cost, outcome)
         })
         .collect()
 }
@@ -920,6 +1036,8 @@ pub fn export_guard_holds(live_kwh: f32, floor_kwh: f32, battery: &BatteryParams
 /// most `mode_switch_min_benefit_czk` over the run it is made for. Hold is kept only in blocks
 /// without PV. Projected blocks use the same rule as the head, so a block's projected mode is
 /// the head decision once it starts (brief H25). With None the first block defaults to SelfUse.
+///
+/// The force direction before the first block is that of `current` (see `plan_from_direction`).
 pub fn plan_from(
     blocks: &[PlanBlock],
     soc_pct: f32,
@@ -928,7 +1046,25 @@ pub fn plan_from(
     params: &WinterReserveParams,
     current: Option<PlanMode>,
 ) -> Plan {
-    plan_with_rule(blocks, soc_pct, tz, battery, params, current, KEEP_RULE)
+    let direction = ForceDirection::of(current);
+    plan_from_direction(blocks, soc_pct, tz, battery, params, current, direction)
+}
+
+/// `plan_from` with the force direction before the first block given (`direction`, the last
+/// Charge or Export applied, kept through SelfUse/Hold heads). A first-block force mode opposite
+/// to it pays `direction_reversal_cost_czk` in the plan choice, as a reversal inside the horizon.
+pub fn plan_from_direction(
+    blocks: &[PlanBlock],
+    soc_pct: f32,
+    tz: Tz,
+    battery: &BatteryParams,
+    params: &WinterReserveParams,
+    current: Option<PlanMode>,
+    direction: ForceDirection,
+) -> Plan {
+    plan_with_rule(
+        blocks, soc_pct, tz, battery, params, current, direction, KEEP_RULE,
+    )
 }
 
 /// How the forward pass compares a kept SelfUse/Hold mode with a switch to the other one.
@@ -954,15 +1090,17 @@ struct Horizon<'a> {
     blocks: &'a [PlanBlock],
     floors: &'a [f32],
     caps: &'a [f32],
-    values: &'a [Vec<f32>],
+    /// values[k][direction slot][grid point]
+    values: &'a [Vec<Vec<f32>>],
     grid: &'a [f32],
     modes: &'a [Vec<PlanMode>],
     battery: &'a BatteryParams,
     min_benefit: f32,
+    reversal_cost: f32,
 }
 
 impl Horizon<'_> {
-    fn step(&self, k: usize) -> DpStep<'_> {
+    fn step(&self, k: usize, direction: ForceDirection) -> DpStep<'_> {
         DpStep {
             block: &self.blocks[k],
             floor_kwh: self.floors[k],
@@ -970,6 +1108,8 @@ impl Horizon<'_> {
             battery: self.battery,
             grid: self.grid,
             next_values: &self.values[k + 1],
+            direction,
+            reversal_cost: self.reversal_cost,
         }
     }
 
@@ -978,12 +1118,14 @@ impl Horizon<'_> {
     /// in the other SelfUse/Hold mode; it ends where that plan returns to `kept`, leaves
     /// SelfUse/Hold, where `kept` is not allowed (not a candidate, or Hold in a PV block), or at
     /// the horizon end. The kept path runs `kept` through the run, then continues optimally.
+    /// SelfUse/Hold keep the force direction, so the whole run plans from `direction`.
     fn keep_run_extra_cost(
         &self,
         k: usize,
         energy_kwh: f32,
         kept: PlanMode,
         chosen: &(PlanMode, f32, BlockOutcome),
+        direction: ForceDirection,
     ) -> f32 {
         let n = self.blocks.len();
         let mut len = 0;
@@ -998,7 +1140,7 @@ impl Horizon<'_> {
             len += 1;
             if k + len < n {
                 cur = choose(
-                    &self.step(k + len),
+                    &self.step(k + len, direction),
                     &self.modes[k + len],
                     cur.2.energy_end_kwh,
                     self.min_benefit,
@@ -1018,7 +1160,12 @@ impl Horizon<'_> {
             cost += outcome_cost(&outcome, block, self.battery.wear_cost_czk_per_kwh);
             energy = outcome.energy_end_kwh;
         }
-        cost + interpolate(self.grid, &self.values[k + len], energy) - chosen.1
+        let next = &self.values[k + len];
+        cost + interpolate(
+            self.grid,
+            &next[direction_slot(next.len(), direction)],
+            energy,
+        ) - chosen.1
     }
 }
 
@@ -1050,6 +1197,7 @@ fn soc_grid(emin: f32, emax: f32, capacity: f32, resolution_pct: f32) -> Vec<f32
         .collect()
 }
 
+#[expect(clippy::too_many_arguments)]
 fn plan_with_rule(
     blocks: &[PlanBlock],
     soc_pct: f32,
@@ -1057,6 +1205,7 @@ fn plan_with_rule(
     battery: &BatteryParams,
     params: &WinterReserveParams,
     current: Option<PlanMode>,
+    start_direction: ForceDirection,
     rule: KeepRule,
 ) -> Plan {
     let n = blocks.len();
@@ -1103,16 +1252,37 @@ fn plan_with_rule(
 
     let grid = soc_grid(emin, emax, capacity, params.soc_resolution_pct);
 
-    // values[k][i] = V_k at grid[i]; values[n] is the terminal value.
+    // Candidate modes per block (`values` below holds the value tables).
     let mut all_modes: Vec<Vec<PlanMode>> = blocks
         .iter()
         .map(|b| candidate_modes(b, median_buy, cheap_ref, battery, params))
         .collect();
     house_from_grid_defaults(blocks, &mut all_modes);
-    let mut values: Vec<Vec<f32>> = vec![Vec::new(); n + 1];
+    // One value table per force direction when a reversal has a cost and can happen (a Charge and
+    // an Export candidate, or one opposite to the start direction). Otherwise the direction
+    // changes nothing and a single table gives the plan without the reversal cost.
+    let has = |mode: PlanMode| all_modes.iter().any(|m| m.contains(&mode));
+    let (has_charge, has_export) = (has(PlanMode::Charge), has(PlanMode::Export));
+    let reversal_possible = (has_charge
+        && (has_export || start_direction == ForceDirection::Exporting))
+        || (has_export && start_direction == ForceDirection::Charging);
+    let reversal_cost = if reversal_possible && params.direction_reversal_cost_czk > 0.0 {
+        params.direction_reversal_cost_czk
+    } else {
+        0.0
+    };
+    let directions: &[ForceDirection] = if reversal_cost > 0.0 {
+        &ForceDirection::TABLES
+    } else {
+        &[ForceDirection::None]
+    };
+    // values[k][slot][i] = V_k at grid[i] with the force direction of `slot` before block k;
+    // values[n] is the terminal value.
+    let mut values: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n + 1];
     // Leftover energy is worth its cost of charge (else a cheap purchase minus the wear).
     let terminal_price = terminal_price(battery, cheap_ref);
-    values[n] = grid.iter().map(|&e| -e * terminal_price).collect();
+    let terminal: Vec<f32> = grid.iter().map(|&e| -e * terminal_price).collect();
+    values[n] = vec![terminal; directions.len()];
     for (k, block) in blocks.iter().enumerate().rev() {
         let (current, later) = values.split_at_mut(k + 1);
         let modes = &all_modes[k];
@@ -1123,21 +1293,44 @@ fn plan_with_rule(
             battery,
             grid: &grid,
             next_values: &later[0],
+            direction: ForceDirection::None,
+            reversal_cost,
         };
-        current[k] = grid
-            .iter()
-            .map(|&e| {
-                choose(
-                    &dp,
-                    modes,
-                    e,
+        let mut tables = vec![Vec::with_capacity(grid.len()); directions.len()];
+        let mut forced: Vec<Option<f32>> = Vec::with_capacity(modes.len());
+        let mut evals: Vec<(PlanMode, f32, BlockOutcome)> = Vec::with_capacity(modes.len());
+        for &e in &grid {
+            // The block is simulated once; each direction differs only in the value after it.
+            // After a Charge or an Export that value is the same from every direction.
+            let costs = block_costs(&dp, modes, e);
+            forced.clear();
+            forced.extend(costs.iter().map(|&(mode, cost, outcome)| {
+                matches!(mode, PlanMode::Charge | PlanMode::Export)
+                    .then(|| cost + dp.future(ForceDirection::None.after(mode), &outcome))
+            }));
+            for (table, &direction) in tables.iter_mut().zip(directions) {
+                evals.clear();
+                evals.extend(
+                    costs
+                        .iter()
+                        .zip(&forced)
+                        .map(|(&(mode, cost, outcome), forced)| {
+                            let value = forced.unwrap_or_else(|| {
+                                cost + dp.future(direction.after(mode), &outcome)
+                            });
+                            (mode, dp.with_reversal(direction, mode, value), outcome)
+                        }),
+                );
+                let (_, value, _) = select_mode(
+                    &evals,
                     params.min_mode_benefit_czk,
                     params.mode_switch_min_benefit_czk,
                     None,
-                )
-                .1
-            })
-            .collect();
+                );
+                table.push(value);
+            }
+        }
+        current[k] = tables;
     }
 
     // Forward pass with the exact simulator, starting from the real live SOC. A SOC below Emin is
@@ -1154,11 +1347,30 @@ fn plan_with_rule(
         modes: &all_modes,
         battery,
         min_benefit: params.min_mode_benefit_czk,
+        reversal_cost,
     };
     let mut previous = current;
+    // With a reversal cost, a start with no direction plans from the table that values the start
+    // best (`ForceDirection::TABLES`); the direction then follows the planned force modes.
+    let mut direction = if directions.len() > 1 && start_direction == ForceDirection::None {
+        let start_value = |d: ForceDirection| {
+            interpolate(
+                &grid,
+                &values[0][direction_slot(directions.len(), d)],
+                energy,
+            )
+        };
+        if start_value(ForceDirection::Exporting) < start_value(ForceDirection::Charging) {
+            ForceDirection::Exporting
+        } else {
+            ForceDirection::Charging
+        }
+    } else {
+        start_direction
+    };
     for (k, block) in blocks.iter().enumerate() {
         let modes = &all_modes[k];
-        let dp = horizon.step(k);
+        let dp = horizon.step(k, direction);
         // Keep the applied mode in blocks without PV, or when it is SelfUse at any PV. The simulator
         // models Hold as never charging from PV, so a kept Hold could block real PV charging.
         // SelfUse charges from PV, so keeping it is safe.
@@ -1184,7 +1396,8 @@ fn plan_with_rule(
                         if kept.0 != chosen.0
                             && switch_only(kept.0)
                             && switch_only(chosen.0)
-                            && horizon.keep_run_extra_cost(k, energy, kept.0, &chosen)
+                            && horizon
+                                .keep_run_extra_cost(k, energy, kept.0, &chosen, direction)
                                 <= params.mode_switch_min_benefit_czk =>
                     {
                         *kept
@@ -1194,6 +1407,7 @@ fn plan_with_rule(
             }
         };
         previous = Some(mode);
+        direction = direction.after(mode);
         let cost = outcome_cost(&outcome, block, battery.wear_cost_czk_per_kwh);
         let soc_start_pct = soc_pct_of(energy, capacity);
         let soc_end_pct = soc_pct_of(outcome.energy_end_kwh, capacity);
@@ -1268,11 +1482,25 @@ struct PlanDumpBlock<'a> {
 #[derive(Serialize)]
 struct PlanDump<'a> {
     soc_pct: f32,
+    /// Mode of the previous head the replan kept to (`plan_from_direction`'s `current`)
+    current: Option<PlanMode>,
+    /// Force direction the replan started from (`plan_from_direction`'s `direction`)
+    start_direction: ForceDirection,
     blocks: Vec<PlanDumpBlock<'a>>,
 }
 
+/// A head replan with the inputs it started from besides the horizon and SOC, so it can be
+/// reproduced offline (`plan_from_direction(horizon, soc, tz, battery, params, current,
+/// start_direction)`)
+struct Replan {
+    plan: Plan,
+    current: Option<PlanMode>,
+    start_direction: ForceDirection,
+}
+
 /// One INFO line per head replan, and the full planner input as JSON to `LAST_PLAN_PATH`.
-fn log_replan(horizon: &[PlanBlock], plan: &Plan, soc_pct: f32, inputs: PlanInputs, tz: Tz) {
+fn log_replan(horizon: &[PlanBlock], replan: &Replan, soc_pct: f32, inputs: PlanInputs, tz: Tz) {
+    let plan = &replan.plan;
     let sum = |f: fn(&PlanBlock) -> f32| horizon.iter().map(f).sum::<f32>();
     let stamp = |b: &PlanBlock| b.start.format("%Y-%m-%dT%H:%MZ").to_string();
     let first_morning = horizon
@@ -1286,7 +1514,7 @@ fn log_replan(horizon: &[PlanBlock], plan: &Plan, soc_pct: f32, inputs: PlanInpu
         "WinterReserve horizon: n={} first={} last={} block_forecasts={} profile={} \
          load_expected_kwh={:.2} pv_expected_kwh={:.2} load_reserve_kwh={:.2} pv_reserve_kwh={:.2} \
          first_morning={first_morning} head_floor_kwh={:.2} head_mode={:?} soc_pct={soc_pct:.1} \
-         cautious_pv={}",
+         cautious_pv={} current={:?} start_direction={:?}",
         horizon.len(),
         stamp(&horizon[0]),
         stamp(&horizon[horizon.len() - 1]),
@@ -1299,25 +1527,34 @@ fn log_replan(horizon: &[PlanBlock], plan: &Plan, soc_pct: f32, inputs: PlanInpu
         head.floor_kwh,
         head.mode,
         cautious_pv_log(inputs.cautious_pv, inputs.cautious_any),
+        replan.current,
+        replan.start_direction,
     );
-    dump_last_plan(horizon, plan, soc_pct);
+    dump_last_plan(horizon, replan, soc_pct);
 }
 
-fn dump_last_plan(horizon: &[PlanBlock], plan: &Plan, soc_pct: f32) {
-    if !std::path::Path::new(LAST_PLAN_DIR).is_dir() {
-        return;
-    }
-    let dump = PlanDump {
+/// The planner input of a head replan as `LAST_PLAN_PATH` stores it.
+fn plan_dump<'a>(horizon: &'a [PlanBlock], replan: &Replan, soc_pct: f32) -> PlanDump<'a> {
+    PlanDump {
         soc_pct,
+        current: replan.current,
+        start_direction: replan.start_direction,
         blocks: horizon
             .iter()
-            .zip(&plan.blocks)
+            .zip(&replan.plan.blocks)
             .map(|(block, planned)| PlanDumpBlock {
                 block,
                 floor_kwh: planned.floor_kwh,
             })
             .collect(),
-    };
+    }
+}
+
+fn dump_last_plan(horizon: &[PlanBlock], replan: &Replan, soc_pct: f32) {
+    if !std::path::Path::new(LAST_PLAN_DIR).is_dir() {
+        return;
+    }
+    let dump = plan_dump(horizon, replan, soc_pct);
     let written = serde_json::to_string(&dump)
         .map_err(std::io::Error::other)
         .and_then(|json| {
@@ -1343,6 +1580,9 @@ struct CachedPlan {
     price_fingerprint: u64,
     /// Effective minimum SOC (%) the plan used; a change, such as the Back Up floor, replans
     min_soc_pct: f32,
+    /// Force direction after the plan's head block: the last Charge or Export the planner
+    /// applied, kept through SelfUse/Hold heads; the next replan starts from it
+    direction: ForceDirection,
 }
 
 /// The levers the planner reads. VPR and the kill switch are applied by execution, so they are
@@ -1413,6 +1653,33 @@ pub fn min_charge_kwh(max_charge_kw: f32, mode_change_interval_secs: u64) -> f32
     (max_charge_kw * mode_change_interval_secs as f32 / 3600.0).max(0.5)
 }
 
+/// The HOLD routing the planner uses: `control.hold_pv_to_battery`, except on the direct VPP path
+/// (the decided path, see [`crate::vpp::active_path`]; the option itself without a path state),
+/// which writes HOLD as VPP mode 7 (house from solar then grid, never the battery), so the default
+/// model applies. INFO once per `logged` flag when the option is overridden.
+pub fn planner_hold_pv_to_battery(
+    control: &ControlConfig,
+    path: Option<&crate::vpp::VppPathState>,
+    logged: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if !control.hold_pv_to_battery {
+        return false;
+    }
+    if crate::vpp::active_path(control, path) != crate::vpp::ActivePath::Vpp {
+        return true;
+    }
+    if !logged.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "HOLD planned with the default model (house from PV, surplus to the battery): control.hold_pv_to_battery is ignored on the direct VPP path, which runs HOLD as VPP mode 7"
+        );
+    }
+    false
+}
+
+/// The once-per-run flag of [`planner_hold_pv_to_battery`]'s INFO for the live planner
+static HOLD_ON_VPP_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Battery limits the live planner derives from the control configuration.
 pub fn battery_params(control: &ControlConfig) -> BatteryParams {
     let max_discharge_kw = control.max_battery_charge_rate_kw;
@@ -1428,9 +1695,12 @@ pub fn battery_params(control: &ControlConfig) -> BatteryParams {
         max_export_kw: control.maximum_export_power_w as f32 / 1000.0,
         export_guard_margin_kwh: mode_change_kwh.max(0.5),
         force_discharge_enabled: control.force_discharge_enabled,
-        // TODO(#648): force false (INFO once) when `control.vpp_direct_enabled`: direct VPP
-        // writes HOLD as mode 7, which runs the default model.
-        hold_pv_to_battery: control.hold_pv_to_battery,
+        // Off on the direct VPP path: HOLD runs as VPP mode 7, the default model
+        hold_pv_to_battery: planner_hold_pv_to_battery(
+            control,
+            crate::vpp::served_path().as_ref(),
+            &HOLD_ON_VPP_LOGGED,
+        ),
         min_charge_kwh: min_charge_kwh(
             control.max_battery_charge_rate_kw,
             control.min_mode_change_interval_secs,
@@ -1643,9 +1913,18 @@ impl WinterReserveStrategy {
         tz: Tz,
         battery: &BatteryParams,
         current: Option<PlanMode>,
+        direction: ForceDirection,
     ) -> Plan {
         self.plan_count.fetch_add(1, Ordering::Relaxed);
-        plan_from(horizon, soc_pct, tz, battery, &self.params, current)
+        plan_from_direction(
+            horizon,
+            soc_pct,
+            tz,
+            battery,
+            &self.params,
+            current,
+            direction,
+        )
     }
 
     /// Planned entry for `horizon[0]`. Head calls reuse or refresh the cache; projection
@@ -1661,7 +1940,7 @@ impl WinterReserveStrategy {
         battery: &BatteryParams,
         is_head: bool,
         fingerprint: u64,
-    ) -> (PlannedBlock, Option<Plan>) {
+    ) -> (PlannedBlock, Option<Replan>) {
         let first = horizon[0].start;
         let last = horizon[horizon.len() - 1].start;
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -1672,7 +1951,7 @@ impl WinterReserveStrategy {
                 .and_then(|c| c.plan.blocks.iter().find(|b| b.start == first))
                 .cloned();
             let entry = hit.unwrap_or_else(|| {
-                self.run_plan(horizon, soc_pct, tz, battery, None)
+                self.run_plan(horizon, soc_pct, tz, battery, None, ForceDirection::None)
                     .blocks
                     .swap_remove(0)
             });
@@ -1706,20 +1985,27 @@ impl WinterReserveStrategy {
 
         // The head mode of the last plan (not read from the inverter). Overrides such as the kill
         // switch, VPR or fixed slots leave it unchanged, so the plan stays stable under them.
-        let current = cache
+        let recent = cache
             .as_ref()
-            .filter(|c| now - c.planned_at <= Duration::minutes(REPLAN_MAX_AGE_MIN * 2))
-            .and_then(|c| c.plan.blocks.first())
-            .map(|b| b.mode);
-        let plan = self.run_plan(horizon, soc_pct, tz, battery, current);
+            .filter(|c| now - c.planned_at <= Duration::minutes(REPLAN_MAX_AGE_MIN * 2));
+        let current = recent.and_then(|c| c.plan.blocks.first()).map(|b| b.mode);
+        // The force direction comes from the same plan as `current`, kept through SelfUse/Hold
+        // heads, so a block projected after a reversal is decided the same way as head.
+        let direction = recent.map_or(ForceDirection::None, |c| c.direction);
+        let plan = self.run_plan(horizon, soc_pct, tz, battery, current, direction);
         let entry = plan.blocks[0].clone();
-        let replanned = plan.clone();
+        let replanned = Replan {
+            plan: plan.clone(),
+            current,
+            start_direction: direction,
+        };
         *cache = Some(CachedPlan {
             plan,
             planned_at: now,
             horizon_last_start: last,
             price_fingerprint: fingerprint,
             min_soc_pct: battery.min_soc_pct,
+            direction: direction.after(entry.mode),
         });
         (entry, Some(replanned))
     }
@@ -1747,7 +2033,7 @@ impl super::EconomicStrategy for WinterReserveStrategy {
         let fingerprint = price_fingerprint(&horizon, context.user_levers);
         let (entry, replanned) =
             self.entry_for(now, &horizon, live_soc, tz, &battery, is_head, fingerprint);
-        if let Some(plan) = &replanned {
+        if let Some(replan) = &replanned {
             let inputs = PlanInputs {
                 block_forecasts: context.block_forecasts.is_some(),
                 profile: context.hourly_consumption_profile.is_some(),
@@ -1761,7 +2047,7 @@ impl super::EconomicStrategy for WinterReserveStrategy {
                     )
                 }),
             };
-            log_replan(&horizon, plan, live_soc, inputs, tz);
+            log_replan(&horizon, replan, live_soc, inputs, tz);
         }
         let head = &horizon[0];
 
@@ -2021,6 +2307,50 @@ mod tests {
             assert!(approx(o.battery_charge_kwh, 0.0));
             assert!(approx(o.grid_import_kwh, 2.0));
         }
+    }
+
+    /// #648: on the direct VPP path HOLD runs as mode 7, so the option is ignored (the default
+    /// HOLD model), with one INFO; on the EEPROM path the option stands
+    #[test]
+    fn hold_pv_to_battery_is_off_on_the_direct_vpp_path() {
+        use crate::vpp::{ModePath, VppPathState};
+        use std::sync::atomic::AtomicBool;
+        let control = ControlConfig {
+            hold_pv_to_battery: true,
+            vpp_direct_enabled: true,
+            ..ControlConfig::default()
+        };
+        // The live planner params: no path registered, so the option decides (direct VPP)
+        assert!(!battery_params(&control).hold_pv_to_battery);
+        let direct = VppPathState::new(ModePath::Direct { no_mode8: vec![] });
+        let eeprom = VppPathState::new(ModePath::Eeprom("test".to_owned()));
+        let logged = AtomicBool::new(false);
+        let logs = crate::continuous_systems::levers_execution_tests::captured_logs(|| {
+            for _ in 0..3 {
+                assert!(!planner_hold_pv_to_battery(
+                    &control,
+                    Some(&direct),
+                    &logged
+                ));
+            }
+            assert!(!planner_hold_pv_to_battery(&control, None, &logged));
+        });
+        assert_eq!(
+            logs.matches("HOLD planned with the default model").count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains(" INFO "), "{logs}");
+        // The EEPROM path (decided, or the option off) keeps the option
+        let logged = AtomicBool::new(false);
+        assert!(planner_hold_pv_to_battery(&control, Some(&eeprom), &logged));
+        let off = ControlConfig {
+            vpp_direct_enabled: false,
+            ..control.clone()
+        };
+        assert!(planner_hold_pv_to_battery(&off, None, &logged));
+        assert!(battery_params(&off).hold_pv_to_battery);
+        assert!(!logged.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -2708,20 +3038,38 @@ mod tests {
                 pblock(i, buy, buy - 0.5, 0.6, pv)
             })
             .collect();
-        let start = std::time::Instant::now();
-        let p = plan(
-            &blocks,
-            50.0,
-            chrono_tz::Europe::Prague,
-            &battery(),
-            &WinterReserveParams::default(),
-        );
-        let elapsed = start.elapsed();
-        assert_eq!(p.blocks.len(), 192);
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "plan took {elapsed:?}"
-        );
+        // Without the reversal cost: one value table, the budget before it (200 ms). With it (the
+        // default 2.0, Charge and Export both possible here): two tables, about twice the work
+        // (2026-11-05, debug build: 116-204 ms against 56-128 ms before, single test run), so
+        // twice the budget.
+        for (cost, budget_ms) in [(0.0, 200), (2.0, 400)] {
+            let params = WinterReserveParams {
+                direction_reversal_cost_czk: cost,
+                ..WinterReserveParams::default()
+            };
+            // The fastest of 3 runs, so a loaded host (parallel test threads) does not fail it
+            // while a slower planner still does.
+            let fastest = (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let p = plan(
+                        &blocks,
+                        50.0,
+                        chrono_tz::Europe::Prague,
+                        &battery(),
+                        &params,
+                    );
+                    let elapsed = start.elapsed();
+                    assert_eq!(p.blocks.len(), 192);
+                    elapsed
+                })
+                .min()
+                .unwrap();
+            assert!(
+                fastest < std::time::Duration::from_millis(budget_ms),
+                "cost {cost}: fastest of 3 plans took {fastest:?}"
+            );
+        }
     }
 
     // ---- Wrapper ----
@@ -2837,7 +3185,14 @@ mod tests {
         let s = strategy();
         let horizon = s.horizon_blocks(&ctx(&blocks, 0, &ctl, 20.0));
         let battery = battery_params(&ctl);
-        let plan = s.run_plan(&horizon, 20.0, chrono_tz::UTC, &battery, None);
+        let plan = s.run_plan(
+            &horizon,
+            20.0,
+            chrono_tz::UTC,
+            &battery,
+            None,
+            ForceDirection::None,
+        );
         // No phantom start at the floor
         assert!(
             (plan.blocks[0].soc_start_pct - 20.0).abs() < 0.01,
@@ -2905,6 +3260,7 @@ mod tests {
     fn seed(s: &WinterReserveStrategy, blocks: &[TimeBlockPrice], entry: PlannedBlock) {
         let fingerprint =
             price_fingerprint(&s.horizon_blocks(&ctx(blocks, 0, &control(), 50.0)), None);
+        let direction = ForceDirection::of(Some(entry.mode));
         *s.cache.lock().unwrap() = Some(CachedPlan {
             plan: Plan {
                 blocks: vec![entry],
@@ -2916,6 +3272,7 @@ mod tests {
             horizon_last_start: blocks.last().unwrap().block_start,
             price_fingerprint: fingerprint,
             min_soc_pct: control().min_battery_soc,
+            direction,
         });
     }
 
@@ -4372,6 +4729,7 @@ mod keep_rule_tests {
             &b,
             &params,
             Some(PlanMode::Hold),
+            ForceDirection::None,
             KeepRule::PerBlock,
         );
         assert!(old.blocks.iter().all(|x| x.mode == PlanMode::Hold));
@@ -4595,7 +4953,16 @@ mod keep_rule_tests {
                     .collect();
                 let soc_now =
                     (energy + (end_energy - energy) * r as f32 / 3.0) / b.capacity_kwh * 100.0;
-                let plan = plan_with_rule(&horizon, soc_now, TZ, &b, params, current, rule);
+                let plan = plan_with_rule(
+                    &horizon,
+                    soc_now,
+                    TZ,
+                    &b,
+                    params,
+                    current,
+                    ForceDirection::of(current),
+                    rule,
+                );
                 let head = &plan.blocks[0];
                 current = Some(head.mode);
                 if r == 0 {
@@ -6135,7 +6502,14 @@ mod cautious_pv_tests {
                 PRAGUE,
                 cautious_pv,
             ));
-            let p = s.run_plan(&horizon, soc, PRAGUE, &battery, current);
+            let p = s.run_plan(
+                &horizon,
+                soc,
+                PRAGUE,
+                &battery,
+                current,
+                ForceDirection::of(current),
+            );
             let head = &p.blocks[0];
             if head.mode == PlanMode::Charge && blocks[i].effective_price_czk_per_kwh < 8.0 {
                 night_charge += head.outcome.battery_charge_kwh;
@@ -6248,5 +6622,483 @@ mod soc_bounds_tests {
         );
         assert_eq!(fine[0], 0.0);
         assert_eq!(*fine.last().unwrap(), 8.0);
+    }
+}
+
+/// Direction-reversal cost (owner 2026-11-05): no Charge/Export flip-flop, sell in the best
+/// contiguous blocks
+#[cfg(test)]
+mod reversal_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    const TZ: Tz = chrono_tz::Europe::Prague;
+    /// Owner site evening sell prices (spot − fee, CZK/kWh), 17:00-20:15 local, 2026-11-05 plan
+    const OWNER_EVENING_SELL: [f32; 14] = [
+        8.30, 8.38, 8.20, 8.05, 8.13, 8.60, 8.01, 8.75, 8.46, 8.28, 7.95, 8.10, 8.14, 7.89,
+    ];
+
+    /// Owner-like battery: 23 kWh, 10 kW charge, discharge and export, 25 % Back Up floor
+    fn owner_battery() -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 23.0,
+            min_soc_pct: 25.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 10.0,
+            max_discharge_kw: 10.0,
+            efficiency: 0.95,
+            wear_cost_czk_per_kwh: 0.1,
+            max_export_kw: 10.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: true,
+            hold_pv_to_battery: false,
+            min_charge_kwh: 0.5,
+            charge_cost_czk_per_kwh: None,
+        }
+    }
+
+    fn block_at(start: DateTime<Utc>, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
+        PlanBlock {
+            start,
+            duration_minutes: 15,
+            buy_czk: buy,
+            sell_czk: sell,
+            load_kwh: load,
+            pv_kwh: pv,
+            reserve_load_kwh: load,
+            reserve_pv_kwh: pv,
+            force_charge: false,
+            no_discharge: false,
+            force_charge_at_or_below_czk: None,
+            export_min_soc_pct: None,
+            export_allowed: true,
+        }
+    }
+
+    /// Fixed buy 3.22 all along. 17:00-20:15 local: the owner's evening sells. Then a night with no
+    /// load and sell 2.0 (no export pays, and selling below the end value never pays for a
+    /// charge), and a sunny morning, so the night closes and the floor stays at the 25 % minimum,
+    /// as on the owner's plan.
+    fn owner_evening() -> Vec<PlanBlock> {
+        // 2026-11-05 17:00 CET
+        let start = Utc.with_ymd_and_hms(2026, 11, 5, 16, 0, 0).unwrap();
+        (0..14 + 56 + 12)
+            .map(|i| {
+                let at = start + Duration::minutes(15 * i as i64);
+                if i < 14 {
+                    block_at(at, 3.22, OWNER_EVENING_SELL[i], 0.0, 0.0)
+                } else if i < 14 + 56 {
+                    block_at(at, 3.22, 2.0, 0.0, 0.0)
+                } else {
+                    block_at(at, 3.22, 2.0, 0.2, 1.0)
+                }
+            })
+            .collect()
+    }
+
+    fn params(cost: f32) -> WinterReserveParams {
+        WinterReserveParams {
+            direction_reversal_cost_czk: cost,
+            ..WinterReserveParams::default()
+        }
+    }
+
+    fn modes(plan: &Plan) -> Vec<PlanMode> {
+        plan.blocks.iter().map(|b| b.mode).collect()
+    }
+
+    /// Reversals of `modes` starting from `direction`
+    fn reversals(mut direction: ForceDirection, modes: &[PlanMode]) -> usize {
+        let mut count = 0;
+        for &mode in modes {
+            if direction.reversed_by(mode) {
+                count += 1;
+            }
+            direction = direction.after(mode);
+        }
+        count
+    }
+
+    fn letters(modes: &[PlanMode]) -> String {
+        modes
+            .iter()
+            .map(|m| match m {
+                PlanMode::SelfUse => 'S',
+                PlanMode::Charge => 'C',
+                PlanMode::Hold => 'H',
+                PlanMode::Export => 'E',
+                PlanMode::NoDischarge => 'N',
+            })
+            .collect()
+    }
+
+    /// Plan cost plus the energy left valued as the DP values it (`terminal_price`): what the
+    /// planner minimises, without the reversal cost
+    fn objective(plan: &Plan, battery: &BatteryParams) -> f32 {
+        let end = plan.blocks.last().map_or(0.0, |b| b.outcome.energy_end_kwh);
+        plan.expected_cost_czk - end * terminal_price(battery, plan.cheap_ref_czk)
+    }
+
+    /// Two spreads a day: cheap night (2.0) and midday (2.5) buys, morning (06-09, sell 9.0) and
+    /// evening (17-20, sell 10.0) peaks, from 00:00 local to a sunny 10:00 the next day
+    fn big_spread() -> Vec<PlanBlock> {
+        // 2026-11-06 00:00 CET
+        let start = Utc.with_ymd_and_hms(2026, 11, 5, 23, 0, 0).unwrap();
+        (0..136)
+            .map(|i| {
+                let at = start + Duration::minutes(15 * i as i64);
+                let hour = i / 4;
+                let (buy, sell) = match hour {
+                    0..5 => (2.0, 1.5),
+                    5 => (4.0, 3.5),
+                    6..9 => (7.0, 9.0),
+                    9..11 | 14..17 | 20..24 => (5.0, 4.0),
+                    11..14 => (2.5, 3.0),
+                    17..20 => (7.0, 10.0),
+                    _ => (4.0, 3.5),
+                };
+                let pv = if hour >= 32 { 1.0 } else { 0.0 };
+                block_at(at, buy, sell, 0.0, pv)
+            })
+            .collect()
+    }
+
+    /// Evening window of `owner_evening` (17:00-20:15 local)
+    const EVENING: usize = 14;
+
+    /// In every stretch of the evening without a Charge, the exported blocks are the dearest
+    /// ones: no block left unexported sells for more than an exported one (0.1 CZK/kWh slack,
+    /// the planner's `min_mode_benefit_czk` per block)
+    fn exports_take_the_best_sells(blocks: &[PlanBlock], modes: &[PlanMode]) -> Result<(), String> {
+        let mut start = 0;
+        while start < modes.len() {
+            let end = (start..modes.len())
+                .find(|&k| modes[k] == PlanMode::Charge)
+                .unwrap_or(modes.len());
+            let sells = |export: bool| {
+                (start..end)
+                    .filter(move |&k| (modes[k] == PlanMode::Export) == export)
+                    .map(|k| blocks[k].sell_czk)
+            };
+            let lowest_export = sells(true).fold(f32::INFINITY, f32::min);
+            let best_skipped = sells(false).fold(f32::NEG_INFINITY, f32::max);
+            if best_skipped > lowest_export + 0.1 {
+                return Err(format!(
+                    "blocks {start}..{end}: sell {best_skipped} skipped, {lowest_export} exported"
+                ));
+            }
+            start = end + 1;
+        }
+        Ok(())
+    }
+
+    /// Owner site 2026-11-05 (fixed buy 3.22, sell 7.9-8.9 all evening): today's planner (cost 0)
+    /// alternates Charge and Export in 15-minute blocks, `CECCCECEEECCEE` from 35 % SOC and
+    /// `EECCCECEEECCEE` from 46 % and 57 % (6-8 reversals; documented, not asserted). With the
+    /// default cost 2.0 the evening runs in contiguous blocks with at most 3 reversals, the plan
+    /// pays at least 2 CZK per reversal it keeps, and exports take the dearest blocks. From the
+    /// owner's 17:00 state (35 %, after the 15:30-16:45 export run) the plan is one charge run then
+    /// one export run.
+    #[test]
+    fn owner_evening_groups_charge_and_export_into_runs() {
+        let b = owner_battery();
+        let blocks = owner_evening();
+        for soc in [35.0, 46.0, 57.0] {
+            for direction in [ForceDirection::None, ForceDirection::Exporting] {
+                let free = plan_from_direction(&blocks, soc, TZ, &b, &params(0.0), None, direction);
+                let p = plan_from_direction(&blocks, soc, TZ, &b, &params(2.0), None, direction);
+                let m = modes(&p);
+                let evening = &m[..EVENING];
+                let (rev, rev_free) = (
+                    reversals(direction, evening),
+                    reversals(direction, &modes(&free)[..EVENING]),
+                );
+                let case = format!(
+                    "SOC {soc} from {direction:?}: {} (cost 0: {}, {rev_free} reversals)",
+                    letters(evening),
+                    letters(&modes(&free)[..EVENING]),
+                );
+                assert!(rev <= 3, "{case}");
+                assert!(rev < rev_free, "{case}");
+                // Each reversal it keeps buys at least the reversal cost (DP grid slack 0.1 CZK)
+                assert!(
+                    objective(&p, &b) + 2.0 * rev as f32
+                        <= objective(&free, &b) + 2.0 * rev_free as f32 + 0.1,
+                    "{case}: {} vs {}",
+                    objective(&p, &b),
+                    objective(&free, &b)
+                );
+                exports_take_the_best_sells(&blocks[..EVENING], evening)
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+                // The reversal cost steers the plan only: the plan cost is its blocks' cost
+                let block_sum: f32 = p.blocks.iter().map(|x| x.cost_czk).sum();
+                assert!((p.expected_cost_czk - block_sum).abs() < 1e-3, "{case}");
+            }
+        }
+        // The owner's state at 17:00: SOC 35 % after an export run
+        let p = plan_from(&blocks, 35.0, TZ, &b, &params(2.0), Some(PlanMode::Export));
+        let evening = letters(&modes(&p)[..EVENING]);
+        assert_eq!(evening, "ECCCCCCCEEEEEE");
+    }
+
+    /// Two spreads a day: the plan still charges at night, exports in the morning peak, charges
+    /// at midday and exports in the evening peak (3 reversals, each worth far more than 2 CZK),
+    /// and loses nothing against the plan without the reversal cost.
+    #[test]
+    fn big_spread_still_cycles_twice_a_day() {
+        let b = owner_battery();
+        let blocks = big_spread();
+        let free = plan(&blocks, 25.0, TZ, &b, &params(0.0));
+        let p = plan(&blocks, 25.0, TZ, &b, &params(2.0));
+        let m = modes(&p);
+        // Force runs in order, other modes skipped
+        let mut runs: Vec<PlanMode> = Vec::new();
+        for &mode in m
+            .iter()
+            .filter(|m| matches!(m, PlanMode::Charge | PlanMode::Export))
+        {
+            if runs.last() != Some(&mode) {
+                runs.push(mode);
+            }
+        }
+        use PlanMode::{Charge as C, Export as E};
+        assert_eq!(runs, vec![C, E, C, E], "{}", letters(&m));
+        let hour_of = |k: usize| k / 4;
+        for (k, &mode) in m.iter().enumerate() {
+            match mode {
+                C => assert!(
+                    matches!(hour_of(k), 0..5 | 11..14),
+                    "C at {k}: {}",
+                    letters(&m)
+                ),
+                E => assert!(
+                    matches!(hour_of(k), 6..9 | 17..20),
+                    "E at {k}: {}",
+                    letters(&m)
+                ),
+                _ => {}
+            }
+        }
+        let rev = reversals(ForceDirection::None, &m);
+        assert_eq!(rev, 3);
+        assert!(
+            objective(&p, &b) <= objective(&free, &b) + 2.0 * rev as f32,
+            "{} vs {}",
+            objective(&p, &b),
+            objective(&free, &b)
+        );
+    }
+
+    /// Cost 0 is today's planner: the plans below were printed by the planner before this change
+    /// (origin/legacy/winter-strategy 5071b009) for the same inputs and must stay identical.
+    #[test]
+    fn zero_cost_plans_match_the_planner_before_the_change() {
+        let b = owner_battery();
+        let night: String = "S".repeat(56 + 12);
+        let cases: [(f32, &str, f32); 3] = [
+            (35.0, "CECCCECEEECCEE", -88.149994),
+            (46.0, "EECCCECEEECCEE", -109.2549),
+            (57.0, "EECCCECEEECCEE", -116.69999),
+        ];
+        for (soc, evening, cost) in cases {
+            for current in [None, Some(PlanMode::Charge), Some(PlanMode::Export)] {
+                let p = plan_from(&owner_evening(), soc, TZ, &b, &params(0.0), current);
+                assert_eq!(
+                    letters(&modes(&p)),
+                    format!("{evening}{night}"),
+                    "{soc} {current:?}"
+                );
+                assert_eq!(p.expected_cost_czk, cost, "{soc} {current:?}");
+            }
+        }
+        let p = plan(&big_spread(), 25.0, TZ, &b, &params(0.0));
+        assert_eq!(
+            letters(&modes(&p)),
+            format!(
+                "{}{}",
+                "HHHHHHHHHHHHCCHCCCCCHHHHHHHHHEEEEEEEHHHHHHHHHHHHCCCCCCHCHHHHHHHHHHHHHHHHHEEEEEEE",
+                "S".repeat(56)
+            )
+        );
+        assert_eq!(p.expected_cost_czk, -233.79999);
+    }
+
+    /// One marginal charge (buy 6.5) that an export at 8.0 repays by about 2.5 CZK, from the
+    /// 25 % floor. Charge cost of the stored energy 4.0, so the export clears the profit gap.
+    fn marginal_charge() -> Vec<PlanBlock> {
+        let start = Utc.with_ymd_and_hms(2026, 11, 5, 16, 0, 0).unwrap();
+        (0..8 + 56 + 12)
+            .map(|i| {
+                let at = start + Duration::minutes(15 * i as i64);
+                match i {
+                    0 => block_at(at, 6.5, 5.0, 0.0, 0.0),
+                    1 | 2 => block_at(at, 9.0, 8.0, 0.0, 0.0),
+                    _ if i < 8 + 56 => block_at(at, 9.0, 2.0, 0.0, 0.0),
+                    _ => block_at(at, 9.0, 2.0, 0.2, 1.0),
+                }
+            })
+            .collect()
+    }
+
+    /// While the battery exports, a charge that gains less than two reversals (export, charge,
+    /// export) is not planned next. The direction comes from the applied mode, and from the last
+    /// force mode through a Hold head. From no direction, or with no reversal cost, the same
+    /// charge is planned, so the test is not vacuous.
+    #[test]
+    fn exporting_direction_blocks_a_marginal_charge() {
+        let b = BatteryParams {
+            charge_cost_czk_per_kwh: Some(4.0),
+            ..owner_battery()
+        };
+        let blocks = marginal_charge();
+        let head = |p: &Plan| p.blocks[0].mode;
+        let exporting = plan_from(&blocks, 25.0, TZ, &b, &params(2.0), Some(PlanMode::Export));
+        assert_ne!(
+            head(&exporting),
+            PlanMode::Charge,
+            "{}",
+            letters(&modes(&exporting))
+        );
+        assert!(!modes(&exporting).contains(&PlanMode::Charge));
+        let through_hold = plan_from_direction(
+            &blocks,
+            25.0,
+            TZ,
+            &b,
+            &params(2.0),
+            Some(PlanMode::Hold),
+            ForceDirection::Exporting,
+        );
+        assert_ne!(head(&through_hold), PlanMode::Charge);
+        // Not vacuous: no direction, or no cost, charges in block 0
+        let none = plan_from(&blocks, 25.0, TZ, &b, &params(2.0), Some(PlanMode::Hold));
+        assert_eq!(head(&none), PlanMode::Charge, "{}", letters(&modes(&none)));
+        let free = plan_from(&blocks, 25.0, TZ, &b, &params(0.0), Some(PlanMode::Export));
+        assert_eq!(head(&free), PlanMode::Charge);
+        assert!(
+            modes(&free)[1..3].contains(&PlanMode::Export),
+            "{}",
+            letters(&modes(&free))
+        );
+    }
+
+    #[test]
+    fn force_direction_follows_charge_and_export_only() {
+        use ForceDirection::{Charging, Exporting, None as NoDir};
+        assert_eq!(NoDir.after(PlanMode::Charge), Charging);
+        assert_eq!(Charging.after(PlanMode::Hold), Charging);
+        assert_eq!(Charging.after(PlanMode::SelfUse), Charging);
+        assert_eq!(Exporting.after(PlanMode::NoDischarge), Exporting);
+        assert!(Charging.reversed_by(PlanMode::Export));
+        assert!(Exporting.reversed_by(PlanMode::Charge));
+        assert!(!NoDir.reversed_by(PlanMode::Export));
+        assert!(!Charging.reversed_by(PlanMode::Charge));
+        // C, S, E is one reversal
+        assert_eq!(
+            reversals(
+                NoDir,
+                &[PlanMode::Charge, PlanMode::SelfUse, PlanMode::Export]
+            ),
+            1
+        );
+        assert_eq!(ForceDirection::of(Some(PlanMode::Export)), Exporting);
+        assert_eq!(ForceDirection::of(Some(PlanMode::Hold)), NoDir);
+        assert_eq!(
+            WinterReserveParams::default().direction_reversal_cost_czk,
+            2.0
+        );
+    }
+
+    /// The live cache path (`WinterReserveStrategy::entry_for`, as `evaluate` calls it on a head
+    /// block) on the `marginal_charge` horizon at 16:00 UTC, replanned at 16:05
+    fn replan_head(s: &WinterReserveStrategy, battery: &BatteryParams) -> (PlanMode, Replan) {
+        let now = Utc.with_ymd_and_hms(2026, 11, 5, 16, 5, 0).unwrap();
+        let (entry, replan) = s.entry_for(now, &marginal_charge(), 25.0, TZ, battery, true, 1);
+        (entry.mode, replan.expect("a head replan"))
+    }
+
+    fn strategy(cost: f32) -> WinterReserveStrategy {
+        WinterReserveStrategy::new(true, params(cost))
+    }
+
+    /// Review r1 item 1: the force direction the live strategy carries from one head replan to
+    /// the next, through `CachedPlan.direction`.
+    #[test]
+    fn strategy_cache_carries_the_export_direction_into_the_next_replan() {
+        let b = BatteryParams {
+            charge_cost_czk_per_kwh: Some(4.0),
+            ..owner_battery()
+        };
+        // (a) The previous head replan (15:45 block, SOC 35 %) exports at 9.0; the next one must
+        // not plan the marginal charge.
+        let s = strategy(2.0);
+        let t0 = Utc.with_ymd_and_hms(2026, 11, 5, 15, 50, 0).unwrap();
+        let mut previous = vec![block_at(t0 - Duration::minutes(5), 9.0, 9.0, 0.0, 0.0)];
+        previous.extend(marginal_charge());
+        let (head, first) = s.entry_for(t0, &previous, 35.0, TZ, &b, true, 0);
+        assert_eq!(
+            head.mode,
+            PlanMode::Export,
+            "{}",
+            letters(&modes(&first.unwrap().plan))
+        );
+        let (mode, replan) = replan_head(&s, &b);
+        assert_ne!(mode, PlanMode::Charge, "{}", letters(&modes(&replan.plan)));
+        assert_eq!(replan.start_direction, ForceDirection::Exporting);
+        assert_eq!(replan.current, Some(PlanMode::Export));
+
+        // (b) The previous head is a Hold after an export: the direction is still Exporting.
+        let s = strategy(2.0);
+        let hold = PlannedBlock {
+            start: t0 - Duration::minutes(5),
+            mode: PlanMode::Hold,
+            soc_start_pct: 25.0,
+            soc_end_pct: 25.0,
+            floor_kwh: 5.75,
+            charge_cap_kwh: 23.0,
+            outcome: BlockOutcome::default(),
+            cost_czk: 0.0,
+            reason: "WinterReserve TEST".into(),
+        };
+        *s.cache.lock().unwrap() = Some(CachedPlan {
+            plan: Plan {
+                blocks: vec![hold],
+                cheap_ref_czk: 9.0,
+                median_buy_czk: 9.0,
+                expected_cost_czk: 0.0,
+            },
+            planned_at: t0,
+            horizon_last_start: t0,
+            price_fingerprint: 0,
+            min_soc_pct: b.min_soc_pct,
+            direction: ForceDirection::Exporting,
+        });
+        let (mode, replan) = replan_head(&s, &b);
+        assert_ne!(mode, PlanMode::Charge, "{}", letters(&modes(&replan.plan)));
+        assert_eq!(replan.current, Some(PlanMode::Hold));
+        assert_eq!(replan.start_direction, ForceDirection::Exporting);
+
+        // (c) Controls: no cached plan, or no reversal cost after the same export, charges.
+        let (mode, replan) = replan_head(&strategy(2.0), &b);
+        assert_eq!(replan.start_direction, ForceDirection::None);
+        assert_eq!(mode, PlanMode::Charge);
+        let s = strategy(0.0);
+        s.entry_for(t0, &previous, 35.0, TZ, &b, true, 0);
+        assert_eq!(replan_head(&s, &b).0, PlanMode::Charge);
+    }
+
+    /// Review r1 item 2: the plan dump records the inputs a replan started from.
+    #[test]
+    fn plan_dump_records_current_and_start_direction() {
+        let horizon = marginal_charge();
+        let replan = Replan {
+            plan: plan(&horizon, 25.0, TZ, &owner_battery(), &params(2.0)),
+            current: Some(PlanMode::Hold),
+            start_direction: ForceDirection::Exporting,
+        };
+        let json = serde_json::to_value(plan_dump(&horizon, &replan, 25.0)).unwrap();
+        assert_eq!(json["current"], "Hold");
+        assert_eq!(json["start_direction"], "Exporting");
+        assert_eq!(json["blocks"].as_array().unwrap().len(), horizon.len());
     }
 }

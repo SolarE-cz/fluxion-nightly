@@ -10,6 +10,34 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.74] - 2026-11-05
+
+### Added
+
+- Direct VPP mode control for SolaX, **on by default** (`control.vpp_direct_enabled: true`): every block mode and export curtailment go through the volatile direct VPP remote control, re-sent every cycle and read back; the basic work mode (Self Use / Back Up) is the only EEPROM write. The EEPROM mode writes are the automatic fallback when the startup preconditions fail (solax-modbus older than 2026.10.01, direct entities missing, target set type not "Set", non-SolaX inverter), logged once as a WARN with the reason; `/api/config` shows the active path in `control.vpp_direct_path`. **To opt out**, set `control.vpp_direct_enabled: false` in the add-on configuration (restarts the add-on): FluxION then writes modes exactly as before.
+- Direct VPP on parallel (master/slave) sites, no opt-in: commands go to the master only, the slaves follow it; push power is the system total (measured on an X3-Ultra pair).
+- Direct VPP startup check (owner ruling 2026-10-28): one complete read decides, retried every 10 s for up to 120 s with no mode written meanwhile; without one the EEPROM mode writes run and a later good read switches to direct VPP once. The solax-modbus version comes from `update.solax_inverter_modbus_update` (or any update entity naming solax and modbus) and fails closed when missing, old or unparsable.
+- Direct VPP Feed-in and Force Discharge in two regimes (mode 8): PV uncapped with the battery filling export up to the cap (push = cap + house load − PV from a noise-aware estimate: a significant PV rise is projected over the read-back lag, a decrease of 100 W or more over the cap is written at once, and a band keeps read noise from writing), and, once PV alone reaches cap + house load, PV capped there with push 0 (the curtailment controller). A command that lowers export is written at once, even within the 20 s write gap. A switch between the two regimes writes the PV limit before the push both ways. Without mode 8 the same push runs on mode 4.
+- Direct VPP: a startup check that ran in debug mode (at start or while pending) leaves the target set type unverified; it is set to "Set" before the first VPP command once debug is off, or the EEPROM mode writes run (WARN). A transient error of that check, or an unreadable VPP read-back during it, is retried every 10 s; still unverified 120 s after the first check, the EEPROM mode writes run for the rest of the run (ERROR). A kill switch turned on while the check holds the inverter keeps its mode 0: sent before that fall-back, or with the default mode once the check passes. With several controlled masters each is verified on its own. The startup window is enforced by wall clock, and the 60 s retries read only the entities they need (an update entity matched by its title included).
+- Kill switch already on at start: no basic work mode write on either path (direct VPP: mode 0 once for a live command, waiting for a known read-back and a pending target set type check; EEPROM path: no mode write until the switch is turned off).
+- Winter Reserve direction-reversal cost: `strategies.winter_reserve.direction_reversal_cost_czk`
+  (default 2.0 CZK, 0 = off). A grid Charge after an Export, or an Export after a grid Charge (with
+  any Self-Use or Hold blocks between them), must gain at least this much more than a plan without
+  the reversal, so charge and export run in contiguous blocks instead of alternating every 15 minutes
+  (owner 2026-11-05: 17 EEPROM mode writes in one evening on fixed buy 3.22 and sell 7.9–8.9). It
+  steers the plan only and is never counted in the plan cost or profit. A delta, not a price
+  threshold. Add-on-only: the add-on value applies over a saved web UI config.
+- Inverters without mode 8 (X3-Ultra) are detected at startup and run VPP modes 1–7: force modes and Feed-in as mode 4, Hold mode 7; an export curtailment that needs mode 8 uses the export limit instead. `control.vpp_direct_path` shows "direct VPP (modes 1-7, no mode 8: <inverter>)".
+
+### Changed
+
+- `control.hold_pv_to_battery` is ignored when the run uses direct VPP control, which runs HOLD as
+  mode 7 (INFO once).
+- Stale inverter state on the direct VPP path: the end is VPP mode 0, then the default work mode
+  only when the inverter's work mode (last read) differs; no VPP command is renewed on stale data (a
+  Feed-in or curtailment mode 8 lapses by its 3 min duration). The stale window, the direct VPP
+  startup read window and the lever sync wait are one 120 s constant.
+
 ## [0.2.73] - 2026-11-03
 
 ### Security

@@ -272,6 +272,25 @@ pub struct ControlConfig {
     /// write. Planning and the dashboard keep running. Default: true
     #[serde(default = "default_true")]
     pub mode_control_enabled: bool,
+
+    /// SolaX only: drive every block mode and export curtailment through the direct VPP remote
+    /// control (volatile, re-sent every cycle). The only EEPROM write left is the basic work mode
+    /// (Self Use or Back Up, from the user's default mode). Fixed for the add-on's run.
+    /// Default: true. The per-block work mode and export limit writes (EEPROM) run when it is
+    /// false, and as the automatic fallback when the startup preconditions fail.
+    #[serde(default = "default_true")]
+    pub vpp_direct_enabled: bool,
+
+    /// The mode path this run uses ("direct VPP" or "EEPROM mode writes (<reason>)"), set at
+    /// startup; shown in `/api/config`, never read from a config file
+    #[serde(default, skip_deserializing)]
+    pub vpp_direct_path: Option<String>,
+
+    /// Inverters without the mode 8 entities (the Ultra, GEN5; owner direction D5), set at
+    /// startup: direct VPP runs modes 1–7 there and curtails by the export limit when mode 8 is
+    /// needed. Never read from a config file
+    #[serde(default, skip_deserializing)]
+    pub vpp_no_mode8: Vec<String>,
 }
 
 // Default value functions for serde
@@ -364,6 +383,9 @@ impl Default for ControlConfig {
             hot_standby_entity: None,
             ensure_hot_standby: true,
             mode_control_enabled: true,
+            vpp_direct_enabled: true,
+            vpp_direct_path: None,
+            vpp_no_mode8: Vec::new(),
         }
     }
 }
@@ -1100,6 +1122,12 @@ pub struct WinterReserveConfigCore {
     /// blocks the switch is made for (default: 1.0)
     #[serde(default = "default_wr_mode_switch_min_benefit")]
     pub mode_switch_min_benefit_czk: f32,
+    /// Planning cost (CZK) of reversing the force direction: a grid Charge after an Export, or an
+    /// Export after a grid Charge, with any SelfUse/Hold blocks between them. It steers the plan
+    /// into contiguous charge and export runs and is never counted in the plan cost. A delta, not a
+    /// price threshold; 0 = off (default: 2.0)
+    #[serde(default = "default_wr_direction_reversal_cost")]
+    pub direction_reversal_cost_czk: f32,
     /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
     #[serde(default = "default_wr_soc_resolution_pct")]
     pub soc_resolution_pct: f32,
@@ -1149,6 +1177,9 @@ fn default_wr_min_mode_benefit() -> f32 {
 fn default_wr_mode_switch_min_benefit() -> f32 {
     1.0
 }
+fn default_wr_direction_reversal_cost() -> f32 {
+    2.0
+}
 fn default_wr_soc_resolution_pct() -> f32 {
     0.5
 }
@@ -1174,6 +1205,7 @@ impl Default for WinterReserveConfigCore {
             pv_confidence: default_wr_pv_confidence(),
             min_mode_benefit_czk: default_wr_min_mode_benefit(),
             mode_switch_min_benefit_czk: default_wr_mode_switch_min_benefit(),
+            direction_reversal_cost_czk: default_wr_direction_reversal_cost(),
             soc_resolution_pct: default_wr_soc_resolution_pct(),
             export_floor_until_cheap: false,
             cautious_pv_mae_pct: default_wr_cautious_pv_mae_pct(),

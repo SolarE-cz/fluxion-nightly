@@ -23,8 +23,8 @@ use crate::components::{
 };
 use crate::savings::RecordedBlock;
 use crate::strategy::winter_reserve::{
-    BatteryParams, BlockOutcome, PlanBlock, PlanMode, WinterReserveParams, cautious_pv_at,
-    cheap_reference, export_guard_holds, plan_from, simulate_block,
+    BatteryParams, BlockOutcome, ForceDirection, PlanBlock, PlanMode, WinterReserveParams,
+    cautious_pv_at, cheap_reference, export_guard_holds, plan_from_direction, simulate_block,
 };
 use crate::traits::HistoryDataPoint;
 
@@ -410,6 +410,8 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
     let mut cost_basis: Option<BatteryCostBasis> = None;
     // Mode applied to the previous block: the planner keeps it while it is within the benefit
     let mut applied: Option<PlanMode> = None;
+    // Last force direction (Charge or Export) of the planned heads, as the live plan cache keeps it
+    let mut direction = ForceDirection::None;
     // The live profile depends only on the day: build it once per day.
     let mut profiles: HashMap<NaiveDate, Option<HourlyConsumptionProfile>> = HashMap::new();
     let mut last_day: Option<NaiveDate> = None;
@@ -556,13 +558,22 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                 });
                 plan_battery.charge_cost_czk_per_kwh = basis.cost_czk_per_kwh;
             }
-            let result = plan_from(&horizon, soc_now, tz, &plan_battery, params, applied);
+            let result = plan_from_direction(
+                &horizon,
+                soc_now,
+                tz,
+                &plan_battery,
+                params,
+                applied,
+                direction,
+            );
             let first = result
                 .blocks
                 .first()
                 .ok_or("planner returned an empty plan")?;
             planned_blocks += 1;
             applied = Some(first.mode);
+            direction = direction.after(first.mode);
             // The live head guard: an Export at the night floor runs as SelfUse
             let live_kwh = soc_now / 100.0 * plan_battery.capacity_kwh;
             if first.mode == PlanMode::Export

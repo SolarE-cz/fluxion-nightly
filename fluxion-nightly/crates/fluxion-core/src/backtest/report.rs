@@ -31,6 +31,7 @@ pub fn winter_reserve_params(config: &WinterReserveConfigCore) -> WinterReserveP
         pv_confidence: config.pv_confidence,
         min_mode_benefit_czk: config.min_mode_benefit_czk,
         mode_switch_min_benefit_czk: config.mode_switch_min_benefit_czk,
+        direction_reversal_cost_czk: config.direction_reversal_cost_czk,
         soc_resolution_pct: config.soc_resolution_pct,
         export_floor_until_cheap: config.export_floor_until_cheap,
         cautious_pv_fallback_months: config.cautious_pv_fallback_months.clone(),

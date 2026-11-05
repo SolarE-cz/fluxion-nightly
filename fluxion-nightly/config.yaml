@@ -40,6 +40,7 @@ options:
     min_battery_soc: 10
     mode_control_enabled: true
     planner_load_margin: 1.1
+    vpp_direct_enabled: true
   history:
     consumption_entity: ''
     house_load_power_entity: ''
@@ -216,6 +217,7 @@ options:
       cautious_pv_mae_pct: 25.0
       cautious_pv_off_pct: 20.0
       cheap_percentile: 0.2
+      direction_reversal_cost_czk: 2.0
       enabled: true
       export_floor_until_cheap: false
       insane_price_multiplier: 3.0
@@ -256,6 +258,7 @@ schema:
     min_battery_soc: float(0,100)?
     mode_control_enabled: bool?
     planner_load_margin: float(1.0,1.5)?
+    vpp_direct_enabled: bool?
   history:
     consumption_entity: str?
     house_load_power_entity: str?
@@ -486,6 +489,7 @@ schema:
       cautious_pv_mae_pct: float(0,100)?
       cautious_pv_off_pct: float(0,100)?
       cheap_percentile: float(0,0.5)?
+      direction_reversal_cost_czk: float(0,)?
       enabled: bool?
       export_floor_until_cheap: bool?
       insane_price_multiplier: float(0,10)?
@@ -505,4 +509,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.73
+version: 0.2.74

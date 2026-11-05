@@ -186,4 +186,15 @@ pub enum InverterCommand {
 
     /// Set Back Up Mode after the inverter's backup minimum SOC (%) is in place (brief H19)
     SetBackupMode { min_soc_pct: u8 },
+
+    /// Direct VPP remote-control command (volatile, `control.vpp_direct_enabled`)
+    SetVpp(crate::vpp::VppCommand),
+
+    /// Sync only the inverter's Back Up minimum SOC (%), no work mode write (direct VPP keeps
+    /// the basic work mode and writes it only when it differs)
+    SetBackupMinSoc { min_soc_pct: u8 },
+
+    /// Direct VPP: set both target-set-type selects to "Set" while the power control reads
+    /// Disabled; an error when that is not possible (after debug mode, R4-3)
+    EnsureVppTargetSetType,
 }

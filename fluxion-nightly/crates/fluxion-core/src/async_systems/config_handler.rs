@@ -111,13 +111,32 @@ pub struct ConfigEventParams<'w, 's> {
     warmup_log: Local<'s, LearningWarmupLog>,
 }
 
-/// Keep `control.mode_control_enabled` of the running config in `new` (brief H37): the inverter
-/// adapter takes it at startup, so the executor and the guards must not see a different value.
-/// Returns true when `new` asked for a change.
+/// Names of the add-on options fixed for the run that `new` changes from `running` (brief H37):
+/// `control.mode_control_enabled` and `control.vpp_direct_enabled`
+fn fixed_control_keys_changed(running: &SystemConfig, new: &SystemConfig) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if new.control_config.mode_control_enabled != running.control_config.mode_control_enabled {
+        changed.push("control.mode_control_enabled");
+    }
+    if new.control_config.vpp_direct_enabled != running.control_config.vpp_direct_enabled {
+        changed.push("control.vpp_direct_enabled");
+    }
+    changed
+}
+
+/// Keep `control.mode_control_enabled` and `control.vpp_direct_enabled` of the running config in
+/// `new` (brief H37): the inverter adapter takes them at startup, so the executor and the guards
+/// must not see a different value. Returns true when `new` asked for a change.
 pub fn keep_running_mode_control(running: &SystemConfig, new: &mut SystemConfig) -> bool {
-    let keep = running.control_config.mode_control_enabled;
-    let changed = new.control_config.mode_control_enabled != keep;
-    new.control_config.mode_control_enabled = keep;
+    let changed = !fixed_control_keys_changed(running, new).is_empty();
+    new.control_config.mode_control_enabled = running.control_config.mode_control_enabled;
+    new.control_config.vpp_direct_enabled = running.control_config.vpp_direct_enabled;
+    new.control_config
+        .vpp_direct_path
+        .clone_from(&running.control_config.vpp_direct_path);
+    new.control_config
+        .vpp_no_mode8
+        .clone_from(&running.control_config.vpp_no_mode8);
     changed
 }
 
@@ -171,10 +190,11 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
 
         // Mode control stays as started (brief H37): the adapter took it at startup
         let mut new_config = new_config;
+        let refused = fixed_control_keys_changed(&params.system_config, &new_config);
         if keep_running_mode_control(&params.system_config, &mut new_config) {
             error!(
-                "control.mode_control_enabled cannot change at runtime; keeping {} until the add-on restarts",
-                params.system_config.control_config.mode_control_enabled
+                "{} cannot change at runtime; keeping the running value until the add-on restarts",
+                refused.join(", ")
             );
         }
 

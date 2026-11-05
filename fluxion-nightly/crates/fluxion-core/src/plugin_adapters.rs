@@ -451,6 +451,7 @@ pub fn init_plugin_manager(
         pv_confidence: wr_core.pv_confidence,
         min_mode_benefit_czk: wr_core.min_mode_benefit_czk,
         mode_switch_min_benefit_czk: wr_core.mode_switch_min_benefit_czk,
+        direction_reversal_cost_czk: wr_core.direction_reversal_cost_czk,
         soc_resolution_pct: wr_core.soc_resolution_pct,
         export_floor_until_cheap: wr_core.export_floor_until_cheap,
         cautious_pv_fallback_months: wr_core.cautious_pv_fallback_months.clone(),

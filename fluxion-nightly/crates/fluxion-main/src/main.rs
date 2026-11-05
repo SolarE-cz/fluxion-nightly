@@ -74,6 +74,137 @@ fn main() -> Result<()> {
     })
 }
 
+/// Decide the direct VPP mode path of this run into `state` (owner directions D1, D5, N2):
+/// direct VPP by default, the EEPROM mode writes when the option is off or as the automatic
+/// fallback. A path the config already fixes (option or mode control off, a non-SolaX inverter)
+/// is set at once; otherwise the startup check runs in the background with its 120 s window and
+/// no mode is written until it decides.
+fn start_vpp_path_decision(
+    runtime: &tokio::runtime::Handle,
+    client: Arc<fluxion_adapters::HomeAssistantClient>,
+    config: &config::AppConfig,
+    state: fluxion_core::vpp::VppPathState,
+) {
+    let inverters: Vec<fluxion_adapters::ha::vpp::VppInverter> = config
+        .inverters
+        .iter()
+        .filter(|inv| inv.topology != "slave")
+        .map(|inv| fluxion_adapters::ha::vpp::VppInverter {
+            id: inv.id.clone(),
+            control_prefix: inv.control_prefix_override().unwrap_or(&inv.id).to_owned(),
+            solax: matches!(
+                inv.inverter_type,
+                fluxion_core::InverterType::Solax | fluxion_core::InverterType::SolaxUltra
+            ),
+        })
+        .collect();
+    let enabled = config.control.vpp_direct_enabled;
+    let mode_control = config.control.mode_control_enabled;
+    // The live debug flag: kept current by the VPP system, read by each check (R5-2)
+    state.set_debug(config.system.debug_mode);
+    if !enabled || !mode_control {
+        let reason = if enabled {
+            "mode control off: no mode writes"
+        } else {
+            "control.vpp_direct_enabled = false"
+        };
+        info!("Mode path: EEPROM mode writes ({reason})");
+        state.set(fluxion_core::vpp::ModePath::Eeprom(reason.to_owned()));
+        return;
+    }
+    if config.inverters.iter().any(|inv| inv.topology == "master") {
+        info!(
+            "Parallel site: direct VPP commands go to the master only (the slaves follow it); push power is the system total"
+        );
+    }
+    info!(
+        "Direct VPP startup check: no mode writes until it decides (retry every {} s, EEPROM after {} s)",
+        fluxion_core::vpp::STARTUP_RETRY_SECS,
+        fluxion_core::vpp::STARTUP_READ_WINDOW_SECS
+    );
+    let updates = Arc::new(fluxion_adapters::ha::vpp::UpdateIds::default());
+    let path = state.clone();
+    runtime.spawn(fluxion_adapters::ha::vpp::decide_path(state, move |full| {
+        let client = client.clone();
+        let inverters = inverters.clone();
+        let updates = updates.clone();
+        let path = path.clone();
+        async move {
+            fluxion_adapters::ha::vpp::live_attempt(
+                &client,
+                enabled,
+                mode_control,
+                &inverters,
+                &path,
+                full,
+                &updates,
+            )
+            .await
+        }
+    }));
+}
+
+/// Wait for SIGTERM or SIGINT; then, when a direct VPP command may be live, write mode 0 to each
+/// controlled inverter (10 s at most) and exit.
+async fn vpp_exit_on_shutdown(
+    source: Arc<dyn fluxion_core::InverterDataSource>,
+    inverters: Vec<String>,
+    live: fluxion_core::vpp::VppLive,
+) {
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                warn!("Cannot listen for SIGTERM: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        () = terminate => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    // Stop the VPP system's writes, then end each live command with a mode 0 queued behind
+    // that inverter's write in flight (queued keep-alives are dropped); 10 s budget
+    live.stop();
+    let live_inverters: Vec<String> = live
+        .live_inverters()
+        .into_iter()
+        .filter(|id| inverters.contains(id))
+        .collect();
+    if live_inverters.is_empty() {
+        info!("🛑 Shutdown: no direct VPP command live");
+    } else {
+        info!("🛑 Shutdown: direct VPP mode 0 (basic work mode) before exit");
+        let command = fluxion_core::InverterCommand::SetVpp(fluxion_core::vpp::VppCommand::Exit);
+        let writes = async {
+            for id in &live_inverters {
+                match live.writer() {
+                    Some(writer) => {
+                        let _ = writer.write_vpp_and_wait(id.clone(), command.clone()).await;
+                    }
+                    None => {
+                        if let Err(e) = source.write_command(id, &command).await {
+                            tracing::error!("❌ Direct VPP mode 0 for {} failed: {e:#}", id);
+                        }
+                    }
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(10), writes)
+            .await
+            .is_err()
+        {
+            tracing::error!("❌ Direct VPP mode 0 at shutdown timed out");
+        } else {
+            info!("✅ Direct VPP mode 0 sent to {:?}", live_inverters);
+        }
+    }
+    std::process::exit(0);
+}
+
 /// What the backtest reads: the live entity ids (the controlled inverter, never a slave; PV adds
 /// `pv_extra_prefixes`), prices, control and Winter Reserve settings. `Err` says what is missing.
 fn backtest_site(
@@ -305,6 +436,17 @@ fn initialize_and_run() -> Result<()> {
         mapper.vendor_name().display_name()
     );
 
+    // Mode path (control.vpp_direct_enabled, default on): decided in the background into the
+    // run's state; the config keeps the user's value (N8)
+    let vpp_path = fluxion_core::vpp::VppPathState::default();
+    fluxion_core::vpp::register_served_path(vpp_path.clone());
+    start_vpp_path_decision(
+        &runtime_handle,
+        ha_client.clone(),
+        &config,
+        vpp_path.clone(),
+    );
+
     // Create data sources
     let actuation_guard = fluxion_adapters::ha::actuation::ActuationGuardConfig {
         auto_unlock: config.control.auto_unlock_inverter,
@@ -342,12 +484,31 @@ fn initialize_and_run() -> Result<()> {
     let inverter_adapter = HomeAssistantInverterAdapter::new(ha_client.clone(), mapper)
         .with_guard(actuation_guard)
         .with_pv_extra_prefixes(pv_extra_prefixes)
-        .with_battery_soc_weights(battery_soc_weights);
+        .with_battery_soc_weights(battery_soc_weights)
+        // The VPP read-back is read whenever direct VPP may run (the path can switch to it)
+        .with_vpp_direct(config.control.vpp_direct_enabled && config.control.mode_control_enabled);
     // Shared with the pre-wake system, so both use one awaken rate limit
     let actuation_state =
         fluxion_adapters::ha::actuation::ActuationStateResource(inverter_adapter.actuation_state());
     let inverter_source: Arc<dyn fluxion_core::InverterDataSource> = Arc::new(inverter_adapter);
     info!("🔌 Inverter data source: {}", inverter_source.name());
+
+    // Direct VPP: on SIGTERM/SIGINT a live command is ended with mode 0 before the process exits
+    // (modes 4-7 would otherwise lapse to mode 6 and stay there)
+    let vpp_live = fluxion_core::vpp::VppLive::default();
+    if config.control.vpp_direct_enabled && config.control.mode_control_enabled {
+        let controlled: Vec<String> = config
+            .inverters
+            .iter()
+            .filter(|inv| inv.topology != "slave")
+            .map(|inv| inv.id.clone())
+            .collect();
+        runtime_handle.spawn(vpp_exit_on_shutdown(
+            inverter_source.clone(),
+            controlled,
+            vpp_live.clone(),
+        ));
+    }
 
     // Create spot price adapter (always create, but may not be used)
     let spot_adapter = if let Some(tomorrow_entity) = &config.pricing.tomorrow_price_entity {
@@ -634,6 +795,8 @@ fn initialize_and_run() -> Result<()> {
         .insert_resource(fluxion_core::InverterDataSourceResource(inverter_source))
         .insert_resource(fluxion_core::PriceDataSourceResource(price_source))
         .insert_resource(price_feed_status)
+        .insert_resource(vpp_live)
+        .insert_resource(vpp_path)
         .insert_resource(fluxion_core::ConsumptionHistoryDataSourceResource(
             history_source,
         ))
