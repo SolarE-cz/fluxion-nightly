@@ -1,0 +1,224 @@
+---
+configuration:
+  debug_mode:
+    name: Debug Mode
+    description: >-
+      Enable debug mode to test FluxION without actually controlling your
+      inverters. Recommended for initial setup and testing.
+  log_level:
+    name: Log Level
+    description: The amount of logging the add-on should produce.
+  trusted_peers:
+    name: Trusted Peers
+    description: >-
+      Comma-separated IP addresses allowed to call FluxION besides the Home Assistant ingress proxy. Leave empty.
+  inverters:
+    name: Inverters
+    description: Configure your solar inverters.
+  id:
+    name: Inverter ID
+    description: Unique identifier for this inverter.
+  vendor:
+    name: Vendor
+    description: The manufacturer of your inverter (solax, fronius, sma).
+  entity_prefix:
+    name: Entity Prefix
+    description: >-
+      The prefix used for Home Assistant entities related to this inverter.
+  control_entity_prefix:
+    name: Control Entity Prefix
+    description: >-
+      Prefix of this inverter's control entities (select, number, button, switch,
+      time) when it differs from the entity prefix, e.g. solax_inverter for
+      select.solax_inverter_charger_use_mode. Empty = the entity prefix.
+  topology:
+    name: Topology
+    description: >-
+      Inverter role in multi-inverter setups (independent, master, slave).
+  pv_extra_prefixes:
+    name: Extra PV Prefixes (read-only)
+    description: >-
+      Entity prefixes of parallel units whose PV power and solar energy are
+      added to this inverter's PV. They are only read, never controlled.
+  battery_extra_prefixes:
+    name: Extra Battery Prefixes (read-only)
+    description: >-
+      Entity prefixes of parallel units whose battery SOC is combined with this
+      inverter's SOC, weighted by capacity. They are only read, never controlled.
+  battery_extra_capacities_kwh:
+    name: Extra Battery Capacities (kWh)
+    description: >-
+      Usable capacity (kWh) of each extra battery prefix, in the same order (at least 0.1). The master's share is control.battery_capacity_kwh minus these, so that must be the pair's measured total. If a unit's SOC is unreadable for over 10 min, FluxION holds the last combined SOC, then takes no new state.
+  min_battery_soc:
+    name: Minimum Battery SOC
+    description: >-
+      Minimum battery state of charge (%) that FluxION will maintain.
+  max_battery_soc:
+    name: Maximum Battery SOC
+    description: Maximum battery state of charge (%) that FluxION will charge to.
+  battery_efficiency:
+    name: Battery Efficiency
+    description: >-
+      Battery round trip, AC to AC (0.5 to 1.0): the share of the energy taken from the grid or PV that comes back out as AC. Default 0.875.
+  pricing:
+    name: Pricing
+    description: Configure electricity pricing information.
+  spot_price_entity:
+    name: Spot Price Entity
+    description: >-
+      The Home Assistant entity that provides current electricity spot prices.
+  buy_price_entity:
+    name: Buy Price Entity
+    description: >-
+      Optional Home Assistant entity with the buy price (incl. VAT), in the same format as the spot price entity. Empty = buy at spot price.
+  use_spot_prices_to_buy:
+    name: Use Spot Prices for Buying
+    description: >-
+      Enable using spot prices to determine when to buy electricity from the
+      grid (charge batteries when prices are low).
+  use_spot_prices_to_sell:
+    name: Use Spot Prices for Selling
+    description: >-
+      Enable using spot prices to determine when to sell electricity to the
+      grid (discharge batteries when prices are high).
+  ote_fallback_enabled:
+    name: OTE Price Fallback
+    description: >-
+      When the spot price entity lacks prices (tomorrow's after the check time, or the rest of today), fetch the OTE day-ahead prices directly and fill only the missing slots, after checking them against the entity's prices of today.
+  price_alert_notification:
+    name: Missing Price Notification
+    description: >-
+      Show a Home Assistant notification while the spot price entity lacks prices, and dismiss it when they are back.
+  tomorrow_prices_check_time:
+    name: Tomorrow's Prices Check Time
+    description: >-
+      Time of day (Europe/Prague, HH:MM) after which tomorrow's prices are expected in the spot price entity. Default 13:45.
+  force_charge_hours:
+    name: Force Charge Hours
+    description: >-
+      Number of hours per day to force charge the battery during the lowest
+      price periods.
+  force_discharge_hours:
+    name: Force Discharge Hours
+    description: >-
+      Number of hours per day to force discharge the battery during the highest
+      price periods.
+  fixed_buy_prices:
+    name: Fixed Buy Prices
+    description: Optional list of fixed electricity buy prices if not using spot prices.
+  fixed_sell_prices:
+    name: Fixed Sell Prices
+    description: Optional list of fixed electricity sell prices if not using spot prices.
+  control:
+    name: Control Settings
+    description: Fine-tune FluxION's control behavior.
+  maximum_export_power_w:
+    name: Maximum Export Power (W)
+    description: Maximum power (in watts) that can be exported to the grid.
+  mode_control_enabled:
+    name: Mode Control
+    description: >-
+      When off, FluxION only curtails export (export limit 0 W at or below the curtail price, restored afterwards) and never writes the work mode, Back Up minimum SOC, HotStandBy or battery awaken. Default on.
+  hold_pv_to_battery:
+    name: EEPROM HOLD Charges From PV First
+    description: >-
+      Turn on only for a site whose EEPROM HOLD ("Stop Charge and Discharge") sends PV into the battery first while the house imports (measured on SolaX Ultra). Off: HOLD means PV serves the house, the surplus charges the battery, the rest is exported. Ignored with direct VPP control. Default off: keep it off unless a replay on the site shows a gain (on Jakub's site it replayed about 2 CZK/day worse).
+  vpp_direct_enabled:
+    name: Direct VPP mode control (SolaX)
+    description: >-
+      Default on. Drive every mode and export curtailment through the SolaX direct VPP remote control (volatile, re-sent every cycle). Only the basic work mode (Self Use / Back Up) is written to EEPROM. Needs solax-modbus 2026.10.01 or newer; without it (or without the direct entities) FluxION falls back to the EEPROM mode writes automatically. Parallel (master/slave) sites are included: commands go to the master, which the slaves follow. On an inverter without mode 8 (X3-Ultra) modes 1–7 are used and curtailment falls back to the export limit when needed. Turn off to force the EEPROM mode writes. Restart the add-on after changing.
+  update_interval_secs:
+    name: Update Interval (seconds)
+    description: >-
+      How often (in seconds) FluxION checks conditions and updates control
+      decisions. Must be between 10 and 3600 seconds.
+  strategies:
+    name: Strategies
+    description: Enable and configure specific optimization strategies.
+  direction_reversal_cost_czk:
+    name: Charge/Export Reversal Cost (CZK)
+    description: >-
+      Winter Reserve: a grid charge after an export, or an export after a grid
+      charge, must gain at least this much, so charge and export run in
+      contiguous blocks instead of alternating every 15 minutes. Steers the
+      plan only, never counted in its cost. 0 = off. Default 2.0.
+  export_window_continuity_pct:
+    name: Discharge Window Continuity (%)
+    description: >-
+      Winter Reserve with the morning/evening discharge-hour levers: a block the
+      lever left out, in a gap of one or two blocks between two chosen blocks,
+      may export too when it sells at most this percentage below the chosen
+      block next to it, so export runs are not broken into Export/Hold flips. Never
+      extends a run outward. 0 = off. Default 5.
+  export_selection:
+    name: Export Block Selection
+    description: >-
+      Winter Reserve: which blocks may export. "windows" (default) = the
+      morning/evening discharge-hour levers. "daily_top_n" = the best-selling
+      hours of each local day 00-24 (Daily Export Hours), wherever they fall,
+      the hours already passed today included, plus the continuity gap fills;
+      the discharge-hour levers are then ignored, the max-discharge % lever
+      still applies (with both lever entities unavailable, export runs down
+      to the planner minimum SOC).
+  daily_export_hours:
+    name: Daily Export Hours
+    description: >-
+      Winter Reserve with export selection "daily_top_n": the number of
+      best-selling hours of each local day in which export is allowed
+      (1-24). Default 6.
+  winter_adaptive:
+    name: Winter Adaptive Strategy
+    description: >-
+      Optimized strategy for winter months (low solar). Prioritizes charging
+      during cheap night hours and discharging during evening peaks.
+  ema_period_days:
+    name: EMA Period (Days)
+    description: >-
+      Number of days to use for Exponential Moving Average (EMA) calculation
+      of household consumption. Used for forecasting.
+  min_solar_percentage:
+    name: Minimum Solar Percentage
+    description: >-
+      If solar production forecast is less than this percentage of daily
+      consumption, it is ignored for planning (treated as zero).
+  target_battery_soc:
+    name: Target Battery SOC (%)
+    description: >-
+      Target state of charge to reach before the evening peak period.
+      The strategy will plan charging to reach this level.
+  top_expensive_blocks:
+    name: Top Expensive Blocks
+    description: >-
+      Number of most expensive 15-minute blocks per day during which the
+      battery should be discharged.
+  tomorrow_preservation_threshold:
+    name: Tomorrow Price Threshold (Multiplier)
+    description: >-
+      If tomorrow's average peak price is higher than today's by this factor
+      (e.g. 1.2 = 20% higher), the battery will be preserved today to save
+      it for tomorrow's higher prices.
+  grid_export_price_threshold:
+    name: Grid Export Price Threshold (CZK/kWh)
+    description: >-
+      Absolute price threshold above which grid export is considered.
+      Must also exceed the daily average by the export multiplier.
+  min_soc_for_export:
+    name: Minimum SOC for Export (%)
+    description: >-
+      Minimum battery state of charge required to allow forced export to grid.
+      Reserves this amount for self-consumption.
+  export_trigger_multiplier:
+    name: Export Trigger Multiplier
+    description: >-
+      How many times the daily average price the current price must exceed
+      to trigger forced grid export (e.g. 2.5x average).
+  negative_price_handling_enabled:
+    name: Enable Negative Price Handling
+    description: >-
+      If enabled, the system will aggressively charge the battery during
+      negative price periods (when you are paid to consume electricity).
+  charge_on_negative_even_if_full:
+    name: Charge on Negative Even If Full
+    description: >-
+      If enabled, the system will force charge during negative prices even if
+      the battery is effectively full (may waste energy but generates revenue).

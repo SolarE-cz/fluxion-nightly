@@ -1,0 +1,223 @@
+---
+configuration:
+  debug_mode:
+    name: Testovací režim
+    description: >-
+      Zapněte testovací režim pro vyzkoušení FluxION bez skutečného ovládání
+      střídačů. Doporučeno pro počáteční nastavení a testování.
+  log_level:
+    name: Úroveň logování
+    description: Množství informací, které bude add-on zaznamenávat.
+  trusted_peers:
+    name: Důvěryhodné adresy
+    description: >-
+      IP adresy oddělené čárkou, které mohou kromě proxy Home Assistant ingress volat FluxION. Nechte prázdné.
+  inverters:
+    name: Střídače
+    description: Konfigurace vašich solárních střídačů.
+  id:
+    name: ID střídače
+    description: Jedinečný identifikátor tohoto střídače.
+  vendor:
+    name: Výrobce
+    description: Výrobce vašeho střídače (solax, fronius, sma).
+  entity_prefix:
+    name: Prefix entity
+    description: >-
+      Prefix používaný pro Home Assistant entity související s tímto střídačem.
+  control_entity_prefix:
+    name: Prefix řídicích entit
+    description: >-
+      Prefix řídicích entit střídače (select, number, button, switch, time),
+      pokud se liší od prefixu entit, např. solax_inverter pro
+      select.solax_inverter_charger_use_mode. Prázdné = prefix entit.
+  topology:
+    name: Topologie
+    description: >-
+      Role střídače při zapojení více střídačů (independent, master, slave).
+  pv_extra_prefixes:
+    name: Další FV prefixy (jen čtení)
+    description: >-
+      Prefixy entit paralelních jednotek, jejichž FV výkon a vyrobená energie
+      se přičtou k tomuto střídači. Pouze se čtou, nikdy se neřídí.
+  battery_extra_prefixes:
+    name: Další prefixy baterií (jen čtení)
+    description: >-
+      Prefixy entit paralelních jednotek, jejichž SOC baterie se spojí s SOC
+      tohoto střídače podle kapacity. Pouze se čtou, nikdy se neřídí.
+  battery_extra_capacities_kwh:
+    name: Kapacity dalších baterií (kWh)
+    description: >-
+      Použitelná kapacita (kWh) každého dalšího prefixu baterie, ve stejném pořadí (alespoň 0,1). Podíl mastera = control.battery_capacity_kwh minus tyto kapacity, takže ta musí být změřená celková kapacita dvojice. Když SOC jednotky nejde přečíst přes 10 min, FluxION drží poslední kombinovaný SOC a pak nepřebírá nový stav.
+  min_battery_soc:
+    name: Minimální SOC baterie
+    description: >-
+      Minimální stav nabití baterie (%), který bude FluxION udržovat.
+  max_battery_soc:
+    name: Maximální SOC baterie
+    description: Maximální stav nabití baterie (%), na který bude FluxION dobíjet.
+  battery_efficiency:
+    name: Účinnost baterie
+    description: >-
+      Účinnost baterie, AC na AC (0.5 až 1.0): podíl energie odebrané ze sítě nebo FVE, který se vrátí jako střídavá energie. Výchozí 0.875.
+  pricing:
+    name: Cenotvorba
+    description: Konfigurace informací o cenách elektřiny.
+  spot_price_entity:
+    name: Entita spotové ceny
+    description: >-
+      Home Assistant entita poskytující aktuální spotové ceny elektřiny.
+  buy_price_entity:
+    name: Entita nákupní ceny
+    description: >-
+      Volitelná Home Assistant entita s nákupní cenou (včetně DPH) ve stejném formátu jako spotová cena. Prázdné = nákup za spotovou cenu.
+  use_spot_prices_to_buy:
+    name: Použít spotové ceny pro nákup
+    description: >-
+      Povolit použití spotových cen k určení, kdy nakupovat elektřinu ze sítě
+      (dobíjet baterie při nízkých cenách).
+  use_spot_prices_to_sell:
+    name: Použít spotové ceny pro prodej
+    description: >-
+      Povolit použití spotových cen k určení, kdy prodávat elektřinu do sítě
+      (vybíjet baterie při vysokých cenách).
+  ote_fallback_enabled:
+    name: Záložní ceny z OTE
+    description: >-
+      Když entitě spotové ceny chybí ceny (zítřejší po čase kontroly nebo zbytek dneška), stáhnout denní trh přímo z OTE a doplnit jen chybějící úseky, po kontrole proti dnešním cenám entity.
+  price_alert_notification:
+    name: Upozornění na chybějící ceny
+    description: >-
+      Zobrazit upozornění v Home Assistantu, dokud entitě spotové ceny chybí ceny, a zrušit ho, až budou zpět.
+  tomorrow_prices_check_time:
+    name: Čas kontroly zítřejších cen
+    description: >-
+      Čas (Europe/Prague, HH:MM), od kterého se v entitě spotové ceny očekávají zítřejší ceny. Výchozí 13:45.
+  force_charge_hours:
+    name: Hodiny vynuceného dobíjení
+    description: >-
+      Počet hodin denně pro vynucené dobíjení baterie během nejnižších cenových
+      období.
+  force_discharge_hours:
+    name: Hodiny vynuceného vybíjení
+    description: >-
+      Počet hodin denně pro vynucené vybíjení baterie během nejvyšších cenových
+      období.
+  fixed_buy_prices:
+    name: Fixní ceny nákupu
+    description: Volitelný seznam fixních cen nákupu elektřiny při nepoužívání spotových cen.
+  fixed_sell_prices:
+    name: Fixní ceny prodeje
+    description: Volitelný seznam fixních cen prodeje elektřiny při nepoužívání spotových cen.
+  control:
+    name: Nastavení řízení
+    description: Jemné doladění chování řízení FluxION.
+  maximum_export_power_w:
+    name: Maximální výkon exportu (W)
+    description: Maximální výkon (ve wattech), který může být exportován do sítě.
+  mode_control_enabled:
+    name: Řízení režimu
+    description: >-
+      Vypnuto = FluxION jen omezuje export (limit exportu 0 W při ceně na prahu omezení nebo pod ním, poté obnoví) a nikdy nemění pracovní režim, minimální SOC Back Up, HotStandBy ani probuzení baterie. Výchozí zapnuto.
+  hold_pv_to_battery:
+    name: EEPROM HOLD nabíjí nejdřív z FV
+    description: >-
+      Zapněte jen u místa, kde EEPROM HOLD („Stop Charge and Discharge“) posílá FV nejdřív do baterie a dům odebírá ze sítě (změřeno na SolaX Ultra). Vypnuto: při HOLD FV kryje dům, přebytek nabíjí baterii, zbytek jde do sítě. Při přímém řízení VPP se ignoruje. Výchozí vypnuto: nechte vypnuté, dokud replay na daném místě neukáže zisk (u Jakuba vyšel asi o 2 Kč/den hůř).
+  vpp_direct_enabled:
+    name: Přímé řízení režimů přes VPP (SolaX)
+    description: >-
+      Výchozí zapnuto. Všechny režimy a omezení přetoků přes přímé VPP řízení SolaX (nevolatilní paměť se nezapisuje, příkaz se opakuje každý cyklus). Do EEPROM se zapisuje jen základní režim (Self Use / Back Up). Vyžaduje solax-modbus 2026.10.01 nebo novější; bez něj (nebo bez přímých entit) FluxION automaticky přejde na zápis režimů do EEPROM. Platí i pro paralelní instalace (master/slave): příkazy jdou do masteru, slavy ho následují. Na střídači bez režimu 8 (X3-Ultra) se používají režimy 1–7 a omezení přetoků v případě potřeby přejde na limit exportu. Vypnutím vynutíte zápis režimů do EEPROM. Po změně restartujte doplněk.
+  update_interval_secs:
+    name: Interval aktualizace (sekundy)
+    description: >-
+      Jak často (v sekundách) FluxION kontroluje podmínky a aktualizuje
+      rozhodnutí o řízení. Musí být mezi 10 a 3600 sekundami.
+  strategies:
+    name: Strategie
+    description: Povolit a konfigurovat specifické optimalizační strategie.
+  direction_reversal_cost_czk:
+    name: Cena obratu nabíjení/export (CZK)
+    description: >-
+      Winter Reserve: nabíjení ze sítě po exportu nebo export po nabíjení ze
+      sítě musí přinést aspoň tolik, takže nabíjení a export běží v souvislých
+      blocích a nestřídají se po 15 minutách. Ovlivňuje jen volbu plánu, do
+      nákladů plánu se nepočítá. 0 = vypnuto. Výchozí 2.0.
+  export_window_continuity_pct:
+    name: Souvislost okna vybíjení (%)
+    description: >-
+      Winter Reserve s pákami ranních/večerních hodin vybíjení: blok, který
+      páka vynechala, v mezeře jednoho nebo dvou bloků mezi dvěma vybranými
+      bloky smí také exportovat, když je jeho prodejní cena nejvýš o tolik
+      procent nižší než u sousedního vybraného bloku, takže se export netrhá
+      na střídání Export/Hold. Běh nikdy neprodlužuje ven. 0 = vypnuto.
+      Výchozí 5.
+  export_selection:
+    name: Výběr bloků pro export
+    description: >-
+      Winter Reserve: ve kterých blocích se smí exportovat. "windows"
+      (výchozí) = páky ranních/večerních hodin vybíjení. "daily_top_n" =
+      nejlépe placené hodiny každého místního dne 00-24 (Denní hodiny
+      exportu), ať leží kdekoli, včetně hodin, které už dnes proběhly, plus
+      doplnění mezer podle souvislosti; páky hodin vybíjení se pak
+      nepoužijí, páka max. vybití baterie (%) platí dál (když jsou obě
+      entity pák nedostupné, vybíjí se až na minimální SOC plánovače).
+  daily_export_hours:
+    name: Denní hodiny exportu
+    description: >-
+      Winter Reserve s výběrem "daily_top_n": počet nejlépe placených hodin
+      každého místního dne, ve kterých se smí exportovat (1-24). Výchozí 6.
+  winter_adaptive:
+    name: Zimní adaptivní strategie
+    description: >-
+      Optimalizovaná strategie pro zimní měsíce (nízký sluneční svit). Upřednostňuje
+      nabíjení během levných nočních hodin a vybíjení během večerních špiček.
+  ema_period_days:
+    name: Období EMA (Dny)
+    description: >-
+      Počet dní pro výpočet exponenciálního klouzavého průměru (EMA)
+      spotřeby domácnosti. Používá se pro předpovědi.
+  min_solar_percentage:
+    name: Minimální procento solární výroby
+    description: >-
+      Pokud je předpověď solární výroby menší než toto procento denní spotřeby,
+      je pro plánování ignorována (považována za nulu).
+  target_battery_soc:
+    name: Cílové SOC baterie (%)
+    description: >-
+      Cílový stav nabití, kterého má být dosaženo před večerní špičkou.
+      Strategie naplánuje nabíjení tak, aby této úrovně dosáhla.
+  top_expensive_blocks:
+    name: Počet nejdražších bloků
+    description: >-
+      Počet nejdražších 15minutových bloků denně, během kterých by se měla
+      baterie vybíjet.
+  tomorrow_preservation_threshold:
+    name: Práh ceny pro zítřek (Násobitel)
+    description: >-
+      Pokud je průměrná špičková cena zítra vyšší než dnes o tento faktor
+      (např. 1.2 = o 20% vyšší), baterie bude dnes šetřena pro zítřejší vyšší ceny.
+  grid_export_price_threshold:
+    name: Cenový práh pro export do sítě (CZK/kWh)
+    description: >-
+      Absolutní cenový práh, nad kterým se zvažuje export do sítě.
+      Musí také překročit denní průměr o násobitel exportu.
+  min_soc_for_export:
+    name: Minimální SOC pro export (%)
+    description: >-
+      Minimální stav nabití baterie vyžadovaný pro povolení vynuceného exportu do sítě.
+      Rezervuje toto množství pro vlastní spotřebu.
+  export_trigger_multiplier:
+    name: Násobitel spuštění exportu
+    description: >-
+      Kolikrát musí aktuální cena překročit denní průměrnou cenu,
+      aby se spustil vynucený export do sítě (např. 2.5x průměr).
+  negative_price_handling_enabled:
+    name: Povolit zpracování záporných cen
+    description: >-
+      Pokud je povoleno, systém bude agresivně nabíjet baterii během období
+      se zápornými cenami (kdy dostáváte zaplaceno za spotřebu elektřiny).
+  charge_on_negative_even_if_full:
+    name: Nabíjet při záporné ceně i když je plná
+    description: >-
+      Pokud je povoleno, systém bude vynucovat nabíjení během záporných cen, i když
+      je baterie fakticky plná (může plýtvat energií, ale generuje zisk).

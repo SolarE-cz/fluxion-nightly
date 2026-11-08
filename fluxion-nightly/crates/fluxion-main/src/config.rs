@@ -251,8 +251,8 @@ pub struct ControlConfig {
     #[serde(default = "default_battery_wear_cost")]
     pub battery_wear_cost_czk_per_kwh: f32,
 
-    /// Battery one-way efficiency (0.0 to 1.0, default 0.95). The cost of charge (brief H33)
-    /// uses its square as the round trip; the Winter Reserve planner applies it once, on charge.
+    /// Battery AC-to-AC round trip (0.0 to 1.0, default 0.875). Each leg keeps its square root in
+    /// the Winter Reserve planner and the cost of charge (brief H33), which prices at the round trip.
     #[serde(default = "default_battery_efficiency")]
     pub battery_efficiency: f32,
 
@@ -361,7 +361,7 @@ fn default_battery_wear_cost() -> f32 {
 }
 
 fn default_battery_efficiency() -> f32 {
-    0.95 // one-way; the round trip is its square (0.9025)
+    0.875 // AC to AC round trip; each leg keeps its square root (about 0.935)
 }
 
 fn default_min_mode_change_interval() -> u64 {
@@ -3664,7 +3664,11 @@ mod tests {
     fn test_ha_addon_wear_and_efficiency_default_when_missing() {
         let config: AppConfig = serde_json::from_str(&ha_addon_control_json("")).unwrap();
         assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.1);
-        assert_eq!(config.control.battery_efficiency, 0.95);
+        assert_eq!(config.control.battery_efficiency, 0.875);
+        // The add-on's config.yaml declares the same default and the 0.5-1.0 range
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    battery_efficiency: 0.875\n"));
+        assert!(addon.contains("    battery_efficiency: float(0.5,1.0)?\n"));
     }
 
     #[test]

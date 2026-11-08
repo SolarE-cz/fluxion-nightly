@@ -362,7 +362,7 @@ impl Default for ControlConfig {
             maximum_export_power_w: 10000,
             battery_capacity_kwh: 20.0,
             battery_wear_cost_czk_per_kwh: 0.1,
-            battery_efficiency: 0.95,
+            battery_efficiency: 0.875,
             min_mode_change_interval_secs: 300,
             average_household_load_kw: 1.0,
             planner_load_margin: default_planner_load_margin(),
@@ -1859,6 +1859,16 @@ impl Currency {
             Currency::USD => "$",
             Currency::CZK => "Kč",
         }
+    }
+}
+
+#[cfg(test)]
+mod battery_efficiency_default_tests {
+    use super::ControlConfig;
+
+    #[test]
+    fn battery_efficiency_defaults_to_the_ac_to_ac_round_trip() {
+        assert_eq!(ControlConfig::default().battery_efficiency, 0.875);
     }
 }
 

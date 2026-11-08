@@ -18,7 +18,8 @@
 //! - from the grid: the effective buy price.
 //!
 //! The cost per kWh later delivered from the battery is `price / round_trip + wear`, with
-//! `round_trip = battery_efficiency²` (`control.battery_efficiency` is one-way: 0.95 → 0.9025).
+//! `round_trip = battery_efficiency` (`control.battery_efficiency` is the AC-to-AC round trip:
+//! 0.875 → each leg keeps √0.875). Stored energy per kWh charged is `one_way_efficiency`.
 //! It is a weighted average over the usable energy (energy above the current minimum SOC).
 //! Discharging lowers the usable energy but not the average. At the minimum the cost resets.
 //! When solar and grid charge in the same interval, the site meter decides: the grid part is
@@ -61,15 +62,22 @@ pub struct CostBasisBattery {
     /// Current minimum SOC (%): `control.min_battery_soc`, or the Back Up floor in Back Up
     pub min_soc_pct: f32,
     pub max_soc_pct: f32,
-    /// One-way efficiency (`control.battery_efficiency`); the round trip is its square
+    /// AC-to-AC round trip (`control.battery_efficiency`); each leg keeps `one_way_efficiency`
     pub efficiency: f32,
     pub wear_czk_per_kwh: f32,
+}
+
+/// One-way (per leg) efficiency of a battery whose AC-to-AC round trip is `round_trip`: each leg
+/// keeps its square root. Stored energy = AC in × this; AC out = stored drained × this.
+#[must_use]
+pub fn one_way_efficiency(round_trip: f32) -> f32 {
+    round_trip.clamp(1e-6, 1.0).sqrt()
 }
 
 impl CostBasisBattery {
     #[must_use]
     pub fn round_trip(&self) -> f32 {
-        (self.efficiency * self.efficiency).max(1e-6)
+        self.efficiency.max(1e-6)
     }
 
     /// Cost per kWh later delivered from the battery of energy charged at `price_czk`.
@@ -224,8 +232,8 @@ impl BatteryCostBasis {
                 0.0
             };
             let solar_value_czk = sellable * step.sell_czk;
-            let eta = battery.efficiency.max(1e-6);
-            let (solar_stored, grid_stored) = (solar * eta, grid * eta);
+            let one_way = one_way_efficiency(battery.efficiency);
+            let (solar_stored, grid_stored) = (solar * one_way, grid * one_way);
             let base = self.usable_kwh;
             if solar_stored > 0.0 {
                 // Average price of this interval's solar: sellable part at sell, rest at 0.
@@ -649,16 +657,38 @@ mod tests {
     };
 
     #[test]
-    fn round_trip_is_the_square_of_the_one_way_efficiency() {
-        assert!(approx(battery().round_trip(), 0.9025));
+    fn round_trip_is_the_control_efficiency() {
+        assert!(approx(battery().round_trip(), 0.95));
+    }
+
+    #[test]
+    fn one_way_efficiency_is_the_square_root_of_the_round_trip() {
+        let one_way = one_way_efficiency(0.875);
+        assert!(approx(one_way, 0.875_f32.sqrt()));
+        assert!(approx(one_way * one_way, 0.875));
+    }
+
+    #[test]
+    fn grid_charge_at_the_default_round_trip_costs_price_over_round_trip_plus_wear() {
+        let bat = CostBasisBattery {
+            efficiency: 0.875,
+            ..battery()
+        };
+        let mut b = empty();
+        b.update(&step(29.0, 2.0, 2.5, 3.0, 4.0), &bat);
+        // 4.0 / 0.875 + 0.1 = 4.6714
+        assert!(
+            approx(b.cost_czk_per_kwh.unwrap(), 4.0 / 0.875 + 0.1),
+            "{b:?}"
+        );
     }
 
     #[test]
     fn solar_only_charge_costs_the_sell_price_plus_losses_and_wear() {
         let mut b = empty();
-        // 2 kWh in at η 0.95 = 1.9 kWh stored: 10 % → 29 %, nothing imported
+        // 2 kWh in at round trip 0.95 = 2 × √0.95 stored: 10 % → 29 %, nothing imported
         b.update(&step(29.0, 2.0, 0.0, 3.0, 4.0), &battery());
-        let want = 3.0 / 0.9025 + 0.1;
+        let want = 3.0 / 0.95 + 0.1;
         assert!(approx(b.cost_czk_per_kwh.unwrap(), want), "{b:?}");
         assert!(approx(b.solar_share().unwrap(), 1.0));
     }
@@ -668,7 +698,7 @@ mod tests {
         let mut b = empty();
         // The site imports more than the charge: all of it is grid
         b.update(&step(29.0, 2.0, 2.5, 3.0, 4.0), &battery());
-        let want = 4.0 / 0.9025 + 0.1;
+        let want = 4.0 / 0.95 + 0.1;
         assert!(approx(b.cost_czk_per_kwh.unwrap(), want), "{b:?}");
         assert!(approx(b.solar_share().unwrap(), 0.0));
     }
@@ -688,10 +718,13 @@ mod tests {
     fn two_charges_give_the_energy_weighted_average() {
         let mut b = empty();
         let bat = battery();
-        // 1 kWh in at buy 2.0 (0.95 stored), then 3 kWh in at buy 4.0 (2.85 stored)
+        // 1 kWh in at buy 2.0, then 3 kWh in at buy 4.0; each stores × √0.95, and the usable
+        // energy before the second charge is the 0.95 kWh anchored to SOC 19.5 %
+        let one_way = one_way_efficiency(0.95);
         b.update(&step(19.5, 1.0, 1.0, 1.0, 2.0), &bat);
         b.update(&step(48.0, 3.0, 3.0, 1.0, 4.0), &bat);
-        let want = (bat.delivered_cost(2.0) * 0.95 + bat.delivered_cost(4.0) * 2.85) / 3.8;
+        let want = (bat.delivered_cost(2.0) * 0.95 + bat.delivered_cost(4.0) * 3.0 * one_way)
+            / (0.95 + 3.0 * one_way);
         assert!(approx(b.cost_czk_per_kwh.unwrap(), want), "{b:?}");
         assert!(approx(b.usable_kwh, 3.8));
     }

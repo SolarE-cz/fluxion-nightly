@@ -277,6 +277,14 @@ Default value: `true`
 
 Fine-tune FluxION's control behavior.
 
+#### Option: `control.battery_efficiency`
+
+AC-to-AC round trip of the battery (0.5 to 1.0): the share of the energy taken from the grid or PV
+that comes back out as AC. Each charge or discharge leg keeps its square root (0.875 is about 0.935
+per leg). The planner and the cost of charge both read it this way.
+
+Default value: `0.875`
+
 #### Option: `control.maximum_export_power_w`
 
 Maximum power (in watts) that can be exported to the grid.

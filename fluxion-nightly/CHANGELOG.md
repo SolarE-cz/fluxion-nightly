@@ -10,6 +10,19 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.76] - 2026-11-08
+
+### Changed
+
+- `control.battery_efficiency` is now the AC-to-AC round trip (default 0.875, measured 0.86–0.875 on
+  the owner's site from the SolaX counters and the grid meter). Before, the planner applied it once on
+  charge and the cost of charge squared it (0.95 → 0.9025). The planner now loses √round trip on
+  charge and on discharge, and the energy left at the horizon end is valued at what it delivers.
+  A saved 0.95 now means a 0.95 round trip, which overstates every margin: set 0.875.
+- Winter Reserve night floor and the room kept for solar charging are counted in stored energy
+  (AC deficit / √round trip, solar surplus × √round trip), so an evening export down to the floor
+  still covers the night without grid import.
+
 ## [0.2.75] - 2026-11-06
 
 ### Added

@@ -17,7 +17,9 @@ use chrono::{DateTime, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::battery_cost_basis::{BatteryCostBasis, CostBasisBattery, CostBasisStep};
+use crate::battery_cost_basis::{
+    BatteryCostBasis, CostBasisBattery, CostBasisStep, one_way_efficiency,
+};
 use crate::components::{
     HourlyConsumptionProfile, aggregate_hourly_house_load, pick_hourly_profile,
 };
@@ -185,12 +187,12 @@ pub struct ReplayRun {
 
 impl ReplayRun {
     /// End state: energy Winter Reserve left above self-use, valued at the last day's
-    /// `cheap_ref` times efficiency.
+    /// `cheap_ref` times the one-way efficiency (the AC a stored kWh delivers).
     #[must_use]
     pub fn end_soc_adjustment_czk(&self, battery: &BatteryParams) -> f32 {
         (self.energy_end_wr_kwh - self.energy_end_selfuse_kwh)
             * self.cheap_ref_last_day
-            * battery.efficiency
+            * one_way_efficiency(battery.efficiency)
     }
 }
 
@@ -399,7 +401,8 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
     };
     let mut planned_blocks = 0usize;
     // Cost of charge of the simulated Winter Reserve battery (with `track_cost_basis`). The
-    // simulator applies `efficiency` once, on charge; the tracker treats it as one-way.
+    // simulator applies each leg's one-way share of `efficiency`; the tracker takes it as the
+    // round trip.
     let cost_battery = CostBasisBattery {
         capacity_kwh: capacity,
         min_soc_pct: battery.min_soc_pct,

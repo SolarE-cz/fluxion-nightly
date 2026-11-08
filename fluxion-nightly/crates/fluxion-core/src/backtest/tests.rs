@@ -543,6 +543,13 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     // it exported the surplus with the battery idle before) moved them from 148.63 (wear 13.30)
     // and 156.03 (wear 12.60). Cautious PV (owner ruling 2026-11-02; the fixture's October days
     // are fallback months) moved them from 155.02 (wear 13.30) and 164.24 (wear 13.02).
+    // Round-trip change 2026-11-07 (control.battery_efficiency is the AC-to-AC round trip, one way
+    // sqrt(0.9) = 0.9487 per leg; fixture efficiency 0.9) moved them, with SelfUse, from
+    // SelfUse 195.61 (wear 8.13) / WinterReserve 156.44 (wear 13.62) to SelfUse 200.38 (wear 7.83) /
+    // WinterReserve 160.40 (wear 12.57); the house profile from 163.61 (wear 12.92) to 167.58 (wear 12.31).
+    // Review fixes 2026-11-08 (night floors and solar-headroom caps in stored kWh, not AC): the
+    // default WinterReserve 160.40 → 159.58 (wear 12.50), cautious off/on 160.01 → 159.92 and
+    // 160.40 → 159.58, house profile 167.58 → 168.03 (wear 12.29).
     let (tz, mut battery, rows) = fixture_rows();
     assert!(battery.min_charge_kwh <= 0.0);
     battery.min_charge_kwh = crate::strategy::winter_reserve::min_charge_kwh(
@@ -553,13 +560,13 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     let run = replay(&rows, &options).unwrap();
     assert_eq!(
         printed_totals(&run),
-        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 156.44 CZK (wear 13.62)"
+        "totals: actual 196.09 CZK | SelfUse 200.38 CZK (wear 7.83) | WinterReserve 159.58 CZK (wear 12.50)"
     );
     assert_eq!(run.planned_blocks, 863);
     assert_eq!(run.fallback_blocks, 6151);
     assert_eq!(
         format!("{:.2}", run.end_soc_adjustment_czk(&battery)),
-        "2.07"
+        "0.99"
     );
 
     let mut house = options;
@@ -567,7 +574,7 @@ fn replay_totals_equal_the_example_on_the_fixture() {
     let run = replay(&rows, &house).unwrap();
     assert_eq!(
         printed_totals(&run),
-        "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 163.61 CZK (wear 12.92)"
+        "totals: actual 196.09 CZK | SelfUse 200.38 CZK (wear 7.83) | WinterReserve 168.03 CZK (wear 12.29)"
     );
 }
 
@@ -592,8 +599,8 @@ fn replay_plans_with_the_cautious_pv_state() {
         });
         printed_totals(&replay(&rows, &options).unwrap())
     };
-    let off = "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 155.02 CZK (wear 13.30)";
-    let on = "totals: actual 196.09 CZK | SelfUse 195.61 CZK (wear 8.13) | WinterReserve 156.44 CZK (wear 13.62)";
+    let off = "totals: actual 196.09 CZK | SelfUse 200.38 CZK (wear 7.83) | WinterReserve 159.92 CZK (wear 12.72)";
+    let on = "totals: actual 196.09 CZK | SelfUse 200.38 CZK (wear 7.83) | WinterReserve 159.58 CZK (wear 12.50)";
     assert_eq!(totals(Some(false), vec![10, 11, 12, 1, 2, 3]), off);
     assert_eq!(totals(Some(true), Vec::new()), on);
     assert_eq!(totals(None, Vec::new()), off);

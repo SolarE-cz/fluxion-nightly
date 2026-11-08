@@ -24,7 +24,7 @@ options:
     auto_unlock_inverter: true
     average_household_load_kw: 0.5
     battery_capacity_kwh: 23.0
-    battery_efficiency: 0.95
+    battery_efficiency: 0.875
     battery_wear_cost_czk_per_kwh: 0.1
     ensure_hot_standby: true
     export_curtail_at_or_below_czk: 0.0
@@ -243,7 +243,7 @@ schema:
     auto_unlock_inverter: bool?
     average_household_load_kw: float(0,)?
     battery_capacity_kwh: float(0,)?
-    battery_efficiency: float(0,1)?
+    battery_efficiency: float(0.5,1.0)?
     battery_wear_cost_czk_per_kwh: float(0,)?
     ensure_hot_standby: bool?
     export_curtail_at_or_below_czk: float?
@@ -515,4 +515,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.75
+version: 0.2.76

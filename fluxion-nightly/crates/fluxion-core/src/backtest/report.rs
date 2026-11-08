@@ -66,7 +66,7 @@ pub struct StrategyTotals {
     pub export_kwh: f32,
     pub soc_start_pct: f32,
     pub soc_end_pct: f32,
-    /// End battery difference to self-use valued at `cheap_ref × efficiency` (CZK)
+    /// End battery difference to self-use valued at `cheap_ref × sqrt(round trip)` (CZK)
     pub end_adjustment_czk: f32,
     /// `self-use cost − cost + end_adjustment` (CZK); 0 for self-use itself
     pub savings_vs_selfuse_czk: f32,
@@ -361,7 +361,8 @@ pub fn build_report(
         .or(day_rows.last().copied())
         .map_or(soc_start_pct, |r| r.soc_pct);
     let e_su = run.energy_end_selfuse_kwh;
-    let value = |energy_end_kwh: f32| (energy_end_kwh - e_su) * cheap_ref * battery.efficiency;
+    let one_way = crate::battery_cost_basis::one_way_efficiency(battery.efficiency);
+    let value = |energy_end_kwh: f32| (energy_end_kwh - e_su) * cheap_ref * one_way;
     let sum = |f: fn(&RecordedBlock) -> f32| recorded.iter().map(f).sum::<f32>();
 
     let totals_self_use = StrategyTotals {

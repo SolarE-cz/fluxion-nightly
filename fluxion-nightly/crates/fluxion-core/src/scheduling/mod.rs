@@ -10,6 +10,7 @@
 //
 // For commercial licensing, please contact: info@solare.cz
 
+use crate::battery_cost_basis::one_way_efficiency;
 use crate::resources::UserLeversResource;
 use crate::strategy::BlockEvaluation;
 use crate::strategy::winter_reserve::WinterReserveStrategy;
@@ -604,12 +605,14 @@ pub fn generate_schedule_with_optimizer(
 
         // Update battery cost tracking based on the decision
         let current_price = price_block.effective_price_czk_per_kwh;
+        // Stored energy per AC kWh charged or discharged: one leg of the round trip
+        let one_way = one_way_efficiency(control_config.battery_efficiency);
         match evaluation.mode {
             InverterOperationMode::ForceCharge => {
                 // Energy charged = max charge rate * 0.25 hours (15 min block)
                 let charge_kwh = control_config.max_battery_charge_rate_kw * 0.25;
                 let charge_cost = charge_kwh * current_price;
-                battery_energy_kwh += charge_kwh * control_config.battery_efficiency;
+                battery_energy_kwh += charge_kwh * one_way;
                 battery_total_cost_czk += charge_cost;
             }
             InverterOperationMode::ForceDischarge
@@ -625,19 +628,21 @@ pub fn generate_schedule_with_optimizer(
                 };
 
                 if discharge_kwh > 0.0 && battery_energy_kwh > 0.0 {
-                    // Remove proportional cost when discharging
-                    let discharge_ratio = (discharge_kwh / battery_energy_kwh).min(1.0);
+                    // Remove proportional cost when discharging. AC out is stored drained / one_way
+                    let drained_kwh = discharge_kwh / one_way;
+                    let discharge_ratio = (drained_kwh / battery_energy_kwh).min(1.0);
                     battery_total_cost_czk *= 1.0 - discharge_ratio;
-                    battery_energy_kwh = (battery_energy_kwh - discharge_kwh).max(0.0);
+                    battery_energy_kwh = (battery_energy_kwh - drained_kwh).max(0.0);
                 }
             }
             InverterOperationMode::BackUpMode => {
                 // Similar to SelfUse but more conservative
                 let discharge_kwh = (consumption_kwh - solar_kwh).max(0.0);
                 if discharge_kwh > 0.0 && battery_energy_kwh > 0.0 {
-                    let discharge_ratio = (discharge_kwh / battery_energy_kwh).min(1.0);
+                    let drained_kwh = discharge_kwh / one_way;
+                    let discharge_ratio = (drained_kwh / battery_energy_kwh).min(1.0);
                     battery_total_cost_czk *= 1.0 - discharge_ratio;
-                    battery_energy_kwh = (battery_energy_kwh - discharge_kwh).max(0.0);
+                    battery_energy_kwh = (battery_energy_kwh - drained_kwh).max(0.0);
                 }
             }
             InverterOperationMode::NoChargeNoDischarge => {

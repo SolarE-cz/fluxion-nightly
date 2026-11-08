@@ -24,6 +24,7 @@ use fluxion_types::{CautiousPvSignal, DischargeWindowLimit, UserLevers};
 use serde::{Deserialize, Serialize};
 
 use super::{Assumptions, BlockEvaluation, EnergyFlows};
+use crate::battery_cost_basis::one_way_efficiency;
 
 /// Re-plan on a head call once the cached plan is this old (PRD "Re-plan triggers").
 const REPLAN_MAX_AGE_MIN: i64 = 15;
@@ -36,7 +37,8 @@ pub struct BatteryParams {
     pub max_soc_pct: f32,
     pub max_charge_kw: f32,
     pub max_discharge_kw: f32,
-    /// Round-trip efficiency, applied on charge (stored = input * efficiency)
+    /// AC-to-AC round trip (`control.battery_efficiency`). Each leg keeps `one_way_efficiency`:
+    /// stored = AC in × one-way; AC out = stored drained × one-way
     pub efficiency: f32,
     pub wear_cost_czk_per_kwh: f32,
     pub max_export_kw: f32,
@@ -55,7 +57,7 @@ pub struct BatteryParams {
     pub hold_pv_to_battery: bool,
     /// Smallest stored energy (kWh) a Charge block must be able to add before the runtime guard
     /// stops it (max SOC − 1 %): max_charge_kw × one mode-change interval, at least 0.5 kWh (the
-    /// export guard margin's rule). Stored at η × max_charge_kw, that takes longer than the
+    /// export guard margin's rule). Stored at one-way × max_charge_kw, that takes longer than the
     /// interval, so a planned charge never trips the guard within one debounce. A smaller top-up
     /// ends within minutes and the guard flips the mode mid-block (brief H30). 0 disables the
     /// check. Price-lever (forced) charges are exempt.
@@ -421,8 +423,8 @@ impl DpStep<'_> {
     fn charge_too_small(&self, energy_kwh: f32) -> bool {
         let b = self.battery;
         let (_, emax) = b.bounds_kwh();
-        let eta = b.efficiency.max(1e-6);
-        let block_stored = b.max_charge_kw * self.block.duration_minutes as f32 / 60.0 * eta;
+        let one_way = one_way_efficiency(b.efficiency);
+        let block_stored = b.max_charge_kw * self.block.duration_minutes as f32 / 60.0 * one_way;
         let guard_kwh = b.guard_cutoff_kwh().min(emax).min(self.charge_cap_kwh);
         let room = guard_kwh - energy_kwh.clamp(0.0, emax);
         if room <= 1e-6 && self.charge_cap_kwh < emax {
@@ -543,7 +545,7 @@ fn house_from_grid_defaults(blocks: &[PlanBlock], modes: &mut [Vec<PlanMode>]) {
 }
 
 /// Cost (CZK) of one kWh of battery energy sold to the grid: its cost of charge, which already
-/// includes the losses and the wear (brief H33). Without a known cost: `cheap_ref / efficiency
+/// includes the losses and the wear (brief H33). Without a known cost: `cheap_ref / round trip
 /// + wear`, the rule before H33. Export needs `sell − this ≥ min_arbitrage_profit_czk`.
 fn export_unit_cost(battery: &BatteryParams, cheap_ref: f32) -> f32 {
     battery
@@ -559,7 +561,7 @@ fn export_unit_cost(battery: &BatteryParams, cheap_ref: f32) -> f32 {
 /// more than that. Uncapped, a cost of charge above the horizon's cheap prices makes buying at
 /// the end pay on paper (a plan that ends full), and when the horizon end stops moving (prices of
 /// tomorrow missing) those charges execute and raise the cost further. A cap of
-/// `cheap_ref / efficiency` would still make every block below `cheap_ref` (the mean of the
+/// `cheap_ref / round trip` would still make every block below `cheap_ref` (the mean of the
 /// cheapest blocks) such a buy. With this cap, a known cost never raises the end value above the
 /// no-cost plan's, so it never ends a plan fuller; a cheap (solar) cost lowers it.
 fn terminal_price(battery: &BatteryParams, cheap_ref: f32) -> f32 {
@@ -581,6 +583,8 @@ fn terminal_price(battery: &BatteryParams, cheap_ref: f32) -> f32 {
 /// is exempt.
 fn charge_caps(blocks: &[PlanBlock], battery: &BatteryParams, tz: Tz) -> Vec<f32> {
     let (emin, emax) = battery.bounds_kwh();
+    // The room is AC surplus that PV stores through one leg: stored = surplus × one_way.
+    let one_way = one_way_efficiency(battery.efficiency);
     let day = |b: &PlanBlock| b.start.with_timezone(&tz).date_naive();
     let mut caps = vec![emax; blocks.len()];
     let mut i = 0;
@@ -602,8 +606,8 @@ fn charge_caps(blocks: &[PlanBlock], battery: &BatteryParams, tz: Tz) -> Vec<f32
                 if pv < load {
                     continue; // late: the rest of the day's sun does not cover the house
                 }
-                let room: f32 = rest.iter().map(|b| (b.pv_kwh - b.load_kwh).max(0.0)).sum();
-                caps[k] = (emax - room).max(emin);
+                let surplus: f32 = rest.iter().map(|b| (b.pv_kwh - b.load_kwh).max(0.0)).sum();
+                caps[k] = (emax - surplus * one_way).max(emin);
             }
         }
         i = end;
@@ -780,10 +784,12 @@ fn night_floors(
 ) -> Vec<f32> {
     let (emin, emax) = battery.bounds_kwh();
     let morning = morning_blocks(blocks, tz);
-    // prefix[i] = sum of max(net, 0) over blocks[..i]
+    // The floor is stored energy: an AC deficit of d needs d / one_way stored (the discharge leg).
+    let one_way = one_way_efficiency(battery.efficiency);
+    // prefix[i] = sum of max(net, 0) / one_way over blocks[..i] (stored kWh)
     let prefix: Vec<f32> = std::iter::once(0.0)
         .chain(blocks.iter().scan(0.0_f32, |acc, b| {
-            *acc += (b.reserve_load_kwh - b.reserve_pv_kwh).max(0.0);
+            *acc += (b.reserve_load_kwh - b.reserve_pv_kwh).max(0.0) / one_way;
             Some(*acc)
         }))
         .collect();
@@ -809,7 +815,8 @@ fn night_floors(
     } else {
         None
     };
-    let eta = battery.efficiency.max(1e-6);
+    // Round trip: a later block's buy costs `buy / round trip + wear` per kWh delivered
+    let round_trip = battery.efficiency.max(1e-6);
     let wear = battery.wear_cost_czk_per_kwh;
     let mut next_cheap = n;
     for (k, block) in blocks.iter().enumerate().rev() {
@@ -823,7 +830,7 @@ fn night_floors(
                 let later = &blocks[j];
                 later.buy_czk <= cheap_ref
                     && block.sell_czk > later.sell_czk + params.min_mode_benefit_czk
-                    && block.sell_czk - (later.buy_czk / eta + wear)
+                    && block.sell_czk - (later.buy_czk / round_trip + wear)
                         >= params.min_arbitrage_profit_czk
             })
         } else {
@@ -930,7 +937,9 @@ fn simulate_block_capped(
 ) -> BlockOutcome {
     let h = block.duration_minutes as f32 / 60.0;
     let (emin, emax) = battery.bounds_kwh();
-    let eta = battery.efficiency.max(1e-6);
+    // Each leg loses the one-way share of the round trip: stored = AC in × one_way, and AC out
+    // = stored drained × one_way
+    let one_way = one_way_efficiency(battery.efficiency);
     let cmax = battery.max_charge_kw * h;
     let dmax = battery.max_discharge_kw * h;
     let xmax = battery.max_export_kw * h;
@@ -945,44 +954,44 @@ fn simulate_block_capped(
         PlanMode::Hold if battery.hold_pv_to_battery => {
             // EEPROM SolaX "Stop Charge and Discharge": PV charges the battery first (it never
             // discharges), the rest serves the house, then the grid.
-            let c = pv.min(cmax).min(((emax - e) / eta).max(0.0));
+            let c = pv.min(cmax).min(((emax - e) / one_way).max(0.0));
             o.battery_charge_kwh = c;
-            o.energy_end_kwh = e + c * eta;
+            o.energy_end_kwh = e + c * one_way;
             grid_balance(&mut o, load - (pv - c), xmax);
         }
         // HOLD: the house is not served from the battery. PV serves the house, the surplus charges
         // the battery and the rest is exported, as NoDischarge (SolaX direct VPP mode 7).
         PlanMode::SelfUse | PlanMode::NoDischarge | PlanMode::Hold if pv >= load => {
             let surplus = pv - load;
-            let c = surplus.min(cmax).min(((emax - e) / eta).max(0.0));
+            let c = surplus.min(cmax).min(((emax - e) / one_way).max(0.0));
             o.battery_charge_kwh = c;
-            o.energy_end_kwh = e + c * eta;
+            o.energy_end_kwh = e + c * one_way;
             o.grid_export_kwh = (surplus - c).min(xmax);
             o.curtailed_kwh = surplus - c - o.grid_export_kwh;
         }
         PlanMode::SelfUse | PlanMode::NoDischarge | PlanMode::Hold => {
             let deficit = load - pv;
             let q = match mode {
-                PlanMode::SelfUse => deficit.min(dmax).min(e - emin).max(0.0),
+                PlanMode::SelfUse => deficit.min(dmax).min((e - emin) * one_way).max(0.0),
                 _ => 0.0,
             };
             o.battery_discharge_kwh = q;
-            o.energy_end_kwh = e - q;
+            o.energy_end_kwh = e - q / one_way;
             o.grid_import_kwh = deficit - q;
         }
         PlanMode::Charge => {
-            let c = cmax.min(((emax.min(charge_cap_kwh) - e) / eta).max(0.0));
+            let c = cmax.min(((emax.min(charge_cap_kwh) - e) / one_way).max(0.0));
             o.battery_charge_kwh = c;
-            o.energy_end_kwh = e + c * eta;
+            o.energy_end_kwh = e + c * one_way;
             grid_balance(&mut o, load + c - pv, xmax);
         }
         PlanMode::Export => {
             // The inverter throttles discharge to what the house plus the export cap can take.
             let sink = xmax + (load - pv).max(0.0);
             let keep = emin.max(floor_kwh + battery.export_guard_margin_kwh);
-            let q = (e - keep).max(0.0).min(dmax).min(sink);
+            let q = ((e - keep).max(0.0) * one_way).min(dmax).min(sink);
             o.battery_discharge_kwh = q;
-            o.energy_end_kwh = e - q;
+            o.energy_end_kwh = e - q / one_way;
             grid_balance(&mut o, load - (q + pv), xmax);
         }
     }
@@ -1306,8 +1315,10 @@ fn plan_with_rule(
     // values[k][slot][i] = V_k at grid[i] with the force direction of `slot` before block k;
     // values[n] is the terminal value.
     let mut values: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n + 1];
-    // Leftover energy is worth its cost of charge (else a cheap purchase minus the wear).
-    let terminal_price = terminal_price(battery, cheap_ref);
+    // Leftover energy is worth its cost of charge (else a cheap purchase minus the wear) per AC
+    // kWh it delivers: a stored kWh delivers one_way of one, so it is worth one_way times that.
+    let terminal_price =
+        terminal_price(battery, cheap_ref) * one_way_efficiency(battery.efficiency);
     let terminal: Vec<f32> = grid.iter().map(|&e| -e * terminal_price).collect();
     values[n] = vec![terminal; directions.len()];
     for (k, block) in blocks.iter().enumerate().rev() {
@@ -2538,7 +2549,8 @@ mod tests {
             &b,
         );
         assert!(approx(o.battery_charge_kwh, 5.0));
-        assert!(approx(o.energy_end_kwh, 50.0 + 5.0 * 0.9));
+        // 5 kWh AC in, one-way sqrt(0.9) = 0.9487: 5 x 0.9487 = 4.743 kWh stored, 50 + 4.743
+        assert!(approx(o.energy_end_kwh, 50.0 + 5.0 * 0.9_f32.sqrt()));
         assert!(approx(o.grid_import_kwh, 2.0));
         assert!(approx(o.grid_export_kwh, 0.0));
         assert!(approx(o.battery_discharge_kwh, 0.0));
@@ -2578,7 +2590,8 @@ mod tests {
             &b,
         );
         assert!(approx(o.battery_charge_kwh, 3.0));
-        assert!(approx(o.energy_end_kwh, 50.0 + 3.0 * 0.9));
+        // 3 kWh AC in, one-way sqrt(0.9): 3 x 0.9487 = 2.846 kWh stored, 50 + 2.846
+        assert!(approx(o.energy_end_kwh, 50.0 + 3.0 * 0.9_f32.sqrt()));
         assert!(approx(o.grid_import_kwh, 0.0));
         assert!(approx(o.grid_export_kwh, 0.0));
         // Full battery: the surplus is exported
@@ -2683,7 +2696,8 @@ mod tests {
             &b,
         );
         assert!(approx(o.battery_charge_kwh, 1.5));
-        assert!(approx(o.energy_end_kwh, 50.0 + 1.5 * 0.9));
+        // 1.5 kWh AC in, one-way sqrt(0.9): 1.5 x 0.9487 = 1.423 kWh stored, 50 + 1.423
+        assert!(approx(o.energy_end_kwh, 50.0 + 1.5 * 0.9_f32.sqrt()));
         assert!(approx(o.grid_export_kwh, 0.0));
 
         // 12 kWh pv, no load: charge limited to 7.5 kWh (30 kW * 0.25 h), export capped at 2.5 kWh
@@ -2695,7 +2709,8 @@ mod tests {
             &b,
         );
         assert!(approx(o.battery_charge_kwh, 7.5));
-        assert!(approx(o.energy_end_kwh, 50.0 + 7.5 * 0.9));
+        // 7.5 kWh AC in, one-way sqrt(0.9): 7.5 x 0.9487 = 7.115 kWh stored, 50 + 7.115
+        assert!(approx(o.energy_end_kwh, 50.0 + 7.5 * 0.9_f32.sqrt()));
         assert!(approx(o.grid_export_kwh, 2.5));
         assert!(approx(o.curtailed_kwh, 2.0));
     }
@@ -2711,9 +2726,11 @@ mod tests {
             &b,
         );
         assert!(approx(o.energy_end_kwh, 96.0));
-        assert!(approx(o.battery_charge_kwh, 0.5 / 0.9));
+        // 0.5 kWh of room stored needs 0.5 / sqrt(0.9) = 0.5 / 0.9487 = 0.527 kWh AC
+        assert!(approx(o.battery_charge_kwh, 0.5 / 0.9_f32.sqrt()));
         assert!(approx(o.grid_export_kwh, 2.5));
-        assert!(approx(o.curtailed_kwh, 5.0 - 0.5 / 0.9 - 2.5));
+        // 5 - 0.527 charged - 2.5 exported = 1.973 kWh curtailed
+        assert!(approx(o.curtailed_kwh, 5.0 - 0.5 / 0.9_f32.sqrt() - 2.5));
     }
 
     #[test]
@@ -2727,14 +2744,15 @@ mod tests {
             &b,
         );
         assert!(approx(o.battery_discharge_kwh, 1.0));
-        assert!(approx(o.energy_end_kwh, 49.0));
+        // 1 kWh AC out needs 1 / sqrt(0.9) = 1.054 kWh drained: 50 - 1.054 = 48.946
+        assert!(approx(o.energy_end_kwh, 50.0 - 1.0 / 0.9_f32.sqrt()));
         assert!(approx(o.grid_import_kwh, 0.0));
     }
 
     #[test]
     fn sim_selfuse_deficit_clipped_by_emin_and_dmax() {
         let b = battery();
-        // Only 0.4 kWh above Emin (9.6): remaining 0.6 imported
+        // Only 0.4 kWh above Emin (9.6) = 0.4 x sqrt(0.9) = 0.379 kWh AC served: 1 - 0.379 = 0.621 imported
         let o = simulate_block(
             PlanMode::SelfUse,
             10.0,
@@ -2743,7 +2761,7 @@ mod tests {
             &b,
         );
         assert!(approx(o.energy_end_kwh, 9.6));
-        assert!(approx(o.grid_import_kwh, 0.6));
+        assert!(approx(o.grid_import_kwh, 1.0 - 0.4 * 0.9_f32.sqrt()));
         // Deficit 10 kWh, dmax 7.5 kWh per block: 2.5 imported
         let o = simulate_block(
             PlanMode::SelfUse,
@@ -2768,7 +2786,8 @@ mod tests {
             &b,
         );
         assert!(approx(o.battery_charge_kwh, 7.5));
-        assert!(approx(o.energy_end_kwh, 50.0 + 7.5 * 0.9));
+        // 7.5 kWh AC in, one-way sqrt(0.9): 7.5 x 0.9487 = 7.115 kWh stored, 50 + 7.115
+        assert!(approx(o.energy_end_kwh, 50.0 + 7.5 * 0.9_f32.sqrt()));
         assert!(approx(o.grid_import_kwh, 7.0));
         assert!(approx(o.grid_export_kwh, 0.0));
         // Charge with 8 kWh pv, 0.5 load: grid balance 0.5 + 7.5 - 8 = 0
@@ -2817,7 +2836,7 @@ mod tests {
         );
         assert!(approx(o.battery_discharge_kwh, 4.5));
         assert!(approx(o.grid_export_kwh, 2.5));
-        // Floor 40 with 42 stored: discharge stops at the floor, 2 kWh exported
+        // Floor 40 with 42 stored: discharge stops at the floor. 2 kWh stored x sqrt(0.9) = 1.897 kWh AC exported
         let o = simulate_block(
             PlanMode::Export,
             42.0,
@@ -2826,7 +2845,7 @@ mod tests {
             &b,
         );
         assert!(approx(o.energy_end_kwh, 40.0));
-        assert!(approx(o.grid_export_kwh, 2.0));
+        assert!(approx(o.grid_export_kwh, 2.0 * 0.9_f32.sqrt()));
         // dmax binds when export cap is large: 7.5 kWh discharged, 2 kW load, 5.5 exported
         let big = BatteryParams {
             max_export_kw: 30.0,
@@ -2841,7 +2860,7 @@ mod tests {
         );
         assert!(approx(o.battery_discharge_kwh, 7.5));
         assert!(approx(o.grid_export_kwh, 5.5));
-        // Export never leaves the battery below Emin
+        // Export never leaves the battery below Emin: 0.4 kWh stored = 0.379 kWh AC, so 1 - 0.379 = 0.621 imported
         let o = simulate_block(
             PlanMode::Export,
             10.0,
@@ -2850,7 +2869,7 @@ mod tests {
             &b,
         );
         assert!(approx(o.energy_end_kwh, 9.6));
-        assert!(approx(o.grid_import_kwh, 0.6));
+        assert!(approx(o.grid_import_kwh, 1.0 - 0.4 * 0.9_f32.sqrt()));
     }
 
     #[test]
@@ -2995,12 +3014,51 @@ mod tests {
             + blocks[9..56]
                 .iter()
                 .map(|x| (x.load_kwh - x.pv_kwh).max(0.0))
-                .sum::<f32>();
+                .sum::<f32>()
+                / 0.9_f32.sqrt();
         assert!(
             approx(p.blocks[8].floor_kwh, expected),
             "{} vs {expected}",
             p.blocks[8].floor_kwh
         );
+    }
+
+    /// The floor is stored energy: 59 night blocks of 0.25 kWh AC load need 14.75 / one_way
+    /// stored above Emin at the round trip 0.875 (one way 0.9354), not 14.75. Starting at the
+    /// floor with SelfUse over those blocks, the battery serves the whole night from the grid-free
+    /// stored energy. (Without the division the grid imports 14.75 × (1 − one_way) = 0.953 kWh.)
+    #[test]
+    fn night_floor_covers_the_ac_night_load_in_stored_energy() {
+        let b = BatteryParams {
+            capacity_kwh: 30.0,
+            efficiency: 0.875,
+            ..battery()
+        };
+        let mut blocks = vec![pblock(0, 2.0, 1.0, 0.0, 0.0)];
+        blocks.extend((1..60).map(|i| pblock(i, 2.0, 1.0, 0.25, 0.0)));
+        blocks.extend((60..64).map(|i| pblock(i, 6.0, 5.0, 0.25, 2.0)));
+        let floors = night_floors(
+            &blocks,
+            &b,
+            2.0,
+            &WinterReserveParams::default(),
+            chrono_tz::Europe::Prague,
+        );
+        let emin = b.bounds_kwh().0;
+        // 59 blocks × 0.25 = 14.75 kWh AC; stored = 14.75 / sqrt(0.875) = 14.75 / 0.9354 = 15.77
+        assert!(
+            approx(floors[0], emin + 14.75 / 0.875_f32.sqrt()),
+            "{}",
+            floors[0]
+        );
+        let mut energy = floors[0];
+        let mut import = 0.0;
+        for block in &blocks[1..60] {
+            let o = simulate_block(PlanMode::SelfUse, energy, block, emin, &b);
+            energy = o.energy_end_kwh;
+            import += o.grid_import_kwh;
+        }
+        assert!(import.abs() < 1e-4, "grid import {import}");
     }
 
     #[test]
@@ -3019,7 +3077,8 @@ mod tests {
             blocks[r]
                 .iter()
                 .map(|x| (x.load_kwh - x.pv_kwh).max(0.0))
-                .sum()
+                .sum::<f32>()
+                / 0.9_f32.sqrt()
         };
         let emin = b.bounds_kwh().0;
         let mut params = WinterReserveParams::default();
@@ -3054,7 +3113,11 @@ mod tests {
         let old = night_floors(&blocks, &b, 3.0, &WinterReserveParams::default(), tz);
         let new = night_floors(&blocks, &b, 3.0, &params, tz);
         assert!(approx(old[8], emax));
-        assert!(approx(new[8], emin + 7.0 * 0.75), "{}", new[8]);
+        assert!(
+            approx(new[8], emin + 7.0 * 0.75 / 0.9_f32.sqrt()),
+            "{}",
+            new[8]
+        );
     }
 
     #[test]
@@ -3074,7 +3137,11 @@ mod tests {
             })
             .collect();
         let new = night_floors(&blocks, &b, 2.0, &params, tz);
-        assert!(approx(new[0], (emin + 31.0 * 0.75).min(emax)), "{}", new[0]);
+        assert!(
+            approx(new[0], (emin + 31.0 * 0.75 / 0.9_f32.sqrt()).min(emax)),
+            "{}",
+            new[0]
+        );
         // Flat prices: nothing is cheap, the floor stays as without the option
         let flat: Vec<PlanBlock> = (0..40).map(|i| pblock(i, 5.0, 8.0, 0.75, 0.0)).collect();
         let old = night_floors(&flat, &b, 5.0, &WinterReserveParams::default(), tz);
@@ -3150,7 +3217,8 @@ mod tests {
             + blocks[1..8]
                 .iter()
                 .map(|x| (x.reserve_load_kwh - x.reserve_pv_kwh).max(0.0))
-                .sum::<f32>();
+                .sum::<f32>()
+                / 0.9_f32.sqrt();
         assert!(approx(floors[0], expected), "{} vs {expected}", floors[0]);
         assert!(floors[0] < emax);
     }
@@ -3188,7 +3256,8 @@ mod tests {
             + blocks[1..]
                 .iter()
                 .map(|x| (x.reserve_load_kwh - x.reserve_pv_kwh).max(0.0))
-                .sum::<f32>();
+                .sum::<f32>()
+                / 0.9_f32.sqrt();
         assert!(approx(floors[0], expected), "{} vs {expected}", floors[0]);
     }
 
@@ -3228,7 +3297,8 @@ mod tests {
                 + blocks[1..80]
                     .iter()
                     .map(|x| (x.reserve_load_kwh - x.reserve_pv_kwh).max(0.0))
-                    .sum::<f32>();
+                    .sum::<f32>()
+                    / 0.9_f32.sqrt();
             assert!(approx(floors[0], expected), "{} vs {expected}", floors[0]);
             assert!(floors[0] > 50.0);
         }
@@ -3280,7 +3350,10 @@ mod tests {
             })
             .collect();
         let p = plan(&surplus_end, 50.0, tz, &b, &WinterReserveParams::default());
-        assert!(approx(p.blocks[0].floor_kwh, emin + 4.0 * 0.75));
+        assert!(approx(
+            p.blocks[0].floor_kwh,
+            emin + 4.0 * 0.75 / 0.9_f32.sqrt()
+        ));
     }
 
     #[test]
@@ -4216,7 +4289,8 @@ mod tests {
             + blocks[9..56]
                 .iter()
                 .map(|x| (x.load_kwh - x.pv_kwh).max(0.0))
-                .sum::<f32>();
+                .sum::<f32>()
+                / 0.9_f32.sqrt();
         assert!(approx(floors[8], expected), "{} vs {expected}", floors[8]);
     }
 
@@ -4296,10 +4370,20 @@ mod tests {
     /// Block 0 has PV 0.3 kWh, then 15 blocks without PV; `load` is the load of every block.
     /// Buy is 6.0 for 8 blocks, then `later`.
     fn pv_block_zero_plan(load: f32, later: f32, previous: PlanMode) -> PlanMode {
+        pv_block_zero_plan_at(0.9, load, later, previous)
+    }
+
+    fn pv_block_zero_plan_at(
+        efficiency: f32,
+        load: f32,
+        later: f32,
+        previous: PlanMode,
+    ) -> PlanMode {
         let tz = chrono_tz::Europe::Prague;
         let params = WinterReserveParams::default();
         let b = BatteryParams {
             capacity_kwh: 10.0,
+            efficiency,
             ..battery()
         };
         let mut blocks: Vec<PlanBlock> = (0..8).map(|i| pblock(i, 6.0, 2.0, load, 0.0)).collect();
@@ -4323,15 +4407,16 @@ mod tests {
 
     #[test]
     fn pv_block_switches_to_hold_when_gain_is_above_threshold() {
+        // efficiency 1.0: this tests the keep rule, not losses (round-trip change 2026-11-07)
         // Block 0 has PV. Hold gains 1.19 CZK at block 0, above the 1.0 CZK switch threshold
         assert_eq!(
-            pv_block_zero_plan(2.0, 8.0, PlanMode::SelfUse),
+            pv_block_zero_plan_at(1.0, 2.0, 8.0, PlanMode::SelfUse),
             PlanMode::Hold
         );
         // H25: the switch threshold counts the whole Hold run, not one block of delay. At load 1.5
         // Hold gains 0.95 CZK at block 0 but more than 1.0 CZK over its 7-block run: switch.
         assert_eq!(
-            pv_block_zero_plan(1.5, 8.0, PlanMode::SelfUse),
+            pv_block_zero_plan_at(1.0, 1.5, 8.0, PlanMode::SelfUse),
             PlanMode::Hold
         );
     }
@@ -4498,7 +4583,8 @@ mod tests {
             export_guard_margin_kwh: 2.5,
             ..battery()
         };
-        // Floor 40 + margin 2.5 = 42.5: discharge stops there, 1.5 kWh exported
+        // Floor 40 + margin 2.5 = 42.5: discharge stops there. 44 - 42.5 = 1.5 kWh stored, which
+        // is 1.5 x sqrt(0.9) = 1.5 x 0.9487 = 1.423 kWh AC exported
         let o = simulate_block(
             PlanMode::Export,
             44.0,
@@ -4507,7 +4593,7 @@ mod tests {
             &b,
         );
         assert!(approx(o.energy_end_kwh, 42.5));
-        assert!(approx(o.grid_export_kwh, 1.5));
+        assert!(approx(o.grid_export_kwh, 1.5 * 0.9_f32.sqrt()));
     }
 
     #[test]
@@ -4749,6 +4835,65 @@ mod tests {
         );
     }
 
+    /// Round trip at the default 0.875 (`control.battery_efficiency`, AC to AC): each leg keeps
+    /// √0.875, so 10 kWh AC in stores 10 × √0.875 and the discharge to the floor gives back
+    /// 10 × √0.875 × √0.875 = 8.75 kWh AC.
+    #[test]
+    fn ten_kwh_ac_in_gives_eight_point_seven_five_ac_out_at_the_default_round_trip() {
+        let bat = BatteryParams {
+            efficiency: 0.875,
+            max_charge_kw: 40.0,
+            max_discharge_kw: 1000.0,
+            ..battery()
+        };
+        let one_way = one_way_efficiency(0.875);
+        let (emin, _) = bat.bounds_kwh();
+        let charge = pblock(0, 1.0, 1.0, 0.0, 0.0);
+        let c = simulate_block(PlanMode::Charge, emin, &charge, 0.0, &bat);
+        assert!((c.battery_charge_kwh - 10.0).abs() < 1e-4, "{c:?}");
+        assert!(
+            (c.energy_end_kwh - emin - 10.0 * one_way).abs() < 1e-4,
+            "{c:?}"
+        );
+        let discharge = pblock(1, 1.0, 1.0, 50.0, 0.0);
+        let d = simulate_block(PlanMode::SelfUse, c.energy_end_kwh, &discharge, emin, &bat);
+        assert!(
+            (d.battery_discharge_kwh - 10.0 * 0.875).abs() < 1e-4,
+            "{d:?}"
+        );
+        assert!((d.energy_end_kwh - emin).abs() < 1e-4, "{d:?}");
+    }
+
+    /// Discharging q kWh AC drains q / √0.875 from the stored energy.
+    #[test]
+    fn discharge_drains_the_ac_output_over_one_way_efficiency() {
+        let bat = BatteryParams {
+            efficiency: 0.875,
+            max_discharge_kw: 1000.0,
+            ..battery()
+        };
+        let one_way = one_way_efficiency(0.875);
+        let discharge = pblock(0, 1.0, 1.0, 2.0, 0.0);
+        let d = simulate_block(PlanMode::SelfUse, 50.0, &discharge, 9.6, &bat);
+        assert!((d.battery_discharge_kwh - 2.0).abs() < 1e-4, "{d:?}");
+        assert!(
+            (d.energy_end_kwh - (50.0 - 2.0 / one_way)).abs() < 1e-4,
+            "{d:?}"
+        );
+    }
+
+    /// Without a cost basis the export unit cost is cheap_ref / round trip + wear (no square).
+    #[test]
+    fn export_unit_cost_without_a_cost_basis_is_cheap_ref_over_round_trip_plus_wear() {
+        let bat = BatteryParams {
+            efficiency: 0.875,
+            charge_cost_czk_per_kwh: None,
+            ..battery()
+        };
+        // wear 0.125 from the test battery
+        assert!((export_unit_cost(&bat, 4.0) - (4.0 / 0.875 + 0.125)).abs() < 1e-4);
+    }
+
     #[test]
     fn no_discharge_simulator_balances_energy() {
         let bat = battery();
@@ -4764,7 +4909,10 @@ mod tests {
         let surplus = pblock(0, 3.0, 2.0, 0.25, 1.0);
         let o = simulate_block(PlanMode::NoDischarge, 50.0, &surplus, 9.6, &bat);
         assert!(approx(o.battery_charge_kwh, 0.75));
-        assert!(approx(o.energy_end_kwh, 50.0 + 0.75 * bat.efficiency));
+        assert!(approx(
+            o.energy_end_kwh,
+            50.0 + 0.75 * one_way_efficiency(bat.efficiency)
+        ));
         assert!(approx(o.grid_export_kwh, 0.0));
         // Energy in (PV + import) equals energy out (load + export + curtailed + charge).
         for (b, o) in [
@@ -5022,7 +5170,11 @@ mod keep_rule_tests {
     #[test]
     fn applied_hold_at_flat_price_is_released_at_the_next_boundary() {
         let params = WinterReserveParams::default();
-        let b = battery(20.0);
+        // efficiency 1.0: this tests the keep rule, not losses (round-trip change 2026-11-07)
+        let b = BatteryParams {
+            efficiency: 1.0,
+            ..battery(20.0)
+        };
         let blocks: Vec<PlanBlock> = (0..72)
             .map(|i| blk(i, if i < 16 { FLAT_BUY } else { 5.5 }, 1.0, 0.4, 0.0))
             .collect();
@@ -5074,7 +5226,9 @@ mod keep_rule_tests {
                 .map(|i| blk(i, if i < 24 { 5.0 } else { 9.0 }, 1.0, 0.4, 0.0))
                 .collect();
             blocks[0].buy_czk = head_buy;
-            plan_from(&blocks, 30.0, TZ, &b, p, Some(PlanMode::Hold)).blocks[0].mode
+            // SOC 20 (was 30): at 30 the round-trip change (2026-11-07) needs a second charge block
+            // and the leftover energy decides the switch; 20 passes on 6b91d515 and after
+            plan_from(&blocks, 20.0, TZ, &b, p, Some(PlanMode::Hold)).blocks[0].mode
         };
         // Small gain (head 9.2): kept; without a threshold it switches
         assert_eq!(plan_at(9.2, &zero), PlanMode::SelfUse);
@@ -5613,7 +5767,7 @@ mod h30_tests {
                 ..battery()
             };
             let cutoff = bat.guard_cutoff_kwh();
-            let stored_kw = kw * bat.efficiency;
+            let stored_kw = kw * one_way_efficiency(bat.efficiency);
             let mut charges = 0;
             for first in 0..4 {
                 for half_pct in 120..=200 {
@@ -5741,8 +5895,13 @@ mod h33_tests {
         let b = battery();
         let blocks = sunny_day(8);
         let caps = charge_caps(&blocks, &b, TZ);
-        // 08:00: room = 32 blocks × 0.15 = 4.8 kWh
-        assert!((caps[0] - (10.0 - 4.8)).abs() < 1e-3, "{}", caps[0]);
+        // 08:00: surplus = 32 blocks × (0.3 − 0.15) = 4.8 kWh AC; PV stores it through one leg:
+        // 4.8 × sqrt(0.9) = 4.8 × 0.9487 = 4.554 kWh stored, so the cap is 10 − 4.554
+        assert!(
+            (caps[0] - (10.0 - 4.8 * 0.9_f32.sqrt())).abs() < 1e-3,
+            "{}",
+            caps[0]
+        );
         let p = plan(&blocks, 10.0, TZ, &b, &WinterReserveParams::default());
         let charges: Vec<&PlannedBlock> = p
             .blocks
@@ -7045,11 +7204,14 @@ mod reversal_tests {
             .collect()
     }
 
-    /// Plan cost plus the energy left valued as the DP values it (`terminal_price`): what the
-    /// planner minimises, without the reversal cost
+    /// Plan cost plus the energy left valued as the DP values it (`terminal_price` times the
+    /// one-way share, stored kWh): what the planner minimises, without the reversal cost
     fn objective(plan: &Plan, battery: &BatteryParams) -> f32 {
         let end = plan.blocks.last().map_or(0.0, |b| b.outcome.energy_end_kwh);
-        plan.expected_cost_czk - end * terminal_price(battery, plan.cheap_ref_czk)
+        plan.expected_cost_czk
+            - end
+                * terminal_price(battery, plan.cheap_ref_czk)
+                * one_way_efficiency(battery.efficiency)
     }
 
     /// Two spreads a day: cheap night (2.0) and midday (2.5) buys, morning (06-09, sell 9.0) and
@@ -7210,7 +7372,7 @@ mod reversal_tests {
         let night: String = "S".repeat(56 + 12);
         let cases: [(f32, &str, f32); 3] = [
             (35.0, "CECCCECEEECCEE", -88.149994),
-            (46.0, "EECCCECEEECCEE", -109.2549),
+            (46.0, "EECCCECEEECCEE", -108.242256),
             (57.0, "EECCCECEEECCEE", -116.69999),
         ];
         for (soc, evening, cost) in cases {
@@ -7229,11 +7391,11 @@ mod reversal_tests {
             letters(&modes(&p)),
             format!(
                 "{}{}",
-                "HHHHHHHHHHHHCCHCCCCCHHHHHHHHHEEEEEEEHHHHHHHHHHHHCCCCCCHCHHHHHHHHHHHHHHHHHEEEEEEE",
+                "HHHHHHHHHHHHHCCCCCCCHHHHHHHHHEEEEEEEHHHHHHHHHHHHHCCCCCCCHHHHHHHHHHHHHHHHHEEEEEEE",
                 "S".repeat(56)
             )
         );
-        assert_eq!(p.expected_cost_czk, -233.79999);
+        assert_eq!(p.expected_cost_czk, -233.80005);
     }
 
     /// One marginal charge (buy 6.5) that an export at 8.0 repays by about 2.5 CZK, from the
@@ -7494,8 +7656,9 @@ mod continuity_tests {
         0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
         0.0000,
     ];
-    /// The live plan of that replan (`fluxion-ro plan owner`, read 12:47Z)
-    const LIVE_PLAN: &str = "HHHHHHHEEEEEECCCCEHEHEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS";
+    /// The 4 h plan of `owner_live_horizon` on the round-trip model (the 0.2.74 live replan of
+    /// 12:47Z is no longer reproduced: its values moved with the round-trip change)
+    const LIVE_PLAN: &str = "HHHHHHHEEEEEECCCCEHEHEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHSSSSSHHHHCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS";
     /// 18:00-19:15 local in `LIVE_PLAN` (`EHEHEE`)
     const LIVE_ZIGZAG: std::ops::Range<usize> = 17..23;
     /// 12:45Z in the `LIVE_*` arrays
@@ -7649,7 +7812,7 @@ mod continuity_tests {
         usize::try_from((local.with_timezone(&Utc) - first).num_minutes() / 15).unwrap()
     }
 
-    /// Prints the golden of `zero_continuity_matches_0_2_74` (pct 0) and the plans with
+    /// Prints the golden of `zero_continuity_matches_the_round_trip_model` (pct 0) and the plans with
     /// continuity (`--ignored --nocapture`)
     #[test]
     #[ignore = "golden printer, run by hand"]
@@ -7668,36 +7831,38 @@ mod continuity_tests {
             }
         }
     }
-    /// 0.2.74 (e13f01a3) on `owner_live_horizon`: evening hours, export-allowed mask, plan
-    /// letters and `expected_cost_czk` bits, printed by `print_golden` on that commit
-    const GOLDEN_0_2_74: [(u8, &str, &str, u32); 3] = [
+    /// Pinned on the round-trip model (`battery_efficiency` 0.95 in this fixture, one-way sqrt per
+    /// leg; 2026-11-07) on `owner_live_horizon`: evening hours, export-allowed mask, plan letters
+    /// and `expected_cost_czk` bits, printed by `print_golden`. Not the 0.2.74 values any more:
+    /// the 0.2.74 (e13f01a3) golden was re-pinned when the round-trip model landed.
+    const GOLDEN_ROUND_TRIP: [(u8, &str, &str, u32); 3] = [
         (
             4,
             "10000001111111111101011001100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
-            "HHHHHHHEEEEEECCCCEHEHEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
-            0xc289db47,
+            "HHHHHHHEEEEEECCCCEHEHEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHSSSSSHHHHCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+            0xc2875e8f,
         ),
         (
             5,
             "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111011100000000000000",
-            "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
-            0xc2bc15ff,
+            "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+            0xc2b6cb2e,
         ),
         (
             6,
             "10001011111111111111111111110100000000000000000000000000000000000011111111111111011000000000000000001011111111111111111111111000000000000",
-            "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
-            0xc2fb469a,
+            "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+            0xc2f50c9f,
         ),
     ];
 
     #[test]
-    fn zero_continuity_matches_0_2_74() {
-        for (hours, mask, plan_letters_0_2_74, cost_bits) in GOLDEN_0_2_74 {
+    fn zero_continuity_matches_the_round_trip_model() {
+        for (hours, mask, plan_letters_golden, cost_bits) in GOLDEN_ROUND_TRIP {
             let blocks = owner_live_horizon(hours, 0.0);
             assert_eq!(allowed(&blocks), mask, "{hours} h export mask");
             let plan = live_plan(hours, 0.0);
-            assert_eq!(plan_letters(&plan), plan_letters_0_2_74, "{hours} h plan");
+            assert_eq!(plan_letters(&plan), plan_letters_golden, "{hours} h plan");
             assert_eq!(
                 plan.expected_cost_czk.to_bits(),
                 cost_bits,
@@ -8018,7 +8183,7 @@ mod continuity_tests {
             .count();
         let buys: Vec<f32> = blocks[day.from..day.to].iter().map(|b| b.buy_czk).collect();
         let cheap_ref = cheap_reference(&buys, params.cheap_percentile);
-        let end_value = energy * cheap_ref * battery.efficiency;
+        let end_value = energy * cheap_ref * one_way_efficiency(battery.efficiency);
         let net = cost + wear - end_value;
         format!(
             "sim|{}|pv{pv_factor}/load{load_factor}|{}|{}|{}|{}|{}|net {net:.2}|grid {cost:.2}|wear {wear:.2}|end {:.1}% value {end_value:.2}|exported {exported:.2}|changes {changes}|reversals {reversals}|runs {runs}|15-22 {evening}|allowed {evening_allowed}",
@@ -8157,64 +8322,64 @@ mod continuity_tests {
                 2.5,
                 4,
                 "10000001111111111111011001100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
-                "HHHHHHHEEEEEECCCCEEECEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
-                0xc298b189,
+                "HHHHHHHEEEEEECCCCEEECEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHSSSSSHHHHCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+                0xc29584a9,
             ),
             (
                 2.5,
                 5,
                 "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111111100000000000000",
-                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
-                0xc2bc15ff,
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+                0xc2b6cb2e,
             ),
             (
                 2.5,
                 6,
                 "10001011111111111111111111110100000000000000000000000000000000000011111111111111011000000000000000001011111111111111111111111000000000000",
-                "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
-                0xc2fb469a,
+                "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+                0xc2f50c9f,
             ),
             (
                 5.0,
                 4,
                 "10000001111111111111111001100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
-                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
-                0xc29785a1,
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHSSSSSHHHHCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+                0xc29458c3,
             ),
             (
                 5.0,
                 5,
                 "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111111100000000000000",
-                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
-                0xc2bc15ff,
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+                0xc2b6cb2e,
             ),
             (
                 5.0,
                 6,
                 "10001011111111111111111111110100000000000000000000000000000000000011111111111111011000000000000000001011111111111111111111111000000000000",
-                "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
-                0xc2fb469a,
+                "HHHHECEEEEHEECCCCCCEEEECCEEEHEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+                0xc2f50c9f,
             ),
             (
                 10.0,
                 4,
                 "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000001111111111111110001000000000000000",
-                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
-                0xc29785a1,
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHSSSSSHHHHCEEEEEECCCCCEEEEHHHESSSSSSSSSSSSSSS",
+                0xc29458c3,
             ),
             (
                 10.0,
                 5,
                 "10000001111111111111111111100000000000000000000000000000000000000011111111111111011000000000000000000011111111111111111111100000000000000",
-                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
-                0xc2bc15ff,
+                "HHHHHHHEEEEEECCCCCEEEEECCEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSSSCEEEHEEECCCCEEEECCCEEESSSSSSSSSSSSSS",
+                0xc2b6cb2e,
             ),
             (
                 10.0,
                 6,
                 "10001111111111111111111111111100000000000000000000000000000000000011111111111111011000000000000000001111111111111111111111111000000000000",
-                "HHHHEECCEEEEEECCCCCCEEECCEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEECCCCEEEEEEHECCCCCCCHHHHSSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
-                0xc2fc5488,
+                "HHHHEECCEEEEEECCCCCCEEECCEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEEECCCCEEESECCCCCCCHHHHHSSSSSCECEEEHEEECCCCEEEECCCCEEEESSSSSSSSSSSS",
+                0xc2f51aed,
             ),
         ];
 
@@ -8283,14 +8448,15 @@ mod continuity_tests {
             }
         }
 
-        /// `windows` (the default) plans as 3a984783 did, bit for bit, whatever
+        /// `windows` (the default) plans as pinned on the round-trip model (2026-11-07; at
+        /// `battery_efficiency` 1.0 the plans equal 3a984783 bit for bit), whatever
         /// `daily_export_hours` says, on the same blocks (the list from 12:00 local, no ranking
         /// context). With today's started blocks as ranking context (review F1) the golden moves
         /// deliberately in one place: 13:45, the last morning-window block, is no longer among the
         /// best 4 h of 04:00-14:00 (the 06:00-10:00 peak is), so its export bit clears. The plan
         /// letters and the cost stay bit-exact: that replan held at 13:45 anyway.
         #[test]
-        fn windows_mode_is_bit_exact_against_3a984783() {
+        fn windows_mode_is_bit_exact_against_the_pinned_golden() {
             assert_eq!(
                 WinterReserveParams::default().export_selection,
                 ExportSelection::Windows
@@ -8604,7 +8770,7 @@ mod continuity_tests {
                 .count();
             let buys: Vec<f32> = blocks[day.from..day.to].iter().map(|b| b.buy_czk).collect();
             let cheap_ref = cheap_reference(&buys, params.cheap_percentile);
-            let end_value = energy * cheap_ref * battery.efficiency;
+            let end_value = energy * cheap_ref * one_way_efficiency(battery.efficiency);
             let net = cost + wear - end_value;
             format!(
                 "row|{}|pv{pv_factor}/load{load_factor}|{}|net {net:.2}|grid {cost:.2}|wear {wear:.2}|end {:.1}% value {end_value:.2}|exported {exported:.2}|discharged {discharged:.2}|before {discharged_before_kwh:.2}|cycles {:.2}|day cycles {:.2}|changes {changes}|reversals {reversals}|runs {runs}|05-22 {letters_5_22}|allowed {allowed_5_22}",
@@ -8712,38 +8878,39 @@ mod continuity_tests {
     mod ranking_context_tests {
         use super::*;
 
-        /// v0.2.74 (e13f01a3) from 00:00 local on `owner_days` (192 blocks, SOC 37 %, no current
+        /// Pinned on the round-trip model (2026-11-07; at `battery_efficiency` 1.0 these equal
+        /// v0.2.74 e13f01a3 bit for bit) from 00:00 local on `owner_days` (192 blocks, SOC 37 %, no current
         /// mode, reserve load = load × 1.1): morning and evening hours at 25 %, export-allowed mask,
         /// plan letters, `expected_cost_czk` bits; printed by a one-off test on v0.2.74
         /// (`.local/work/daily-topn/golden_midnight_0_2_74.txt`)
-        const GOLDEN_MIDNIGHT_0_2_74: [(u8, u8, &str, &str, u32); 4] = [
+        const GOLDEN_MIDNIGHT: [(u8, u8, &str, &str, u32); 4] = [
             (
                 4,
                 4,
                 "000000000000000000000001011111111111111010000000000000000000000101011111111111111000000000000000000000000000000000000100011111111111111010000000000000000000001111111111101011001100000000000000",
-                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEESECCCCCCCHHHHSSSSHHHHHHCEHEHEEECCCCCEEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHSSSSSSSSSCEEEEEECCCCEHEHEECCEESSSSSSSSSSSSSS",
-                0xbf559900,
+                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEEHECCCCCCCHHHHSSSSHHHHHHCEHEHEEECCCCCEEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHHSSSSSSSSCEEEEEECCCCEHEHEECCEESSSSSSSSSSSSSS",
+                0xbecd6500,
             ),
             (
                 4,
                 5,
                 "000000000000000000000001011111111111111010000000000000000000000111111111111111111110000000000000000000000000000000000100011111111111111010000000000000000000001111111111111111111100000000000000",
-                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEESECCCCCCCHHHHSSSSHHHHHHCEEEEECCCCCEEEEECCEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHSSSSHHHHHCEEEEEECCCCCEEEEECCEESSSSSSSSSSSSSS",
-                0xc1bc09a0,
+                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEEHECCCCCCCHHHHSSSSSSSCSSCEEEEECCCCCEEEEECCEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHHSSSSSSSSCEEEEEECCCCCEEEEECCEESSSSSSSSSSSSSS",
+                0xc1af6124,
             ),
             (
                 4,
                 6,
                 "000000000000000000000001011111111111111010000000000000000001001111111111111111111111100000000000000000000000000000000100011111111111111010000000000000000001011111111111111111111110100000000000",
-                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEESECCCCCCCHHHHSSSSSSSECCEEHEEECCCCCEEEECCCEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHSSSSSSCECEEEEHEECCCCCCEEEECCEEEHESSSSSSSSSSS",
-                0xc265001a,
+                "HHHHHHHHHHHHHHHHHCCCCCCEHEEEEECCCCCEEEEHECCCCCCCHHHHHSSSSSSECCEEHEEECCCCCEEEECCCEEEEEHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHEEEEEECCCCEEEHSECCCCCCCHHHHHSSSSSCECEEEEHEECCCCCCEEEECCEEEHESSSSSSSSSSS",
+                0xc2602526,
             ),
             (
                 2,
                 3,
                 "000000000000000000000000001111111100000000000000000000000000000100001111011111101000000000000000000000000000000000000000001111101110000000000000000000000000001110111100101011001000000000000000",
-                "HHHHHHHHHHHHHHHHHHCCCCCCHHEEEEECEEHCSSSSSCCCCCCCHHHHSSSSHHHHHHCEHHHHEECCCEEEEEECEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCHHEEEEECEEECSSSSSCCCCCCCHHHHSSSSSSSSSCEEEHHEEECCCCEHEEHHESSSSSSSSSSSSSSS",
-                0x425c7e76,
+                "HHHHHHHHHHHHHHHHHHCCCCCCHHEEEEECEEHCSSSSSCCCCCCCHHHHSSSSHHHHHHCEHHHHEECCCEEEEEECEHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHCCCCCCCSSEEEECCEEEHHSSSSCCCCCCCHHHHSSSSHHHHHCEEEHHEEECCCCEHEEHHESSSSSSSSSSSSSSS",
+                0x42619210,
             ),
         ];
 
@@ -8762,9 +8929,9 @@ mod continuity_tests {
         }
 
         /// A lever site at 00:00 knows the whole day: the windows mode with continuity 0 plans as
-        /// 0.2.74, bit for bit, with yesterday's blocks as ranking context (another local day)
+        /// the pinned golden, bit for bit, with yesterday's blocks as ranking context (another local day)
         #[test]
-        fn lever_site_at_midnight_is_bit_exact_against_0_2_74() {
+        fn lever_site_at_midnight_is_bit_exact_against_the_golden() {
             let days = owner_days();
             let yesterday: Vec<TimeBlockPrice> = days[..96]
                 .iter()
@@ -8774,7 +8941,7 @@ mod continuity_tests {
                 })
                 .collect();
             let p = owner_params(0.0, 2.0);
-            for (morning, evening, mask, golden_letters, cost_bits) in GOLDEN_MIDNIGHT_0_2_74 {
+            for (morning, evening, mask, golden_letters, cost_bits) in GOLDEN_MIDNIGHT {
                 let blocks: Vec<PlanBlock> = days
                     .iter()
                     .map(|b| PlanBlock {

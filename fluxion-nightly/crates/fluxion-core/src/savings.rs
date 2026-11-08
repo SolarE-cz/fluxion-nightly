@@ -11,6 +11,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::battery_cost_basis::one_way_efficiency;
 use crate::strategy::winter_reserve::{
     BatteryParams, PlanBlock, PlanMode, cheap_reference, simulate_block,
 };
@@ -34,7 +35,7 @@ pub struct RecordedBlock {
 pub struct DaySavings {
     pub cost_actual: f32,
     pub cost_selfuse: f32,
-    /// End-of-day battery difference valued at `cheap_ref x efficiency`.
+    /// End-of-day battery difference valued at `cheap_ref x one-way efficiency` (sqrt of the round trip).
     pub adj: f32,
     /// `cost_selfuse - cost_actual + adj`.
     pub savings: f32,
@@ -137,7 +138,7 @@ pub fn day_savings(
     );
     let cost_actual = actual_cost(blocks);
     let delta_energy_kwh = soc_end_pct / 100.0 * battery.capacity_kwh - selfuse.energy_end_kwh;
-    let adj = delta_energy_kwh * cheap_ref_czk * battery.efficiency;
+    let adj = delta_energy_kwh * cheap_ref_czk * one_way_efficiency(battery.efficiency);
     DaySavings {
         cost_actual,
         cost_selfuse: selfuse.cost_czk,
@@ -212,9 +213,10 @@ mod tests {
     fn flat_day_with_identical_cycling_saves_nothing() {
         // Flat 4 CZK price, 4 deficit blocks of 0.25 kWh at night. Self-use covers them from the
         // battery, so the recorded day shows the same 1.0 kWh discharge and no grid import.
-        // Start 50% = 11.5 kWh, end 10.5 kWh = 45.65%. Wear 1.0 kWh x 0.125 = 0.125 CZK both ways.
+        // Start 50% = 11.5 kWh. The 1.0 kWh AC drawn drains 1.0 / sqrt(0.9) = 1.054 kWh stored,
+        // so the end is 11.5 - 1.054 = 10.446 kWh = 45.42 %. Wear 1.0 kWh x 0.125 = 0.125 CZK both ways.
         let day = blocks(4, 4.0, 0.25, 0.0, 0.0, 0.0);
-        let soc_end_pct = (11.5 - 1.0) / 23.0 * 100.0;
+        let soc_end_pct = (11.5 - 1.0 / 0.9_f32.sqrt()) / 23.0 * 100.0;
         let result = day_savings(
             &day,
             50.0,
@@ -247,11 +249,12 @@ mod tests {
 
     #[test]
     fn battery_left_fuller_is_valued_at_cheap_ref() {
-        // 10% -> 50% at day end: delta = 0.4 x 23 = 9.2 kWh. adj = 9.2 x 3.0 x 0.9 = 24.84 CZK.
+        // 10% -> 50% at day end: delta = 0.4 x 23 = 9.2 kWh. adj = 9.2 x 3.0 x sqrt(0.9)
+        // = 9.2 x 3.0 x 0.9487 = 26.18 CZK (the stored kWh is valued at the one-way leg).
         // No recorded flows, so savings equals adj.
         let day = blocks(1, 3.0, 0.0, 0.0, 0.0, 0.0);
         let result = day_savings(&day, 10.0, 50.0, 3.0, &battery());
-        assert!(approx(result.adj, 24.84, 0.01), "{result:?}");
-        assert!(approx(result.savings, 24.84, 0.01), "{result:?}");
+        assert!(approx(result.adj, 26.1837, 0.01), "{result:?}");
+        assert!(approx(result.savings, 26.1837, 0.01), "{result:?}");
     }
 }

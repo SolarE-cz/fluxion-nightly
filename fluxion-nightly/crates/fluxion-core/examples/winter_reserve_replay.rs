@@ -46,7 +46,7 @@
 //! does (PV into the battery first, the house imports; `control.hold_pv_to_battery`), in the
 //! planner and the simulated inverter, for sites that still run EEPROM HOLD.
 //! `--plan-hold-to-house` (planner assumes the default HOLD model), `--plan-capacity` and
-//! `--plan-efficiency` change only what the planner assumes, so a replay can run the live config
+//! `--plan-efficiency` (AC-to-AC round trip) change only what the planner assumes, so a replay can run the live config
 //! against the measured battery (calibration). `--param` takes numbers; a boolean parameter
 //! such as `export_floor_until_cheap` takes 1 or 0. `--param direction_reversal_cost_czk=0` plans
 //! without the Charge/Export reversal cost (default 2.0); the `flows:` line counts the reversals
@@ -371,7 +371,7 @@ fn run() -> Result<(), String> {
     let total_wr_grid_charge_czk: f32 = counted().map(|d| d.wr.grid_charge_czk).sum();
     let wr_cols = !baseline_only;
 
-    // End state: energy left above SelfUse's, valued at the last day's cheap_ref times efficiency.
+    // End state: energy left above SelfUse's, valued at the last day's cheap_ref times the one-way efficiency (sqrt of the round trip).
     let cheap_ref_last_day = run.cheap_ref_last_day;
     let end_soc_adjustment_czk = run.end_soc_adjustment_czk(&battery);
     let total_wr_adjusted = total_wr - end_soc_adjustment_czk;
