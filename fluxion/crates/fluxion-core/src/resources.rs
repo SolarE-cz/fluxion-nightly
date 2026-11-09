@@ -20,14 +20,14 @@ use std::time::Duration;
 
 // ============= System Configuration (Imported from fluxion-types) =============
 pub use fluxion_types::config::{
-    ControlConfig, Currency, FixedPriceArbitrageConfigCore, InverterConfig, InverterTopology,
-    NotificationsConfigCore, PriceSchedule, PricingConfig, RemoteAccessConfigCore,
-    SolarAwareChargingConfigCore, SolarForecastConfigCore, StrategiesConfigCore,
-    StrategyEnabledConfigCore, SystemConfig, SystemSettingsConfig, WinterAdaptiveConfigCore,
-    WinterAdaptiveV2ConfigCore, WinterAdaptiveV3ConfigCore, WinterAdaptiveV4ConfigCore,
-    WinterAdaptiveV5ConfigCore, WinterAdaptiveV7ConfigCore, WinterAdaptiveV8ConfigCore,
-    WinterAdaptiveV9ConfigCore, WinterAdaptiveV10ConfigCore, WinterAdaptiveV20ConfigCore,
-    WinterPeakDischargeConfigCore, WinterReserveConfigCore,
+    ControlConfig, Currency, ExportSelection, FixedPriceArbitrageConfigCore, InverterConfig,
+    InverterTopology, NotificationsConfigCore, PriceSchedule, PricingConfig,
+    RemoteAccessConfigCore, SolarAwareChargingConfigCore, SolarForecastConfigCore,
+    StrategiesConfigCore, StrategyEnabledConfigCore, SystemConfig, SystemSettingsConfig,
+    WinterAdaptiveConfigCore, WinterAdaptiveV2ConfigCore, WinterAdaptiveV3ConfigCore,
+    WinterAdaptiveV4ConfigCore, WinterAdaptiveV5ConfigCore, WinterAdaptiveV7ConfigCore,
+    WinterAdaptiveV8ConfigCore, WinterAdaptiveV9ConfigCore, WinterAdaptiveV10ConfigCore,
+    WinterAdaptiveV20ConfigCore, WinterPeakDischargeConfigCore, WinterReserveConfigCore,
 };
 pub use fluxion_types::history::ConsumptionHistoryConfig;
 
@@ -291,12 +291,46 @@ impl PriceCache {
 
 /// Direct async inverter writer that replaces channel-based command execution
 /// Provides both synchronous and fire-and-forget async command writing
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct AsyncInverterWriter {
     source: Arc<dyn crate::traits::InverterDataSource>,
     /// Backup minimum SOC (%) last confirmed by the adapter, per inverter. Set only when a
     /// `SetBackupMode` returns Ok; cleared by any other write to that inverter, success or not.
     backup_confirmed: Arc<parking_lot::Mutex<std::collections::HashMap<String, u8>>>,
+    /// Shutdown: queued VPP writes without a completion signal (keep-alives) are dropped, so
+    /// the shutdown mode 0 goes right after the write in flight
+    vpp_flush: Arc<std::sync::atomic::AtomicBool>,
+    /// Ordered direct VPP write queue per inverter (created on the first VPP command)
+    vpp_queues: Arc<parking_lot::Mutex<std::collections::HashMap<String, Arc<VppQueue>>>>,
+    /// Inverters whose last direct VPP command failed, taken by the VPP system (re-send)
+    vpp_failed: Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>,
+    /// Result of the last `EnsureVppTargetSetType` per inverter, taken by the VPP system
+    target_checks: TargetChecks,
+}
+
+type TargetChecks =
+    Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::vpp::TargetCheck>>>;
+
+/// A queued direct VPP write, with an optional signal sent once it was executed
+type VppQueued = (
+    crate::components::InverterCommand,
+    Option<tokio::sync::oneshot::Sender<()>>,
+);
+
+/// One inverter's ordered write queue and the wake-up of its worker
+#[derive(Default)]
+struct VppQueue {
+    items: parking_lot::Mutex<std::collections::VecDeque<VppQueued>>,
+    wake: tokio::sync::Notify,
+}
+
+/// A non-zero VPP command without a completion signal: superseded by a newer one (coalesced)
+fn vpp_replaceable(item: &VppQueued) -> bool {
+    matches!(
+        item,
+        (crate::components::InverterCommand::SetVpp(command), None)
+            if *command != crate::vpp::VppCommand::Exit
+    )
 }
 
 impl AsyncInverterWriter {
@@ -305,7 +339,21 @@ impl AsyncInverterWriter {
         Self {
             source,
             backup_confirmed: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            vpp_flush: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            vpp_queues: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            vpp_failed: Arc::new(parking_lot::Mutex::new(std::collections::BTreeSet::new())),
+            target_checks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Result of the last target set type check of this inverter, once it ran (cleared)
+    pub fn take_target_check(&self, inverter_id: &str) -> Option<crate::vpp::TargetCheck> {
+        self.target_checks.lock().remove(inverter_id)
+    }
+
+    /// Whether a direct VPP command of this inverter failed since the last call (cleared)
+    pub fn take_vpp_failure(&self, inverter_id: &str) -> bool {
+        self.vpp_failed.lock().remove(inverter_id)
     }
 
     /// Backup minimum SOC the adapter last confirmed for this inverter (brief H19)
@@ -336,7 +384,9 @@ impl AsyncInverterWriter {
     }
 
     /// Write a command asynchronously (fire-and-forget)
-    /// Use this for mode changes where you don't need immediate confirmation
+    /// Use this for mode changes where you don't need immediate confirmation.
+    /// Direct VPP commands go through one ordered queue per inverter, so a mode 0 never lands
+    /// before an earlier keep-alive.
     pub fn write_command_async(
         &self,
         inverter_id: String,
@@ -345,34 +395,177 @@ impl AsyncInverterWriter {
         let source = self.source.clone();
         let backup_confirmed = self.backup_confirmed.clone();
 
+        if matches!(command, crate::components::InverterCommand::SetVpp(_)) {
+            self.queue_vpp(inverter_id, command, None);
+            return;
+        }
+
         tokio::spawn(async move {
-            match source.write_command(&inverter_id, &command).await {
-                Ok(_) => {
-                    tracing::info!(
-                        "✅ Async command succeeded for {}: {:?}",
-                        inverter_id,
-                        command
-                    );
-                    match command {
-                        crate::components::InverterCommand::SetBackupMode { min_soc_pct } => {
-                            backup_confirmed.lock().insert(inverter_id, min_soc_pct);
+            execute_command(&source, &backup_confirmed, inverter_id, command).await;
+        });
+    }
+}
+
+impl AsyncInverterWriter {
+    /// Shutdown mode 0: queued keep-alives of every inverter are dropped, then `command` runs
+    /// right after the inverter's write in flight (never before it); the returned receiver
+    /// fires once it was executed (success or not).
+    pub fn write_vpp_and_wait(
+        &self,
+        inverter_id: String,
+        command: crate::components::InverterCommand,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        self.vpp_flush
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.queue_vpp(inverter_id, command, Some(done));
+        wait
+    }
+
+    /// Queue any command behind the inverter's VPP writes (e.g. the kill switch's basic work
+    /// mode after its mode 0), fire-and-forget.
+    pub fn write_command_queued(
+        &self,
+        inverter_id: String,
+        command: crate::components::InverterCommand,
+    ) {
+        self.queue_vpp(inverter_id, command, None);
+    }
+
+    /// Queue a command in the inverter's ordered queue. Only the latest pending non-zero VPP
+    /// command is kept (a newer one replaces it, so a slow link never builds a backlog); a mode 0,
+    /// the shutdown write and other commands are never dropped.
+    fn queue_vpp(
+        &self,
+        inverter_id: String,
+        command: crate::components::InverterCommand,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let queue = self
+            .vpp_queues
+            .lock()
+            .entry(inverter_id.clone())
+            .or_insert_with(|| {
+                let queue = Arc::new(VppQueue::default());
+                let worker = queue.clone();
+                let source = self.source.clone();
+                let backup_confirmed = self.backup_confirmed.clone();
+                let failed = self.vpp_failed.clone();
+                let flush = self.vpp_flush.clone();
+                let checks = self.target_checks.clone();
+                let id = inverter_id.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let next = worker.items.lock().pop_front();
+                        let Some((command, done)) = next else {
+                            worker.wake.notified().await;
+                            continue;
+                        };
+                        if done.is_none() && flush.load(std::sync::atomic::Ordering::SeqCst) {
+                            tracing::debug!("Shutdown: dropping queued {:?} for {}", command, id);
+                            continue;
                         }
-                        _ => {
-                            backup_confirmed.lock().remove(&inverter_id);
+                        if command == crate::components::InverterCommand::EnsureVppTargetSetType {
+                            let result = match source.write_command(&id, &command).await {
+                                Ok(()) => crate::vpp::TargetCheck::Set,
+                                Err(e) if e.is::<crate::vpp::TargetTypeRefused>() => {
+                                    crate::vpp::TargetCheck::Refused(format!("{e:#}"))
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "⚠️ Target set type check of {} failed: {:#}",
+                                        id,
+                                        e
+                                    );
+                                    crate::vpp::TargetCheck::Failed(format!("{e:#}"))
+                                }
+                            };
+                            checks.lock().insert(id.clone(), result);
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                            }
+                            continue;
+                        }
+                        let vpp = matches!(command, crate::components::InverterCommand::SetVpp(_));
+                        let ok =
+                            execute_command(&source, &backup_confirmed, id.clone(), command).await;
+                        if vpp {
+                            let mut failed = failed.lock();
+                            if ok {
+                                failed.remove(&id);
+                            } else {
+                                failed.insert(id.clone());
+                            }
+                        }
+                        if let Some(done) = done {
+                            let _ = done.send(());
                         }
                     }
+                });
+                queue
+            })
+            .clone();
+        let item = (command, done);
+        {
+            let mut items = queue.items.lock();
+            if vpp_replaceable(&item) {
+                items.retain(|pending| !vpp_replaceable(pending));
+            }
+            items.push_back(item);
+        }
+        queue.wake.notify_one();
+    }
+}
+
+/// Write one command and record the Back Up minimum confirmation (see `AsyncInverterWriter`).
+async fn execute_command(
+    source: &Arc<dyn crate::traits::InverterDataSource>,
+    backup_confirmed: &parking_lot::Mutex<std::collections::HashMap<String, u8>>,
+    inverter_id: String,
+    command: crate::components::InverterCommand,
+) -> bool {
+    use crate::components::InverterCommand;
+    match source.write_command(&inverter_id, &command).await {
+        Ok(_) => {
+            if matches!(command, InverterCommand::SetVpp(_)) {
+                tracing::debug!(
+                    "✅ Async command succeeded for {}: {:?}",
+                    inverter_id,
+                    command
+                );
+            } else {
+                tracing::info!(
+                    "✅ Async command succeeded for {}: {:?}",
+                    inverter_id,
+                    command
+                );
+            }
+            match command {
+                InverterCommand::SetBackupMode { min_soc_pct }
+                | InverterCommand::SetBackupMinSoc { min_soc_pct } => {
+                    backup_confirmed.lock().insert(inverter_id, min_soc_pct);
                 }
-                Err(e) => {
+                // A volatile VPP command leaves the basic work mode and its minimum alone
+                InverterCommand::SetVpp(_) => {}
+                _ => {
                     backup_confirmed.lock().remove(&inverter_id);
-                    tracing::error!(
-                        "❌ Async command failed for {}: {:?} - {}",
-                        inverter_id,
-                        command,
-                        e
-                    );
                 }
             }
-        });
+            true
+        }
+        Err(e) => {
+            // A failed VPP command does not touch the basic work mode or its minimum
+            if !matches!(command, InverterCommand::SetVpp(_)) {
+                backup_confirmed.lock().remove(&inverter_id);
+            }
+            tracing::error!(
+                "❌ Async command failed for {}: {:?} - {}",
+                inverter_id,
+                command,
+                e
+            );
+            false
+        }
     }
 }
 

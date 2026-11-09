@@ -56,6 +56,10 @@ configuration:
   max_battery_soc:
     name: Maximální SOC baterie
     description: Maximální stav nabití baterie (%), na který bude FluxION dobíjet.
+  battery_efficiency:
+    name: Účinnost baterie
+    description: >-
+      Účinnost baterie, AC na AC (0.5 až 1.0): podíl energie odebrané ze sítě nebo FVE, který se vrátí jako střídavá energie. Výchozí 0.875.
   pricing:
     name: Cenotvorba
     description: Konfigurace informací o cenách elektřiny.
@@ -119,6 +123,10 @@ configuration:
     name: EEPROM HOLD nabíjí nejdřív z FV
     description: >-
       Zapněte jen u místa, kde EEPROM HOLD („Stop Charge and Discharge“) posílá FV nejdřív do baterie a dům odebírá ze sítě (změřeno na SolaX Ultra). Vypnuto: při HOLD FV kryje dům, přebytek nabíjí baterii, zbytek jde do sítě. Při přímém řízení VPP se ignoruje. Výchozí vypnuto: nechte vypnuté, dokud replay na daném místě neukáže zisk (u Jakuba vyšel asi o 2 Kč/den hůř).
+  vpp_direct_enabled:
+    name: Přímé řízení režimů přes VPP (SolaX)
+    description: >-
+      Výchozí zapnuto. Všechny režimy a omezení přetoků přes přímé VPP řízení SolaX (nevolatilní paměť se nezapisuje, příkaz se opakuje každý cyklus). Do EEPROM se zapisuje jen základní režim (Self Use / Back Up). Vyžaduje solax-modbus 2026.10.01 nebo novější; bez něj (nebo bez přímých entit) FluxION automaticky přejde na zápis režimů do EEPROM. Platí i pro paralelní instalace (master/slave): příkazy jdou do masteru, slavy ho následují. Na střídači bez režimu 8 (X3-Ultra) se používají režimy 1–7 a omezení přetoků v případě potřeby přejde na limit exportu. Vypnutím vynutíte zápis režimů do EEPROM. Po změně restartujte doplněk.
   update_interval_secs:
     name: Interval aktualizace (sekundy)
     description: >-
@@ -127,6 +135,37 @@ configuration:
   strategies:
     name: Strategie
     description: Povolit a konfigurovat specifické optimalizační strategie.
+  direction_reversal_cost_czk:
+    name: Cena obratu nabíjení/export (CZK)
+    description: >-
+      Winter Reserve: nabíjení ze sítě po exportu nebo export po nabíjení ze
+      sítě musí přinést aspoň tolik, takže nabíjení a export běží v souvislých
+      blocích a nestřídají se po 15 minutách. Ovlivňuje jen volbu plánu, do
+      nákladů plánu se nepočítá. 0 = vypnuto. Výchozí 2.0.
+  export_window_continuity_pct:
+    name: Souvislost okna vybíjení (%)
+    description: >-
+      Winter Reserve s pákami ranních/večerních hodin vybíjení: blok, který
+      páka vynechala, v mezeře jednoho nebo dvou bloků mezi dvěma vybranými
+      bloky smí také exportovat, když je jeho prodejní cena nejvýš o tolik
+      procent nižší než u sousedního vybraného bloku, takže se export netrhá
+      na střídání Export/Hold. Běh nikdy neprodlužuje ven. 0 = vypnuto.
+      Výchozí 5.
+  export_selection:
+    name: Výběr bloků pro export
+    description: >-
+      Winter Reserve: ve kterých blocích se smí exportovat. "windows"
+      (výchozí) = páky ranních/večerních hodin vybíjení. "daily_top_n" =
+      nejlépe placené hodiny každého místního dne 00-24 (Denní hodiny
+      exportu), ať leží kdekoli, včetně hodin, které už dnes proběhly, plus
+      doplnění mezer podle souvislosti; páky hodin vybíjení se pak
+      nepoužijí, páka max. vybití baterie (%) platí dál (když jsou obě
+      entity pák nedostupné, vybíjí se až na minimální SOC plánovače).
+  daily_export_hours:
+    name: Denní hodiny exportu
+    description: >-
+      Winter Reserve s výběrem "daily_top_n": počet nejlépe placených hodin
+      každého místního dne, ve kterých se smí exportovat (1-24). Výchozí 6.
   winter_adaptive:
     name: Zimní adaptivní strategie
     description: >-

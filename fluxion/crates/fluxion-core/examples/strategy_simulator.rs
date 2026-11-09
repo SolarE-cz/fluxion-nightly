@@ -413,6 +413,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 consumption_forecast_kwh: block.consumption_kwh,
                 grid_export_price_czk_per_kwh: spot_price, // Export at spot price (no grid fee)
                 all_price_blocks: Some(&all_price_blocks),
+                ranking_price_blocks: None,
                 backup_discharge_min_soc: config.hardware_min_battery_soc,
                 grid_import_today_kwh: None, // Not tracked in simulation
                 consumption_today_kwh: None, // Not tracked in simulation
@@ -439,9 +440,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             state.total_discharged_kwh += evaluation.energy_flows.battery_discharge_kwh;
 
             // Update SOC
-            let energy_in = evaluation.energy_flows.battery_charge_kwh * config.battery_efficiency;
-            let energy_out =
-                evaluation.energy_flows.battery_discharge_kwh / config.battery_efficiency;
+            // Each leg keeps the one-way share of the AC-to-AC round trip
+            let one_way =
+                fluxion_core::battery_cost_basis::one_way_efficiency(config.battery_efficiency);
+            let energy_in = evaluation.energy_flows.battery_charge_kwh * one_way;
+            let energy_out = evaluation.energy_flows.battery_discharge_kwh / one_way;
             let net_energy_change = energy_in - energy_out;
 
             let soc_change = (net_energy_change / config.battery_capacity_kwh) * 100.0;

@@ -101,6 +101,11 @@ pub struct EvaluationRequest {
     pub forecast: ForecastData,
     /// All available price blocks for analysis
     pub all_blocks: Vec<PriceBlock>,
+    /// Known blocks of the last 24 h that start before `block` (already started or past): for
+    /// ranking only, so a per-day selection sees the whole local day. Never planned or decided.
+    /// Empty from older senders.
+    #[serde(default)]
+    pub ranking_blocks: Vec<PriceBlock>,
     /// Historical data
     pub historical: HistoricalData,
     /// Backup discharge minimum SOC from inverter (%)

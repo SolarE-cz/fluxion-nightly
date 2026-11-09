@@ -243,8 +243,9 @@ fn test_config_update_no_schedule_recalc_when_not_needed() {
     );
 }
 
-/// Brief H37: a config update cannot change `control.mode_control_enabled` at runtime (the inverter
-/// adapter took it at startup); the rest of the update still applies
+/// Brief H37: a config update cannot change `control.mode_control_enabled` or
+/// `control.vpp_direct_enabled` at runtime (the inverter adapter took them at startup); the rest of
+/// the update still applies
 #[test]
 fn test_config_update_keeps_running_mode_control() {
     let mut app = App::new();
@@ -314,6 +315,34 @@ fn test_config_update_keeps_running_mode_control() {
 
         let after = app.world().resource::<SystemConfig>();
         assert_eq!(after.control_config.mode_control_enabled, running);
+        assert_eq!(
+            after.control_config.max_battery_soc,
+            config.control_config.max_battery_soc
+        );
+    }
+
+    // The same for `control.vpp_direct_enabled` (brief H37 pattern, VPP direct control)
+    for (running, requested) in [(false, true), (true, false)] {
+        app.world_mut()
+            .resource_mut::<SystemConfig>()
+            .control_config
+            .vpp_direct_enabled = running;
+        config.control_config.vpp_direct_enabled = requested;
+        config.control_config.max_battery_soc = if running { 95.0 } else { 100.0 };
+        let mut changed_sections = HashSet::new();
+        changed_sections.insert(ConfigSection::Control);
+        config_sender
+            .send_update(ConfigUpdateEvent::new(
+                serde_json::to_value(&config).unwrap(),
+                changed_sections,
+            ))
+            .unwrap();
+        app.world_mut()
+            .run_system_once(fluxion_core::async_systems::config_event_handler)
+            .unwrap();
+
+        let after = app.world().resource::<SystemConfig>();
+        assert_eq!(after.control_config.vpp_direct_enabled, running);
         assert_eq!(
             after.control_config.max_battery_soc,
             config.control_config.max_battery_soc

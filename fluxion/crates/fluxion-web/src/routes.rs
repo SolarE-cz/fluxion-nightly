@@ -113,6 +113,13 @@ pub struct ChartData {
     /// Price source per block when not the HA price entity (`"ote_fallback"`, brief H35).
     /// Aligned with `labels`.
     pub price_sources: Vec<Option<String>>,
+    /// Market spot price per block (spot buy: the spot price; fixed buy: the spot sell price
+    /// plus its fee); `None` where unknown. Aligned with `labels`.
+    pub market_spot_prices: Vec<Option<f32>>,
+    /// Fixed buy pricing: the bars show `market_spot_prices`, the fixed buy price is a line
+    pub fixed_buy: bool,
+    /// Spot sell fee (CZK/kWh), for the fixed buy tooltip
+    pub sell_fee_czk: f32,
 }
 
 /// Live data template (for SSE updates only)
@@ -306,11 +313,14 @@ impl DashboardTemplate {
             let mut solar_forecast_kw = Vec::new();
             let mut solar_forecast_raw_kw = Vec::new();
             let mut price_sources = Vec::new();
+            let mut market_spot_prices = Vec::new();
 
             // Get HDO and pricing fee info from response
             let hdo_schedule = response.hdo_schedule.as_ref();
             let tariff_known = hdo_schedule.is_some_and(|hdo| !hdo.low_tariff_periods.is_empty());
             let pricing_fees = response.pricing_fees.as_ref();
+            let fixed_buy = pricing_fees.is_some_and(|fees| fees.fixed_buy);
+            let sell_fee_czk = pricing_fees.map_or(0.0, |fees| fees.sell_fee_czk);
 
             // Get current time in the appropriate timezone for the "now" marker
             // Round to nearest 15-minute block to match chart data
@@ -350,6 +360,7 @@ impl DashboardTemplate {
                 solar_forecast_kw.push(block.solar_forecast_kw);
                 solar_forecast_raw_kw.push(block.solar_forecast_raw_kw);
                 price_sources.push(block.price_source.clone());
+                market_spot_prices.push(block.market_spot_price);
 
                 modes.push(display_mode_label(block));
 
@@ -587,6 +598,9 @@ impl DashboardTemplate {
                         .as_ref()
                         .and_then(|sf| sf.correction),
                     price_sources,
+                    market_spot_prices,
+                    fixed_buy,
+                    sell_fee_czk,
                 },
             }
         });
@@ -1042,6 +1056,7 @@ mod tests {
             solar_forecast_raw_kw: None,
             backup_min_soc_pct: None,
             price_source: None,
+            market_spot_price: None,
         };
         assert_eq!(display_mode_label(&block), "Hold");
 

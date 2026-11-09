@@ -272,6 +272,25 @@ pub struct ControlConfig {
     /// write. Planning and the dashboard keep running. Default: true
     #[serde(default = "default_true")]
     pub mode_control_enabled: bool,
+
+    /// SolaX only: drive every block mode and export curtailment through the direct VPP remote
+    /// control (volatile, re-sent every cycle). The only EEPROM write left is the basic work mode
+    /// (Self Use or Back Up, from the user's default mode). Fixed for the add-on's run.
+    /// Default: true. The per-block work mode and export limit writes (EEPROM) run when it is
+    /// false, and as the automatic fallback when the startup preconditions fail.
+    #[serde(default = "default_true")]
+    pub vpp_direct_enabled: bool,
+
+    /// The mode path this run uses ("direct VPP" or "EEPROM mode writes (<reason>)"), set at
+    /// startup; shown in `/api/config`, never read from a config file
+    #[serde(default, skip_deserializing)]
+    pub vpp_direct_path: Option<String>,
+
+    /// Inverters without the mode 8 entities (the Ultra, GEN5; owner direction D5), set at
+    /// startup: direct VPP runs modes 1–7 there and curtails by the export limit when mode 8 is
+    /// needed. Never read from a config file
+    #[serde(default, skip_deserializing)]
+    pub vpp_no_mode8: Vec<String>,
 }
 
 // Default value functions for serde
@@ -343,7 +362,7 @@ impl Default for ControlConfig {
             maximum_export_power_w: 10000,
             battery_capacity_kwh: 20.0,
             battery_wear_cost_czk_per_kwh: 0.1,
-            battery_efficiency: 0.95,
+            battery_efficiency: 0.875,
             min_mode_change_interval_secs: 300,
             average_household_load_kw: 1.0,
             planner_load_margin: default_planner_load_margin(),
@@ -364,6 +383,9 @@ impl Default for ControlConfig {
             hot_standby_entity: None,
             ensure_hot_standby: true,
             mode_control_enabled: true,
+            vpp_direct_enabled: true,
+            vpp_direct_path: None,
+            vpp_no_mode8: Vec::new(),
         }
     }
 }
@@ -1100,6 +1122,27 @@ pub struct WinterReserveConfigCore {
     /// blocks the switch is made for (default: 1.0)
     #[serde(default = "default_wr_mode_switch_min_benefit")]
     pub mode_switch_min_benefit_czk: f32,
+    /// Planning cost (CZK) of reversing the force direction: a grid Charge after an Export, or an
+    /// Export after a grid Charge, with any SelfUse/Hold blocks between them. It steers the plan
+    /// into contiguous charge and export runs and is never counted in the plan cost. A delta, not a
+    /// price threshold; 0 = off (default: 2.0)
+    #[serde(default = "default_wr_direction_reversal_cost")]
+    pub direction_reversal_cost_czk: f32,
+    /// Run continuity of the discharge-window levers (%): after a window's best-selling blocks are
+    /// chosen, a block between two chosen blocks of the same window and day may export too when
+    /// its sell price is at least the lowest chosen price minus this percentage. It fills gaps,
+    /// never extends a run outward; 0 = off (default: 5.0)
+    #[serde(default = "default_wr_export_window_continuity_pct")]
+    pub export_window_continuity_pct: f32,
+    /// How the blocks Export may run in are chosen: `windows` (the morning/evening discharge-hour
+    /// levers) or `daily_top_n` (the best `daily_export_hours` of each local day, levers' hours
+    /// ignored). Default: windows
+    #[serde(default)]
+    pub export_selection: ExportSelection,
+    /// `daily_top_n`: hours (×4 blocks) of each local day 00-24, ranked by sell price, in which
+    /// Export may run, plus the continuity gap fills (1-24, default: 6)
+    #[serde(default = "default_wr_daily_export_hours")]
+    pub daily_export_hours: u8,
     /// Stored-energy grid step of the planner, in percent of capacity (default: 0.5)
     #[serde(default = "default_wr_soc_resolution_pct")]
     pub soc_resolution_pct: f32,
@@ -1149,6 +1192,15 @@ fn default_wr_min_mode_benefit() -> f32 {
 fn default_wr_mode_switch_min_benefit() -> f32 {
     1.0
 }
+fn default_wr_direction_reversal_cost() -> f32 {
+    2.0
+}
+fn default_wr_export_window_continuity_pct() -> f32 {
+    5.0
+}
+fn default_wr_daily_export_hours() -> u8 {
+    6
+}
 fn default_wr_soc_resolution_pct() -> f32 {
     0.5
 }
@@ -1174,6 +1226,10 @@ impl Default for WinterReserveConfigCore {
             pv_confidence: default_wr_pv_confidence(),
             min_mode_benefit_czk: default_wr_min_mode_benefit(),
             mode_switch_min_benefit_czk: default_wr_mode_switch_min_benefit(),
+            direction_reversal_cost_czk: default_wr_direction_reversal_cost(),
+            export_window_continuity_pct: default_wr_export_window_continuity_pct(),
+            export_selection: ExportSelection::default(),
+            daily_export_hours: default_wr_daily_export_hours(),
             soc_resolution_pct: default_wr_soc_resolution_pct(),
             export_floor_until_cheap: false,
             cautious_pv_mae_pct: default_wr_cautious_pv_mae_pct(),
@@ -1181,6 +1237,18 @@ impl Default for WinterReserveConfigCore {
             cautious_pv_fallback_months: default_wr_cautious_pv_fallback_months(),
         }
     }
+}
+
+/// How Winter Reserve chooses the blocks Export may run in
+/// (`strategies.winter_reserve.export_selection`, owner 2026-11-05).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportSelection {
+    /// The morning and evening discharge-hour levers (the planner before this option)
+    #[default]
+    Windows,
+    /// The best `daily_export_hours` of each local day 00-24 by sell price, wherever they fall
+    DailyTopN,
 }
 
 /// Winter Adaptive V9 configuration - Solar-Aware Morning Peak Optimizer
@@ -1791,6 +1859,16 @@ impl Currency {
             Currency::USD => "$",
             Currency::CZK => "Kč",
         }
+    }
+}
+
+#[cfg(test)]
+mod battery_efficiency_default_tests {
+    use super::ControlConfig;
+
+    #[test]
+    fn battery_efficiency_defaults_to_the_ac_to_ac_round_trip() {
+        assert_eq!(ControlConfig::default().battery_efficiency, 0.875);
     }
 }
 

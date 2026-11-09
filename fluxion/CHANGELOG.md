@@ -10,6 +10,83 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.76] - 2026-11-08
+
+### Changed
+
+- `control.battery_efficiency` is now the AC-to-AC round trip (default 0.875, measured 0.86–0.875 on
+  the owner's site from the SolaX counters and the grid meter). Before, the planner applied it once on
+  charge and the cost of charge squared it (0.95 → 0.9025). The planner now loses √round trip on
+  charge and on discharge, and the energy left at the horizon end is valued at what it delivers.
+  A saved 0.95 now means a 0.95 round trip, which overstates every margin: set 0.875.
+- Winter Reserve night floor and the room kept for solar charging are counted in stored energy
+  (AC deficit / √round trip, solar surplus × √round trip), so an evening export down to the floor
+  still covers the night without grid import.
+
+## [0.2.75] - 2026-11-06
+
+### Added
+
+- Winter Reserve discharge-window continuity: `strategies.winter_reserve.export_window_continuity_pct`
+  (default 5.0 %, 0 = off). After the morning/evening discharge-hour lever picks its best-selling
+  blocks, a left-out block in a one-block gap between two picked blocks may export when it sells
+  at most 5 % below either picked neighbour; a two-block gap fills only when each block sells at
+  most 5 % below the picked block it touches. Runs are never extended outward (owner 2026-11-05: at 4 h the
+  owner's 18:15 and 18:45 fell just below the cut-off and the evening read E H E H E E).
+  Add-on-only: the add-on value applies over a saved web UI config.
+- Winter Reserve export block selection, opt-in per site: `strategies.winter_reserve.export_selection`
+  = `windows` (default, the morning/evening discharge-hour levers, unchanged) or `daily_top_n`
+  (owner 2026-11-05): export is allowed in the best `strategies.winter_reserve.daily_export_hours`
+  (default 6, range 1–24) of each local day 00–24 by sell price, wherever they fall, the hours
+  already passed included, plus the continuity gap fills. A future day the price feed has published
+  only in part gets the same share of its known time: known × hours / 24 h, rounded up to a block,
+  at most the full hours (a DST day of 23 or 25 h is complete). The discharge-hour levers are then ignored (INFO once); the max-discharge % lever still
+  applies (with both lever entities unavailable, export runs down to the planner minimum SOC).
+  The planner still decides by money within those blocks. Add-on-only: the add-on values apply
+  over a saved web UI config.
+
+### Changed
+
+- Winter Reserve discharge-window levers count their hours by block duration: with hourly prices
+  a 1 h lever allows 1 block (0.2.74 allowed 4, since it assumed 15-minute blocks).
+- Winter Reserve discharge-window levers rank the whole local day, the hours already passed
+  included: the scheduler sends today's started blocks to the planner for ranking only, so the
+  lever's export blocks no longer move as the day passes (0.2.74 ranked only from the current
+  block, so after the morning peak the morning lever chose its remaining hours instead). A plan made
+  at 00:00 is unchanged.
+
+### Fixed
+
+- Dashboard price chart under fixed buy with spot sell: the bars show the market spot price again (they showed the fixed buy price), the HDO fee is no longer stacked on them, and the fixed buy price (energy + HDO) is a magenta stepped line, "Fixed buy (incl. HDO)", with its own tooltip breakdown. Spot-buy and fixed-sell sites render as before.
+
+## [0.2.74] - 2026-11-05
+
+### Added
+
+- Direct VPP mode control for SolaX, **on by default** (`control.vpp_direct_enabled: true`): every block mode and export curtailment go through the volatile direct VPP remote control, re-sent every cycle and read back; the basic work mode (Self Use / Back Up) is the only EEPROM write. The EEPROM mode writes are the automatic fallback when the startup preconditions fail (solax-modbus older than 2026.10.01, direct entities missing, target set type not "Set", non-SolaX inverter), logged once as a WARN with the reason; `/api/config` shows the active path in `control.vpp_direct_path`. **To opt out**, set `control.vpp_direct_enabled: false` in the add-on configuration (restarts the add-on): FluxION then writes modes exactly as before.
+- Direct VPP on parallel (master/slave) sites, no opt-in: commands go to the master only, the slaves follow it; push power is the system total (measured on an X3-Ultra pair).
+- Direct VPP startup check (owner ruling 2026-10-28): one complete read decides, retried every 10 s for up to 120 s with no mode written meanwhile; without one the EEPROM mode writes run and a later good read switches to direct VPP once. The solax-modbus version comes from `update.solax_inverter_modbus_update` (or any update entity naming solax and modbus) and fails closed when missing, old or unparsable.
+- Direct VPP Feed-in and Force Discharge in two regimes (mode 8): PV uncapped with the battery filling export up to the cap (push = cap + house load − PV from a noise-aware estimate: a significant PV rise is projected over the read-back lag, a decrease of 100 W or more over the cap is written at once, and a band keeps read noise from writing), and, once PV alone reaches cap + house load, PV capped there with push 0 (the curtailment controller). A command that lowers export is written at once, even within the 20 s write gap. A switch between the two regimes writes the PV limit before the push both ways. Without mode 8 the same push runs on mode 4.
+- Direct VPP: a startup check that ran in debug mode (at start or while pending) leaves the target set type unverified; it is set to "Set" before the first VPP command once debug is off, or the EEPROM mode writes run (WARN). A transient error of that check, or an unreadable VPP read-back during it, is retried every 10 s; still unverified 120 s after the first check, the EEPROM mode writes run for the rest of the run (ERROR). A kill switch turned on while the check holds the inverter keeps its mode 0: sent before that fall-back, or with the default mode once the check passes. With several controlled masters each is verified on its own. The startup window is enforced by wall clock, and the 60 s retries read only the entities they need (an update entity matched by its title included).
+- Kill switch already on at start: no basic work mode write on either path (direct VPP: mode 0 once for a live command, waiting for a known read-back and a pending target set type check; EEPROM path: no mode write until the switch is turned off).
+- Winter Reserve direction-reversal cost: `strategies.winter_reserve.direction_reversal_cost_czk`
+  (default 2.0 CZK, 0 = off). A grid Charge after an Export, or an Export after a grid Charge (with
+  any Self-Use or Hold blocks between them), must gain at least this much more than a plan without
+  the reversal, so charge and export run in contiguous blocks instead of alternating every 15 minutes
+  (owner 2026-11-05: 17 EEPROM mode writes in one evening on fixed buy 3.22 and sell 7.9–8.9). It
+  steers the plan only and is never counted in the plan cost or profit. A delta, not a price
+  threshold. Add-on-only: the add-on value applies over a saved web UI config.
+- Inverters without mode 8 (X3-Ultra) are detected at startup and run VPP modes 1–7: force modes and Feed-in as mode 4, Hold mode 7; an export curtailment that needs mode 8 uses the export limit instead. `control.vpp_direct_path` shows "direct VPP (modes 1-7, no mode 8: <inverter>)".
+
+### Changed
+
+- `control.hold_pv_to_battery` is ignored when the run uses direct VPP control, which runs HOLD as
+  mode 7 (INFO once).
+- Stale inverter state on the direct VPP path: the end is VPP mode 0, then the default work mode
+  only when the inverter's work mode (last read) differs; no VPP command is renewed on stale data (a
+  Feed-in or curtailment mode 8 lapses by its 3 min duration). The stale window, the direct VPP
+  startup read window and the lever sync wait are one 120 s constant.
+
 ## [0.2.73] - 2026-11-03
 
 ### Security

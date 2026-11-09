@@ -251,8 +251,8 @@ pub struct ControlConfig {
     #[serde(default = "default_battery_wear_cost")]
     pub battery_wear_cost_czk_per_kwh: f32,
 
-    /// Battery one-way efficiency (0.0 to 1.0, default 0.95). The cost of charge (brief H33)
-    /// uses its square as the round trip; the Winter Reserve planner applies it once, on charge.
+    /// Battery AC-to-AC round trip (0.0 to 1.0, default 0.875). Each leg keeps its square root in
+    /// the Winter Reserve planner and the cost of charge (brief H33), which prices at the round trip.
     #[serde(default = "default_battery_efficiency")]
     pub battery_efficiency: f32,
 
@@ -335,6 +335,21 @@ pub struct ControlConfig {
     /// write); planning and the dashboard keep running. Default: true
     #[serde(default = "default_true")]
     pub mode_control_enabled: bool,
+
+    /// SolaX only: every block mode and export curtailment through the direct VPP remote control
+    /// (volatile, re-sent every cycle); the basic work mode is the only EEPROM write. Fixed for
+    /// the add-on's run. Default: true; the EEPROM mode writes run when false, and as the
+    /// automatic fallback when the startup preconditions fail
+    #[serde(default = "default_true")]
+    pub vpp_direct_enabled: bool,
+
+    /// The mode path of this run, set at startup (shown in `/api/config`; never read from a file)
+    #[serde(default, skip_deserializing)]
+    pub vpp_direct_path: Option<String>,
+
+    /// Inverters without mode 8 (D5), set at startup; never read from a file
+    #[serde(default, skip_deserializing)]
+    pub vpp_no_mode8: Vec<String>,
 }
 
 fn default_battery_capacity() -> f32 {
@@ -346,7 +361,7 @@ fn default_battery_wear_cost() -> f32 {
 }
 
 fn default_battery_efficiency() -> f32 {
-    0.95 // one-way; the round trip is its square (0.9025)
+    0.875 // AC to AC round trip; each leg keeps its square root (about 0.935)
 }
 
 fn default_min_mode_change_interval() -> u64 {
@@ -1112,6 +1127,10 @@ pub struct WinterReserveConfig {
     pub pv_confidence: f32,
     pub min_mode_benefit_czk: f32,
     pub mode_switch_min_benefit_czk: f32,
+    pub direction_reversal_cost_czk: f32,
+    pub export_window_continuity_pct: f32,
+    pub export_selection: fluxion_core::ExportSelection,
+    pub daily_export_hours: u8,
     pub soc_resolution_pct: f32,
     pub export_floor_until_cheap: bool,
     pub cautious_pv_mae_pct: f32,
@@ -1132,6 +1151,10 @@ impl Default for WinterReserveConfig {
             pv_confidence: core.pv_confidence,
             min_mode_benefit_czk: core.min_mode_benefit_czk,
             mode_switch_min_benefit_czk: core.mode_switch_min_benefit_czk,
+            direction_reversal_cost_czk: core.direction_reversal_cost_czk,
+            export_window_continuity_pct: core.export_window_continuity_pct,
+            export_selection: core.export_selection,
+            daily_export_hours: core.daily_export_hours,
             soc_resolution_pct: core.soc_resolution_pct,
             export_floor_until_cheap: core.export_floor_until_cheap,
             cautious_pv_mae_pct: core.cautious_pv_mae_pct,
@@ -1686,6 +1709,9 @@ impl Default for AppConfig {
                 hot_standby_entity: None,
                 ensure_hot_standby: true,
                 mode_control_enabled: true,
+                vpp_direct_enabled: true,
+                vpp_direct_path: None,
+                vpp_no_mode8: Vec::new(),
             },
             system: SystemConfig {
                 debug_mode: true, // Safe default
@@ -2481,6 +2507,9 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                     .filter(|e| !e.trim().is_empty()),
                 ensure_hot_standby: app_config.control.ensure_hot_standby,
                 mode_control_enabled: app_config.control.mode_control_enabled,
+                vpp_direct_enabled: app_config.control.vpp_direct_enabled,
+                vpp_direct_path: app_config.control.vpp_direct_path.clone(),
+                vpp_no_mode8: app_config.control.vpp_no_mode8.clone(),
             },
             system_config: fluxion_core::SystemSettingsConfig {
                 update_interval_secs: app_config.system.update_interval_secs,
@@ -2818,6 +2847,16 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .strategies
                         .winter_reserve
                         .mode_switch_min_benefit_czk,
+                    direction_reversal_cost_czk: app_config
+                        .strategies
+                        .winter_reserve
+                        .direction_reversal_cost_czk,
+                    export_window_continuity_pct: app_config
+                        .strategies
+                        .winter_reserve
+                        .export_window_continuity_pct,
+                    export_selection: app_config.strategies.winter_reserve.export_selection,
+                    daily_export_hours: app_config.strategies.winter_reserve.daily_export_hours,
                     soc_resolution_pct: app_config.strategies.winter_reserve.soc_resolution_pct,
                     export_floor_until_cheap: app_config
                         .strategies
@@ -3625,7 +3664,11 @@ mod tests {
     fn test_ha_addon_wear_and_efficiency_default_when_missing() {
         let config: AppConfig = serde_json::from_str(&ha_addon_control_json("")).unwrap();
         assert_eq!(config.control.battery_wear_cost_czk_per_kwh, 0.1);
-        assert_eq!(config.control.battery_efficiency, 0.95);
+        assert_eq!(config.control.battery_efficiency, 0.875);
+        // The add-on's config.yaml declares the same default and the 0.5-1.0 range
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    battery_efficiency: 0.875\n"));
+        assert!(addon.contains("    battery_efficiency: float(0.5,1.0)?\n"));
     }
 
     #[test]
@@ -3857,6 +3900,61 @@ mod tests {
         let addon = include_str!("../../../fluxion/config.yaml");
         assert!(addon.contains("    mode_control_enabled: true\n"));
         assert!(addon.contains("    mode_control_enabled: bool?\n"));
+    }
+
+    /// `control.vpp_direct_enabled` from the add-on options (default true, D1); no parallel
+    /// opt-in (D5)
+    #[test]
+    fn test_ha_addon_vpp_direct_enabled() {
+        let options = |extra: &str| {
+            format!(
+                r#"{{
+                "inverters": [{{"id": "solax", "vendor": "solax", "entity_prefix": "solax",
+                                "topology": "independent"}}],
+                "pricing": {{"spot_price_entity": "sensor.price", "use_spot_prices_to_buy": true,
+                            "use_spot_prices_to_sell": true, "fixed_buy_prices": [],
+                            "fixed_sell_prices": []}},
+                "control": {{"maximum_export_power_w": 5000, "force_charge_hours": 2,
+                            "force_discharge_hours": 1, "min_battery_soc": 10,
+                            "max_battery_soc": 100 {extra}}},
+                "system": {{"debug_mode": true, "log_level": "info", "update_interval_secs": 60}}
+            }}"#
+            )
+        };
+
+        // Missing (options saved before the option existed): on
+        let config: AppConfig = serde_json::from_str(&options("")).expect("parse");
+        assert!(config.control.vpp_direct_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(system.control_config.vpp_direct_enabled);
+
+        // Explicitly off: the EEPROM mode writes
+        let config: AppConfig =
+            serde_json::from_str(&options(r#", "vpp_direct_enabled": false"#)).expect("parse");
+        assert!(config.validate().is_ok());
+        assert!(!config.control.vpp_direct_enabled);
+        let system: fluxion_core::SystemConfig = config.into();
+        assert!(!system.control_config.vpp_direct_enabled);
+
+        // The dropped parallel opt-in of earlier options is ignored
+        let config: AppConfig =
+            serde_json::from_str(&options(r#", "vpp_direct_parallel": false"#)).expect("parse");
+        assert!(config.control.vpp_direct_enabled);
+        // The path of the run and the inverters without mode 8 are never read from a file
+        let config: AppConfig = serde_json::from_str(&options(
+            r#", "vpp_direct_path": "direct VPP", "vpp_no_mode8": ["solax"]"#,
+        ))
+        .expect("parse");
+        assert_eq!(config.control.vpp_direct_path, None);
+        assert!(config.control.vpp_no_mode8.is_empty());
+
+        assert!(AppConfig::default().control.vpp_direct_enabled);
+
+        // The add-on carries the option with its default and an optional bool in its schema
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("    vpp_direct_enabled: true\n"));
+        assert!(addon.contains("    vpp_direct_enabled: bool?\n"));
+        assert!(!addon.contains("vpp_direct_parallel"));
     }
 
     /// Brief H36: `inverters[].control_entity_prefix` from the add-on options
@@ -4280,6 +4378,10 @@ mod winter_reserve_config_tests {
         assert!((wr.pv_confidence - 0.70).abs() < 1e-6);
         assert!((wr.min_mode_benefit_czk - 0.10).abs() < 1e-6);
         assert!((wr.mode_switch_min_benefit_czk - 1.0).abs() < 1e-6);
+        assert!((wr.direction_reversal_cost_czk - 2.0).abs() < 1e-6);
+        assert!((wr.export_window_continuity_pct - 5.0).abs() < 1e-6);
+        assert_eq!(wr.export_selection, fluxion_core::ExportSelection::Windows);
+        assert_eq!(wr.daily_export_hours, 6);
         assert!((wr.soc_resolution_pct - 0.5).abs() < 1e-6);
         assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
         assert!((wr.cautious_pv_off_pct - 20.0).abs() < 1e-6);
@@ -4325,6 +4427,14 @@ mod winter_reserve_config_tests {
         assert!(addon.contains("      cautious_pv_off_pct: 20.0\n"));
         assert!(addon.contains("      cautious_pv_off_pct: float(0,100)?\n"));
         assert!(addon.contains("      cautious_pv_fallback_months:\n        - int(1,12)?\n"));
+        assert!(addon.contains("      direction_reversal_cost_czk: 2.0\n"));
+        assert!(addon.contains("      direction_reversal_cost_czk: float(0,)?\n"));
+        assert!(addon.contains("      export_window_continuity_pct: 5.0\n"));
+        assert!(addon.contains("      export_window_continuity_pct: float(0,100)?\n"));
+        assert!(addon.contains("      export_selection: windows\n"));
+        assert!(addon.contains("      export_selection: list(windows|daily_top_n)?\n"));
+        assert!(addon.contains("      daily_export_hours: 6\n"));
+        assert!(addon.contains("      daily_export_hours: int(1,24)?\n"));
     }
 
     #[test]
@@ -4340,6 +4450,10 @@ mod winter_reserve_config_tests {
                 "pv_confidence": 0.5,
                 "min_mode_benefit_czk": 0.25,
                 "mode_switch_min_benefit_czk": 2.5,
+                "direction_reversal_cost_czk": 4.0,
+                "export_window_continuity_pct": 7.5,
+                "export_selection": "daily_top_n",
+                "daily_export_hours": 8,
                 "soc_resolution_pct": 1.0
             }
         }"#;
@@ -4356,6 +4470,25 @@ mod winter_reserve_config_tests {
         assert!((wr.min_mode_benefit_czk - 0.25).abs() < 1e-6);
         assert!((wr.mode_switch_min_benefit_czk - 2.5).abs() < 1e-6);
         assert!((wr.soc_resolution_pct - 1.0).abs() < 1e-6);
+        assert!((wr.direction_reversal_cost_czk - 4.0).abs() < 1e-6);
+        assert!((wr.export_window_continuity_pct - 7.5).abs() < 1e-6);
+        let top_n = fluxion_core::ExportSelection::DailyTopN;
+        assert_eq!(wr.export_selection, top_n);
+        assert_eq!(wr.daily_export_hours, 8);
+        // The value reaches the core config and the planner parameters
+        let mut app = AppConfig::default();
+        app.strategies.winter_reserve = wr.clone();
+        let system: fluxion_core::SystemConfig = app.into();
+        let core = &system.strategies_config.winter_reserve;
+        assert!((core.direction_reversal_cost_czk - 4.0).abs() < 1e-6);
+        assert!((core.export_window_continuity_pct - 7.5).abs() < 1e-6);
+        let params = fluxion_core::backtest::winter_reserve_params(core);
+        assert!((params.direction_reversal_cost_czk - 4.0).abs() < 1e-6);
+        assert!((params.export_window_continuity_pct - 7.5).abs() < 1e-6);
+        assert_eq!(core.export_selection, top_n);
+        assert_eq!(core.daily_export_hours, 8);
+        assert_eq!(params.export_selection, top_n);
+        assert_eq!(params.daily_export_hours, 8);
     }
 
     #[test]

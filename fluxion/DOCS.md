@@ -186,13 +186,15 @@ inverter state until the unit is readable again, rather than use the master's ow
 off the pair's). A master that is not live fails the state read too. The state's age counts from the
 master's newest heartbeat. With no new data for over 120 s FluxION writes no planned mode, and ends
 a running force charge, force discharge or HOLD once with the default mode (Self-Use, or Back Up in
-the Back Up default). It re-enters a forced mode only after 60 s of good reads; when the exit is the
-second or later within 60 minutes, only after 10 minutes of good reads. A unit outage outside
-standby changes modes at the latest 120 s + 10 minutes + 120 s after the unit's last heartbeat. A
-unit that fails while in standby is found once the master shows more than 200 W of PV or charges (by
-the next morning at the latest), and modes change 10 minutes + 120 s after that. Set in the add-on
-configuration, both also apply when the web UI has saved its own configuration; removing them in the
-add-on UI clears them.
+the Back Up default). With direct VPP control that end is VPP mode 0, followed by the default work
+mode only when the inverter's work mode (last read) differs from it; no VPP command is renewed while
+the data is stale, so a Feed-in or curtailment mode 8 lapses by its own 3-minute duration. It
+re-enters a forced mode only after 60 s of good reads; when the exit is the second or later within
+60 minutes, only after 10 minutes of good reads. A unit outage outside standby changes modes at the
+latest 120 s + 10 minutes + 120 s after the unit's last heartbeat. A unit that fails while in
+standby is found once the master shows more than 200 W of PV or charges (by the next morning at the
+latest), and modes change 10 minutes + 120 s after that. Set in the add-on configuration, both also
+apply when the web UI has saved its own configuration; removing them in the add-on UI clears them.
 
 ### Option Group: `pricing`
 
@@ -275,6 +277,14 @@ Default value: `true`
 
 Fine-tune FluxION's control behavior.
 
+#### Option: `control.battery_efficiency`
+
+AC-to-AC round trip of the battery (0.5 to 1.0): the share of the energy taken from the grid or PV
+that comes back out as AC. Each charge or discharge leg keeps its square root (0.875 is about 0.935
+per leg). The planner and the cost of charge both read it this way.
+
+Default value: `0.875`
+
 #### Option: `control.maximum_export_power_w`
 
 Maximum power (in watts) that can be exported to the grid.
@@ -304,15 +314,174 @@ What HOLD does on this site. HOLD means the house is not served from the battery
 rest exported, and the battery never discharges. This is what direct VPP control's HOLD (mode 7)
 does. Set `true` only for a site that drives modes through EEPROM and whose "Stop Charge and
 Discharge" sends PV into the battery first while the house imports from the grid (measured on
-Jakub's SolaX Ultra pair, 2026-10-26); the planner then models HOLD that way. With direct VPP
-control the option is ignored. Set in the add-on configuration, it also applies when the web UI has
-saved its own configuration.
+Jakub's SolaX Ultra pair, 2026-10-26); the planner then models HOLD that way. When this run uses
+direct VPP control (the decided path, see `control.vpp_direct_path`) the option is ignored and the
+log says so once (INFO). Set in the add-on configuration, it also applies when the web UI has saved
+its own configuration.
 
 Keep it `false` unless a replay on that site shows a gain. On Jakub's site, where it describes the
 inverter correctly, it replayed about 2 CZK/day worse (10.7 days, October 2026). The default model
 plans more midday HOLD. On that site, HOLD stores PV while the house imports, and the evening peaks
 paid back more than those imports cost. The gap is within the replay's run-to-run spread of a few
 CZK/day.
+
+#### Option: `control.vpp_direct_enabled`
+
+SolaX only. Default: `true`. Every block mode and export curtailment goes through the direct VPP
+remote control: Force Charge, Force Discharge, Hold, Feed-in, Self Use under Back Up, and export curtailment
+are written to `select.<control prefix>_modbus_power_control_direct` and
+`number.<control prefix>_remotecontrol_*_direct`. These writes are volatile and re-sent about every
+60 s; FluxION reads the state back from `sensor.<prefix>_modbus_power_control`. The only EEPROM write
+is the basic work mode (`select.<prefix>_charger_use_mode`, Self Use or Back Up from the default
+mode).
+
+Requires solax-modbus 2026.10.01 or newer. Version 2026.09.2 writes the registers one by one and is
+not usable. The version is read from the integration's HACS update entity
+(`update.solax_inverter_modbus_update`, or any `update.*` naming solax and modbus); without it,
+or with a version that is older or not parsable, FluxION does not use direct VPP (fail closed).
+The direct entities must exist. Otherwise FluxION falls back to the EEPROM mode writes
+(the per-block work mode and export limit writes) and logs a WARN once: "Direct VPP unavailable:
+<reason>, using EEPROM mode writes". The same fallback runs for a non-SolaX inverter and with mode
+control off.
+
+The startup check needs one complete read of Home Assistant (states readable, the integration
+loaded, its version known). It is retried every 10 s for up to 120 s, and no mode or export
+limit is written on either path until it decides. Without a complete read in 120 s the EEPROM
+mode writes run (WARN) and the check is retried every 60 s, reading only the integration's
+update entity and the direct entities; a later complete read that passes switches to direct VPP
+once (one way, logged). The 120 s are wall clock: a read still hanging then is cut off. A complete read decides for the whole run.
+`/api/config` shows the path of this run in `control.vpp_direct_path` ("deciding (...)",
+"direct VPP", "direct VPP (modes 1-7, no mode 8: <inverter>)" or "EEPROM mode writes
+(<reason>)"); `control.vpp_direct_enabled` always shows the configured value. Set the
+option to `false` to force the EEPROM mode writes. Both target-set-type selects (`select.<control prefix>_remote_control_target_set_type_direct`,
+`select.<control prefix>_power_control_mode_target_set_type_direct`) must be "Set", since the
+keep-alive relies on a re-sent command restarting its duration. At startup FluxION sets them to
+"Set" while the power control reads Disabled (debug mode only logs "[DEBUG] Would set target
+type Set"); under a running command it does not change them and falls back to the EEPROM mode
+writes (WARN). A check that ran in debug mode (at start, or debug switched while it was pending)
+leaves the type unverified: it is then set before the first VPP command once debug mode is off.
+If the type cannot be set under a running command, the EEPROM mode writes take over (WARN); a
+read, connection or unlock error is retried every 10 s, with no VPP command meanwhile. If the type
+is still not verified 120 s after the first check (e.g. the read-back stays unavailable), the
+EEPROM mode writes take over for the rest of the run (ERROR); a kill switch turned on meanwhile
+gets its mode 0 first, and if the check passes in time, its mode 0 and default mode follow then.
+
+A non-zero VPP mode left by an earlier run (e.g. a crash) is ended with one mode 0 before the
+first plan.
+
+The integration re-sends the whole command when a parameter of the active mode changes, so FluxION
+writes only changed parameters, in an order where each step is safe (mode 8: the push first when it
+falls or the PV limit rises, else the PV limit first; a switch between curtailing and an uncapped
+PV limit of 30 000 W writes the PV limit first both ways), and the mode select on a mode change, as the
+keep-alive, at least every 50 s, and when the read-back shows another mode. If the integration
+rejects a parameter as unknown (a VPP mode started outside FluxION, or first use after an upgrade),
+FluxION writes mode 0, all parameters and the mode once more (WARN). Any other write error (e.g. the
+integration cannot read the active mode over Modbus) never drops to mode 0: the command is re-sent
+after 20 s. Only the newest pending command per inverter is queued. A command that lowers export
+(a lower push, or a lower PV limit + push in mode 8) is written at once, not held by the 20 s gap,
+as is a PV limit raised because the house imports.
+
+On stop (kill switch, automation lever, debug mode, add-on stop, or mode control off) FluxION writes
+VPP mode 0, which exits to the basic work mode. The kill switch and the automation lever then also
+write the configured default mode (e.g. Back Up with its minimum SOC), once per activation; a mode
+changed by hand after that is left alone. When the kill switch is already on at start, FluxION
+writes mode 0 once if a VPP command is live (it waits up to 120 s for a known read-back) and never
+writes the basic work mode, so a mode set by hand stays. On the EEPROM path it writes no mode at
+all until the switch is turned off (a VPR still runs, and Self Use follows its end).
+
+**Parallel (master/slave) sites** use direct VPP like any other site. Commands go to the master
+only; the slaves follow it in the same read-back poll (measured on an X3-Ultra pair, 2026-10-28).
+The push power is the system total, shared between the units (no multiplication by the unit count),
+and the discharge clamp uses the site's PV (master plus `pv_extra_prefixes`). FluxION never writes a
+slave's direct entities.
+
+**Inverters without mode 8** (the X3-Ultra, GEN5: solax-modbus 2026.10.x has no mode 8/9 entities
+for it) are detected at startup and run modes 1–7 (logged; `control.vpp_direct_path` says so):
+Force Charge is mode 4 push −W, Force Discharge mode 4 push +W (the discharge regime below), Feed-in mode 4
+push 0, Hold mode 7, Self Use under Back Up mode 6. Mode 4 lapses to mode 6 after about 10 minutes
+without a write, so the 60 s keep-alive applies. Export curtailment is mode 7 while the battery can
+take the surplus; when mode 8 would be needed (full battery, surplus above the charge power, Force
+Charge or Force Discharge during curtailment) the export limit curtails as with the option off, for
+the rest of that curtailment (logged once per inverter as "no mode 8 on this inverter"), and is
+restored when it ends.
+
+How each plan mode is sent (basic work mode = the default mode; without mode 8 see above):
+
+| Plan mode | Direct VPP command |
+|---|---|
+| Self Use (basic Self Use) / Back Up (basic Back Up) | mode 0: the basic work mode runs |
+| Self Use while the basic mode is Back Up | mode 6 (self-consume charge/discharge) |
+| Back Up while the basic mode is Self Use (VPR "no discharge", fixed slot) | mode 7 (no discharge, PV charges) |
+| Force Charge | mode 8, PV uncapped, push = −`max_battery_charge_rate_kw`; mode 7 at `max_battery_soc` |
+| Force Discharge | mode 8, two regimes (below); mode 7 at the discharge floor |
+| Hold (Stop Charge and Discharge) | mode 7 (PV surplus to the battery, never discharges) |
+| Feed-in Priority | mode 8, push 0, the same two regimes: battery idle, PV to house and grid (PV above the export cap is not stored) |
+
+Force Discharge and Feed-in run in two regimes, stepped once per state read:
+- **Discharge** while PV is below `maximum_export_power_w` + house load: PV uncapped (30 000 W), so
+  the measured PV is the sun, and push = export cap + house load − PV within the battery (Feed-in:
+  push 0). PV − load is estimated from the reads: an average for the level, the read noise, and
+  a rising slope over the last 6–24 reads, used only when it stands out from the noise and then
+  projected about 35 s ahead (the read-back lag and one read), so a push written now still fits
+  when it applies. The push keeps 1.5 σ of the estimate below the cap. It falls at once (not held
+  by the 20 s write gap, even by 100 W) when the last read or the mean of the last 3 shows export
+  more than 100 W over the cap beyond the read noise, and it rises only beyond
+  max(min(200 W, max(100 W, 4 σ)), 10 % of the load), so read noise writes nothing.
+- **Curtail** once the push is 0 and PV is at or above cap + load for 2 reads (at once when 100 W
+  over): PV limit = cap + house load (rounded up), push 0. The limit follows a load drop of 200 W,
+  a rise beyond max(300 W, 10 %) or a rise of 100 W held for 30 s, and a grid import at once. It
+  returns to the discharge regime when the mean of 3 settled PV reads (30 s after the last limit
+  change) is below cap + load by max(300 W, 5 % of the limit + 100 W) plus the read noise, for 2
+  reads. The 5 % covers the inverter's clip below its limit (measured 150 W at 3 kW).
+
+Known limits, measured in a closed-loop plant (lag 15/30 s, ±200 W read noise, 5 seeds): without
+noise, export is over the cap + 100 W only within the lag. With noise, a slow PV ramp (2–15 W/s)
+is not told from the noise at once: export can stay up to ~925 W over (15 W/s) and up to 165 s
+beyond the lag (2 W/s, about 300 W over); a cloud edge right after a regime switch can add up to
+15 s. Cloud edges every 30–90 s each need a write, so they write more than 8 times per 15 min.
+
+With PV or the house load unknown the PV limit is 30 000 W and the inverter's own export limit caps
+the meter. Without mode 8 (mode 4) PV cannot be capped: the discharge regime only, with the same
+push estimate and bands, and the inverter's export limit caps the meter (issue #649 Q3). Force Charge, Force Discharge and Feed-in use mode 8 (Force Charge PV limit 30 000 W,
+clamped to the entity's maximum; duration 180 s, then back to the basic work mode) so that a crashed or stopped FluxION
+lapses to the basic work mode within 3 minutes. Mode 8 discharge is not yet measured on hardware:
+check it in an attended test before enabling the option on a site.
+
+A command whose read-back (`sensor.<prefix>_modbus_power_control`) disagrees is counted at most
+once a minute (an unavailable sensor is not counted). After two counts it is re-sent (WARN); after
+five FluxION falls back to mode 0 and logs an ERROR; export curtailment on that inverter uses the
+export limit again. Every 15 minutes FluxION retries the plan (logged), with the mismatch count
+started over; the export limit keeps curtailing until the read-back confirms a VPP command. Toggling
+the kill switch or debug mode also retries at once.
+
+Export curtailment replaces the export limit write:
+
+- **Mode 7** (charge only) while the battery can take the whole PV surplus: the inverter's own
+  zero-export control puts the surplus into the battery and holds the meter at 0 W while the house
+  load moves.
+- **Mode 8** only when mode 7 would export: the battery at `max_battery_soc` (and a PV surplus
+  above 100 W), or a PV surplus above the battery's charge power. PV limit = house load + charge,
+  rounded up to 100 W (a slight export rather than an import), battery push = −charge. It is
+  recomputed every state read and re-sent at most every 10 s when it changed (other commands: 20 s).
+  Mode 8 does not follow the load between writes, so load swings show on the meter (a few hundred
+  W for up to one cycle).
+- Mode 8 goes back to mode 7 after two state reads with PV below the last sent limit by more than
+  max(300 W, 10 %) (sun-limited; at full battery this means PV below the house load), not counting
+  reads within 30 s of a raised limit (PV still ramping), or, at full battery, once the SOC is 1 %
+  below `max_battery_soc`. The inverter clips about 150 W below the limit (measured 3000 W → 2.85
+  kW), so at full battery the meter can show a small import of that size.
+- Force Charge during curtailment: mode 8 with the full charge power (the grid tops up PV). Force
+  Discharge: mode 8 with the battery idle (no discharge into a curtailed grid).
+
+Mode 8 is the only volatile PV limiter: mode 1 cannot throttle PV (per the integration authors), so
+it is not used.
+
+Curtailment also runs before the first plan. The inverter's persistent export limit is not relied
+on. Untested on hardware so far: mode 7 with a PV surplus above the charge power (the switch to mode
+8 covers it). Force Discharge is capped so that export stays under `maximum_export_power_w`.
+
+Set in the add-on configuration. A change needs an add-on restart; the web UI cannot change it while
+FluxION runs.
 
 Default value: `false`
 
@@ -325,8 +494,82 @@ Default value: `60`
 
 ### Option Group: `strategies.winter_reserve`
 
-Only the cautious-PV options are described here; the other Winter Reserve options keep their
-defaults unless a replay shows a gain.
+Only the cautious-PV options, the direction-reversal cost, the discharge-window continuity and the
+export block selection are described here; the other Winter Reserve options keep their defaults
+unless a replay shows a gain.
+
+#### Option: `strategies.winter_reserve.direction_reversal_cost_czk`
+
+Planning cost (CZK) of reversing the battery's force direction: a grid Charge after an Export
+(Force Discharge), or an Export after a grid Charge, with any Self-Use or Hold blocks between them.
+The planner switches direction only where that gains at least this much, so on a flat buy price
+charge and export run in contiguous blocks instead of alternating every 15 minutes (each switch is
+an inverter mode write). The planner still cycles as often as the spread pays for, and exports in
+the dearest blocks of a run. The cost only steers the plan; it is never added to the plan cost or
+profit. It is a difference, not a price threshold. `0` turns it off (the plan before this option).
+This option applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `2.0`
+
+#### Option: `strategies.winter_reserve.export_window_continuity_pct`
+
+Run continuity of the morning and evening discharge-hour levers ("Počet ranních/večerních hodin
+pro vybíjení"), in percent. The lever allows Export only in its best-selling blocks of the window,
+so a block that sells a little below the cut-off splits an export run into Export, Hold, Export.
+After the lever has chosen its blocks, a block it left out may export too when it lies in a gap
+between two chosen blocks of the same window and day and sells at most this percentage below a
+chosen neighbour (a higher price always qualifies):
+
+- a one-block gap fills when its sell price is at most this percentage below the chosen block
+  before it or the one after it;
+- a two-block gap fills only as a whole, when each block sells at most this percentage below the
+  chosen block it touches;
+- longer gaps, and blocks before the first or after the last chosen block, stay as the lever chose.
+
+Only the lever's own blocks count as neighbours, so filled blocks never chain. The maximum
+discharge percentage, floors, the export guard and caps are unchanged; the planner still decides
+whether an allowed block exports. `0` turns it off (the lever before this option). This option
+applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `5.0`
+
+#### Option: `strategies.winter_reserve.export_selection`
+
+Which blocks the planner may export the battery in:
+
+- `windows` (default): the morning and evening discharge-hour levers ("Počet ranních/večerních
+  hodin pro vybíjení") pick their best-selling blocks, as before this option.
+- `daily_top_n`: the best-selling `daily_export_hours` of each local calendar day (00:00–24:00),
+  wherever they fall, ranked by sell price (ties: the earlier block). The continuity gap fills of
+  `export_window_continuity_pct` apply on top, across the whole day. This replaces the morning and
+  evening windows: the discharge-hour levers are ignored (logged once at INFO); the maximum
+  discharge percentage levers still apply (the higher of the two set values). With both lever
+  entities unavailable there is no such limit, and export runs down to the planner minimum SOC
+  (as in `windows` without levers). A block forced to charge or barred from discharging by the
+  price levers takes no slot.
+
+Both selections rank the whole local day, the hours already passed included: the planner plans
+only from the current block on, but it gets today's earlier prices for ranking, so the export
+blocks do not move as the day passes. A future day the price feed has published only in part is
+ranked over its known blocks; with `daily_top_n` it gets the same share of its known time:
+known × `daily_export_hours` / 24 h, rounded up to a block, at most `daily_export_hours`. A DST
+day of 23 or 25 hours is complete and gets the full `daily_export_hours`.
+
+Within the allowed blocks the planner still decides by money (minimum arbitrage profit, losses,
+wear, later blocks), and a grid charge for a sale later the same day is allowed. Floors,
+`export_floor_until_cheap`, the export guard, caps and the direction-reversal cost are unchanged.
+This option applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `windows`
+
+#### Option: `strategies.winter_reserve.daily_export_hours`
+
+With `export_selection: daily_top_n`, the number of hours of each local day in which export is
+allowed, before the continuity gap fills (counted by block length: 4 quarter-hour blocks or 1
+hourly block per hour). Range 1–24. Ignored with `windows`. This
+option applies over a saved web UI configuration (`/data/config.json`).
+
+Default value: `6`
 
 #### Option: `strategies.winter_reserve.cautious_pv_mae_pct`
 

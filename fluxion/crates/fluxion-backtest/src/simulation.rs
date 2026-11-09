@@ -255,6 +255,7 @@ fn simulate_winter_adaptive(
             consumption_forecast_kwh: load_kw * interval_hours,
             grid_export_price_czk_per_kwh: export_price,
             all_price_blocks: Some(&time_block_prices),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: 10.0,
             grid_import_today_kwh: None,
             consumption_today_kwh: Some(cumulative_consumption_kwh),

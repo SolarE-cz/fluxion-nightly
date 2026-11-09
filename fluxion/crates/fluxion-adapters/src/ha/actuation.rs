@@ -244,7 +244,13 @@ pub fn command_allowed(
     cfg: &ActuationGuardConfig,
     command: &fluxion_core::InverterCommand,
 ) -> bool {
-    cfg.mode_control_enabled || matches!(command, fluxion_core::InverterCommand::SetExportLimit(_))
+    // Mode 0 ends a direct VPP command a previous run may have left (it changes no mode)
+    cfg.mode_control_enabled
+        || matches!(
+            command,
+            fluxion_core::InverterCommand::SetExportLimit(_)
+                | fluxion_core::InverterCommand::SetVpp(fluxion_core::vpp::VppCommand::Exit)
+        )
 }
 
 impl ActuationState {

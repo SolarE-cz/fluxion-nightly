@@ -40,7 +40,9 @@ use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::Europe::Prague;
 use chrono_tz::Tz;
 use fluxion_core::backtest::{ProfileSource, ReplayOptions, ReplayRow, replay};
-use fluxion_core::battery_cost_basis::{BatteryCostBasis, CostBasisBattery, CostBasisStep};
+use fluxion_core::battery_cost_basis::{
+    BatteryCostBasis, CostBasisBattery, CostBasisStep, one_way_efficiency,
+};
 use fluxion_core::savings::RecordedBlock;
 use fluxion_core::strategy::winter_reserve::{
     BatteryParams, BlockOutcome, PlanBlock, PlanMode, WinterReserveParams, WinterReserveStrategy,
@@ -411,23 +413,23 @@ fn realize(
 ) -> BlockOutcome {
     let emin = bat.min_soc_pct / 100.0 * bat.capacity_kwh;
     let emax = bat.max_soc_pct / 100.0 * bat.capacity_kwh;
-    let eta = bat.efficiency.max(1e-6);
+    let one_way = one_way_efficiency(bat.efficiency);
     let xmax = bat.max_export_kw * actual.duration_minutes as f32 / 60.0;
     let (load, pv) = (actual.load_kwh, actual.pv_kwh.max(0.0));
     let mut o = BlockOutcome::default();
     let balance = match mode {
         InverterOperationMode::ForceCharge => {
-            let c = planned_charge_kwh.min(((emax - energy) / eta).max(0.0));
+            let c = planned_charge_kwh.min(((emax - energy) / one_way).max(0.0));
             o.battery_charge_kwh = c;
-            o.energy_end_kwh = energy + c * eta;
+            o.energy_end_kwh = energy + c * one_way;
             load + c - pv
         }
         InverterOperationMode::ForceDischarge => {
             let q = planned_discharge_kwh
-                .min((energy - emin).max(0.0))
+                .min((energy - emin).max(0.0) * one_way)
                 .min(xmax + (load - pv).max(0.0));
             o.battery_discharge_kwh = q;
-            o.energy_end_kwh = energy - q;
+            o.energy_end_kwh = energy - q / one_way;
             load - pv - q
         }
         other => {
@@ -622,6 +624,7 @@ fn run_synthetic_closed_loop(
             consumption_forecast_kwh: slice_forecasts[in_slice_idx].consumption_kwh,
             grid_export_price_czk_per_kwh: ctl.grid_export_fee_czk_per_kwh,
             all_price_blocks: Some(slice_prices),
+            ranking_price_blocks: None,
             backup_discharge_min_soc: ctl.min_battery_soc,
             grid_import_today_kwh: None,
             consumption_today_kwh: None,

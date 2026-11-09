@@ -74,6 +74,11 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
 
     fn evaluate(&self, request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
         let (price_block, all_blocks) = convert_request(request);
+        let ranking_blocks: Vec<TimeBlockPrice> = request
+            .ranking_blocks
+            .iter()
+            .map(time_block_price)
+            .collect();
 
         // Back Up default mode raises the minimum SOC the strategy plans with (brief H19)
         let planner_control;
@@ -96,6 +101,7 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
             consumption_forecast_kwh: request.forecast.consumption_kwh,
             grid_export_price_czk_per_kwh: request.forecast.grid_export_price_czk_per_kwh,
             all_price_blocks: Some(&all_blocks),
+            ranking_price_blocks: Some(&ranking_blocks),
             backup_discharge_min_soc: request.backup_discharge_min_soc,
             grid_import_today_kwh: request.historical.grid_import_today_kwh,
             consumption_today_kwh: request.historical.consumption_today_kwh,
@@ -161,20 +167,20 @@ fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBloc
         spot_sell_price_czk_per_kwh: request.block.spot_sell_price_czk_per_kwh,
     };
 
-    let all_blocks: Vec<TimeBlockPrice> = request
-        .all_blocks
-        .iter()
-        .map(|b| TimeBlockPrice {
-            buy_price_czk_per_kwh: None,
-            block_start: b.block_start,
-            duration_minutes: b.duration_minutes,
-            price_czk_per_kwh: b.price_czk_per_kwh,
-            effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
-            spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
-        })
-        .collect();
+    let all_blocks: Vec<TimeBlockPrice> = request.all_blocks.iter().map(time_block_price).collect();
 
     (price_block, all_blocks)
+}
+
+fn time_block_price(b: &fluxion_plugins::PriceBlock) -> TimeBlockPrice {
+    TimeBlockPrice {
+        buy_price_czk_per_kwh: None,
+        block_start: b.block_start,
+        duration_minutes: b.duration_minutes,
+        price_czk_per_kwh: b.price_czk_per_kwh,
+        effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
+        spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
+    }
 }
 
 /// Calculate net profit from energy flows and pricing (centralized cost calculation).
@@ -451,6 +457,10 @@ pub fn init_plugin_manager(
         pv_confidence: wr_core.pv_confidence,
         min_mode_benefit_czk: wr_core.min_mode_benefit_czk,
         mode_switch_min_benefit_czk: wr_core.mode_switch_min_benefit_czk,
+        direction_reversal_cost_czk: wr_core.direction_reversal_cost_czk,
+        export_window_continuity_pct: wr_core.export_window_continuity_pct,
+        export_selection: wr_core.export_selection,
+        daily_export_hours: wr_core.daily_export_hours,
         soc_resolution_pct: wr_core.soc_resolution_pct,
         export_floor_until_cheap: wr_core.export_floor_until_cheap,
         cautious_pv_fallback_months: wr_core.cautious_pv_fallback_months.clone(),
@@ -594,6 +604,71 @@ mod winter_reserve_registration_tests {
                 "Recording".to_owned(),
             )
         }
+    }
+
+    /// Records the block starts of the ranking context it is given
+    struct RankingRecorder(std::sync::Mutex<Option<Vec<chrono::DateTime<chrono::Utc>>>>);
+
+    impl EconomicStrategy for RankingRecorder {
+        fn name(&self) -> &str {
+            "RankingRecorder"
+        }
+
+        fn evaluate(&self, context: &EvaluationContext) -> crate::strategy::BlockEvaluation {
+            *self.0.lock().unwrap() = context
+                .ranking_price_blocks
+                .map(|r| r.iter().map(|b| b.block_start).collect());
+            crate::strategy::BlockEvaluation::new(
+                context.price_block.block_start,
+                context.price_block.duration_minutes,
+                fluxion_types::inverter::InverterOperationMode::SelfUse,
+                "RankingRecorder".to_owned(),
+            )
+        }
+    }
+
+    /// Review F1 of legacy/daily-top-n-ship: the request's ranking blocks reach the strategy
+    #[test]
+    fn test_request_ranking_blocks_reach_the_strategy_context() {
+        let block = |start: &str, sell: f32| {
+            serde_json::json!({
+                "block_start": start, "duration_minutes": 15, "price_czk_per_kwh": 3.0,
+                "effective_price_czk_per_kwh": 3.5, "spot_sell_price_czk_per_kwh": sell,
+            })
+        };
+        let current = block("2026-11-05T13:00:00Z", 6.0);
+        let request: EvaluationRequest = serde_json::from_value(serde_json::json!({
+            "block": current,
+            "battery": {
+                "current_soc_percent": 50.0, "capacity_kwh": 23.0, "max_charge_rate_kw": 10.0,
+                "min_soc_percent": 10.0, "max_soc_percent": 100.0, "efficiency": 0.95,
+                "wear_cost_czk_per_kwh": 0.1,
+            },
+            "forecast": {"solar_kwh": 0.0, "consumption_kwh": 0.5, "grid_export_price_czk_per_kwh": 6.0},
+            "all_blocks": [current],
+            "ranking_blocks": [block("2026-11-05T07:00:00Z", 9.0), block("2026-11-05T07:15:00Z", 8.0)],
+            "historical": {"grid_import_today_kwh": null, "consumption_today_kwh": null},
+            "backup_discharge_min_soc": 10.0,
+        }))
+        .unwrap();
+        let plugin = StrategyPlugin::new(
+            RankingRecorder(std::sync::Mutex::new(None)),
+            100,
+            ControlConfig::default(),
+        );
+        plugin.evaluate(&request).unwrap();
+        let seen = plugin
+            .strategy
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("ranking context");
+        let t = |s: &str| s.parse::<chrono::DateTime<chrono::Utc>>().unwrap();
+        assert_eq!(
+            seen,
+            vec![t("2026-11-05T07:00:00Z"), t("2026-11-05T07:15:00Z")]
+        );
     }
 
     #[test]

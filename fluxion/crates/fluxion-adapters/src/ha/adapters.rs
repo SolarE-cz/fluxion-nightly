@@ -24,6 +24,7 @@ use crate::ha::actuation::{self, ActuationGuardConfig, ActuationState};
 use crate::ha::client::HomeAssistantClient;
 use fluxion_core::continuous_systems::STATE_STALE_SECS;
 use fluxion_core::pricing::parse_spot_price_response;
+use fluxion_core::vpp::{PV_UNCAPPED_W, VppCommand};
 use fluxion_core::{
     GenericInverterState, InverterCommand, InverterDataSource, InverterOperationMode,
     PriceDataSource, SpotPriceData, VendorEntityMapper,
@@ -57,6 +58,10 @@ pub struct HomeAssistantInverterAdapter {
     heartbeat_discovery_warned: Mutex<std::collections::HashSet<String>>,
     /// Parallel units whose SOC is taken in standby (INFO once per standby period)
     standby_units: Mutex<std::collections::HashSet<String>>,
+    /// `control.vpp_direct_enabled` with its preconditions met: read the VPP mode back
+    vpp_direct: bool,
+    /// Last direct VPP block written per control prefix (dropped on any write error)
+    vpp_written: Mutex<HashMap<String, VppWritten>>,
 }
 
 /// Liveness of an entity prefix from its heartbeat entities
@@ -131,6 +136,110 @@ pub struct BatterySocWeights {
     pub extras: Vec<(String, f32)>,
 }
 
+/// What the integration holds for one control prefix after FluxION's writes: the selected mode
+/// and the parameter values (the integration stores them locally across modes).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct VppWritten {
+    mode: Option<u8>,
+    values: HashMap<&'static str, i64>,
+    /// When the select was last written (the block is selected at least every
+    /// `VPP_SELECT_REFRESH`, so a mode that lapsed behind FluxION's back is started again)
+    selected_at: Option<Instant>,
+}
+
+/// Longest time between two select writes while parameters keep changing (below the core's
+/// 60 s keep-alive, so each keep-alive carries a select)
+const VPP_SELECT_REFRESH: Duration = Duration::from_secs(50);
+/// A read-back that differs from the selected mode this long after the select drops the cached
+/// mode, so the next write selects again
+const VPP_READBACK_LAG: Duration = Duration::from_secs(30);
+
+impl VppWritten {
+    /// The read-back shows another mode than the one selected (lapsed, rebooted, or changed by
+    /// hand): forget the cached mode so the next write sends the select.
+    fn note_readback(&mut self, read_mode: u8, now: Instant) {
+        if self.mode.is_some_and(|mode| mode != read_mode)
+            && self
+                .selected_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= VPP_READBACK_LAG)
+        {
+            self.mode = None;
+        }
+    }
+}
+
+/// The integration's rejection of a parameter edit while a VPP mode it does not fully know is
+/// active ("Direct VPP parameter '…' is unknown. Configure the direct VPP targets and select the
+/// mode before updating an already active command.", solax-modbus `plugin_solax.py`). Any other
+/// error (e.g. "Cannot read the active SolaX VPP mode") is not retried through mode 0.
+fn is_unknown_vpp_parameter(error: &crate::ha::errors::HaError) -> bool {
+    match error {
+        crate::ha::errors::HaError::ServiceCallFailed { reason, .. } => {
+            let reason = reason.to_ascii_lowercase();
+            reason.contains("direct vpp parameter") && reason.contains("is unknown")
+        }
+        _ => false,
+    }
+}
+
+/// The integration re-sends the whole block at once when a parameter of the active mode
+/// (input 0x100) changes, and on every select write. So only changed parameters are written,
+/// ordered so each intermediate block is safe, and the select on a mode change, when nothing
+/// changed (keep-alive), or `VPP_SELECT_REFRESH` after the last select. Returns (parameters to
+/// write in order, write the select).
+fn vpp_write_plan(
+    prev: Option<&VppWritten>,
+    command: VppCommand,
+    now: Instant,
+) -> (Vec<(&'static str, i64)>, bool) {
+    let mut changed: Vec<(&'static str, i64)> = command
+        .parameters()
+        .into_iter()
+        .filter(|(key, value)| prev.and_then(|p| p.values.get(key)) != Some(value))
+        .collect();
+    let same_mode = prev.and_then(|p| p.mode) == Some(command.mode());
+    // Mode 8 active: the push goes first when it falls or the PV limit rises; otherwise the PV
+    // limit goes first. So no intermediate block pairs a higher PV limit with the old push, or a
+    // lower PV limit with the old (higher) push. A regime switch (the PV limit to or from
+    // `PV_UNCAPPED_W`) writes the PV limit first both ways (R7-7): on entry to curtailing the
+    // lower limit is the safe side; on the exit the push is still 0 and the exit happens only
+    // with PV below cap + load, so the uncapped PV exports at most the cap
+    if same_mode && let VppCommand::PvAndBattery { pv_limit_w, push_w } = command {
+        let old = |key| prev.and_then(|p| p.values.get(key)).copied();
+        let raising = old("pv_power_limit").is_some_and(|old| i64::from(pv_limit_w) > old);
+        let push_falls = old("push_mode_power_8_9").is_some_and(|old| i64::from(push_w) < old);
+        let uncapped = i64::from(PV_UNCAPPED_W);
+        let regime_switch = old("pv_power_limit")
+            .is_some_and(|old| (old == uncapped) != (i64::from(pv_limit_w) == uncapped));
+        let push_first = (raising || push_falls) && !regime_switch;
+        changed.sort_by_key(|(key, _)| match (*key, push_first) {
+            ("push_mode_power_8_9", true) | ("pv_power_limit", false) => 0,
+            ("pv_power_limit", true) | ("push_mode_power_8_9", false) => 1,
+            _ => 2,
+        });
+    }
+    let select_stale = prev
+        .and_then(|p| p.selected_at)
+        .is_none_or(|at| now.saturating_duration_since(at) >= VPP_SELECT_REFRESH);
+    let select = !same_mode || changed.is_empty() || select_stale;
+    (changed, select)
+}
+
+/// A direct VPP write failed: a parameter the integration rejected as unknown (a mode it does
+/// not fully know is active), or any other error.
+enum VppWriteError {
+    UnknownParameter(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl VppWriteError {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::UnknownParameter(e) | Self::Other(e) => e,
+        }
+    }
+}
+
 /// PV values read from a parallel unit's entities
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct PvExtras {
@@ -157,6 +266,137 @@ impl HomeAssistantInverterAdapter {
             heartbeats: Mutex::new(HashMap::new()),
             heartbeat_discovery_warned: Mutex::new(std::collections::HashSet::new()),
             standby_units: Mutex::new(std::collections::HashSet::new()),
+            vpp_direct: false,
+            vpp_written: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Direct VPP mode control (`control.vpp_direct_enabled`, preconditions met): `read_state`
+    /// also reads `sensor.<prefix>_modbus_power_control`. Off by default (no extra read).
+    #[must_use]
+    pub fn with_vpp_direct(mut self, enabled: bool) -> Self {
+        self.vpp_direct = enabled;
+        self
+    }
+
+    /// Write one direct VPP command (`number.<control prefix>_remotecontrol_<key>_direct`, then
+    /// `select.<control prefix>_modbus_power_control_direct`), see [`vpp_write_plan`]. A
+    /// parameter the integration rejects as unknown (a VPP mode started outside FluxION, or
+    /// before the integration stored its parameters) is retried once: mode 0, all parameters,
+    /// then the select. Any other error is returned (the core re-sends after its write gap).
+    async fn write_vpp(
+        &self,
+        inverter_id: &str,
+        control_prefix: &str,
+        command: VppCommand,
+    ) -> Result<()> {
+        match self.write_vpp_once(control_prefix, command).await {
+            Ok(()) => Ok(()),
+            Err(VppWriteError::Other(e)) => Err(e),
+            Err(VppWriteError::UnknownParameter(e)) => {
+                warn!(
+                    "⚠️ [ADAPTER] Direct VPP parameter unknown to the integration on {} ({e:#}); retrying once via mode 0",
+                    inverter_id
+                );
+                self.write_vpp_once(control_prefix, VppCommand::Exit)
+                    .await
+                    .map_err(VppWriteError::into_inner)?;
+                self.vpp_written.lock().remove(control_prefix);
+                self.write_vpp_once(control_prefix, command)
+                    .await
+                    .map_err(VppWriteError::into_inner)
+            }
+        }
+    }
+
+    async fn write_vpp_once(
+        &self,
+        control_prefix: &str,
+        command: VppCommand,
+    ) -> std::result::Result<(), VppWriteError> {
+        let prefix = control_prefix.replace('.', "_");
+        let (parameters, select) = {
+            let written = self.vpp_written.lock();
+            vpp_write_plan(written.get(control_prefix), command, Instant::now())
+        };
+        for (key, value) in parameters {
+            let entity_id = format!("number.{prefix}_remotecontrol_{key}_direct");
+            // An uncapped PV limit is clamped to the entity's maximum (unknown: as requested)
+            let written = if key == "pv_power_limit" {
+                match self.client.get_state(&entity_id).await {
+                    Ok(state) => number_max_attribute(&state.attributes)
+                        .map_or(value, |max| value.min(i64::from(max))),
+                    Err(_) => value,
+                }
+            } else {
+                value
+            };
+            let result = self
+                .client
+                .call_service(
+                    "number.set_value",
+                    serde_json::json!({ "entity_id": entity_id, "value": written }),
+                )
+                .await;
+            let mut written = self.vpp_written.lock();
+            match result {
+                Ok(_) => {
+                    written
+                        .entry(control_prefix.to_owned())
+                        .or_default()
+                        .values
+                        .insert(key, value);
+                }
+                Err(e) => {
+                    written.remove(control_prefix);
+                    let unknown = is_unknown_vpp_parameter(&e);
+                    let e = anyhow::Error::from(e).context(format!(
+                        "Failed to set {entity_id} to {value} for VPP {command}"
+                    ));
+                    return Err(if unknown {
+                        VppWriteError::UnknownParameter(e)
+                    } else {
+                        VppWriteError::Other(e)
+                    });
+                }
+            }
+        }
+        if !select {
+            debug!(
+                "✅ [ADAPTER] Direct VPP {} written (parameters only)",
+                command
+            );
+            return Ok(());
+        }
+        let entity_id = format!("select.{prefix}_modbus_power_control_direct");
+        let result = self
+            .client
+            .call_service(
+                "select.select_option",
+                serde_json::json!({ "entity_id": entity_id, "option": command.select_option() }),
+            )
+            .await;
+        let mut written = self.vpp_written.lock();
+        match result {
+            Ok(_) => {
+                let entry = written.entry(control_prefix.to_owned()).or_default();
+                entry.mode = Some(command.mode());
+                entry.selected_at = Some(Instant::now());
+                debug!(
+                    "✅ [ADAPTER] Direct VPP {} written via {}",
+                    command, entity_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                written.remove(control_prefix);
+                Err(VppWriteError::Other(anyhow::Error::from(e).context(
+                    format!(
+                        "Failed to set {entity_id} to '{}' for VPP {command}",
+                        command.select_option()
+                    ),
+                )))
+            }
         }
     }
 
@@ -747,10 +987,37 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
                 }
             };
 
+        // Direct VPP read-back (input 0x100), decoded with the integration's labels only
+        let vpp_mode = if self.vpp_direct {
+            let entity = format!(
+                "sensor.{}_modbus_power_control",
+                inverter_id.replace('.', "_")
+            );
+            let mode = match self.client.get_state(&entity).await {
+                Ok(state) => fluxion_core::vpp::decode_power_control(&state.state),
+                Err(e) => {
+                    debug!("VPP read-back {} unreadable: {}", entity, e);
+                    None
+                }
+            };
+            if let Some(mode) = mode
+                && let Some(written) = self
+                    .vpp_written
+                    .lock()
+                    .get_mut(self.mapper.control_prefix(inverter_id))
+            {
+                written.note_readback(mode, Instant::now());
+            }
+            mode
+        } else {
+            None
+        };
+
         let state = GenericInverterState {
             inverter_id: inverter_id.to_string(),
             battery_soc,
             work_mode,
+            vpp_mode,
             grid_power_w: grid_power,
             battery_power_w: battery_power,
             pv_power_w: pv_power,
@@ -828,14 +1095,66 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
             anyhow::bail!("mode control disabled; {command:?} not written to {inverter_id}");
         }
 
-        info!(
-            "📝 [ADAPTER] Writing command to {}: {:?}",
-            inverter_id, command
-        );
+        // Direct VPP keep-alives come every minute: logged by the VPP system on change only
+        if matches!(command, InverterCommand::SetVpp(_)) {
+            debug!(
+                "📝 [ADAPTER] Writing command to {}: {:?}",
+                inverter_id, command
+            );
+        } else {
+            info!(
+                "📝 [ADAPTER] Writing command to {}: {:?}",
+                inverter_id, command
+            );
+        }
 
         // Pre-actuation guard (brief H11): the single choke point for every SolaX write.
         // Unlock before any write, including export limits; the write is skipped on error.
         actuation::ensure_unlocked(&self.client, inverter_id, control_prefix, &self.guard).await?;
+
+        // Direct VPP command (volatile) and the minimum-SOC-only sync
+        match command {
+            InverterCommand::SetVpp(vpp) => {
+                if vpp.charges() {
+                    actuation::ensure_awake(
+                        &self.client,
+                        inverter_id,
+                        control_prefix,
+                        &self.actuation,
+                    )
+                    .await;
+                }
+                self.write_vpp(inverter_id, control_prefix, *vpp).await?;
+                // The "grid charge did not start" check only for a grid charge (mode 4)
+                let mode = if vpp.grid_charges() {
+                    InverterOperationMode::ForceCharge
+                } else {
+                    InverterOperationMode::SelfUse
+                };
+                if actuation::note_mode_written(&self.actuation, mode) {
+                    actuation::start_charge_check(
+                        self.client.clone(),
+                        &self.actuation,
+                        inverter_id,
+                        self.mapper.get_battery_power_entity(inverter_id),
+                        &self.guard,
+                    );
+                }
+                return Ok(());
+            }
+            InverterCommand::SetBackupMinSoc { min_soc_pct } => {
+                return self.sync_backup_min_soc(control_prefix, *min_soc_pct).await;
+            }
+            InverterCommand::EnsureVppTargetSetType => {
+                return crate::ha::vpp::ensure_target_set_type_now(
+                    &self.client,
+                    inverter_id,
+                    control_prefix,
+                )
+                .await;
+            }
+            _ => {}
+        }
 
         // Back Up Mode: the minimum SOC is synced first, then the mode is written as SetMode
         let mode_command;
@@ -979,9 +1298,12 @@ impl InverterDataSource for HomeAssistantInverterAdapter {
 
                 info!("✅ [ADAPTER] Export limit set successfully");
             }
-            InverterCommand::SetBackupMode { .. } => {
-                // Mapped to SetMode above; reaching this arm would be a dispatch bug
-                anyhow::bail!("SetBackupMode was not mapped for {}", inverter_id);
+            InverterCommand::SetBackupMode { .. }
+            | InverterCommand::SetVpp(_)
+            | InverterCommand::SetBackupMinSoc { .. }
+            | InverterCommand::EnsureVppTargetSetType => {
+                // Handled above; reaching this arm would be a dispatch bug
+                anyhow::bail!("{:?} was not dispatched for {}", command, inverter_id);
             }
         }
         Ok(())
@@ -1911,11 +2233,7 @@ mod tests {
 
     // ---- Read-only PV extras of a parallel unit (pv_extra_prefixes) ----
 
-    async fn mock_state(
-        server: &mut mockito::ServerGuard,
-        entity: &'static str,
-        state: &'static str,
-    ) {
+    async fn mock_state(server: &mut mockito::Server, entity: &'static str, state: &'static str) {
         server
             .mock("GET", format!("/api/states/{entity}").as_str())
             .with_body_from_request(move |_| state_body(entity, state))
@@ -1924,7 +2242,7 @@ mod tests {
     }
 
     /// `/api/states` lists no heartbeat entity: the state age is not checked
-    async fn no_heartbeats(server: &mut mockito::ServerGuard) {
+    async fn no_heartbeats(server: &mut mockito::Server) {
         server
             .mock("GET", "/api/states")
             .with_body("[]")
@@ -1933,7 +2251,7 @@ mod tests {
     }
 
     /// Master `solax_80` with its core reads, PV 2000 W, today 51.3 kWh, total 1000 kWh
-    async fn master_states(server: &mut mockito::ServerGuard) {
+    async fn master_states(server: &mut mockito::Server) {
         no_heartbeats(server).await;
         for (entity, state) in [
             ("sensor.solax_80_battery_capacity", "55"),
@@ -3229,6 +3547,448 @@ mod tests {
             &off,
             &InverterCommand::SetExportLimit(0)
         ));
+    }
+
+    // ---- Direct VPP (control.vpp_direct_enabled) ----
+
+    /// Every service call (service path, body) the adapter makes, in order
+    async fn record_services(
+        server: &mut mockito::Server,
+    ) -> Arc<StdMutex<Vec<(String, serde_json::Value)>>> {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        for service in ["select/select_option", "number/set_value", "button/press"] {
+            let calls = calls.clone();
+            server
+                .mock("POST", format!("/api/services/{service}").as_str())
+                .with_body_from_request(move |request| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(request.body().unwrap()).unwrap();
+                    calls.lock().unwrap().push((service.to_owned(), body));
+                    b"[]".to_vec()
+                })
+                .create_async()
+                .await;
+        }
+        calls
+    }
+
+    fn n(entity_key: &str, value: i64) -> (String, serde_json::Value) {
+        (
+            "number/set_value".to_owned(),
+            json!({"entity_id": format!("number.solax_inverter_remotecontrol_{entity_key}_direct"), "value": value}),
+        )
+    }
+
+    fn vpp_select(option: &str) -> (String, serde_json::Value) {
+        (
+            "select/select_option".to_owned(),
+            json!({"entity_id": "select.solax_inverter_modbus_power_control_direct", "option": option}),
+        )
+    }
+
+    /// A server of its own (not mockito's pool) for tests whose writes start the background
+    /// charge check: a late request of that task can never reach another test's server (N5)
+    async fn isolated_server() -> mockito::Server {
+        mockito::Server::new_with_opts_async(mockito::ServerOpts::default()).await
+    }
+
+    /// A VPP command writes only changed parameters (the integration re-sends the block on each),
+    /// in a safe order, and the select only on a mode change or as the keep-alive; all under
+    /// the control prefix
+    #[tokio::test]
+    async fn vpp_writes_only_changed_parameters_in_a_safe_order() {
+        let mut server = isolated_server().await;
+        mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+        let calls = record_services(&mut server).await;
+        let adapter = control_prefix_adapter(server.url()).with_vpp_direct(true);
+        let m8 = |pv_limit_w, push_w| VppCommand::PvAndBattery { pv_limit_w, push_w };
+        let steps: Vec<(VppCommand, Vec<(String, serde_json::Value)>)> = vec![
+            // First write: every parameter, then the select
+            (
+                m8(3000, -2000),
+                vec![
+                    n("pv_power_limit", 3000),
+                    n("push_mode_power_8_9", -2000),
+                    n("duration_8", 180),
+                    n("timeout_8_9", 160),
+                    vpp_select("Individual Setting - Duration Mode"),
+                ],
+            ),
+            // Keep-alive: the select only
+            (
+                m8(3000, -2000),
+                vec![vpp_select("Individual Setting - Duration Mode")],
+            ),
+            // Higher PV limit: push first, then the limit; no select
+            (
+                m8(4000, -3000),
+                vec![n("push_mode_power_8_9", -3000), n("pv_power_limit", 4000)],
+            ),
+            // Lower PV limit: the limit first, then the push
+            (
+                m8(2000, -1000),
+                vec![n("pv_power_limit", 2000), n("push_mode_power_8_9", -1000)],
+            ),
+            // Push only
+            (m8(2000, -1500), vec![n("push_mode_power_8_9", -1500)]),
+            // Regime switches (the PV limit to or from 30000): the PV limit first both ways
+            // (R7-7). Into Force Discharge, then into curtailment, where the lower limit with the
+            // old push exports less than the old block
+            (
+                m8(30000, 5000),
+                vec![n("pv_power_limit", 30000), n("push_mode_power_8_9", 5000)],
+            ),
+            (
+                m8(1200, 0),
+                vec![n("pv_power_limit", 1200), n("push_mode_power_8_9", 0)],
+            ),
+            (VppCommand::Exit, vec![vpp_select("Disabled")]),
+            (
+                VppCommand::Push { push_w: -2000 },
+                vec![
+                    n("push_mode_power", -2000),
+                    n("timeout", 0),
+                    vpp_select("Push Power-Positive/Negative Mode"),
+                ],
+            ),
+            // Mode 7 shares timeout 0 with mode 4: the select only
+            (
+                VppCommand::ChargeOnly,
+                vec![vpp_select("Self-Consume - Charge Only Mode")],
+            ),
+        ];
+        for (n_step, (command, expected)) in steps.into_iter().enumerate() {
+            adapter
+                .write_command("solax", &InverterCommand::SetVpp(command))
+                .await
+                .unwrap();
+            let got = std::mem::take(&mut *calls.lock().unwrap());
+            assert_eq!(got, expected, "step {n_step}: {command}");
+        }
+    }
+
+    /// The integration's text for a parameter of an active mode it does not know
+    const UNKNOWN_PARAMETER: &str = "{\"message\": \"Direct VPP parameter 'Push Mode Power' is unknown. Configure the direct VPP targets and select the mode before updating an already active command.\"}";
+
+    /// A parameter the integration rejects as unknown (VPP started outside FluxION): one retry
+    /// via mode 0, all parameters, then the select
+    #[tokio::test]
+    async fn unknown_parameter_retries_via_mode_0() {
+        let mut server = isolated_server().await;
+        mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+        let rejected = server
+            .mock("POST", "/api/services/number/set_value")
+            .with_status(400)
+            .with_body(UNKNOWN_PARAMETER)
+            .expect(1)
+            .create_async()
+            .await;
+        let calls = record_services(&mut server).await;
+        let adapter = control_prefix_adapter(server.url()).with_vpp_direct(true);
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetVpp(VppCommand::Push { push_w: 1500 }),
+            )
+            .await
+            .unwrap();
+        rejected.assert_async().await;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                vpp_select("Disabled"),
+                n("push_mode_power", 1500),
+                n("timeout", 0),
+                vpp_select("Push Power-Positive/Negative Mode"),
+            ]
+        );
+    }
+
+    /// Any other error (e.g. the integration cannot read 0x100 on a flaky Modbus link) is
+    /// returned without a mode 0, and the next write sends the whole block again
+    #[tokio::test]
+    async fn other_vpp_errors_never_drop_to_mode_0() {
+        let mut server = isolated_server().await;
+        mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+        let failing = server
+            .mock("POST", "/api/services/number/set_value")
+            .with_status(400)
+            .with_body(
+                "{\"message\": \"Cannot read the active SolaX VPP mode (input register 0x100); no VPP command was sent\"}",
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let calls = record_services(&mut server).await;
+        let adapter = control_prefix_adapter(server.url()).with_vpp_direct(true);
+        let command = InverterCommand::SetVpp(VppCommand::Push { push_w: 1500 });
+        assert!(adapter.write_command("solax", &command).await.is_err());
+        failing.assert_async().await;
+        assert_eq!(*calls.lock().unwrap(), vec![]);
+
+        // The failed write left nothing cached: the retry writes every parameter and the select
+        adapter.write_command("solax", &command).await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                n("push_mode_power", 1500),
+                n("timeout", 0),
+                vpp_select("Push Power-Positive/Negative Mode"),
+            ]
+        );
+    }
+
+    /// The select is re-written at least every `VPP_SELECT_REFRESH` while parameters change, and
+    /// after a read-back that disagrees (past the lag), so a lapsed mode 8 is started again
+    #[test]
+    fn vpp_select_is_refreshed_and_follows_the_readback() {
+        let t0 = Instant::now();
+        let m8 = |pv_limit_w| VppCommand::PvAndBattery {
+            pv_limit_w,
+            push_w: 0,
+        };
+        let (_, select) = vpp_write_plan(None, m8(1000), t0);
+        assert!(select);
+        let mut written = VppWritten {
+            mode: Some(8),
+            values: m8(1000).parameters().into_iter().collect(),
+            selected_at: Some(t0),
+        };
+        // Parameters change every 10 s: no select until the refresh is due
+        let (params, select) =
+            vpp_write_plan(Some(&written), m8(1100), t0 + Duration::from_secs(10));
+        assert_eq!(params, vec![("pv_power_limit", 1100)]);
+        assert!(!select);
+        let (_, select) = vpp_write_plan(Some(&written), m8(1100), t0 + VPP_SELECT_REFRESH);
+        assert!(select);
+
+        // A read-back of mode 0 inside the lag window is ignored, after it the mode is dropped
+        written.note_readback(0, t0 + Duration::from_secs(5));
+        assert_eq!(written.mode, Some(8));
+        written.note_readback(8, t0 + Duration::from_secs(40));
+        assert_eq!(written.mode, Some(8));
+        written.note_readback(0, t0 + Duration::from_secs(40));
+        assert_eq!(written.mode, None);
+        let (_, select) = vpp_write_plan(Some(&written), m8(1100), t0 + Duration::from_secs(41));
+        assert!(select);
+    }
+
+    /// R7-7: a regime switch of mode 8 (the PV limit to or from `PV_UNCAPPED_W`) writes the PV
+    /// limit before the push, on entry to curtailing and on the exit; other mode 8 changes keep
+    /// the push-first rule when the push falls or the limit rises
+    #[test]
+    fn vpp_regime_switch_writes_the_pv_limit_first() {
+        let t0 = Instant::now();
+        let m8 = |pv_limit_w, push_w| VppCommand::PvAndBattery { pv_limit_w, push_w };
+        let written = |command: VppCommand| VppWritten {
+            mode: Some(8),
+            values: command.parameters().into_iter().collect(),
+            selected_at: Some(t0),
+        };
+        let at = t0 + Duration::from_secs(10);
+        // Entry: (30000, 3000) → (5000, 0)
+        let (params, _) = vpp_write_plan(Some(&written(m8(PV_UNCAPPED_W, 3000))), m8(5000, 0), at);
+        assert_eq!(
+            params,
+            vec![("pv_power_limit", 5000), ("push_mode_power_8_9", 0)]
+        );
+        // Exit: (5000, 0) → (30000, 3000)
+        let (params, _) = vpp_write_plan(Some(&written(m8(5000, 0))), m8(PV_UNCAPPED_W, 3000), at);
+        assert_eq!(
+            params,
+            vec![("pv_power_limit", 30000), ("push_mode_power_8_9", 3000)]
+        );
+        // Inside a regime the push still goes first when the limit rises or the push falls
+        let (params, _) = vpp_write_plan(Some(&written(m8(5000, 0))), m8(6000, 500), at);
+        assert_eq!(
+            params,
+            vec![("push_mode_power_8_9", 500), ("pv_power_limit", 6000)]
+        );
+        let (params, _) = vpp_write_plan(
+            Some(&written(m8(PV_UNCAPPED_W, 3000))),
+            m8(PV_UNCAPPED_W, 2000),
+            at,
+        );
+        assert_eq!(params, vec![("push_mode_power_8_9", 2000)]);
+        let (params, _) = vpp_write_plan(Some(&written(m8(6000, 500))), m8(5000, 1000), at);
+        assert_eq!(
+            params,
+            vec![("pv_power_limit", 5000), ("push_mode_power_8_9", 1000)]
+        );
+    }
+
+    /// The minimum-SOC-only sync writes no work mode
+    #[tokio::test]
+    async fn backup_min_soc_sync_writes_no_work_mode() {
+        let mut server = isolated_server().await;
+        mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+        mock_state(
+            &mut server,
+            "number.solax_inverter_backup_discharge_min_soc",
+            "20",
+        )
+        .await;
+        let calls = record_services(&mut server).await;
+        let adapter = control_prefix_adapter(server.url());
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetBackupMinSoc { min_soc_pct: 30 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(
+                "number/set_value".to_owned(),
+                json!({"entity_id": "number.solax_inverter_backup_discharge_min_soc", "value": 30})
+            )]
+        );
+    }
+
+    /// D3: with the option on (the default), a site on solax-modbus 2026.09.2 without the direct
+    /// entities falls back to the EEPROM path, whose writes are today's (written out by hand)
+    #[tokio::test]
+    async fn an_old_integration_falls_back_to_todays_mode_writes() {
+        let mut server = isolated_server().await;
+        mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+        mock_state(&mut server, "sensor.solax_run_mode", "Normal Mode").await;
+        server
+            .mock("GET", "/api/states")
+            .with_body(
+                json!([{
+                    "entity_id": "update.solax_inverter_modbus_update", "state": "on",
+                    "attributes": {"installed_version": "2026.09.2"},
+                    "last_changed": "2026-10-27T10:00:00Z", "last_updated": "2026-10-27T10:00:00Z"
+                }, {
+                    "entity_id": "sensor.solax_pv_power", "state": "1200",
+                    "attributes": {},
+                    "last_changed": "2026-10-27T10:00:00Z", "last_updated": "2026-10-27T10:00:00Z"
+                }])
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let calls = record_services(&mut server).await;
+        let client = Arc::new(HomeAssistantClient::new(server.url(), "t").unwrap());
+        let attempt = crate::ha::vpp::resolve_path(
+            &client,
+            true,
+            true,
+            &[crate::ha::vpp::VppInverter {
+                id: "solax".to_owned(),
+                control_prefix: "solax_inverter".to_owned(),
+                solax: true,
+            }],
+            false,
+            crate::ha::vpp::ReadScope::All,
+            &crate::ha::vpp::UpdateIds::default(),
+        )
+        .await;
+        let crate::ha::vpp::Attempt::Decided(path, _) = attempt else {
+            panic!("{attempt:?}");
+        };
+        let reason = path.describe();
+        assert!(!path.is_direct());
+        assert!(reason.contains("2026.09.2"), "{reason}");
+        assert!(reason.contains("does not exist"), "{reason}");
+        assert!(calls.lock().unwrap().is_empty(), "no write while checking");
+
+        let adapter = control_prefix_adapter(server.url()).with_vpp_direct(path.is_direct());
+        adapter
+            .write_command(
+                "solax",
+                &InverterCommand::SetMode(InverterOperationMode::ForceCharge),
+            )
+            .await
+            .unwrap();
+        let select = |entity: &str, option: &str| {
+            (
+                "select/select_option".to_owned(),
+                json!({"entity_id": format!("select.solax_inverter_{entity}"), "option": option}),
+            )
+        };
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                select("charger_use_mode", "Manual Mode"),
+                select("manual_mode_select", "Force Charge"),
+            ]
+        );
+    }
+
+    /// Option off: the work mode writes of every mode are today's, written out by hand (the VPP
+    /// flag does not change them), and the VPP read-back sensor is read only with the option on
+    #[tokio::test]
+    async fn option_off_mode_writes_are_unchanged_and_no_vpp_readback() {
+        let select = |entity: &str, option: &str| {
+            (
+                "select/select_option".to_owned(),
+                json!({"entity_id": format!("select.solax_inverter_{entity}"), "option": option}),
+            )
+        };
+        let manual = |sub: &str| {
+            vec![
+                select("charger_use_mode", "Manual Mode"),
+                select("manual_mode_select", sub),
+            ]
+        };
+        for (mode, expected) in [
+            (
+                InverterOperationMode::SelfUse,
+                vec![select("charger_use_mode", "Self Use Mode")],
+            ),
+            (
+                InverterOperationMode::BackUpMode,
+                vec![select("charger_use_mode", "Back Up Mode")],
+            ),
+            (InverterOperationMode::ForceCharge, manual("Force Charge")),
+            (
+                InverterOperationMode::ForceDischarge,
+                manual("Force Discharge"),
+            ),
+            (
+                InverterOperationMode::NoChargeNoDischarge,
+                manual("Stop Charge and Discharge"),
+            ),
+            (
+                InverterOperationMode::FeedinPriority,
+                vec![select("charger_use_mode", "Feedin Priority")],
+            ),
+        ] {
+            for vpp in [false, true] {
+                let mut server = isolated_server().await;
+                mock_state(&mut server, "select.solax_inverter_lock_state", "Unlocked").await;
+                mock_state(&mut server, "sensor.solax_run_mode", "Normal Mode").await;
+                let calls = record_services(&mut server).await;
+                let adapter = control_prefix_adapter(server.url()).with_vpp_direct(vpp);
+                adapter
+                    .write_command("solax", &InverterCommand::SetMode(mode))
+                    .await
+                    .unwrap();
+                assert_eq!(*calls.lock().unwrap(), expected, "{mode:?} vpp {vpp}");
+            }
+        }
+
+        for (vpp, expected) in [(false, None), (true, Some(7))] {
+            let mut server = isolated_server().await;
+            master_states(&mut server).await;
+            let readback = server
+                .mock("GET", "/api/states/sensor.solax_80_modbus_power_control")
+                .with_body_from_request(|_| {
+                    state_body(
+                        "sensor.solax_80_modbus_power_control",
+                        "Self Consume - Charge Only Mode",
+                    )
+                })
+                .expect(usize::from(vpp))
+                .create_async()
+                .await;
+            let adapter = extras_adapter(server.url()).with_vpp_direct(vpp);
+            let state = adapter.read_state("solax_80").await.unwrap();
+            assert_eq!(state.vpp_mode, expected);
+            readback.assert_async().await;
+        }
     }
 }
 

@@ -185,7 +185,7 @@ pub const HA_OPTIONS_PATH: &str = "/data/options.json";
 /// Add-on options that only the add-on UI sets (the web UI has no field for them). On an existing
 /// install `/data/config.json` wins over `options.json`, so without this overlay a change of
 /// these in the add-on UI would never apply (H33, H34, H35, H37, EEPROM HOLD routing, peak export
-/// floor). Each entry is the key's path from the root of the options.
+/// floor, direct VPP). Each entry is the key's path from the root of the options.
 pub const ADDON_ONLY_OPTIONS: &[&[&str]] = &[
     &["control", "battery_wear_cost_czk_per_kwh"],
     &["control", "battery_efficiency"],
@@ -196,6 +196,19 @@ pub const ADDON_ONLY_OPTIONS: &[&[&str]] = &[
     &["control", "mode_control_enabled"],
     &["control", "hold_pv_to_battery"],
     &["strategies", "winter_reserve", "export_floor_until_cheap"],
+    &[
+        "strategies",
+        "winter_reserve",
+        "direction_reversal_cost_czk",
+    ],
+    &[
+        "strategies",
+        "winter_reserve",
+        "export_window_continuity_pct",
+    ],
+    &["strategies", "winter_reserve", "export_selection"],
+    &["strategies", "winter_reserve", "daily_export_hours"],
+    &["control", "vpp_direct_enabled"],
 ];
 
 /// Per-inverter add-on-only options (brief H36, pair SOC), applied to the inverter of
@@ -407,6 +420,10 @@ mod tests {
         let mut saved = AppConfig::default();
         saved.pricing.spot_price_entity = "sensor.from_web_ui".to_owned();
         saved.pricing.buy_price_entity = Some("sensor.buy_from_web_ui".to_owned());
+        saved.strategies.winter_reserve.direction_reversal_cost_czk = 0.5;
+        saved.strategies.winter_reserve.export_window_continuity_pct = 1.0;
+        saved.strategies.winter_reserve.daily_export_hours = 3;
+        saved.strategies.winter_reserve.mode_switch_min_benefit_czk = 1.5;
         persistence.save(&saved, "web_ui").unwrap();
         let mut config = persistence.load().unwrap().config;
 
@@ -414,6 +431,13 @@ mod tests {
         fs::write(
             &options,
             serde_json::json!({
+                "strategies": {"winter_reserve": {
+                    "direction_reversal_cost_czk": 3.5,
+                    "export_window_continuity_pct": 10.0,
+                    "export_selection": "daily_top_n",
+                    "daily_export_hours": 8,
+                    "mode_switch_min_benefit_czk": 1.0
+                }},
                 "pricing": {
                     "spot_price_entity": "sensor.from_addon_ui",
                     "ote_fallback_enabled": false,
@@ -440,7 +464,23 @@ mod tests {
         assert!((config.control.battery_efficiency - 0.9).abs() < 1e-6);
         assert!(config.control.hold_pv_to_battery);
         assert!(!config.solar_forecast.pv_forecast_correction_enabled);
-        // Other keys: config.json still wins
+        assert!((config.strategies.winter_reserve.direction_reversal_cost_czk - 3.5).abs() < 1e-6);
+        assert!(
+            (config
+                .strategies
+                .winter_reserve
+                .export_window_continuity_pct
+                - 10.0)
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(
+            config.strategies.winter_reserve.export_selection,
+            fluxion_core::ExportSelection::DailyTopN
+        );
+        assert_eq!(config.strategies.winter_reserve.daily_export_hours, 8);
+        // Other keys: config.json still wins, also beside an add-on-only key of the same section
+        assert!((config.strategies.winter_reserve.mode_switch_min_benefit_czk - 1.5).abs() < 1e-6);
         assert_eq!(config.pricing.spot_price_entity, "sensor.from_web_ui");
         assert_eq!(
             config.pricing.buy_price_entity.as_deref(),
@@ -480,6 +520,40 @@ mod tests {
         config.control.mode_control_enabled = false;
         assert!(overlay_addon_options(&mut config, &serde_json::json!({"control": {}})).is_empty());
         assert!(!config.control.mode_control_enabled);
+    }
+
+    /// `control.vpp_direct_enabled` from the add-on UI applies over `config.json`, both ways;
+    /// options without the key keep the saved value (default on)
+    #[test]
+    fn addon_vpp_direct_enabled_overrides_the_web_ui_config() {
+        let (persistence, dir) = create_test_persistence();
+        let mut saved = AppConfig::default();
+        assert!(saved.control.vpp_direct_enabled);
+        // A config.json saved with the option off
+        saved.control.vpp_direct_enabled = false;
+        persistence.save(&saved, "web_ui").unwrap();
+        let mut config = persistence.load().unwrap().config;
+
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({"control": {"vpp_direct_enabled": true}}).to_string(),
+        )
+        .unwrap();
+        overlay_addon_options_file(&mut config, &options);
+        assert!(config.control.vpp_direct_enabled);
+        config.validate().unwrap();
+
+        let changed = overlay_addon_options(
+            &mut config,
+            &serde_json::json!({"control": {"vpp_direct_enabled": false}}),
+        );
+        assert_eq!(changed, vec!["control.vpp_direct_enabled".to_owned()]);
+        assert!(!config.control.vpp_direct_enabled);
+
+        config.control.vpp_direct_enabled = true;
+        assert!(overlay_addon_options(&mut config, &serde_json::json!({"control": {}})).is_empty());
+        assert!(config.control.vpp_direct_enabled);
     }
 
     /// H36: the add-on UI's `inverters[].control_entity_prefix` applies over `config.json`,

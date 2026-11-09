@@ -29,6 +29,9 @@ pub struct ConfigApiState {
     pub config_path: String,
     /// Sender for config update events to ECS
     pub config_update_sender: Option<fluxion_core::ConfigUpdateSender>,
+    /// The run's direct VPP mode path, shown as `control.vpp_direct_path` (runtime state only:
+    /// it never changes `control.vpp_direct_enabled`, N8)
+    pub vpp_path: Option<fluxion_core::vpp::VppPathState>,
 }
 
 impl std::fmt::Debug for ConfigApiState {
@@ -38,6 +41,7 @@ impl std::fmt::Debug for ConfigApiState {
             .field("startup_config", &"<Value>")
             .field("config_path", &self.config_path)
             .field("config_update_sender", &self.config_update_sender.is_some())
+            .field("vpp_path", &self.vpp_path)
             .finish()
     }
 }
@@ -54,7 +58,33 @@ impl ConfigApiState {
             config: Arc::new(RwLock::new(config)),
             config_path: config_path.into(),
             config_update_sender,
+            vpp_path: fluxion_core::vpp::served_path(),
         }
+    }
+
+    /// Use this mode path state (tests; the server takes the registered one)
+    #[must_use]
+    pub fn with_vpp_path(mut self, state: fluxion_core::vpp::VppPathState) -> Self {
+        self.vpp_path = Some(state);
+        self
+    }
+
+    /// The config as served: the stored values plus the run's mode path
+    #[must_use]
+    pub fn served_config(&self) -> serde_json::Value {
+        let mut config = self.config.read().clone();
+        if let Some(path) = self
+            .vpp_path
+            .as_ref()
+            .map(fluxion_core::vpp::VppPathState::get)
+            && let Some(control) = config
+                .get_mut("control")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            control.insert("vpp_direct_path".to_owned(), path.describe().into());
+            control.insert("vpp_no_mode8".to_owned(), path.no_mode8().into());
+        }
+        config
     }
 }
 
@@ -154,7 +184,7 @@ pub struct ResetSectionRequest {
 pub async fn get_config_handler(
     State(state): State<ConfigApiState>,
 ) -> Result<Json<ConfigResponse>, StatusCode> {
-    let config = state.config.read().clone();
+    let config = state.served_config();
 
     // Try to read metadata from persistent storage
     let (last_modified, modified_by) =
@@ -231,21 +261,40 @@ pub fn mode_control_change(
     current: &serde_json::Value,
     update: &serde_json::Value,
 ) -> Option<ValidationIssue> {
-    let requested = update
-        .get("control")
-        .and_then(|c| c.get("mode_control_enabled"))?;
+    fixed_control_change(current, update, "mode_control_enabled", true)
+}
+
+/// `control.vpp_direct_enabled` is fixed for the add-on's run like `mode_control_enabled` (brief
+/// H37): an update that sets a different value is refused with this issue.
+#[must_use]
+pub fn vpp_direct_change(
+    current: &serde_json::Value,
+    update: &serde_json::Value,
+) -> Option<ValidationIssue> {
+    fixed_control_change(current, update, "vpp_direct_enabled", true)
+}
+
+/// Refuse an update that sets `control.<key>` to a value other than the running one (`default`
+/// when the running config lacks the key)
+fn fixed_control_change(
+    current: &serde_json::Value,
+    update: &serde_json::Value,
+    key: &str,
+    default: bool,
+) -> Option<ValidationIssue> {
+    let requested = update.get("control").and_then(|c| c.get(key))?;
     let running = current
         .get("control")
-        .and_then(|c| c.get("mode_control_enabled"))
+        .and_then(|c| c.get(key))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(default);
     if requested.as_bool() == Some(running) {
         return None;
     }
     Some(ValidationIssue {
-        field: "control.mode_control_enabled".to_owned(),
+        field: format!("control.{key}"),
         message: format!(
-            "control.mode_control_enabled cannot change at runtime (running with {running}); set it in the add-on configuration and restart the add-on"
+            "control.{key} cannot change at runtime (running with {running}); set it in the add-on configuration and restart the add-on"
         ),
         severity: "error".to_owned(),
     })
@@ -367,13 +416,20 @@ pub fn max_battery_soc_warning(
     })
 }
 
-/// The first update refused at runtime: `mode_control_enabled` (brief H37), then the startup-only
-/// adapter settings (scan #46, #49)
-fn startup_only_change(
+/// The updates refused at runtime: `mode_control_enabled` and `vpp_direct_enabled` (brief H37), and
+/// the startup-only adapter settings (scan #46, #49)
+fn startup_only_changes(
     current: &serde_json::Value,
     update: &serde_json::Value,
-) -> Option<ValidationIssue> {
-    mode_control_change(current, update).or_else(|| adapter_restart_change(current, update))
+) -> Vec<ValidationIssue> {
+    [
+        mode_control_change(current, update),
+        vpp_direct_change(current, update),
+        adapter_restart_change(current, update),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Equal settings; numbers compare by value, so `90` and `90.0` are the same
@@ -384,14 +440,18 @@ fn same_setting(a: &serde_json::Value, b: &serde_json::Value) -> bool {
     }
 }
 
-/// The response to an update refused because of `issue` (nothing is saved)
-fn refused_update(issue: ValidationIssue) -> UpdateConfigResponse {
-    let error = issue.message.clone();
+/// The response to an update refused because of `refused` (nothing is saved)
+fn refused_update(refused: Vec<ValidationIssue>) -> UpdateConfigResponse {
+    let error = refused
+        .iter()
+        .map(|issue| issue.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
     UpdateConfigResponse {
         success: false,
         validation: ValidateResponse {
             valid: false,
-            errors: vec![issue],
+            errors: refused,
             warnings: Vec::new(),
             restart_required: true,
         },
@@ -408,10 +468,16 @@ pub async fn update_config_handler(
     State(state): State<ConfigApiState>,
     Json(request): Json<UpdateConfigRequest>,
 ) -> Result<Json<UpdateConfigResponse>, StatusCode> {
-    // Mode control and the startup-only adapter settings are fixed until the add-on restarts
-    if let Some(issue) = startup_only_change(&state.config.read(), &request.config) {
-        info!("Config update refused: {}", issue.message);
-        return Ok(Json(refused_update(issue)));
+    // Mode control, VPP direct control and the startup-only adapter settings are fixed until the
+    // add-on restarts
+    let refused = startup_only_changes(&state.config.read(), &request.config);
+    if !refused.is_empty() {
+        let response = refused_update(refused);
+        info!(
+            "Config update refused: {}",
+            response.error.as_deref().unwrap_or_default()
+        );
+        return Ok(Json(response));
     }
 
     // Merge partial config with current config
@@ -590,6 +656,38 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// N8: a fall-back to the EEPROM path shows in `control.vpp_direct_path` only; the user's
+    /// `control.vpp_direct_enabled` is served (and saved) unchanged
+    #[test]
+    fn served_config_shows_the_path_and_keeps_the_option() {
+        let path = fluxion_core::vpp::VppPathState::new(fluxion_core::vpp::ModePath::Eeprom(
+            "solax-modbus 2026.09.2".to_owned(),
+        ));
+        let state = ConfigApiState::new(
+            json!({"control": {"vpp_direct_enabled": true, "vpp_direct_path": null}}),
+            "/tmp/unused.json",
+            None,
+        )
+        .with_vpp_path(path.clone());
+        let served = state.served_config();
+        assert_eq!(served["control"]["vpp_direct_enabled"], json!(true));
+        assert_eq!(
+            served["control"]["vpp_direct_path"],
+            json!("EEPROM mode writes (solax-modbus 2026.09.2)")
+        );
+        // The stored config is not touched
+        assert_eq!(
+            state.config.read()["control"]["vpp_direct_path"],
+            json!(null)
+        );
+        path.set(fluxion_core::vpp::ModePath::Direct {
+            no_mode8: vec!["solax".to_owned()],
+        });
+        let served = state.served_config();
+        assert_eq!(served["control"]["vpp_no_mode8"], json!(["solax"]));
+        assert_eq!(served["control"]["vpp_direct_enabled"], json!(true));
+    }
+
     /// Brief H37: the config API refuses to change `control.mode_control_enabled` at runtime
     /// Scan #49: auto-unlock cannot change at runtime (no UI field, safety guard)
     #[test]
@@ -682,6 +780,48 @@ mod tests {
         assert!(mode_control_change(&off, &json!({"system": {"debug_mode": false}})).is_none());
     }
 
+    /// Brief H37 pattern: the config API refuses to change `control.vpp_direct_enabled` at runtime
+    #[test]
+    fn vpp_direct_cannot_change_at_runtime() {
+        let on = json!({"control": {"vpp_direct_enabled": true, "max_battery_soc": 90.0}});
+        let off = json!({"control": {"vpp_direct_enabled": false}});
+        let issue = vpp_direct_change(&on, &json!({"control": {"vpp_direct_enabled": false}}))
+            .expect("refused");
+        assert_eq!(issue.field, "control.vpp_direct_enabled");
+        assert!(
+            issue.message.contains("restart the add-on"),
+            "{}",
+            issue.message
+        );
+        assert!(
+            vpp_direct_change(&off, &json!({"control": {"vpp_direct_enabled": true}})).is_some()
+        );
+        // A key missing from the running config counts as the default (on)
+        assert!(
+            vpp_direct_change(
+                &json!({}),
+                &json!({"control": {"vpp_direct_enabled": false}})
+            )
+            .is_some()
+        );
+        assert!(
+            vpp_direct_change(
+                &json!({}),
+                &json!({"control": {"vpp_direct_enabled": true}})
+            )
+            .is_none()
+        );
+        // The same value, or an update without the key, passes
+        assert!(
+            vpp_direct_change(&on, &json!({"control": {"vpp_direct_enabled": true}})).is_none()
+        );
+        assert!(vpp_direct_change(&on, &json!({"control": {"max_battery_soc": 100.0}})).is_none());
+        // Mode control is checked separately and is not affected by the VPP key
+        assert!(
+            mode_control_change(&on, &json!({"control": {"vpp_direct_enabled": false}})).is_none()
+        );
+    }
+
     /// Handler state over a temp config file, optionally pre-filled with a stored `config` object
     fn handler_state(
         stored_config: Option<serde_json::Value>,
@@ -746,6 +886,45 @@ mod tests {
         assert_eq!(
             state.config.read()["control"]["auto_unlock_inverter"],
             json!(true)
+        );
+    }
+
+    /// Brief H37 through the handler: a `vpp_direct_enabled` change is refused next to the other
+    /// startup-only settings, every refusal is reported and nothing is saved
+    #[tokio::test]
+    async fn vpp_direct_change_is_refused_by_the_handler_and_nothing_is_saved() {
+        let mut current = serde_json::to_value(crate::validation::tests::default_config()).unwrap();
+        current["control"]["vpp_direct_enabled"] = json!(true);
+        current["control"]["auto_unlock_inverter"] = json!(true);
+        let (state, _dir) = handler_state_from(current, None);
+        let response = post_update(&state, json!({"control": {"vpp_direct_enabled": false}})).await;
+        assert!(!response.success);
+        assert_eq!(
+            response.validation.errors[0].field,
+            "control.vpp_direct_enabled"
+        );
+        assert!(
+            !std::path::Path::new(&state.config_path).exists(),
+            "refused update was saved"
+        );
+        assert_eq!(
+            state.config.read()["control"]["vpp_direct_enabled"],
+            json!(true)
+        );
+        let response = post_update(
+            &state,
+            json!({"control": {"vpp_direct_enabled": false, "auto_unlock_inverter": false}}),
+        )
+        .await;
+        let fields: Vec<&str> = response
+            .validation
+            .errors
+            .iter()
+            .map(|issue| issue.field.as_str())
+            .collect();
+        assert_eq!(
+            fields,
+            ["control.vpp_direct_enabled", "control.auto_unlock_inverter"]
         );
     }
 

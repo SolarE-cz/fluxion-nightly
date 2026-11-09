@@ -346,6 +346,7 @@ impl SimulationEngine {
                 consumption_forecast_kwh: consumption,
                 grid_export_price_czk_per_kwh: export_price,
                 all_price_blocks: Some(&all_price_blocks),
+                ranking_price_blocks: None,
                 backup_discharge_min_soc: state.config.min_soc,
                 grid_import_today_kwh: state
                     .strategy_results

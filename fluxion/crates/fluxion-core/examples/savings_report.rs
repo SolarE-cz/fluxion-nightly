@@ -6,7 +6,7 @@
 //!
 //! Input: the JSON written by `fluxion/tools/winter_reserve/export_ha_history.py`.
 //! Each local day: `savings = cost_selfuse - cost_actual + adj`, with
-//! `adj = (soc_end_actual - soc_end_selfuse) x cheap_ref x efficiency`. Definitions:
+//! `adj = (soc_end_actual - soc_end_selfuse) x cheap_ref x sqrt(efficiency)` (efficiency = round trip). Definitions:
 //! `docs/legacy-levers/brief-H6-savings.md`. The same functions run live in the add-on.
 //!
 //! Usage: `cargo run -p fluxion-core --example savings_report -- data.json`

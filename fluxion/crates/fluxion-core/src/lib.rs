@@ -31,6 +31,7 @@ pub mod strategy;
 pub mod traits;
 pub mod user_control_persistence;
 pub mod utils;
+pub mod vpp;
 pub mod web_bridge;
 
 pub use async_tasks::*;

@@ -24,6 +24,7 @@ pub mod solar_forecast_accuracy;
 pub mod solar_forecast_fetcher;
 pub mod transport;
 pub mod types;
+pub mod vpp;
 pub mod ws;
 
 pub use adapters::{

@@ -222,6 +222,9 @@ pub struct PricingFees {
     pub buy_fee_czk: f32,
     /// Spot sell fee in CZK/kWh
     pub sell_fee_czk: f32,
+    /// Fixed buy pricing (`use_spot_prices_to_buy` off): the block price is the fixed buy price
+    #[serde(default)]
+    pub fixed_buy: bool,
 }
 
 /// Cost of charge of the battery energy for the dashboard (brief H33)
@@ -514,6 +517,10 @@ pub struct PriceBlockData {
     /// Where the price came from when not the HA price entity: `"ote_fallback"` (brief H35)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_source: Option<String>,
+    /// Market spot price (CZK/kWh) for the chart: the block price on spot buy, the spot sell
+    /// price plus the sell fee under fixed buy; `None` when no spot price is known
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_spot_price: Option<f32>,
 }
 
 /// System health data
@@ -923,6 +930,9 @@ fn build_dashboard_response(
                         )
                     });
 
+                let fixed_buy = !system_config.pricing_config.use_spot_prices_to_buy;
+                let sell_fee_czk = system_config.pricing_config.spot_sell_fee_czk;
+
                 // Build price blocks with classification
                 let blocks: Vec<PriceBlockData> = prices
                     .time_block_prices
@@ -1061,6 +1071,11 @@ fn build_dashboard_response(
                             price_source: prices
                                 .is_fallback_block(block.block_start)
                                 .then(|| crate::price_feed::PRICE_SOURCE_OTE_FALLBACK.to_owned()),
+                            market_spot_price: chart_market_spot_price(
+                                block,
+                                fixed_buy,
+                                sell_fee_czk,
+                            ),
                         }
                     })
                     .collect();
@@ -1334,6 +1349,7 @@ fn build_dashboard_response(
             0.0
         },
         sell_fee_czk: system_config.pricing_config.spot_sell_fee_czk,
+        fixed_buy: !system_config.pricing_config.use_spot_prices_to_buy,
     });
 
     // Build solar forecast info
@@ -1400,6 +1416,23 @@ fn build_dashboard_response(
         solar_forecast,
         battery_cost_basis: None,
         price_feed: None,
+    }
+}
+
+/// Market spot price of a block for the price chart. Under fixed buy the block price is the
+/// fixed buy price, so the spot price is the spot sell price plus the sell fee (None when sell
+/// is fixed too); on spot buy the block price is the spot price.
+fn chart_market_spot_price(
+    block: &fluxion_types::pricing::TimeBlockPrice,
+    fixed_buy: bool,
+    sell_fee_czk: f32,
+) -> Option<f32> {
+    if fixed_buy {
+        block
+            .spot_sell_price_czk_per_kwh
+            .map(|sell| sell + sell_fee_czk)
+    } else {
+        Some(block.price_czk_per_kwh)
     }
 }
 
@@ -1663,6 +1696,35 @@ mod tests {
         assert!((info.low_tariff_czk - 0.5).abs() < f32::EPSILON);
         assert!((info.high_tariff_czk - 1.8).abs() < f32::EPSILON);
         assert_eq!(info.low_tariff_periods, hdo.low_tariff_periods);
+    }
+
+    #[test]
+    fn chart_market_spot_price_is_the_spot_price_under_fixed_buy() {
+        let block = |price: f32, sell: Option<f32>| fluxion_types::pricing::TimeBlockPrice {
+            block_start: "2026-11-05T10:00:00Z".parse().unwrap(),
+            duration_minutes: 15,
+            price_czk_per_kwh: price,
+            effective_price_czk_per_kwh: price,
+            spot_sell_price_czk_per_kwh: sell,
+            buy_price_czk_per_kwh: None,
+        };
+
+        // Fixed buy with spot sell: the block holds the fixed price, spot = sell + fee
+        let fixed_buy_spot_sell = block(2.85, Some(1.0));
+        assert_eq!(
+            chart_market_spot_price(&fixed_buy_spot_sell, true, 0.25),
+            Some(1.25)
+        );
+        // Fixed buy with fixed sell: no spot price
+        assert_eq!(
+            chart_market_spot_price(&block(2.85, None), true, 0.25),
+            None
+        );
+        // Spot buy: the block price is the spot price
+        assert_eq!(
+            chart_market_spot_price(&fixed_buy_spot_sell, false, 0.25),
+            Some(2.85)
+        );
     }
 
     #[test]

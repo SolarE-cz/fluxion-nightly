@@ -234,6 +234,10 @@ pub struct EvaluationContext<'a> {
     /// All price blocks for today/tomorrow (for global price analysis)
     pub all_price_blocks: Option<&'a [TimeBlockPrice]>,
 
+    /// Known blocks before `all_price_blocks` (already started or past, last 24 h), for
+    /// ranking only: a per-day selection ranks the whole local day with them. Never planned.
+    pub ranking_price_blocks: Option<&'a [TimeBlockPrice]>,
+
     /// Backup discharge minimum SOC from HA sensor (%)  
     /// Read from number.<prefix>_backup_discharge_min_soc sensor
     pub backup_discharge_min_soc: f32,

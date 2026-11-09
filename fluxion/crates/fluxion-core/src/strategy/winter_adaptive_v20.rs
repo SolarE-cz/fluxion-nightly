@@ -1614,6 +1614,7 @@ mod tests {
         let context = EvaluationContext {
             price_block: &blocks[block_index],
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             control_config: &control_config,
             current_battery_soc: 80.0,
             solar_forecast_kwh: 0.0,

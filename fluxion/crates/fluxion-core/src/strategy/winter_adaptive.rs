@@ -1606,6 +1606,7 @@ mod tests {
         let context = EvaluationContext {
             price_block: &blocks[0], // 19:00 - expensive hour
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             current_battery_soc: 75.0, // Good battery level, no urgent need
             control_config: &control_config,
             solar_forecast_kwh: 0.5,       // Winter - minimal solar
@@ -1698,6 +1699,7 @@ mod tests {
         let context = EvaluationContext {
             price_block: &blocks[0],
             all_price_blocks: Some(&blocks),
+            ranking_price_blocks: None,
             current_battery_soc: 79.0, // Just below target 80%
             control_config: &control_config,
             solar_forecast_kwh: 0.0,

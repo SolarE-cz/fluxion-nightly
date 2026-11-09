@@ -56,6 +56,10 @@ configuration:
   max_battery_soc:
     name: Maximum Battery SOC
     description: Maximum battery state of charge (%) that FluxION will charge to.
+  battery_efficiency:
+    name: Battery Efficiency
+    description: >-
+      Battery round trip, AC to AC (0.5 to 1.0): the share of the energy taken from the grid or PV that comes back out as AC. Default 0.875.
   pricing:
     name: Pricing
     description: Configure electricity pricing information.
@@ -119,6 +123,10 @@ configuration:
     name: EEPROM HOLD Charges From PV First
     description: >-
       Turn on only for a site whose EEPROM HOLD ("Stop Charge and Discharge") sends PV into the battery first while the house imports (measured on SolaX Ultra). Off: HOLD means PV serves the house, the surplus charges the battery, the rest is exported. Ignored with direct VPP control. Default off: keep it off unless a replay on the site shows a gain (on Jakub's site it replayed about 2 CZK/day worse).
+  vpp_direct_enabled:
+    name: Direct VPP mode control (SolaX)
+    description: >-
+      Default on. Drive every mode and export curtailment through the SolaX direct VPP remote control (volatile, re-sent every cycle). Only the basic work mode (Self Use / Back Up) is written to EEPROM. Needs solax-modbus 2026.10.01 or newer; without it (or without the direct entities) FluxION falls back to the EEPROM mode writes automatically. Parallel (master/slave) sites are included: commands go to the master, which the slaves follow. On an inverter without mode 8 (X3-Ultra) modes 1–7 are used and curtailment falls back to the export limit when needed. Turn off to force the EEPROM mode writes. Restart the add-on after changing.
   update_interval_secs:
     name: Update Interval (seconds)
     description: >-
@@ -127,6 +135,37 @@ configuration:
   strategies:
     name: Strategies
     description: Enable and configure specific optimization strategies.
+  direction_reversal_cost_czk:
+    name: Charge/Export Reversal Cost (CZK)
+    description: >-
+      Winter Reserve: a grid charge after an export, or an export after a grid
+      charge, must gain at least this much, so charge and export run in
+      contiguous blocks instead of alternating every 15 minutes. Steers the
+      plan only, never counted in its cost. 0 = off. Default 2.0.
+  export_window_continuity_pct:
+    name: Discharge Window Continuity (%)
+    description: >-
+      Winter Reserve with the morning/evening discharge-hour levers: a block the
+      lever left out, in a gap of one or two blocks between two chosen blocks,
+      may export too when it sells at most this percentage below the chosen
+      block next to it, so export runs are not broken into Export/Hold flips. Never
+      extends a run outward. 0 = off. Default 5.
+  export_selection:
+    name: Export Block Selection
+    description: >-
+      Winter Reserve: which blocks may export. "windows" (default) = the
+      morning/evening discharge-hour levers. "daily_top_n" = the best-selling
+      hours of each local day 00-24 (Daily Export Hours), wherever they fall,
+      the hours already passed today included, plus the continuity gap fills;
+      the discharge-hour levers are then ignored, the max-discharge % lever
+      still applies (with both lever entities unavailable, export runs down
+      to the planner minimum SOC).
+  daily_export_hours:
+    name: Daily Export Hours
+    description: >-
+      Winter Reserve with export selection "daily_top_n": the number of
+      best-selling hours of each local day in which export is allowed
+      (1-24). Default 6.
   winter_adaptive:
     name: Winter Adaptive Strategy
     description: >-

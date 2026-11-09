@@ -46,9 +46,17 @@
 //! does (PV into the battery first, the house imports; `control.hold_pv_to_battery`), in the
 //! planner and the simulated inverter, for sites that still run EEPROM HOLD.
 //! `--plan-hold-to-house` (planner assumes the default HOLD model), `--plan-capacity` and
-//! `--plan-efficiency` change only what the planner assumes, so a replay can run the live config
+//! `--plan-efficiency` (AC-to-AC round trip) change only what the planner assumes, so a replay can run the live config
 //! against the measured battery (calibration). `--param` takes numbers; a boolean parameter
-//! such as `export_floor_until_cheap` takes 1 or 0.
+//! such as `export_floor_until_cheap` takes 1 or 0. `--param direction_reversal_cost_czk=0` plans
+//! without the Charge/Export reversal cost (default 2.0); the `flows:` line counts the reversals
+//! (Charge after Export or Export after Charge, other modes between them) of the applied modes.
+//! `--param export_window_continuity_pct=X` is accepted like any planner parameter, but the replay
+//! passes no user levers, so it changes no replayed plan; the lever-continuity day grid runs in
+//! `strategy::winter_reserve::continuity_tests::closed_loop_grid` (an ignored test).
+//! `--param export_selection=daily_top_n` and `--param daily_export_hours=N` are accepted too, but
+//! the shared replay (`backtest::replay`) builds its blocks without the export rules, so they change
+//! no replayed plan either.
 
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
@@ -56,7 +64,9 @@ use fluxion_core::backtest::{
     MODE_LETTERS, ProfileSource, ReplayOptions, ReplayRow, mode_index, replay,
 };
 use fluxion_core::savings::RecordedBlock;
-use fluxion_core::strategy::winter_reserve::{BatteryParams, WinterReserveParams, min_charge_kwh};
+use fluxion_core::strategy::winter_reserve::{
+    BatteryParams, ForceDirection, WinterReserveParams, min_charge_kwh,
+};
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::fs;
@@ -91,9 +101,6 @@ fn set_param(params: &mut WinterReserveParams, assignment: &str) -> Result<(), S
     let (key, value) = assignment
         .split_once('=')
         .ok_or_else(|| format!("--param expects key=value, got {assignment}"))?;
-    let value: f32 = value
-        .parse()
-        .map_err(|_| format!("--param {key}: not a number: {value}"))?;
     let mut map = match serde_json::to_value(&*params) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => return Err("cannot serialise WinterReserveParams".into()),
@@ -101,11 +108,21 @@ fn set_param(params: &mut WinterReserveParams, assignment: &str) -> Result<(), S
     if !map.contains_key(key) {
         return Err(format!("unknown parameter {key}"));
     }
-    // Boolean parameters take 1 (true) or 0 (false)
-    let json = if map[key].is_boolean() {
-        serde_json::json!(value != 0.0)
-    } else {
+    // Text parameters (export_selection) take their value as written
+    let json = if map[key].is_string() {
         serde_json::json!(value)
+    } else {
+        let number: f32 = value
+            .parse()
+            .map_err(|_| format!("--param {key}: not a number: {value}"))?;
+        // Boolean parameters take 1 (true) or 0 (false); whole-number ones a whole number
+        if map[key].is_boolean() {
+            serde_json::json!(number != 0.0)
+        } else if map[key].is_u64() {
+            serde_json::json!(number as u64)
+        } else {
+            serde_json::json!(number)
+        }
     };
     map.insert(key.to_string(), json);
     *params = serde_json::from_value(serde_json::Value::Object(map))
@@ -354,7 +371,7 @@ fn run() -> Result<(), String> {
     let total_wr_grid_charge_czk: f32 = counted().map(|d| d.wr.grid_charge_czk).sum();
     let wr_cols = !baseline_only;
 
-    // End state: energy left above SelfUse's, valued at the last day's cheap_ref times efficiency.
+    // End state: energy left above SelfUse's, valued at the last day's cheap_ref times the one-way efficiency (sqrt of the round trip).
     let cheap_ref_last_day = run.cheap_ref_last_day;
     let end_soc_adjustment_czk = run.end_soc_adjustment_czk(&battery);
     let total_wr_adjusted = total_wr - end_soc_adjustment_czk;
@@ -447,17 +464,25 @@ fn run() -> Result<(), String> {
             .sum();
         let exported: f32 = counted().map(|d| d.wr.export_kwh).sum();
         let mut mode_changes = 0usize;
+        // Charge after Export or Export after Charge, with any other modes between them
+        let mut reversals = 0usize;
         let mut previous = None;
+        let mut direction = ForceDirection::None;
         for wr in counted_blocks().filter_map(|b| b.winter_reserve.as_ref()) {
             if previous.is_some_and(|m| m != wr.mode) {
                 mode_changes += 1;
             }
+            if direction.reversed_by(wr.mode) {
+                reversals += 1;
+            }
+            direction = direction.after(wr.mode);
             previous = Some(wr.mode);
         }
+        let counted_days = counted().count();
         let _ = writeln!(
             out,
-            "flows: WinterReserve exported {exported:.2} kWh, curtailed {curtailed:.2} kWh, mode changes {mode_changes} (force_discharge_enabled {}, cost_basis {cost_basis})",
-            battery.force_discharge_enabled,
+            "flows: WinterReserve exported {exported:.2} kWh, curtailed {curtailed:.2} kWh, mode changes {mode_changes}, reversals {reversals}, days {counted_days} (force_discharge_enabled {}, cost_basis {cost_basis}, direction_reversal_cost_czk {:.2})",
+            battery.force_discharge_enabled, options.params.direction_reversal_cost_czk,
         );
     }
     if !skipped_days.is_empty() {

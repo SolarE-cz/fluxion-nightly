@@ -200,7 +200,9 @@ const STALE_BACKOFF_SETTLE_SECS: i64 = 600;
 /// With no successful state read (5 s cadence) for longer than this the executor makes no mode
 /// write: a failed read keeps the previous state, so its SOC and mode may be frozen. Reads can
 /// stall for up to a minute, so one good read in the window counts as fresh (PR #647 N1, owner
-/// ruling 2026-10-28).
+/// ruling 2026-10-28). The one 120 s read window: the direct VPP startup read window
+/// (`vpp::STARTUP_READ_WINDOW_SECS`), its target set type deadline and the lever sync wait
+/// (`LEVERS_STARTUP_WAIT`) are defined from it.
 pub const STATE_STALE_SECS: i64 = 120;
 
 /// Freshness of an inverter's state read
@@ -265,8 +267,10 @@ fn permitted_mode(
     mode
 }
 
-/// Max wait for the first lever sync before inverter writes proceed (startup only).
-const LEVERS_STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Max wait for the first lever sync before inverter writes proceed (startup only): the shared
+/// 120 s read window
+const LEVERS_STARTUP_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(STATE_STALE_SECS.unsigned_abs());
 
 /// Startup state for lever-gated writes: when the first run happened, and whether the wait was logged.
 #[derive(Default)]
@@ -293,7 +297,10 @@ pub fn lever_startup_wait(
         return false;
     }
     if !startup.logged {
-        info!("⏳ Waiting for the lever sync before writing inverter modes (max 120 s)");
+        info!(
+            "⏳ Waiting for the lever sync before writing inverter modes (max {} s)",
+            LEVERS_STARTUP_WAIT.as_secs()
+        );
         startup.logged = true;
     }
     true
@@ -441,6 +448,11 @@ pub struct ExecutorState {
     wait_logged: BTreeMap<String, DateTime<Utc>>,
     /// Block start whose stale-schedule fallback was already warned about, per inverter
     stale_warned: BTreeMap<String, DateTime<Utc>>,
+    /// The mode path of the last run: a switch resyncs against the hardware mode
+    path: Option<crate::vpp::ActivePath>,
+    /// The kill switch was already on when the executor started: hands off, no mode write
+    /// until it is turned off (owner ruling R4-4, extended to the EEPROM path)
+    kill_hands_off: bool,
 }
 
 impl ExecutorState {
@@ -742,16 +754,34 @@ pub fn schedule_execution_system(
     mut sync_tracker: ResMut<InitialModeSyncTracker>,
     user_control: Option<Res<crate::resources::UserControlResource>>,
     (levers, backup_soc, clock): ExecutorInputs,
-    timezone: Option<Res<crate::resources::TimezoneConfig>>,
+    (timezone, vpp_path): (
+        Option<Res<crate::resources::TimezoneConfig>>,
+        Option<Res<crate::vpp::VppPathState>>,
+    ),
     mut debug_was_enabled: Local<Option<bool>>,
     mut vpr_was_active: Local<bool>,
-    mut kill_was_active: Local<bool>,
+    mut kill_was_active: Local<Option<bool>>,
     mut lever_startup: Local<LeversStartup>,
     mut executor: Local<ExecutorState>,
     mut warned: Local<ScheduleWarnings>,
 ) {
     let now = crate::resources::clock_now(clock.as_deref());
     let force_discharge_enabled = system_config.control_config.force_discharge_enabled;
+    // Direct VPP: the executor decides the mode (CurrentMode) and writes nothing; the VPP system
+    // turns it into the command and owns the read-back
+    let path = crate::vpp::active_path(&system_config.control_config, vpp_path.as_deref());
+    // Direct VPP startup check pending (N2): no mode write on either path yet
+    if path == crate::vpp::ActivePath::Pending {
+        return;
+    }
+    let vpp = path == crate::vpp::ActivePath::Vpp;
+    // Path switched (direct VPP → EEPROM after a failed target set type check, R4-3, or the
+    // one-way EEPROM → VPP): CurrentMode was kept by the other writer, so resync and send
+    if executor.path.is_some_and(|last| last != path) {
+        info!("Mode path switched to {:?}: resyncing inverter modes", path);
+        sync_tracker.synced_inverters.clear();
+    }
+    executor.path = Some(path);
 
     // Mode control off (brief H37): no mode command from any path of the executor (schedule,
     // initial sync, drift re-apply, Back Up default, fixed slots, VPR, kill switch Self-Use).
@@ -826,11 +856,18 @@ pub fn schedule_execution_system(
         || levers.is_some_and(|l| l.automation_disabled);
 
     // Kill switch turned off: the owner may have set modes by hand, so resync against hardware
-    if *kill_was_active && !kill_switch {
+    if *kill_was_active == Some(true) && !kill_switch {
         info!("▶️ Automation re-enabled — resyncing inverter modes");
         sync_tracker.synced_inverters.clear();
     }
-    *kill_was_active = kill_switch;
+    if kill_was_active.is_none() && kill_switch {
+        info!("⏸️ FluxION disabled by user at start: no mode write until it is enabled");
+        executor.kill_hands_off = true;
+    }
+    if !kill_switch {
+        executor.kill_hands_off = false;
+    }
+    *kill_was_active = Some(kill_switch);
 
     // Kill switch: VPR while active, otherwise the default basic mode once (Self-Use, or Back Up
     // in the Back Up default), then no more mode commands
@@ -841,6 +878,15 @@ pub fn schedule_execution_system(
             let Some(raw) = raw_state else {
                 continue;
             };
+            // Kill switch on at start: hands off (a basic mode write is an EEPROM write). A VPR
+            // takes control, so its end is followed by Self Use again
+            if vpr_override.is_some() {
+                executor.kill_hands_off = false;
+            }
+            if executor.kill_hands_off {
+                sync_tracker.synced_inverters.insert(inverter.id.clone());
+                continue;
+            }
             let (target, reason, command) = match &vpr_override {
                 Some((mode, reason)) => (
                     *mode,
@@ -859,7 +905,7 @@ pub fn schedule_execution_system(
             let target = permitted_mode(target, force_discharge_enabled, &inverter.id);
             // Not synced yet (startup or after a resync): compare with the hardware mode
             let is_initial_sync = !sync_tracker.synced_inverters.contains(&inverter.id);
-            let compared = if is_initial_sync {
+            let compared = if is_initial_sync && !vpp {
                 raw.state.work_mode
             } else {
                 current_mode.mode
@@ -893,7 +939,16 @@ pub fn schedule_execution_system(
                     continue;
                 }
             }
-            if debug.enabled {
+            if vpp {
+                debug!(
+                    "{} - direct VPP target of {}: {:?}",
+                    reason, inverter.id, target
+                );
+                // The VPP system writes this target now: see `ModeDriftWatch::mode_written`
+                if !debug.enabled {
+                    executor.mode_written(&inverter.id, now);
+                }
+            } else if debug.enabled {
                 info!(
                     "🔧 [DEBUG] {} - would set {} to {:?} (currently {:?})",
                     reason, inverter.id, target, current_mode.mode
@@ -1045,6 +1100,15 @@ pub fn schedule_execution_system(
                                 "🔧 [DEBUG] Stale state of {} - would end {:?} with {:?}",
                                 inverter.id, forced, mode
                             );
+                        } else if vpp {
+                            // Direct VPP: the default mode as the target; the VPP system sends
+                            // mode 0, then the default basic mode only if the hardware work mode
+                            // differs (#648)
+                            warn!(
+                                "Ending {:?} on {}: no successful state read for over {} s, direct VPP mode 0 ({:?})",
+                                forced, inverter.id, STATE_STALE_SECS, mode
+                            );
+                            executor.mode_written(&inverter.id, now);
                         } else {
                             warn!(
                                 "Ending {:?} on {}: no successful state read for over {} s, setting {:?}",
@@ -1152,7 +1216,10 @@ pub fn schedule_execution_system(
                 // Determine which mode to compare against:
                 // - On initial sync: use actual inverter mode (if available) to detect mismatch
                 // - After initial sync: use CurrentMode (our internal tracking)
-                let effective_current_mode = if is_initial_sync {
+                // Direct VPP: the hardware work mode is the basic mode, not the block's mode, so
+                // the first run always takes the plan
+                let vpp_initial = vpp && is_initial_sync;
+                let effective_current_mode = if is_initial_sync && !vpp {
                     actual_mode.unwrap_or(current_mode.mode)
                 } else {
                     current_mode.mode
@@ -1162,6 +1229,7 @@ pub fn schedule_execution_system(
                 // it (e.g. another controller rewrote it). Never in debug mode.
                 if !is_initial_sync
                     && !debug.enabled
+                    && !vpp
                     && scheduled_mode.mode == current_mode.mode
                     && let Some(raw) = raw_state
                     && executor
@@ -1211,12 +1279,14 @@ pub fn schedule_execution_system(
                     });
                 // Back Up default: the adapter must confirm the minimum SOC, not just the mode
                 let backup_pending = !debug.enabled
+                    && !vpp
                     && backup_min_soc.is_some_and(|target| {
                         async_writer.confirmed_backup_min_soc(&inverter.id) != Some(target)
                     });
                 if scheduled_mode.mode != effective_current_mode
                     || ambiguous_manual_resync
                     || backup_pending
+                    || vpp_initial
                 {
                     // Fresh again after a stale exit but not settled: no forced mode yet
                     if warned.settling.contains_key(&inverter.id)
@@ -1317,10 +1387,14 @@ pub fn schedule_execution_system(
                     // earlier block (e.g. a guard stop) is a boundary change and is not held by it
                     // (brief H30). Later changes in the block are debounced from this write.
                     let first_change_in_block = current_mode.set_at < scheduled_mode.block_start;
-                    if !bypass_debounce
-                        && !first_change_in_block
-                        && !can_change_mode(&current_mode, &config, now)
-                    {
+                    // Direct VPP writes are RAM: only a 20 s minimum between mode changes
+                    let debounce_ok = if vpp {
+                        now - current_mode.set_at
+                            >= chrono::Duration::seconds(crate::vpp::MIN_WRITE_GAP_SECS)
+                    } else {
+                        can_change_mode(&current_mode, &config, now)
+                    };
+                    if !bypass_debounce && !first_change_in_block && !debounce_ok {
                         debug!(
                             "Skipping mode change for {}: too soon since last change",
                             inverter.id
@@ -1341,7 +1415,8 @@ pub fn schedule_execution_system(
                     let soc = battery.soc_percent as f32;
 
                     // Skip force-charge if battery is already at max SOC
-                    if scheduled_mode.mode == InverterOperationMode::ForceCharge
+                    if !vpp
+                        && scheduled_mode.mode == InverterOperationMode::ForceCharge
                         && soc >= system_config.control_config.max_battery_soc
                     {
                         debug!(
@@ -1370,7 +1445,8 @@ pub fn schedule_execution_system(
                                 system_config.control_config.max_battery_soc,
                             )
                         });
-                    if scheduled_mode.mode == InverterOperationMode::ForceDischarge
+                    if !vpp
+                        && scheduled_mode.mode == InverterOperationMode::ForceDischarge
                         && soc <= discharge_floor
                     {
                         debug!(
@@ -1390,7 +1466,35 @@ pub fn schedule_execution_system(
                     }
 
                     // Execute mode change
-                    if debug.enabled {
+                    if vpp {
+                        // Direct VPP: the target only; the VPP system writes the command
+                        let mode_sent = permitted_mode(
+                            scheduled_mode.mode,
+                            force_discharge_enabled,
+                            &inverter.id,
+                        );
+                        info!(
+                            "🎯 Direct VPP target of {}: {:?} -> {:?}: {}{}",
+                            inverter.id,
+                            effective_current_mode,
+                            mode_sent,
+                            scheduled_mode.reason,
+                            if is_initial_sync {
+                                " (initial sync)"
+                            } else {
+                                ""
+                            }
+                        );
+                        current_mode.mode = mode_sent;
+                        current_mode.set_at = now;
+                        current_mode.reason = scheduled_mode.reason.clone();
+                        // A new target is a VPP mode write by the VPP system on this run (its
+                        // keep-alives are not targets): read-backs from before it are no drift
+                        // evidence once the path switches to the EEPROM writes (#648)
+                        if !debug.enabled {
+                            executor.mode_written(&inverter.id, now);
+                        }
+                    } else if debug.enabled {
                         info!(
                             "🔧 [DEBUG] Would change {} from {:?} to {:?}: {}{}",
                             inverter.id,
@@ -1497,11 +1601,21 @@ pub fn export_curtailment_system(
     mut state: ResMut<ExportCurtailmentState>,
     mut debug_state: Local<ExportCurtailmentState>,
     mut startup: Local<LeversStartup>,
+    (vpp_curtailment, vpp_path): (
+        Option<ResMut<crate::vpp::VppCurtailment>>,
+        Option<Res<crate::vpp::VppPathState>>,
+    ),
 ) {
     let now = Utc::now();
     if lever_startup_wait(levers.as_deref(), &mut startup, Instant::now()) {
         return;
     }
+    let path = crate::vpp::active_path(&system_config.control_config, vpp_path.as_deref());
+    // Direct VPP startup check pending (N2): no export limit write either
+    if path == crate::vpp::ActivePath::Pending {
+        return;
+    }
+    let vpp = path == crate::vpp::ActivePath::Vpp;
     let control: &ControlConfig = &system_config.control_config;
     let threshold = control.export_curtail_at_or_below_czk;
     let tz: chrono_tz::Tz = timezone
@@ -1534,6 +1648,28 @@ pub fn export_curtailment_system(
         && !kill_switch
         && !sells_to_grid
         && sell_price.is_some_and(|price| price <= threshold);
+
+    // Direct VPP: curtailment is VPP mode 7/8, no export limit write (except a fell-back link or
+    // an inverter without mode 8, both in `fallback`). A limit stored by an
+    // earlier run is still restored below.
+    let mut vpp_fallback = std::collections::BTreeSet::new();
+    if let Some(mut vpp_curtailment) = vpp_curtailment {
+        vpp_fallback = vpp_curtailment.fallback.clone();
+        let wanted = vpp && curtail_wanted;
+        if vpp_curtailment.wanted != wanted {
+            if wanted {
+                info!(
+                    "🚫 Export curtailed by direct VPP (sell {:.3} ≤ {:.3})",
+                    sell_price.unwrap_or_default(),
+                    threshold
+                );
+            } else if vpp {
+                info!("✅ Direct VPP export curtailment ended");
+            }
+            vpp_curtailment.wanted = wanted;
+        }
+    }
+    let curtail_wanted_any = curtail_wanted;
 
     // Debug mode keeps its own in-memory would-be state and never touches the real one
     let export: &mut ExportCurtailmentState = if debug.enabled {
@@ -1575,6 +1711,9 @@ pub fn export_curtailment_system(
         ) {
             continue;
         }
+        // Direct VPP curtails with mode 7/8, unless its link fell back to mode 0 or the inverter
+        // has no mode 8 and needs it (D5)
+        let curtail_wanted = curtail_wanted_any && (!vpp || vpp_fallback.contains(&inverter.id));
         let read_back = raw_state.and_then(|raw| raw.state.export_limit_w);
         let entity_max_w = raw_state.and_then(|raw| raw.state.export_limit_max_w);
         let watch = export.limit_watch.entry(inverter.id.clone()).or_default();
@@ -1935,6 +2074,9 @@ impl Plugin for ContinuousSystemsPlugin {
             .init_resource::<InitialModeSyncTracker>()
             // Persisted export limit to restore (a restart while curtailed restores it)
             .insert_resource(ExportCurtailmentState::load(EXPORT_LIMIT_RESTORE_PATH))
+            // Direct VPP (control.vpp_direct_enabled): curtailment wanted, live command flag
+            .init_resource::<crate::vpp::VppCurtailment>()
+            .init_resource::<crate::vpp::VppLive>()
             // Cost of charge of the battery energy (brief H33), persisted across restarts
             .insert_resource(crate::battery_cost_basis::BatteryCostTracker::load(
                 crate::battery_cost_basis::BATTERY_COST_BASIS_PATH,
@@ -1964,6 +2106,10 @@ impl Plugin for ContinuousSystemsPlugin {
                     // Keep schedule execution but update to use channels
                     schedule_execution_system,
                     export_curtailment_system,
+                    // Direct VPP commands from the executor's mode and the curtailment decision
+                    crate::vpp::vpp_direct_system
+                        .after(schedule_execution_system)
+                        .after(export_curtailment_system),
                     // Trigger battery history fetch periodically
                     trigger_battery_history_fetch_system,
                     // Process web queries via message passing (ECS -> Web)
@@ -2043,7 +2189,7 @@ mod hdo_cache_sync_tests {
 }
 
 #[cfg(test)]
-mod levers_execution_tests {
+pub(crate) mod levers_execution_tests {
     use super::*;
     use crate::execution::ExecutionConfig;
     use crate::resources::{
@@ -2118,6 +2264,8 @@ mod levers_execution_tests {
             },
             control_config: fluxion_types::ControlConfig {
                 maximum_export_power_w: max_export_w,
+                // The EEPROM mode path (direct VPP is the default; it has its own tests)
+                vpp_direct_enabled: false,
                 ..Default::default()
             },
             system_config: SystemSettingsConfig {
@@ -2222,6 +2370,19 @@ mod levers_execution_tests {
 
         fn set_levers(&mut self, levers: UserLevers) {
             self.world.resource_mut::<UserLeversResource>().levers = levers;
+        }
+
+        /// One run with the kill switch off and no schedule (nothing to write), so a kill switch
+        /// set afterwards is turned on while running, not on at start (hands off, R4-4)
+        fn start_with_kill_switch_off(&mut self) {
+            let mut query = self.world.query::<&mut OperationSchedule>();
+            let blocks =
+                std::mem::take(&mut query.single_mut(&mut self.world).unwrap().scheduled_blocks);
+            let levers = self.world.resource::<UserLeversResource>().levers;
+            self.set_levers(UserLevers::default());
+            self.run();
+            self.set_levers(levers);
+            query.single_mut(&mut self.world).unwrap().scheduled_blocks = blocks;
         }
 
         /// Hardware read-back (the RawInverterState of the inverter), taken at `read_at`.
@@ -2398,16 +2559,15 @@ mod levers_execution_tests {
     #[tokio::test]
     async fn kill_switch_without_vpr_sets_selfuse_once() {
         let now = Utc::now();
-        let mut h = harness(
-            vec![block(
-                now - Duration::minutes(1),
-                InverterOperationMode::ForceCharge,
-            )],
-            false,
-        );
+        // No schedule yet: the first run records the kill switch off and syncs nothing
+        let mut h = harness(vec![], false);
         {
             h.set_hardware(InverterOperationMode::ForceCharge, now);
         }
+        h.set_levers(UserLevers::default());
+        h.run();
+        assert!(h.sent_modes().await.is_empty());
+        // Turned on while running (on at start is hands off, R4-4)
         h.set_levers(UserLevers {
             automation_disabled: true,
             ..Default::default()
@@ -2461,8 +2621,10 @@ mod levers_execution_tests {
         );
     }
 
+    /// Kill switch already on at start (owner ruling R4-4 extended to the EEPROM path): hands
+    /// off, no mode write at all, even with the hardware in a manual mode
     #[tokio::test]
-    async fn kill_switch_restart_with_hardware_discharge_sends_selfuse_once() {
+    async fn kill_switch_on_at_restart_writes_no_mode() {
         let now = Utc::now();
         let mut h = harness(
             vec![block(
@@ -2477,10 +2639,11 @@ mod levers_execution_tests {
             ..Default::default()
         });
 
-        h.run();
-        h.run();
+        for _ in 0..5 {
+            h.run();
+        }
 
-        assert_eq!(h.sent_modes().await, vec![InverterOperationMode::SelfUse]);
+        assert!(h.sent_modes().await.is_empty());
     }
 
     #[tokio::test]
@@ -2494,6 +2657,9 @@ mod levers_execution_tests {
             true,
         );
         h.set_hardware(InverterOperationMode::ForceCharge, now);
+        h.set_levers(UserLevers::default());
+        h.run();
+        // Turned on while running, in debug (on at start is hands off, R4-4)
         h.set_levers(UserLevers {
             automation_disabled: true,
             ..Default::default()
@@ -2688,6 +2854,8 @@ mod levers_execution_tests {
     async fn kill_switch_writes_self_use_on_a_stale_state() {
         let now = Utc::now();
         let mut h = n1_harness(now);
+        // Turned on while running (on at start is hands off, #648 R4-4)
+        h.start_with_kill_switch_off();
         h.set_levers(UserLevers {
             automation_disabled: true,
             ..Default::default()
@@ -2848,6 +3016,32 @@ mod levers_execution_tests {
             }
         }
 
+        /// The same rig on the direct VPP path: the VPP system runs after the executor on the
+        /// stepped clock
+        fn with_vpp(mut self) -> Self {
+            use crate::vpp::{VppClock, VppCurtailment, VppLive, vpp_direct_system};
+            {
+                let mut config = self.world.resource_mut::<crate::resources::SystemConfig>();
+                config.control_config.vpp_direct_enabled = true;
+                config.control_config.force_discharge_enabled = true;
+            }
+            self.world.insert_resource(VppClock(self.t0));
+            self.world.insert_resource(VppCurtailment::default());
+            self.world.insert_resource(VppLive::default());
+            let mut schedule = Schedule::default();
+            schedule.set_executor_kind(bevy_ecs::schedule::ExecutorKind::SingleThreaded);
+            schedule.add_systems(
+                (
+                    crate::async_systems::read_inverter_states_system,
+                    schedule_execution_system,
+                    vpp_direct_system,
+                )
+                    .chain(),
+            );
+            self.schedule = schedule;
+            self
+        }
+
         /// The source's data stops changing at `t0 + secs` (see `FlakySource`)
         fn freeze_at(&self, secs: i64) {
             *self.frozen_at.lock().unwrap() = Some(self.t0 + Duration::seconds(secs));
@@ -2875,6 +3069,10 @@ mod levers_execution_tests {
         /// to completion (current-thread `rt`), as the 5 s between real reads would
         fn tick(&mut self, rt: &tokio::runtime::Runtime, secs: i64) {
             *self.clock.lock().unwrap() = self.t0 + Duration::seconds(secs);
+            if self.world.contains_resource::<crate::vpp::VppClock>() {
+                self.world
+                    .insert_resource(crate::vpp::VppClock(self.t0 + Duration::seconds(secs)));
+            }
             self.schedule.run(&mut self.world);
             rt.block_on(async {
                 for _ in 0..8 {
@@ -2990,6 +3188,145 @@ mod levers_execution_tests {
         assert_eq!(count("No successful state read of inv1"), 1);
         assert_eq!(count("Ending ForceCharge on inv1"), 1);
         assert_eq!(count("Inverter state of inv1 is fresh again"), 1);
+    }
+
+    /// #648 stale exit on the direct VPP path, at the 5 s cadence: reads fail during a VPP Force
+    /// Discharge. Mode 0 at 125 s, no work mode write (the hardware already reads the default),
+    /// nothing more while stale; once reads are back the plan resumes after the 60 s settle
+    #[test]
+    fn stale_reads_during_a_vpp_force_discharge_send_mode_0_once() {
+        use crate::vpp::VppCommand;
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::SelfUse,
+            InverterOperationMode::ForceDischarge,
+        )
+        .with_vpp();
+        let sent = rig.run(&rt, 600, |secs| secs == 0);
+        let exits: Vec<i64> = sent
+            .iter()
+            .filter(|(_, c)| *c == InverterCommand::SetVpp(VppCommand::Exit))
+            .map(|(at, _)| *at)
+            .collect();
+        assert_eq!(exits, vec![125], "{sent:?}");
+        let mode8: Vec<i64> = sent
+            .iter()
+            .filter(|(_, c)| matches!(c, InverterCommand::SetVpp(VppCommand::PvAndBattery { .. })))
+            .map(|(at, _)| *at)
+            .collect();
+        assert_eq!(mode8.first(), Some(&0), "{sent:?}");
+        assert!(mode8.iter().all(|at| *at <= 120), "{sent:?}");
+        assert!(
+            sent.iter().all(|(at, _)| *at <= 125),
+            "nothing after mode 0 while stale: {sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(_, c)| matches!(
+                c,
+                InverterCommand::SetMode(_) | InverterCommand::SetBackupMode { .. }
+            )),
+            "no charger_use_mode write: {sent:?}"
+        );
+
+        // Reads back from 605 s: the discharge resumes only after the 60 s settle (#647)
+        let mut resumed = Vec::new();
+        for secs in (605..=700).step_by(5) {
+            rig.set_reachable(true);
+            let seen = rig.sent().len();
+            rig.tick(&rt, secs);
+            resumed.extend(rig.sent()[seen..].iter().map(|c| (secs, c.clone())));
+        }
+        let first = resumed
+            .iter()
+            .find(|(_, c)| matches!(c, InverterCommand::SetVpp(VppCommand::PvAndBattery { .. })))
+            .map(|(at, _)| *at);
+        assert!(first.is_some_and(|at| at >= 665), "{resumed:?}");
+    }
+
+    /// #648 stale exit on the direct VPP path when the hardware work mode differs from the
+    /// default: mode 0 first, then the default basic mode once
+    #[test]
+    fn stale_vpp_exit_writes_the_default_after_mode_0_when_the_work_mode_differs() {
+        use crate::vpp::VppCommand;
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        // The last good read (0 s) shows Back Up; the default is Self Use
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::BackUpMode,
+            InverterOperationMode::ForceDischarge,
+        )
+        .with_vpp();
+        let sent = rig.run(&rt, 600, |secs| secs == 0);
+        let late: Vec<InverterCommand> = sent
+            .iter()
+            .filter(|(at, _)| *at > 120)
+            .map(|(_, c)| c.clone())
+            .collect();
+        assert_eq!(
+            late,
+            vec![
+                InverterCommand::SetVpp(VppCommand::Exit),
+                InverterCommand::SetMode(InverterOperationMode::SelfUse)
+            ],
+            "{sent:?}"
+        );
+    }
+
+    /// #648: a stale state stops the VPP keep-alives (Feed-in, mode 8 is not a forced mode and
+    /// gets no mode 0): stale for 130 s (reads fail until 250 s) → no VPP write after 120 s
+    /// until the next fresh read; the last mode 8 lapses by its own duration
+    #[test]
+    fn stale_reads_stop_the_vpp_keep_alive() {
+        use crate::vpp::{MODE8_DURATION_S, VppCommand};
+        let rt = cadence_runtime();
+        let _guard = rt.enter();
+        let mut rig = CadenceRig::new(
+            InverterOperationMode::SelfUse,
+            InverterOperationMode::FeedinPriority,
+        )
+        .with_vpp();
+        let sent = rig.run(&rt, 255, |secs| secs == 0 || secs > 250);
+        let vpp: Vec<(i64, VppCommand)> = sent
+            .iter()
+            .filter_map(|(at, c)| match c {
+                InverterCommand::SetVpp(v) => Some((*at, *v)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            vpp.iter()
+                .all(|(_, v)| matches!(v, VppCommand::PvAndBattery { .. })),
+            "{vpp:?}"
+        );
+        let times: Vec<i64> = vpp.iter().map(|(at, _)| *at).collect();
+        assert_eq!(times.first(), Some(&0), "{vpp:?}");
+        assert!(
+            times.iter().all(|at| *at <= 120 || *at >= 255),
+            "keep-alive on stale data: {vpp:?}"
+        );
+        // The last write before the stale period carries the 180 s duration (lapses by 300 s)
+        let last = vpp.iter().rev().find(|(at, _)| *at <= 120).unwrap().1;
+        assert!(
+            last.parameters()
+                .contains(&("duration_8", i64::from(MODE8_DURATION_S)))
+        );
+        // Fresh again at 255 s: the keep-alive resumes
+        assert!(times.contains(&255), "{vpp:?}");
+    }
+
+    /// #648: the 120 s read window is one constant (the state staleness, the direct VPP startup
+    /// read window and the lever sync wait)
+    #[test]
+    fn one_120_s_read_window() {
+        assert_eq!(
+            crate::vpp::STARTUP_READ_WINDOW_SECS,
+            STATE_STALE_SECS.unsigned_abs()
+        );
+        assert_eq!(
+            LEVERS_STARTUP_WAIT.as_secs(),
+            STATE_STALE_SECS.unsigned_abs()
+        );
     }
 
     /// PR #647 R4-2: one good read every 130 s for an hour (each just past the 120 s limit) must
@@ -3381,6 +3718,8 @@ mod levers_execution_tests {
             false,
         );
         h.mark_synced();
+        // Turned on while running (on at start is hands off, #648 R4-4)
+        h.start_with_kill_switch_off();
         h.set_current(InverterOperationMode::ForceCharge);
         h.set_levers(UserLevers {
             automation_disabled: true,
@@ -3456,6 +3795,8 @@ mod levers_execution_tests {
             uc.state.backup_min_soc_pct
         };
         h.mark_synced();
+        // Turned on while running (on at start is hands off, #648 R4-4)
+        h.start_with_kill_switch_off();
         h.set_current(InverterOperationMode::ForceCharge);
         h.set_hardware(InverterOperationMode::ForceCharge, now);
         h.set_levers(UserLevers {
@@ -3885,19 +4226,17 @@ mod levers_execution_tests {
     #[tokio::test]
     async fn kill_switch_skips_inverter_without_state_and_does_not_sync_it() {
         let now = Utc::now();
-        let mut h = harness(
-            vec![block(
-                now - Duration::minutes(1),
-                InverterOperationMode::SelfUse,
-            )],
-            false,
-        );
+        // No schedule yet: the first run records the kill switch off and syncs nothing
+        let mut h = harness(vec![], false);
         let inverter = h
             .world
             .query_filtered::<Entity, With<RawInverterState>>()
             .single(&h.world)
             .unwrap();
         h.world.entity_mut(inverter).remove::<RawInverterState>();
+        h.set_levers(UserLevers::default());
+        h.run();
+        // Turned on while running (on at start is hands off, R4-4)
         h.set_levers(UserLevers {
             automation_disabled: true,
             ..Default::default()
@@ -5450,6 +5789,16 @@ mod levers_execution_tests {
     #[test]
     fn mode_control_is_on_by_default() {
         assert!(fluxion_types::ControlConfig::default().mode_control_enabled);
+    }
+
+    /// Owner direction D1: direct VPP is the default; mode 8 is assumed until startup finds
+    /// an inverter without it (D5)
+    #[test]
+    fn direct_vpp_is_on_by_default() {
+        let control = fluxion_types::ControlConfig::default();
+        assert!(control.vpp_direct_enabled);
+        assert_eq!(control.vpp_direct_path, None);
+        assert!(control.vpp_no_mode8.is_empty());
     }
 
     #[tokio::test]
