@@ -202,6 +202,21 @@ pub fn config_event_handler(mut params: ConfigEventParams) {
         let old_config = params.system_config.clone();
         *params.system_config = new_config;
 
+        // The built-in strategy plugins copy their config at registration: rebuild them from the
+        // new one so the planner sees it before the schedule is recalculated below
+        if event.section_changed(ConfigSection::Control)
+            || event.section_changed(ConfigSection::Strategies)
+        {
+            let mut plugin_manager = params.plugin_manager_res.0.write();
+            crate::plugin_adapters::rebuild_builtin_plugins(
+                &mut plugin_manager,
+                Some(&params.system_config.strategies_config),
+                &params.system_config.control_config,
+            );
+            drop(plugin_manager);
+            info!("🔁 Strategy plugins rebuilt from the updated config");
+        }
+
         // Sync DebugModeConfig resource with SystemConfig.system_config.debug_mode
         if old_config.system_config.debug_mode != params.system_config.system_config.debug_mode {
             params.debug_config.enabled = params.system_config.system_config.debug_mode;
