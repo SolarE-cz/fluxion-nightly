@@ -570,6 +570,25 @@ pub fn create_plugin_manager(
     manager
 }
 
+/// Replace the built-in strategy plugins of a shared manager with ones built from a new config.
+///
+/// The built-ins copy their config at registration, so a runtime config update must re-register
+/// them. External plugins registered into the same manager are kept.
+pub fn rebuild_builtin_plugins(
+    manager: &mut PluginManager,
+    strategies_config: Option<&fluxion_types::config::StrategiesConfigCore>,
+    control_config: &ControlConfig,
+) {
+    let builtin: std::collections::HashSet<String> =
+        create_plugin_manager(strategies_config, control_config)
+            .list_plugins()
+            .into_iter()
+            .map(|(name, _, _)| name.to_owned())
+            .collect();
+    manager.retain(|name| !builtin.contains(name));
+    init_plugin_manager(manager, strategies_config, control_config);
+}
+
 #[cfg(test)]
 mod winter_reserve_registration_tests {
     use super::*;

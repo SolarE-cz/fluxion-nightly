@@ -98,6 +98,11 @@ impl PluginManager {
         );
     }
 
+    /// Remove every plugin whose name `keep` rejects
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.plugins.retain(|name, _| keep(name));
+    }
+
     /// Enable or disable a plugin
     pub fn set_enabled(&mut self, name: &str, enabled: bool) -> bool {
         if let Some(entry) = self.plugins.get_mut(name) {
@@ -214,5 +219,44 @@ impl PluginManager {
     pub fn evaluate(&self, request: &EvaluationRequest) -> BlockDecision {
         let decisions = self.evaluate_all(request);
         self.merge_decisions(decisions, request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NamedPlugin(&'static str);
+
+    impl Plugin for NamedPlugin {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn priority(&self) -> u8 {
+            100
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+
+        fn evaluate(&self, _request: &EvaluationRequest) -> anyhow::Result<BlockDecision> {
+            anyhow::bail!("not evaluated in this test")
+        }
+    }
+
+    #[test]
+    fn test_retain_removes_only_rejected_names() {
+        let mut manager = PluginManager::new();
+        manager.register(Arc::new(NamedPlugin("Keep-A")));
+        manager.register(Arc::new(NamedPlugin("Drop-B")));
+        manager.register(Arc::new(NamedPlugin("Keep-C")));
+
+        manager.retain(|name| name.starts_with("Keep"));
+
+        let mut names: Vec<&str> = manager.list_plugins().iter().map(|(n, _, _)| *n).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["Keep-A", "Keep-C"]);
     }
 }
