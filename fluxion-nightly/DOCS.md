@@ -571,6 +571,18 @@ option applies over a saved web UI configuration (`/data/config.json`).
 
 Default value: `6`
 
+#### Option: `solar_forecast.provider`
+
+The solar forecast platform, or a comma-separated list of platforms (for example
+`open_meteo_solar_forecast,forecast_solar`). Several providers are averaged, not summed: the day
+totals are the mean over the providers, and the 15-minute shape comes from the providers that
+publish per-block data, scaled to that mean. Several sensors of one provider (roof planes or
+entries) are summed. A provider whose sensors were not updated since local midnight is left out
+of the mean until they are. With several providers the PV forecast correction takes its snapshots
+only and does not rebuild days from HA history.
+
+Default value: `"open_meteo_solar_forecast"`
+
 #### Option: `strategies.winter_reserve.cautious_pv_mae_pct`
 
 Cautious PV: while the solar forecast misses a lot, the planner plans on the forecast PV times
@@ -612,10 +624,16 @@ Default value: `[10, 11, 12, 1, 2, 3]`
 
 #### Option: `strategies.winter_reserve.low_tariff_fill_months`
 
-Local calendar months (1–12) in which every HDO low-tariff block charges the battery to max SOC and
-holds it there, so the house runs from the grid during the low tariff (winter sites with little PV).
-Only blocks whose HDO tariff is known are filled; without an HDO sensor the option does nothing. In a
-filled block the `Zákaz vybíjení` price lever does not apply. This option applies over a saved web UI
+Local calendar months (1–12) in which the battery is filled to max SOC by the end of each HDO
+low-tariff run, so the house runs from the grid during the low tariff (winter sites with little PV).
+The planner charges in the cheapest blocks of the run and holds in the others (house from the grid,
+battery idle). The battery never discharges in a filled block. A price lever that forces charging
+still applies. Only blocks whose HDO tariff is known are filled; without an HDO sensor the option
+does nothing. In a filled block the `Zákaz vybíjení` price lever does not apply. A run too short to
+fill charges as much as it can. Known trade-off: the run-end target outweighs price spreads, so
+before a low-tariff run too short to refill the plan may hold the battery or even grid-charge in
+high-tariff blocks at or below the median price, which can cost more than with the option off. Keep
+the option off on spot sites unless the owner asks for it. This option applies over a saved web UI
 configuration (`/data/config.json`). Not applied in the `/backtest` day replay.
 
 Default value: `[]` (off)

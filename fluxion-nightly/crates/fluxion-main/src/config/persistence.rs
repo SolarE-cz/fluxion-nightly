@@ -190,6 +190,7 @@ pub const ADDON_ONLY_OPTIONS: &[&[&str]] = &[
     &["control", "battery_wear_cost_czk_per_kwh"],
     &["control", "battery_efficiency"],
     &["solar_forecast", "pv_forecast_correction_enabled"],
+    &["solar_forecast", "provider"],
     &["pricing", "ote_fallback_enabled"],
     &["pricing", "price_alert_notification"],
     &["pricing", "tomorrow_prices_check_time"],
@@ -425,6 +426,7 @@ mod tests {
         saved.strategies.winter_reserve.export_window_continuity_pct = 1.0;
         saved.strategies.winter_reserve.daily_export_hours = 3;
         saved.strategies.winter_reserve.mode_switch_min_benefit_czk = 1.5;
+        saved.solar_forecast.provider = "forecast_solar".to_owned();
         persistence.save(&saved, "web_ui").unwrap();
         let mut config = persistence.load().unwrap().config;
 
@@ -451,7 +453,10 @@ mod tests {
                     "min_battery_soc": 55.0,
                     "hold_pv_to_battery": true
                 },
-                "solar_forecast": {"pv_forecast_correction_enabled": false}
+                "solar_forecast": {
+                    "pv_forecast_correction_enabled": false,
+                    "provider": "open_meteo_solar_forecast,forecast_solar"
+                }
             })
             .to_string(),
         )
@@ -465,6 +470,11 @@ mod tests {
         assert!((config.control.battery_efficiency - 0.9).abs() < 1e-6);
         assert!(config.control.hold_pv_to_battery);
         assert!(!config.solar_forecast.pv_forecast_correction_enabled);
+        // The add-on provider list wins over the saved web UI value
+        assert_eq!(
+            config.solar_forecast.provider,
+            "open_meteo_solar_forecast,forecast_solar"
+        );
         assert!((config.strategies.winter_reserve.direction_reversal_cost_czk - 3.5).abs() < 1e-6);
         assert!(
             (config

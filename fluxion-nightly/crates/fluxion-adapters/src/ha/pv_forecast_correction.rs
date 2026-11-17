@@ -44,6 +44,8 @@ pub type SharedForecastStore = Arc<Mutex<ForecastStore>>;
 /// The provider's discovered total-today sensors, kept current by the fetcher (discovery may
 /// finish or change after the worker started)
 pub type SharedSensorList = Arc<Mutex<Vec<String>>>;
+/// How many providers the fetcher averages (1 for one provider or the pattern only)
+pub type SharedProviderCount = Arc<Mutex<usize>>;
 
 /// Local date of `now`
 fn local_date(now: DateTime<Utc>, tz: Tz) -> NaiveDate {
@@ -175,6 +177,8 @@ pub struct CorrectionWorker<R: HistoryReader> {
     pub path: PathBuf,
     /// The provider's total-today sensors (bootstrap source), read at each bootstrap
     pub forecast_entities: SharedSensorList,
+    /// Providers averaged by the fetcher; with several, the history rebuild is skipped
+    pub providers: SharedProviderCount,
     pub sender: crossbeam_channel::Sender<CorrectionResult>,
     /// Cautious PV for Winter Reserve from the forecast error; `None` = not wired
     pub cautious_pv: Option<CautiousPvOutput>,
@@ -270,6 +274,18 @@ impl<R: HistoryReader> CorrectionWorker<R> {
 
     /// Rebuild the window's days that have no snapshot from the provider sensors' history
     async fn bootstrap(&self, today: NaiveDate) {
+        // A day of averaged providers has no single history to rebuild from: snapshots only
+        let providers = self
+            .providers
+            .lock()
+            .map(|n| *n)
+            .unwrap_or_else(|e| *e.into_inner());
+        if providers > 1 {
+            info!(
+                "PV forecast correction: several providers averaged, history rebuild skipped; snapshots only"
+            );
+            return;
+        }
         let forecast_entities = self
             .forecast_entities
             .lock()
@@ -453,6 +469,7 @@ mod tests {
             forecast_entities: Arc::new(Mutex::new(vec![
                 "sensor.energy_production_today".to_owned(),
             ])),
+            providers: Arc::new(Mutex::new(1)),
             sender: tx,
             cautious_pv: None,
         };
@@ -877,6 +894,7 @@ mod tests {
             store: Arc::new(Mutex::new(store)),
             path: dir.path().join("snapshots.json"),
             forecast_entities: Arc::new(Mutex::new(Vec::new())),
+            providers: Arc::new(Mutex::new(1)),
             sender: tx,
             cautious_pv: Some(CautiousPvOutput {
                 thresholds: T,
@@ -991,5 +1009,45 @@ mod tests {
         // The same store one day later is recent and is sent
         worker.send_stored_cautious_pv(oct(16));
         assert!(rx.try_recv().unwrap().unwrap().cautious);
+    }
+
+    /// Counts the history reads: the bootstrap reads history for each missing day and sensor
+    #[derive(Clone, Default)]
+    struct CountingHistory(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl HistoryReader for CountingHistory {
+        async fn history(
+            &self,
+            _entity_id: &str,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+            _with_attributes: bool,
+        ) -> Result<Vec<HistoryState>, HistoryError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rebuilds_from_history_only_with_one_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let reads = CountingHistory::default();
+        let (mut worker, _crx, _view) = worker_with(reads.clone(), ForecastStore::default(), &dir);
+        worker.forecast_entities = Arc::new(Mutex::new(vec![
+            "sensor.energy_production_today".to_owned(),
+        ]));
+        // One provider: the empty store's missing days are read from history
+        worker.bootstrap(oct(19)).await;
+        let single = reads.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(single > 0, "positive control: the bootstrap reads history");
+        // Two providers averaged: no history is read, the days stay missing
+        *worker.providers.lock().unwrap() = 2;
+        worker.bootstrap(oct(19)).await;
+        assert_eq!(
+            reads.0.load(std::sync::atomic::Ordering::SeqCst),
+            single,
+            "several providers must not rebuild snapshots from history"
+        );
     }
 }

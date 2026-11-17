@@ -10,6 +10,37 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.79] - 2026-11-17
+
+### Added
+
+- `solar_forecast.provider` takes several comma-separated platforms, for example
+  `open_meteo_solar_forecast,forecast_solar`. FluxION averages their forecasts (day totals and the
+  per-block shape) instead of summing them. A provider with several planes or entries is still
+  summed. A named provider with no total-today sensor is skipped with a WARN. One name works as
+  before.
+
+### Changed
+
+- Low-tariff fill (`strategies.winter_reserve.low_tariff_fill_months`): the battery now reaches max
+  SOC by the end of each low-tariff run by charging in its cheapest blocks and holding (house from
+  the grid) in the others, instead of charging in every low-tariff block. The battery still does not
+  discharge in a filled block. The plan reason shows `HOLD (low tariff fill)` for a held block. The
+  runtime guard holds a fill block that would charge at max SOC or at the solar headroom (it was
+  SELF-USE). Known trade-off: the run-end target outweighs price spreads, so before a low-tariff run
+  too short to refill the plan may hold the battery or even grid-charge in high-tariff blocks at or
+  below the median price, which can cost more than with the option off. Keep the option off on spot
+  sites unless the owner asks for it.
+- `solar_forecast.provider` set in the add-on options now overrides a value saved through the web UI
+  or `/api/config/update`; check the add-on option before updating a site that changed the provider
+  there.
+
+### Fixed
+
+- The planner values a battery that starts below min SOC from its real energy. Before, it was planned
+  as if it were at min SOC, so night charging looked worthless and was missed (Přelouč 2026-11-17: 21 %
+  with min SOC 30 %).
+
 ## [0.2.78] - 2026-11-17
 
 ### Added

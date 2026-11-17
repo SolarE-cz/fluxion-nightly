@@ -14,7 +14,7 @@ use crate::ha::HaClientResource;
 use crate::ha::client::HomeAssistantClient;
 use crate::ha::hot_standby::{RegistryEntry, fetch_registry};
 use crate::ha::pv_forecast_correction::{
-    CautiousPvOutput, CorrectionWorker, SharedForecastStore, SharedSensorList,
+    CautiousPvOutput, CorrectionWorker, SharedForecastStore, SharedProviderCount, SharedSensorList,
 };
 use crate::ha::solar_forecast_accuracy::{AccuracyMonitor, BIAS_STATE_PATH, SharedCautiousPv};
 use crate::ha::types::HaEntityState;
@@ -25,9 +25,10 @@ use fluxion_core::async_systems::{
     CautiousPvChannel, PvCorrectionChannel, SolarForecastChannel, SolarForecastData,
     SolarForecastSender, SolarForecastUpdate, correction_to_apply,
 };
+use fluxion_core::backtest::local_midnight_utc;
 use fluxion_core::pv_correction::{ForecastStore, PvCorrectionSiteResource, SNAPSHOT_PATH};
 use fluxion_core::{SystemConfig, TimezoneConfig};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,11 +40,22 @@ struct DiscoveredSensors {
     total_today: Vec<String>,
     remaining_today: Vec<String>,
     tomorrow: Vec<String>,
+    /// The sensors of each selected provider, averaged when there are several
+    providers: Vec<ProviderSensors>,
+    /// Named providers skipped in the last discovery (no total-today sensor)
+    skipped_providers: Vec<String>,
     initialized: bool,
     /// How the provider filter was applied in the last discovery
     source: Option<ProviderSource>,
     /// When discovery last ran successfully
     last_attempt: Option<Instant>,
+    /// The averaging INFO line as last logged
+    averaged_info: Option<AveragedInfo>,
+    /// The selection of the last discovery that found the named providers (kept while the
+    /// registry is unavailable or matches nothing)
+    good_providers: Vec<ProviderSensors>,
+    /// Whether the averaged forecast currently has no fresh provider
+    no_fresh: NoFreshEpisode,
 }
 
 /// How often provider discovery is retried while it is in a fallback
@@ -129,7 +141,7 @@ pub fn spawn_solar_forecast_fetcher(
 
         // Fetch immediately on startup
         tracing::debug!("📊 Fetching initial solar forecast from HA");
-        let fetched = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+        let fetched = fetch_and_send_solar_forecast(&client, &discovered, &sender, tz).await;
         record_snapshot(correction.as_ref(), &fetched);
         accuracy
             .tick(&client, Utc::now(), fetched.total_today)
@@ -144,6 +156,7 @@ pub fn spawn_solar_forecast_fetcher(
                 store: setup.store.clone(),
                 path: PathBuf::from(SNAPSHOT_PATH),
                 forecast_entities,
+                providers: setup.providers.clone(),
                 sender: setup.sender.clone(),
                 cautious_pv: cautious_sender.map(|sender| CautiousPvOutput {
                     thresholds: cautious_thresholds,
@@ -162,7 +175,7 @@ pub fn spawn_solar_forecast_fetcher(
             if let Some(setup) = &correction {
                 share_sensors(setup, &discovered).await;
             }
-            let fetched = fetch_and_send_solar_forecast(&client, &discovered, &sender).await;
+            let fetched = fetch_and_send_solar_forecast(&client, &discovered, &sender, tz).await;
             record_snapshot(correction.as_ref(), &fetched);
             accuracy
                 .tick(&client, Utc::now(), fetched.total_today)
@@ -188,15 +201,21 @@ struct CorrectionSetup {
     sender: crossbeam_channel::Sender<fluxion_core::pv_correction::CorrectionResult>,
     /// Discovered total-today sensors, for the worker's bootstrap
     sensors: SharedSensorList,
+    /// Providers averaged in the last discovery
+    providers: SharedProviderCount,
 }
 
-/// Publish the current discovered total-today sensors to the correction worker
+/// Publish the current discovered total-today sensors and provider count to the correction worker
 async fn share_sensors(setup: &CorrectionSetup, discovered: &Arc<RwLock<DiscoveredSensors>>) {
-    let current = discovered.read().await.total_today.clone();
+    let (current, providers) = {
+        let cache = discovered.read().await;
+        (cache.total_today.clone(), cache.providers.len())
+    };
     let mut shared = setup.sensors.lock().unwrap_or_else(|e| e.into_inner());
     if *shared != current {
         *shared = current;
     }
+    *setup.providers.lock().unwrap_or_else(|e| e.into_inner()) = providers;
 }
 
 /// The correction runs when the option is on and the site and channel exist
@@ -227,6 +246,7 @@ fn correction_setup(
         ))),
         sender: channel.sender.clone(),
         sensors: Arc::new(std::sync::Mutex::new(Vec::new())),
+        providers: Arc::new(std::sync::Mutex::new(1)),
     })
 }
 
@@ -269,7 +289,7 @@ async fn discover_sensors(
         all_states.len()
     );
 
-    // Find matching sensors for each pattern, then keep the configured provider's sensors
+    // Find matching sensors for each pattern, then keep the configured providers' sensors
     let pattern_sets = [
         find_matching_sensor_ids(&all_states, &config.sensor_total_today_pattern),
         find_matching_sensor_ids(&all_states, &config.sensor_remaining_today_pattern),
@@ -289,14 +309,62 @@ async fn discover_sensors(
             }
         }
     };
-    let selection = select_provider_sensors(pattern_sets, registry.as_deref(), &config.provider);
-    let previous = discovered.read().await.source;
+    let several = provider_names(&config.provider).len() > 1;
+    let mut selection =
+        select_provider_sensors(pattern_sets, registry.as_deref(), &config.provider);
+    let (previous, previous_skipped, good) = {
+        let cache = discovered.read().await;
+        (
+            cache.source,
+            cache.skipped_providers.clone(),
+            cache.good_providers.clone(),
+        )
+    };
+    let kept = apply_last_good(&mut selection, several, &good);
+    for name in selection
+        .skipped
+        .iter()
+        .filter(|name| !previous_skipped.contains(*name))
+    {
+        tracing::warn!(
+            "⚠️ Solar forecast provider '{}' has no total-today sensor, skipped; retrying every 5 min",
+            name
+        );
+    }
+    for provider in selection
+        .providers
+        .iter()
+        .filter(|p| previous_skipped.contains(&p.name))
+    {
+        tracing::info!(
+            "☀️ Solar forecast provider '{}' has sensors now, included",
+            provider.name
+        );
+    }
     match selection.source {
         ProviderSource::PatternOnly => {}
         ProviderSource::Provider => {
             if previous != Some(ProviderSource::Provider) {
-                tracing::info!(
-                    "☀️ Solar forecast provider '{}': using only its sensors",
+                match selection.providers.as_slice() {
+                    [only] => tracing::info!(
+                        "☀️ Solar forecast provider '{}': using only its sensors",
+                        only.name
+                    ),
+                    several => {
+                        let names: Vec<String> =
+                            several.iter().map(|p| format!("'{}'", p.name)).collect();
+                        tracing::info!(
+                            "☀️ Solar forecast providers {}: averaged",
+                            names.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+        ProviderSource::RegistryUnavailable | ProviderSource::NoProviderMatch if kept => {
+            if fallback_warn_due(previous, selection.source) {
+                tracing::warn!(
+                    "⚠️ Solar forecast providers '{}' not all checked (registry unavailable or no match), keeping the last good selection; retrying every 5 min",
                     config.provider
                 );
             }
@@ -307,6 +375,11 @@ async fn discover_sensors(
                     "⚠️ Solar forecast provider '{}' not checked (registry unavailable), using pattern match only; retrying every 5 min",
                     config.provider
                 );
+                if several {
+                    tracing::warn!(
+                        "⚠️ Several solar forecast providers named with no last good selection: their totals may be summed across providers"
+                    );
+                }
             }
         }
         ProviderSource::NoProviderMatch => {
@@ -315,6 +388,11 @@ async fn discover_sensors(
                     "⚠️ No sensors of solar forecast provider '{}' match, using pattern match only; retrying every 5 min",
                     config.provider
                 );
+                if several {
+                    tracing::warn!(
+                        "⚠️ Several solar forecast providers named with no last good selection: their totals may be summed across providers"
+                    );
+                }
             }
         }
     }
@@ -365,6 +443,11 @@ async fn discover_sensors(
     cache.total_today = total_today;
     cache.remaining_today = remaining_today;
     cache.tomorrow = tomorrow;
+    if selection.source == ProviderSource::Provider {
+        cache.good_providers = selection.providers.clone();
+    }
+    cache.providers = selection.providers;
+    cache.skipped_providers = selection.skipped;
     cache.initialized = true;
     cache.source = Some(selection.source);
     cache.last_attempt = Some(Instant::now());
@@ -390,6 +473,12 @@ fn discovery_retry_due(
         && last_attempt.is_none_or(|t| now.duration_since(t) >= DISCOVERY_RETRY)
 }
 
+/// Retry discovery while a named provider is skipped (its sensors may appear), at most every
+/// `DISCOVERY_RETRY`
+fn skipped_retry_due(skipped: bool, last_attempt: Option<Instant>, now: Instant) -> bool {
+    skipped && last_attempt.is_none_or(|t| now.duration_since(t) >= DISCOVERY_RETRY)
+}
+
 /// The fallback WARN is logged once per episode: when a fallback starts, not on each retry
 fn fallback_warn_due(previous: Option<ProviderSource>, current: ProviderSource) -> bool {
     is_fallback(current) && !previous.is_some_and(is_fallback)
@@ -401,11 +490,18 @@ async fn retry_discovery_if_due(
     config: &fluxion_core::SolarForecastConfigCore,
     discovered: &Arc<RwLock<DiscoveredSensors>>,
 ) {
-    let (source, last_attempt) = {
+    let (source, last_attempt, skipped) = {
         let cache = discovered.read().await;
-        (cache.source, cache.last_attempt)
+        (
+            cache.source,
+            cache.last_attempt,
+            !cache.skipped_providers.is_empty(),
+        )
     };
-    if !discovery_retry_due(source, last_attempt, Instant::now()) {
+    let now = Instant::now();
+    if !discovery_retry_due(source, last_attempt, now)
+        && !skipped_retry_due(skipped, last_attempt, now)
+    {
         return;
     }
     if let Err(e) = discover_sensors(client, config, discovered).await {
@@ -434,54 +530,141 @@ enum ProviderSource {
     NoProviderMatch,
 }
 
-/// Sensor sets for [total today, remaining today, tomorrow] after the provider filter
+/// The sensors of one provider (registry platform), in the three sets
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProviderSensors {
+    name: String,
+    total_today: Vec<String>,
+    remaining_today: Vec<String>,
+    tomorrow: Vec<String>,
+}
+
+/// Sensor sets for [total today, remaining today, tomorrow] after the provider filter, and the
+/// sensors of each selected provider
 #[derive(Debug, PartialEq, Eq)]
 struct ProviderSelection {
     sets: [Vec<String>; 3],
     source: ProviderSource,
+    /// Selected providers, one entry for the pattern match when there is no provider filter
+    providers: Vec<ProviderSensors>,
+    /// Named providers skipped for having no total-today sensor
+    skipped: Vec<String>,
 }
 
-/// Keep only the pattern-matched sensors whose registry platform is `provider`.
-/// Falls back to the pattern-only sets when there is no provider, no registry, or no provider
-/// sensor for total today.
+/// The pattern-matched sets as one unfiltered provider
+fn pattern_only(sets: [Vec<String>; 3], source: ProviderSource) -> ProviderSelection {
+    let providers = vec![ProviderSensors {
+        name: String::new(),
+        total_today: sets[0].clone(),
+        remaining_today: sets[1].clone(),
+        tomorrow: sets[2].clone(),
+    }];
+    ProviderSelection {
+        sets,
+        source,
+        providers,
+        skipped: Vec::new(),
+    }
+}
+
+/// Keep only the pattern-matched sensors whose registry platform is one of the `provider` names
+/// (comma-separated). Each named provider keeps its own sensors, so they can be averaged.
+/// Falls back to the pattern-only sets when there is no provider, no registry, or no named
+/// provider with a sensor for total today.
 fn select_provider_sensors(
     pattern_sets: [Vec<String>; 3],
     registry: Option<&[RegistryEntry]>,
     provider: &str,
 ) -> ProviderSelection {
-    if provider.is_empty() {
-        return ProviderSelection {
-            sets: pattern_sets,
-            source: ProviderSource::PatternOnly,
-        };
+    let names = provider_names(provider);
+    if names.is_empty() {
+        return pattern_only(pattern_sets, ProviderSource::PatternOnly);
     }
     let Some(registry) = registry else {
-        return ProviderSelection {
-            sets: pattern_sets,
-            source: ProviderSource::RegistryUnavailable,
-        };
+        return pattern_only(pattern_sets, ProviderSource::RegistryUnavailable);
     };
     let platforms: HashMap<&str, &str> = registry
         .iter()
         .map(|e| (e.entity_id.as_str(), e.platform.as_str()))
         .collect();
-    let keep = |ids: &[String]| -> Vec<String> {
-        ids.iter()
-            .filter(|id| platforms.get(id.as_str()) == Some(&provider))
-            .cloned()
-            .collect()
-    };
-    let filtered = pattern_sets.each_ref().map(|ids| keep(ids));
-    if filtered[0].is_empty() {
-        return ProviderSelection {
-            sets: pattern_sets,
-            source: ProviderSource::NoProviderMatch,
+    let mut providers: Vec<ProviderSensors> = Vec::new();
+    let mut skipped = Vec::new();
+    for name in names {
+        if providers.iter().any(|p| p.name == name) {
+            continue;
+        }
+        let keep = |ids: &[String]| -> Vec<String> {
+            ids.iter()
+                .filter(|id| platforms.get(id.as_str()) == Some(&name))
+                .cloned()
+                .collect()
         };
+        let [total_today, remaining_today, tomorrow] = pattern_sets.each_ref().map(|ids| keep(ids));
+        if total_today.is_empty() {
+            skipped.push(name.to_string());
+            continue;
+        }
+        providers.push(ProviderSensors {
+            name: name.to_string(),
+            total_today,
+            remaining_today,
+            tomorrow,
+        });
+    }
+    if providers.is_empty() {
+        let mut selection = pattern_only(pattern_sets, ProviderSource::NoProviderMatch);
+        selection.skipped = skipped;
+        return selection;
     }
     ProviderSelection {
-        sets: filtered,
+        sets: flat_sets(&providers),
         source: ProviderSource::Provider,
+        providers,
+        skipped,
     }
+}
+
+/// The provider names of the option: comma-separated, trimmed, empty parts dropped
+fn provider_names(provider: &str) -> Vec<&str> {
+    provider
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// The sensors of the providers, each set flattened over the providers
+fn flat_sets(providers: &[ProviderSensors]) -> [Vec<String>; 3] {
+    [
+        providers
+            .iter()
+            .flat_map(|p| p.total_today.iter().cloned())
+            .collect(),
+        providers
+            .iter()
+            .flat_map(|p| p.remaining_today.iter().cloned())
+            .collect(),
+        providers
+            .iter()
+            .flat_map(|p| p.tomorrow.iter().cloned())
+            .collect(),
+    ]
+}
+
+/// Several providers named, and the registry is unavailable or matches none of them: keep the
+/// last good per-provider selection when there is one. Returns whether it was kept; otherwise the
+/// selection stays the pattern-only fallback.
+fn apply_last_good(
+    selection: &mut ProviderSelection,
+    several: bool,
+    good: &[ProviderSensors],
+) -> bool {
+    if !several || good.is_empty() || !is_fallback(selection.source) {
+        return false;
+    }
+    selection.sets = flat_sets(good);
+    selection.providers = good.to_vec();
+    true
 }
 
 /// Power sensors compared with the forecast: the configured list, or the total PV power of each
@@ -543,11 +726,350 @@ struct Fetched {
     sensors: usize,
 }
 
+/// One provider's fetched sums and per-block forecast
+struct ProviderFetch {
+    name: String,
+    total_today: SensorSum,
+    remaining_today: SensorSum,
+    tomorrow: SensorSum,
+    /// Every sensor of the provider was updated since local midnight
+    fresh: bool,
+    /// Per-block forecast of each of the provider's today and tomorrow sensors that answered
+    blocks: Vec<Vec<(DateTime<Utc>, f32)>>,
+}
+
+/// The providers' forecast, averaged
+#[derive(Debug, Default, PartialEq)]
+struct Averaged {
+    total_today: f32,
+    remaining_today: f32,
+    tomorrow: f32,
+    /// Every selected provider gave a complete total for today and, when several are averaged,
+    /// was updated since local midnight. Only then the total and the snapshot are used.
+    answered: bool,
+    /// Providers in the mean
+    used: usize,
+    block_kwh: Vec<(DateTime<Utc>, f32)>,
+}
+
+/// Average the providers. One provider gives its own sums and blocks unchanged. With several, a
+/// provider not updated since local midnight is left out for this fetch: Forecast.Solar updates
+/// its state hourly, so after midnight its `_today` still holds yesterday's total.
+fn average_providers(
+    providers: &[ProviderFetch],
+    today: chrono::NaiveDate,
+    tz: chrono_tz::Tz,
+) -> Averaged {
+    let several = providers.len() > 1;
+    let used: Vec<&ProviderFetch> = providers.iter().filter(|p| !several || p.fresh).collect();
+    let tomorrow_date = today + chrono::Duration::days(1);
+    let per_provider: Vec<Vec<(DateTime<Utc>, f32)>> = used
+        .iter()
+        .map(|p| merge_sensor_blocks(&p.blocks))
+        .collect();
+    let total_today = averaged_sum(&used, |p| p.total_today);
+    let tomorrow = averaged_sum(&used, |p| p.tomorrow);
+    // Accepted choice: a single provider in use is not scaled to its own total
+    let block_kwh = if used.len() > 1 {
+        averaged_blocks(
+            &per_provider,
+            [(today, total_today), (tomorrow_date, tomorrow)],
+            tz,
+        )
+    } else {
+        per_provider.into_iter().next().unwrap_or_default()
+    };
+    Averaged {
+        total_today,
+        remaining_today: averaged_sum(&used, |p| p.remaining_today),
+        tomorrow,
+        answered: providers
+            .iter()
+            .all(|p| p.total_today.complete && (!several || p.fresh)),
+        used: used.len(),
+        block_kwh,
+    }
+}
+
+/// Mean of the used providers' sums whose sum is complete (an incomplete provider is left out,
+/// not counted as 0). Accepted choice: when none is complete, the mean of the partial sums, which
+/// is what one provider gives on its own.
+fn averaged_sum(providers: &[&ProviderFetch], pick: fn(&ProviderFetch) -> SensorSum) -> f32 {
+    let sums: Vec<SensorSum> = providers.iter().map(|p| pick(p)).collect();
+    let complete: Vec<f32> = sums
+        .iter()
+        .filter(|s| s.complete)
+        .map(|s| s.total)
+        .collect();
+    if complete.is_empty() {
+        let partial: Vec<f32> = sums.iter().map(|s| s.total).collect();
+        mean(&partial)
+    } else {
+        mean(&complete)
+    }
+}
+
+fn mean(values: &[f32]) -> f32 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f32>() / values.len() as f32
+    }
+}
+
+/// Local day of a UTC block start
+fn local_day(block_start: DateTime<Utc>, tz: chrono_tz::Tz) -> chrono::NaiveDate {
+    block_start.with_timezone(&tz).date_naive()
+}
+
+/// Per-block shape of the providers, per local day: the mean over the providers that have blocks
+/// on that day. Each day is then scaled so its total is the averaged total for today or tomorrow
+/// (a day with a zero shape total stays zero).
+fn averaged_blocks(
+    per_provider: &[Vec<(DateTime<Utc>, f32)>],
+    totals: [(chrono::NaiveDate, f32); 2],
+    tz: chrono_tz::Tz,
+) -> Vec<(DateTime<Utc>, f32)> {
+    let days: BTreeSet<chrono::NaiveDate> = per_provider
+        .iter()
+        .flatten()
+        .map(|(start, _)| local_day(*start, tz))
+        .collect();
+    let mut out = Vec::new();
+    for day in days {
+        let mut per_block: BTreeMap<DateTime<Utc>, f32> = BTreeMap::new();
+        let mut with_day = 0usize;
+        for blocks in per_provider {
+            let on_day: Vec<_> = blocks
+                .iter()
+                .filter(|(start, _)| local_day(*start, tz) == day)
+                .collect();
+            if on_day.is_empty() {
+                continue;
+            }
+            with_day += 1;
+            for (start, kwh) in on_day {
+                *per_block.entry(*start).or_insert(0.0) += kwh;
+            }
+        }
+        let shape: Vec<(DateTime<Utc>, f32)> = per_block
+            .into_iter()
+            .map(|(start, kwh)| (start, kwh / with_day as f32))
+            .collect();
+        let shape_total: f32 = shape.iter().map(|(_, kwh)| kwh).sum();
+        let target = totals
+            .iter()
+            .find(|(date, _)| *date == day)
+            .map(|(_, total)| *total);
+        // Accepted choice: a day other than today and tomorrow has no averaged total, so it stays
+        // unscaled (the mean shape as the providers give it)
+        let factor = match target {
+            Some(total) if shape_total > 0.0 => total / shape_total,
+            _ => 1.0,
+        };
+        out.extend(shape.into_iter().map(|(start, kwh)| (start, kwh * factor)));
+    }
+    out
+}
+
+/// The averaging as one log line: each provider's today and tomorrow, then the means
+fn averaged_log_line(providers: &[ProviderFetch], averaged: &Averaged) -> String {
+    let each: Vec<String> = providers
+        .iter()
+        .map(|p| {
+            format!(
+                "{} today={:.1} tomorrow={:.1}",
+                p.name, p.total_today.total, p.tomorrow.total
+            )
+        })
+        .collect();
+    format!(
+        "{}; mean today={:.1} tomorrow={:.1}",
+        each.join("; "),
+        averaged.total_today,
+        averaged.tomorrow
+    )
+}
+
+/// The averaging INFO line as last logged
+#[derive(Debug, Clone, Copy)]
+struct AveragedInfo {
+    at: Instant,
+    today: f32,
+    tomorrow: f32,
+}
+
+/// The averaging INFO line is logged when the first averaged fetch comes, when either mean moved
+/// by 0.5 kWh or more, and otherwise at most once an hour, when the means changed
+fn averaged_info_due(last: Option<AveragedInfo>, today: f32, tomorrow: f32, now: Instant) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    let moved = (today - last.today).abs() >= 0.5 || (tomorrow - last.tomorrow).abs() >= 0.5;
+    let changed = today != last.today || tomorrow != last.tomorrow;
+    moved || (changed && now.duration_since(last.at) >= Duration::from_secs(60 * 60))
+}
+
+/// Whether a state was updated at or after `since` (a state that did not update still holds
+/// yesterday's value)
+fn state_updated_since(state: &HaEntityState, since: DateTime<Utc>) -> bool {
+    parse_forecast_timestamp(&state.last_updated).is_some_and(|at| at >= since)
+}
+
+/// Every selected sensor once, for one state call
+fn all_sensor_ids(providers: &[ProviderSensors]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for provider in providers {
+        for id in provider
+            .total_today
+            .iter()
+            .chain(&provider.remaining_today)
+            .chain(&provider.tomorrow)
+        {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// The sums of one sensor set from the states of all selected sensors: its own states, summed with
+/// the completeness check, and whether all of them answered and were updated since `since`
+fn sums_from_states(
+    entity_ids: &[String],
+    states: &[HaEntityState],
+    since: DateTime<Utc>,
+) -> (SensorSum, bool) {
+    if entity_ids.is_empty() {
+        return (sum_sensor_states(entity_ids, &[]), true);
+    }
+    let own: Vec<HaEntityState> = states
+        .iter()
+        .filter(|state| entity_ids.contains(&state.entity_id))
+        .cloned()
+        .collect();
+    let fresh = own.len() == entity_ids.len() && own.iter().all(|s| state_updated_since(s, since));
+    (sum_sensor_states(entity_ids, &own), fresh)
+}
+
+/// One provider from the states of all selected sensors: its sums, whether they are fresh, and
+/// its per-block forecast
+fn provider_from_states(
+    sensors: &ProviderSensors,
+    states: &[HaEntityState],
+    since: DateTime<Utc>,
+) -> ProviderFetch {
+    let (total_today, fresh_total) = sums_from_states(&sensors.total_today, states, since);
+    let (remaining_today, fresh_remaining) =
+        sums_from_states(&sensors.remaining_today, states, since);
+    let (tomorrow, fresh_tomorrow) = sums_from_states(&sensors.tomorrow, states, since);
+    let blocks = states
+        .iter()
+        .filter(|s| {
+            sensors.total_today.contains(&s.entity_id) || sensors.tomorrow.contains(&s.entity_id)
+        })
+        .map(|s| sensor_block_kwh(&s.attributes))
+        .collect();
+    ProviderFetch {
+        name: sensors.name.clone(),
+        total_today,
+        remaining_today,
+        tomorrow,
+        fresh: fresh_total && fresh_remaining && fresh_tomorrow,
+        blocks,
+    }
+}
+
+/// Averaged mode: the states of all selected sensors in one call, split per provider in memory
+async fn fetch_providers_batched(
+    client: &HomeAssistantClient,
+    providers: &[ProviderSensors],
+    since: DateTime<Utc>,
+) -> Vec<ProviderFetch> {
+    let ids = all_sensor_ids(providers);
+    let states = if ids.is_empty() {
+        Vec::new()
+    } else {
+        match client.get_states(&ids).await {
+            Ok(states) => states,
+            Err(e) => {
+                tracing::warn!("⚠️ Failed to fetch sensor states: {}", e);
+                Vec::new()
+            }
+        }
+    };
+    providers
+        .iter()
+        .map(|sensors| provider_from_states(sensors, &states, since))
+        .collect()
+}
+
+/// Single-provider mode: the calls of before, one for the blocks and one per sensor set
+async fn fetch_provider_per_call(
+    client: &HomeAssistantClient,
+    sensors: &ProviderSensors,
+    since: DateTime<Utc>,
+) -> ProviderFetch {
+    let forecast_sensor_ids: Vec<String> = sensors
+        .total_today
+        .iter()
+        .chain(sensors.tomorrow.iter())
+        .cloned()
+        .collect();
+    let per_sensor_blocks = fetch_block_kwh(client, &forecast_sensor_ids).await;
+    let (total_today, fresh_total) = fetch_sum_checked(client, &sensors.total_today, since).await;
+    let (remaining_today, fresh_remaining) =
+        fetch_sum_checked(client, &sensors.remaining_today, since).await;
+    let (tomorrow, fresh_tomorrow) = fetch_sum_checked(client, &sensors.tomorrow, since).await;
+    ProviderFetch {
+        name: sensors.name.clone(),
+        total_today,
+        remaining_today,
+        tomorrow,
+        fresh: fresh_total && fresh_remaining && fresh_tomorrow,
+        blocks: per_sensor_blocks
+            .into_iter()
+            .map(|(_, blocks)| blocks)
+            .collect(),
+    }
+}
+
+/// The no-fresh-provider episode: one WARN when it starts, one INFO when a provider is fresh again
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NoFreshEpisode {
+    active: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NoFreshEvent {
+    Started,
+    Recovered,
+}
+
+impl NoFreshEpisode {
+    /// Record one averaged fetch; returns the event to log, if any
+    fn observe(&mut self, any_fresh: bool) -> Option<NoFreshEvent> {
+        match (self.active, any_fresh) {
+            (false, false) => {
+                self.active = true;
+                Some(NoFreshEvent::Started)
+            }
+            (true, true) => {
+                self.active = false;
+                Some(NoFreshEvent::Recovered)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Fetch and send one solar forecast update
 async fn fetch_and_send_solar_forecast(
     client: &HomeAssistantClient,
     discovered: &Arc<RwLock<DiscoveredSensors>>,
     sender: &crossbeam_channel::Sender<SolarForecastUpdate>,
+    tz: chrono_tz::Tz,
 ) -> Fetched {
     let cache = discovered.read().await;
 
@@ -556,50 +1078,120 @@ async fn fetch_and_send_solar_forecast(
         return Fetched::default();
     }
 
-    // Fetch states for discovered sensors
-    let today = fetch_sum_checked(client, &cache.total_today).await;
-    let total_today = today.total;
-    let remaining_today = fetch_and_sum_sensors(client, &cache.remaining_today).await;
-    let tomorrow = fetch_and_sum_sensors(client, &cache.tomorrow).await;
+    let today = Utc::now().with_timezone(&tz).date_naive();
+    let midnight = local_midnight_utc(today, tz);
+    let several = cache.providers.len() > 1;
 
-    // Per-block PV forecast from the today/tomorrow sensors' attributes
-    let forecast_sensor_ids: Vec<String> = cache
-        .total_today
-        .iter()
-        .chain(cache.tomorrow.iter())
-        .cloned()
-        .collect();
-    let per_sensor_blocks = fetch_block_kwh(client, &forecast_sensor_ids).await;
-    let block_kwh = merge_sensor_blocks(&per_sensor_blocks);
+    // Each provider's sums (and whether its sensors were updated since midnight), with its blocks
+    let providers = if several {
+        fetch_providers_batched(client, &cache.providers, midnight).await
+    } else {
+        let mut providers = Vec::with_capacity(cache.providers.len());
+        for sensors in &cache.providers {
+            providers.push(fetch_provider_per_call(client, sensors, midnight).await);
+        }
+        providers
+    };
+    let averaged = average_providers(&providers, today, tz);
+    for stale in providers.iter().filter(|p| several && !p.fresh) {
+        tracing::debug!(
+            "📊 Solar forecast provider '{}' left out: its sensors are not updated since local midnight",
+            stale.name
+        );
+    }
+    let any_fresh = averaged.used > 0;
+    let total_sensors = cache.total_today.len();
+    let last_info = cache.averaged_info;
+    drop(cache);
+
+    if several {
+        let event = discovered.write().await.no_fresh.observe(any_fresh);
+        match event {
+            Some(NoFreshEvent::Started) => tracing::warn!(
+                "⚠️ PV forecast: no provider fresh for today, keeping the last forecast"
+            ),
+            Some(NoFreshEvent::Recovered) => {
+                tracing::info!("☀️ PV forecast: a provider is fresh again")
+            }
+            None => {}
+        }
+    }
+    if several && !any_fresh {
+        tracing::debug!(
+            "📊 Solar forecast: no provider updated since local midnight, nothing sent"
+        );
+        return Fetched::default();
+    }
 
     // Send update
     let update = SolarForecastUpdate {
-        total_today_kwh: total_today,
-        remaining_today_kwh: remaining_today,
-        tomorrow_kwh: tomorrow,
-        block_kwh,
+        total_today_kwh: averaged.total_today,
+        remaining_today_kwh: averaged.remaining_today,
+        tomorrow_kwh: averaged.tomorrow,
+        block_kwh: averaged.block_kwh.clone(),
     };
 
     tracing::debug!(
         "📊 Solar forecast: today={:.1} kWh, remaining={:.1} kWh, tomorrow={:.1} kWh",
-        total_today,
-        remaining_today,
-        tomorrow
+        averaged.total_today,
+        averaged.remaining_today,
+        averaged.tomorrow
     );
+
+    // The snapshot records one series: the averaged blocks, when every provider answered
+    let (snapshot_blocks, sensors) = if several {
+        let answered = if averaged.answered {
+            vec![averaged.block_kwh.clone()]
+        } else {
+            Vec::new()
+        };
+        (answered, 1)
+    } else {
+        (
+            providers
+                .first()
+                .map(|p| p.blocks.clone())
+                .unwrap_or_default(),
+            total_sensors,
+        )
+    };
+    // Accepted choice: the accuracy monitor gets the averaged total only when it is answered
+    // (every provider complete and, when averaged, updated since midnight)
+    let total_today = averaged.answered.then_some(averaged.total_today);
+
+    let log_line = several.then(|| averaged_log_line(&providers, &averaged));
+    let info_due = log_line.is_some()
+        && averaged_info_due(
+            last_info,
+            averaged.total_today,
+            averaged.tomorrow,
+            Instant::now(),
+        );
+    if let Some(line) = log_line {
+        tracing::debug!("☀️ Solar forecast providers averaged: {}", line);
+        if info_due {
+            tracing::info!("☀️ Solar forecast providers averaged: {}", line);
+            discovered.write().await.averaged_info = Some(AveragedInfo {
+                at: Instant::now(),
+                today: averaged.total_today,
+                tomorrow: averaged.tomorrow,
+            });
+        }
+    }
 
     let _ = sender.send(update);
     Fetched {
-        total_today: today.complete.then_some(total_today),
-        per_sensor_blocks,
-        sensors: cache.total_today.len(),
+        total_today,
+        per_sensor_blocks: snapshot_blocks,
+        sensors,
     }
 }
 
-/// Fetch the per-block PV forecast (UTC block start, kWh) of each sensor that answered
+/// Fetch the per-block PV forecast (UTC block start, kWh) of each sensor that answered, by entity
 async fn fetch_block_kwh(
     client: &HomeAssistantClient,
     entity_ids: &[String],
-) -> Vec<Vec<(DateTime<Utc>, f32)>> {
+) -> Vec<(String, Vec<(DateTime<Utc>, f32)>)> {
     if entity_ids.is_empty() {
         return Vec::new();
     }
@@ -607,7 +1199,7 @@ async fn fetch_block_kwh(
     match client.get_states(entity_ids).await {
         Ok(states) => states
             .iter()
-            .map(|state| sensor_block_kwh(&state.attributes))
+            .map(|state| (state.entity_id.clone(), sensor_block_kwh(&state.attributes)))
             .collect(),
         Err(e) => {
             tracing::warn!("⚠️ Failed to fetch solar forecast attributes: {}", e);
@@ -717,21 +1309,25 @@ fn sum_sensor_states(entity_ids: &[String], states: &[HaEntityState]) -> SensorS
     SensorSum { total, complete }
 }
 
-/// Fetch states for specific entity IDs and sum their values
-async fn fetch_and_sum_sensors(client: &HomeAssistantClient, entity_ids: &[String]) -> f32 {
-    fetch_sum_checked(client, entity_ids).await.total
-}
-
-/// Fetch the states of the entity IDs and sum them, with the completeness check
-async fn fetch_sum_checked(client: &HomeAssistantClient, entity_ids: &[String]) -> SensorSum {
+/// Fetch the states of the entity IDs and sum them, with the completeness check. Also whether every
+/// state was updated at or after `since` (a state that did not update still holds yesterday's value).
+async fn fetch_sum_checked(
+    client: &HomeAssistantClient,
+    entity_ids: &[String],
+    since: DateTime<Utc>,
+) -> (SensorSum, bool) {
     if entity_ids.is_empty() {
-        return sum_sensor_states(entity_ids, &[]);
+        return (sum_sensor_states(entity_ids, &[]), true);
     }
     match client.get_states(entity_ids).await {
-        Ok(states) => sum_sensor_states(entity_ids, &states),
+        Ok(states) => {
+            let fresh = states.len() == entity_ids.len()
+                && states.iter().all(|state| state_updated_since(state, since));
+            (sum_sensor_states(entity_ids, &states), fresh)
+        }
         Err(e) => {
             tracing::warn!("⚠️ Failed to fetch sensor states: {}", e);
-            sum_sensor_states(entity_ids, &[])
+            (sum_sensor_states(entity_ids, &[]), false)
         }
     }
 }
@@ -1288,5 +1884,435 @@ mod tests {
 
         // No sensors at all
         assert!(!sum_sensor_states(&[], &[]).complete);
+    }
+
+    fn complete_sum(total: f32) -> SensorSum {
+        SensorSum {
+            total,
+            complete: true,
+        }
+    }
+
+    fn provider_fetch(
+        name: &str,
+        total_today: SensorSum,
+        blocks: Vec<Vec<(DateTime<Utc>, f32)>>,
+    ) -> ProviderFetch {
+        ProviderFetch {
+            name: name.to_string(),
+            total_today,
+            remaining_today: SensorSum {
+                total: 0.0,
+                complete: false,
+            },
+            tomorrow: SensorSum {
+                total: 0.0,
+                complete: false,
+            },
+            fresh: true,
+            blocks,
+        }
+    }
+
+    /// Open-Meteo: 10 kWh over the 32 daylight blocks of `day`, with per-block attributes
+    fn open_meteo(day: chrono::NaiveDate) -> ProviderFetch {
+        provider_fetch(
+            OPEN_METEO,
+            complete_sum(10.0),
+            vec![sensor_day(day, 10.0 / 32.0)],
+        )
+    }
+
+    /// Forecast.Solar: three plane sensors summing 2 + 4 + 1 kWh, without per-block attributes
+    fn forecast_solar(total: SensorSum) -> ProviderFetch {
+        provider_fetch(
+            "forecast_solar",
+            total,
+            vec![Vec::new(), Vec::new(), Vec::new()],
+        )
+    }
+
+    #[test]
+    fn two_providers_average_the_day_total_and_keep_one_shape() {
+        let tz = chrono_tz::Europe::Prague;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let averaged = average_providers(
+            &[open_meteo(day), forecast_solar(complete_sum(7.0))],
+            day,
+            tz,
+        );
+        assert!((averaged.total_today - 8.5).abs() < 1e-5);
+        assert!(averaged.answered);
+        // Open-Meteo's 32 daylight blocks, scaled from 10 to the averaged 8.5 kWh
+        let daylight: Vec<f32> = averaged
+            .block_kwh
+            .iter()
+            .map(|(_, kwh)| *kwh)
+            .filter(|kwh| *kwh > 0.0)
+            .collect();
+        assert_eq!(daylight.len(), 32);
+        let total: f32 = daylight.iter().sum();
+        assert!((total - 8.5).abs() < 1e-4, "{total}");
+        for kwh in &daylight {
+            assert!((kwh - 0.85 * 10.0 / 32.0).abs() < 1e-5, "{kwh}");
+        }
+    }
+
+    #[test]
+    fn unavailable_provider_is_left_out_of_the_mean() {
+        let tz = chrono_tz::Europe::Prague;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let alone = average_providers(&[open_meteo(day)], day, tz);
+        let unavailable = SensorSum {
+            total: 0.0,
+            complete: false,
+        };
+        let both = average_providers(&[open_meteo(day), forecast_solar(unavailable)], day, tz);
+        assert_eq!(both.total_today, alone.total_today);
+        assert_eq!(both.total_today, 10.0);
+        assert!(!both.answered);
+        assert_eq!(both.block_kwh.len(), alone.block_kwh.len());
+        for ((start, kwh), (alone_start, alone_kwh)) in both.block_kwh.iter().zip(&alone.block_kwh)
+        {
+            assert_eq!(start, alone_start);
+            assert!(
+                (kwh - alone_kwh).abs() < 1e-5,
+                "{start}: {kwh} != {alone_kwh}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_provider_keeps_its_own_total_and_blocks_unscaled() {
+        let tz = chrono_tz::Europe::Prague;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        // The blocks sum to 9 while the day total is 10: a single provider is not scaled
+        let single = provider_fetch(
+            OPEN_METEO,
+            complete_sum(10.0),
+            vec![sensor_day(day, 9.0 / 32.0)],
+        );
+        let expected = merge_sensor_blocks(&single.blocks);
+        let averaged = average_providers(&[single], day, tz);
+        assert_eq!(averaged.total_today, 10.0);
+        assert!(averaged.answered);
+        assert_eq!(averaged.block_kwh, expected);
+    }
+
+    #[test]
+    fn averaged_snapshot_sums_to_the_averaged_total() {
+        let tz = chrono_tz::Europe::Prague;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let averaged = average_providers(
+            &[open_meteo(day), forecast_solar(complete_sum(7.0))],
+            day,
+            tz,
+        );
+        let at = chrono::TimeZone::with_ymd_and_hms(&tz, 2026, 10, 19, 0, 5, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut store = ForecastStore::default();
+        assert!(store.record_snapshot(at, tz, &[averaged.block_kwh], 1));
+        let kwh: f32 = store.day(day).unwrap().hours.iter().map(|h| h.kwh).sum();
+        assert!((kwh - 8.5).abs() < 1e-3, "{kwh}");
+    }
+
+    #[test]
+    fn named_providers_keep_their_own_sensors_and_unknown_names_are_skipped() {
+        let registry = [
+            row("sensor.energy_production_today_4", OPEN_METEO),
+            row("sensor.energy_production_today_5", "forecast_solar"),
+            row("sensor.energy_production_today_6", "forecast_solar"),
+            row("sensor.energy_production_today_7", "other_platform"),
+        ];
+        let pattern = [
+            ids(&[
+                "sensor.energy_production_today_4",
+                "sensor.energy_production_today_5",
+                "sensor.energy_production_today_6",
+                "sensor.energy_production_today_7",
+            ]),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let selection = select_provider_sensors(
+            pattern.clone(),
+            Some(&registry),
+            "open_meteo_solar_forecast, forecast_solar",
+        );
+        assert_eq!(selection.source, ProviderSource::Provider);
+        assert_eq!(selection.providers.len(), 2);
+        assert_eq!(selection.providers[0].name, OPEN_METEO);
+        assert_eq!(selection.providers[1].name, "forecast_solar");
+        assert_eq!(
+            selection.providers[1].total_today,
+            ids(&[
+                "sensor.energy_production_today_5",
+                "sensor.energy_production_today_6"
+            ])
+        );
+        assert_eq!(
+            selection.sets[0],
+            ids(&[
+                "sensor.energy_production_today_4",
+                "sensor.energy_production_today_5",
+                "sensor.energy_production_today_6"
+            ])
+        );
+        assert!(selection.skipped.is_empty());
+
+        let selection = select_provider_sensors(
+            pattern,
+            Some(&registry),
+            "open_meteo_solar_forecast, no_such_platform",
+        );
+        assert_eq!(selection.providers.len(), 1);
+        assert_eq!(selection.skipped, vec!["no_such_platform".to_string()]);
+        assert_eq!(selection.source, ProviderSource::Provider);
+    }
+
+    #[test]
+    fn stale_provider_is_left_out_until_it_refreshes() {
+        // Forecast.Solar still holds yesterday's total after midnight: its 10 kWh is not counted
+        let tz = chrono_tz::Europe::Prague;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let stale_fs = ProviderFetch {
+            fresh: false,
+            ..forecast_solar(complete_sum(10.0))
+        };
+        let before = average_providers(&[open_meteo(day), stale_fs], day, tz);
+        assert_eq!(before.total_today, 10.0, "Open-Meteo alone");
+        assert_eq!(before.used, 1);
+        assert!(!before.answered, "no snapshot while a provider is stale");
+        let alone = average_providers(&[open_meteo(day)], day, tz);
+        assert_eq!(before.block_kwh.len(), alone.block_kwh.len());
+        for ((_, kwh), (_, alone_kwh)) in before.block_kwh.iter().zip(&alone.block_kwh) {
+            assert!((kwh - alone_kwh).abs() < 1e-5, "{kwh} != {alone_kwh}");
+        }
+
+        // After its refresh: the mean of both, and the snapshot is taken
+        let after = average_providers(
+            &[open_meteo(day), forecast_solar(complete_sum(2.0))],
+            day,
+            tz,
+        );
+        assert!(
+            (after.total_today - 6.0).abs() < 1e-5,
+            "{}",
+            after.total_today
+        );
+        assert_eq!(after.used, 2);
+        assert!(after.answered);
+    }
+
+    #[test]
+    fn single_provider_is_not_left_out_when_stale() {
+        // Single-provider mode is unchanged: its freshness is not checked
+        let tz = chrono_tz::Europe::Prague;
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let stale = ProviderFetch {
+            fresh: false,
+            ..open_meteo(day)
+        };
+        let averaged = average_providers(&[stale], day, tz);
+        assert_eq!(averaged.used, 1);
+        assert_eq!(averaged.total_today, 10.0);
+        assert!(averaged.answered);
+    }
+
+    #[test]
+    fn retry_while_a_named_provider_is_skipped_every_five_minutes() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(60);
+        let old = now - DISCOVERY_RETRY - Duration::from_secs(1);
+        assert!(skipped_retry_due(true, None, now));
+        assert!(skipped_retry_due(true, Some(old), now));
+        assert!(!skipped_retry_due(true, Some(recent), now));
+        assert!(!skipped_retry_due(false, Some(old), now));
+    }
+
+    #[test]
+    fn several_providers_keep_the_last_good_selection_when_the_registry_fails() {
+        let good = vec![
+            ProviderSensors {
+                name: OPEN_METEO.to_string(),
+                total_today: ids(&["sensor.energy_production_today_4"]),
+                remaining_today: Vec::new(),
+                tomorrow: Vec::new(),
+            },
+            ProviderSensors {
+                name: "forecast_solar".to_string(),
+                total_today: ids(&["sensor.energy_production_today_5"]),
+                remaining_today: Vec::new(),
+                tomorrow: Vec::new(),
+            },
+        ];
+        let pattern = [
+            ids(&[
+                "sensor.energy_production_today_4",
+                "sensor.energy_production_today_9",
+            ]),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let mut selection = select_provider_sensors(
+            pattern.clone(),
+            None,
+            "open_meteo_solar_forecast,forecast_solar",
+        );
+        assert_eq!(selection.source, ProviderSource::RegistryUnavailable);
+        assert!(apply_last_good(&mut selection, true, &good));
+        assert_eq!(selection.providers, good);
+        assert_eq!(
+            selection.sets[0],
+            ids(&[
+                "sensor.energy_production_today_4",
+                "sensor.energy_production_today_5"
+            ])
+        );
+        // The source stays a fallback, so discovery keeps retrying
+        assert_eq!(selection.source, ProviderSource::RegistryUnavailable);
+
+        // No previous selection, or one provider only: the pattern-only sets stay
+        let mut selection = select_provider_sensors(
+            pattern.clone(),
+            None,
+            "open_meteo_solar_forecast,forecast_solar",
+        );
+        assert!(!apply_last_good(&mut selection, true, &[]));
+        assert_eq!(selection.sets, pattern);
+        let mut selection =
+            select_provider_sensors(pattern.clone(), None, "open_meteo_solar_forecast");
+        assert!(!apply_last_good(&mut selection, false, &good));
+        assert_eq!(selection.sets, pattern);
+    }
+
+    #[test]
+    fn averaging_info_logs_on_a_half_kwh_move_and_otherwise_hourly() {
+        let now = Instant::now();
+        let last = AveragedInfo {
+            at: now - Duration::from_secs(10 * 60),
+            today: 8.0,
+            tomorrow: 9.0,
+        };
+        assert!(averaged_info_due(None, 8.0, 9.0, now), "the first line");
+        // Within the hour: a small move is not logged, a half kWh move is
+        assert!(!averaged_info_due(Some(last), 8.2, 9.2, now));
+        assert!(averaged_info_due(Some(last), 8.5, 9.0, now));
+        assert!(averaged_info_due(Some(last), 8.0, 8.5, now));
+        // After an hour: a change is logged, no change is not
+        let hour_ago = AveragedInfo {
+            at: now - Duration::from_secs(61 * 60),
+            ..last
+        };
+        assert!(averaged_info_due(Some(hour_ago), 8.2, 9.0, now));
+        assert!(!averaged_info_due(Some(hour_ago), 8.0, 9.0, now));
+    }
+
+    fn timed_state(
+        entity_id: &str,
+        state: &str,
+        updated: &str,
+        attributes: serde_json::Value,
+    ) -> HaEntityState {
+        HaEntityState {
+            entity_id: entity_id.to_string(),
+            state: state.to_string(),
+            attributes,
+            last_changed: updated.to_string(),
+            last_updated: updated.to_string(),
+        }
+    }
+
+    #[test]
+    fn batched_split_gives_each_provider_the_totals_of_its_own_states() {
+        let tz = chrono_tz::Europe::Prague;
+        let since = chrono::TimeZone::with_ymd_and_hms(&tz, 2026, 10, 19, 0, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        let updated = "2026-10-19T09:00:00+00:00";
+        let om_block = serde_json::json!({"watts": {"2026-10-19T10:00:00+02:00": 1000}});
+        let states = vec![
+            timed_state("sensor.om_today", "10.0", updated, om_block),
+            timed_state("sensor.fs_today_5", "2.0", updated, serde_json::Value::Null),
+            timed_state("sensor.fs_today_6", "4.0", updated, serde_json::Value::Null),
+            timed_state("sensor.fs_today_7", "1.0", updated, serde_json::Value::Null),
+            timed_state(
+                "sensor.other_tomorrow",
+                "9.0",
+                updated,
+                serde_json::Value::Null,
+            ),
+        ];
+        let om = ProviderSensors {
+            name: OPEN_METEO.to_string(),
+            total_today: ids(&["sensor.om_today"]),
+            remaining_today: Vec::new(),
+            tomorrow: Vec::new(),
+        };
+        let fs = ProviderSensors {
+            name: "forecast_solar".to_string(),
+            total_today: ids(&[
+                "sensor.fs_today_5",
+                "sensor.fs_today_6",
+                "sensor.fs_today_7",
+            ]),
+            remaining_today: Vec::new(),
+            tomorrow: Vec::new(),
+        };
+        // The per-provider path asks for each set alone: its answer is the states of its sensors
+        let split_om = provider_from_states(&om, &states, since);
+        assert_eq!(
+            split_om.total_today,
+            sum_sensor_states(&om.total_today, &states[0..1])
+        );
+        assert!(split_om.fresh);
+        assert_eq!(split_om.blocks.len(), 1);
+        let split_fs = provider_from_states(&fs, &states, since);
+        assert_eq!(
+            split_fs.total_today,
+            sum_sensor_states(&fs.total_today, &states[1..4])
+        );
+        assert_eq!(split_fs.total_today.total, 7.0);
+        assert!(split_fs.fresh);
+        assert_eq!(split_fs.blocks.len(), 3);
+
+        // A sensor not updated since midnight, or missing from the answer: not fresh
+        let mut stale = states.clone();
+        stale[1].last_updated = "2026-10-18T20:00:00+00:00".to_string();
+        assert!(!provider_from_states(&fs, &stale, since).fresh);
+        assert!(!provider_from_states(&fs, &states[..3], since).fresh);
+        assert!(!provider_from_states(&fs, &[], since).fresh);
+    }
+
+    #[test]
+    fn one_batch_covers_every_selected_sensor_once() {
+        let a = ProviderSensors {
+            name: "a".to_string(),
+            total_today: ids(&["x.1", "x.2"]),
+            remaining_today: ids(&["x.r"]),
+            tomorrow: ids(&["x.t"]),
+        };
+        let b = ProviderSensors {
+            name: "b".to_string(),
+            total_today: ids(&["x.2", "y.1"]),
+            remaining_today: Vec::new(),
+            tomorrow: Vec::new(),
+        };
+        assert_eq!(
+            all_sensor_ids(&[a, b]),
+            ids(&["x.1", "x.2", "x.r", "x.t", "y.1"])
+        );
+    }
+
+    #[test]
+    fn no_fresh_episode_warns_once_and_rearms_after_recovery() {
+        let mut episode = NoFreshEpisode::default();
+        assert_eq!(episode.observe(false), Some(NoFreshEvent::Started));
+        assert_eq!(episode.observe(false), None);
+        assert_eq!(episode.observe(false), None);
+        assert_eq!(episode.observe(true), Some(NoFreshEvent::Recovered));
+        assert_eq!(episode.observe(true), None);
+        assert_eq!(episode.observe(false), Some(NoFreshEvent::Started));
     }
 }
