@@ -53,6 +53,7 @@ pub struct SelfUseRun {
 
 fn planner_block(block: &RecordedBlock) -> PlanBlock {
     PlanBlock {
+        low_tariff_fill: false,
         start: block.start,
         duration_minutes: 15,
         buy_czk: block.buy_czk,

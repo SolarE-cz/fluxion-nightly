@@ -38,6 +38,7 @@ pub fn winter_reserve_params(config: &WinterReserveConfigCore) -> WinterReserveP
         soc_resolution_pct: config.soc_resolution_pct,
         export_floor_until_cheap: config.export_floor_until_cheap,
         cautious_pv_fallback_months: config.cautious_pv_fallback_months.clone(),
+        low_tariff_fill_months: config.low_tariff_fill_months.clone(),
     }
 }
 

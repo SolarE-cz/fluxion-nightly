@@ -105,6 +105,7 @@ pub fn calculate_effective_prices(
     pricing_config: &PricingConfig,
 ) {
     for block in time_block_prices.iter_mut() {
+        block.hdo_low_tariff = hdo_cache.and_then(|cache| cache.is_low_tariff(block.block_start));
         let grid_fee = if let Some(cache) = hdo_cache {
             // Try to get HDO tariff period from cache
             match cache.is_low_tariff(block.block_start) {
@@ -1097,6 +1098,7 @@ fn price_block_of(b: &TimeBlockPrice) -> PriceBlock {
         price_czk_per_kwh: b.price_czk_per_kwh,
         effective_price_czk_per_kwh: b.effective_price_czk_per_kwh,
         spot_sell_price_czk_per_kwh: b.spot_sell_price_czk_per_kwh,
+        hdo_low_tariff: b.hdo_low_tariff,
     }
 }
 
@@ -1147,6 +1149,7 @@ fn create_evaluation_request(
             price_czk_per_kwh: price_block.price_czk_per_kwh,
             effective_price_czk_per_kwh: price_block.effective_price_czk_per_kwh,
             spot_sell_price_czk_per_kwh: price_block.spot_sell_price_czk_per_kwh,
+            hdo_low_tariff: price_block.hdo_low_tariff,
         },
         battery: BatteryState {
             current_soc_percent: current_soc,
@@ -1306,6 +1309,7 @@ mod tests {
         let now = Utc::now();
         let blocks: Vec<TimeBlockPrice> = (0..4)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: now + ChronoDuration::minutes(15 * i),
                 duration_minutes: 15,
@@ -1377,6 +1381,7 @@ mod tests {
         // 30 h before now to 2 h after: the started ones are dropped from planning
         let blocks: Vec<TimeBlockPrice> = (-120..8)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: now + ChronoDuration::minutes(15 * i),
                 duration_minutes: 15,
@@ -1444,6 +1449,7 @@ mod tests {
 
     fn spot_block(block_start: DateTime<Utc>, spot: f32) -> TimeBlockPrice {
         TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start,
             duration_minutes: 15,
             price_czk_per_kwh: spot,
@@ -1562,6 +1568,124 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_prices_record_the_hdo_tariff_of_each_block() {
+        let cache = GlobalHdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 14).unwrap(),
+            low_tariff_ranges: vec![HdoTimeRange {
+                start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            }],
+        }]);
+        let pricing = buy_sensor_pricing(true);
+
+        // 02:00 UTC is low tariff, 07:00 UTC high tariff, 14 Jan 2026 has no schedule for 15 Jan
+        let mut blocks = vec![
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 2, 0, 0).unwrap(), 2.0),
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 14, 7, 0, 0).unwrap(), 2.0),
+            spot_block(Utc.with_ymd_and_hms(2026, 1, 15, 2, 0, 0).unwrap(), 2.0),
+        ];
+        calculate_effective_prices(&mut blocks, Some(&cache), &pricing);
+        assert_eq!(blocks[0].hdo_low_tariff, Some(true));
+        assert_eq!(blocks[1].hdo_low_tariff, Some(false));
+        assert_eq!(blocks[2].hdo_low_tariff, None);
+
+        // No HDO cache: the tariff is unknown
+        calculate_effective_prices(&mut blocks, None, &pricing);
+        assert!(blocks.iter().all(|b| b.hdo_low_tariff.is_none()));
+    }
+
+    /// Low tariff fill, end to end (owner 2026-11-17): the HDO tariff that
+    /// `calculate_effective_prices` sets reaches the WinterReserve plugin through
+    /// `create_evaluation_request`, and the plugin force-charges the low-tariff block in a fill month
+    #[test]
+    fn test_low_tariff_fill_reaches_the_winter_reserve_plugin() {
+        use crate::plugin_adapters::StrategyPlugin;
+        use crate::strategy::winter_reserve::{WinterReserveParams, WinterReserveStrategy};
+        use fluxion_plugins::{OperationMode, Plugin};
+
+        let cache = GlobalHdoCache::new(3600);
+        cache.update(vec![HdoDaySchedule {
+            date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+            low_tariff_ranges: vec![HdoTimeRange {
+                start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+            }],
+        }]);
+        let pricing = PricingConfig {
+            spot_price_entity: "sensor.spot_price".to_string(),
+            tomorrow_price_entity: None,
+            buy_price_entity: None,
+            use_spot_prices_to_buy: true,
+            use_spot_prices_to_sell: true,
+            fixed_buy_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            fixed_sell_price_czk: fluxion_types::config::PriceSchedule::Flat(0.0),
+            spot_buy_fee_czk: 0.5,
+            spot_sell_fee_czk: 0.5,
+            hdo_sensor_entity: "sensor.cez_hdo_raw_data".to_string(),
+            hdo_low_tariff_czk: 0.50,
+            hdo_high_tariff_czk: 1.80,
+        };
+
+        // 15 Jan 2026 from local midnight (Prague = UTC+1): 00:00-06:00 low tariff, then high
+        let start = Utc.with_ymd_and_hms(2026, 1, 14, 23, 0, 0).unwrap();
+        let mut blocks: Vec<TimeBlockPrice> = (0..48)
+            .map(|i| spot_block(start + ChronoDuration::minutes(15 * i), 2.0))
+            .collect();
+        calculate_effective_prices(&mut blocks, Some(&cache), &pricing);
+        assert_eq!(blocks[0].hdo_low_tariff, Some(true));
+        assert_eq!(blocks[30].hdo_low_tariff, Some(false));
+
+        let control = ControlConfig {
+            battery_capacity_kwh: 10.0,
+            max_battery_charge_rate_kw: 3.0,
+            battery_efficiency: 0.9,
+            ..ControlConfig::default()
+        };
+        let request = create_evaluation_request(
+            &blocks[0],
+            &blocks,
+            &[],
+            &control,
+            20.0,
+            0.0,
+            0.3,
+            0.5,
+            10.0,
+            None,
+            None,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            Vec::new(),
+            Some("Europe/Prague"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(request.block.hdo_low_tariff, Some(true));
+        assert_eq!(request.all_blocks[0].hdo_low_tariff, Some(true));
+        assert_eq!(request.all_blocks[30].hdo_low_tariff, Some(false));
+
+        let params = WinterReserveParams {
+            low_tariff_fill_months: vec![1],
+            ..WinterReserveParams::default()
+        };
+        let plugin = StrategyPlugin::new(WinterReserveStrategy::new(true, params), 120, control);
+        let decision = plugin.evaluate(&request).unwrap();
+        assert_eq!(decision.mode, OperationMode::ForceCharge);
+        assert!(
+            decision.reason.contains("low tariff fill"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    #[test]
     fn test_effective_price_fixed_buy_uses_local_time_schedule() {
         let cache = GlobalHdoCache::new(3600);
         cache.update(vec![HdoDaySchedule {
@@ -1653,6 +1777,7 @@ mod tests {
         let now = Utc::now();
         let blocks: Vec<TimeBlockPrice> = (0..2)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: now + ChronoDuration::minutes(15 * i),
                 duration_minutes: 15,

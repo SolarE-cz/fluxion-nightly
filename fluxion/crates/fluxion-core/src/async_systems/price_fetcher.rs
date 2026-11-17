@@ -638,6 +638,7 @@ mod hdo_startup_tests {
             Ok(SpotPriceData {
                 time_block_prices: (0..96)
                     .map(|i| TimeBlockPrice {
+                        hdo_low_tariff: None,
                         block_start: start + chrono::Duration::minutes(15 * i),
                         duration_minutes: 15,
                         price_czk_per_kwh: 3.0,
@@ -1070,6 +1071,7 @@ mod hdo_startup_tests {
         SpotPriceData {
             time_block_prices: (0..96)
                 .map(|i| TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: start + chrono::Duration::minutes(15 * i),
                     duration_minutes: 15,
                     price_czk_per_kwh: 3.0,

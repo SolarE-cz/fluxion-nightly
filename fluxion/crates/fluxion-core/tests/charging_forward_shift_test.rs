@@ -35,6 +35,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Early night (22:00-01:00): 12 blocks @ 2.5 CZK (NOT cheapest!)
     for i in 0..12 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,
@@ -47,6 +48,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Transition (01:00-03:00): 8 blocks @ 2.3 CZK
     for i in 12..20 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.3,
@@ -59,6 +61,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Cheapest window (03:00-05:00): 8 blocks @ 2.0 CZK - THIS IS WHERE WE SHOULD CHARGE!
     for i in 20..28 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
@@ -71,6 +74,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Pre-dawn (05:00-07:00): 8 blocks @ 2.8 CZK
     for i in 28..36 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.8,
@@ -83,6 +87,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Morning peak (07:00-10:00): 12 blocks @ 4.0 CZK (expensive)
     for i in 36..48 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 4.0,
@@ -95,6 +100,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Mid-day (10:00-16:00): 24 blocks @ 3.0 CZK
     for i in 48..72 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
@@ -107,6 +113,7 @@ fn create_early_expensive_later_cheap_pattern() -> Vec<TimeBlockPrice> {
     // Evening peak (16:00-22:00): 24 blocks @ 5.0 CZK
     for i in 72..96 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,

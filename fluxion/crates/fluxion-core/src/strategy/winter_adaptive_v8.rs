@@ -924,6 +924,7 @@ mod tests {
         for hour in 0..7 {
             for quarter in 0..4 {
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -940,6 +941,7 @@ mod tests {
         for hour in 7..14 {
             for quarter in 0..4 {
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -956,6 +958,7 @@ mod tests {
         for hour in 14..16 {
             for quarter in 0..4 {
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -972,6 +975,7 @@ mod tests {
         for hour in 16..24 {
             for quarter in 0..4 {
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),

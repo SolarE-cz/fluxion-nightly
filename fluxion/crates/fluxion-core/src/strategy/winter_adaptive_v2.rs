@@ -1633,6 +1633,7 @@ mod tests {
         // Overnight valley (00:00-06:00): 24 blocks @ 1.5 CZK
         for i in 0..24 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.5,
@@ -1645,6 +1646,7 @@ mod tests {
         // Morning peak (06:00-10:00): 16 blocks @ 4.5 CZK
         for i in 24..40 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 4.5,
@@ -1657,6 +1659,7 @@ mod tests {
         // Midday valley (10:00-14:00): 16 blocks @ 2.0 CZK
         for i in 40..56 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -1669,6 +1672,7 @@ mod tests {
         // Evening peak (14:00-22:00): 32 blocks @ 5.0 CZK
         for i in 56..88 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.0,
@@ -1707,6 +1711,7 @@ mod tests {
         // Normal prices
         for i in 0..10 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
@@ -1718,6 +1723,7 @@ mod tests {
 
         // Spike at index 10
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(10 * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 10.0,
@@ -1729,6 +1735,7 @@ mod tests {
         // More normal prices
         for i in 11..20 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,

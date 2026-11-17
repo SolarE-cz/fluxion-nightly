@@ -2151,6 +2151,7 @@ mod hdo_cache_sync_tests {
 
     fn block(utc_hour: u32, spot: f32) -> TimeBlockPrice {
         TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: Utc.with_ymd_and_hms(2026, 1, 14, utc_hour, 0, 0).unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: spot,
@@ -5142,6 +5143,7 @@ pub(crate) mod levers_execution_tests {
     fn sell_price_data(now: DateTime<Utc>, sell: Option<f32>) -> SpotPriceData {
         SpotPriceData {
             time_block_prices: vec![TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: now - Duration::minutes(1),
                 duration_minutes: 15,

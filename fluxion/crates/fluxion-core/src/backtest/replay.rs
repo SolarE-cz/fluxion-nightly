@@ -300,6 +300,7 @@ fn planner_block_load(
 /// The actual block as the simulator sees it: recorded load and PV, no levers.
 fn actual_plan_block(block: &RecordedBlock) -> PlanBlock {
     PlanBlock {
+        low_tariff_fill: false,
         start: block.start,
         duration_minutes: 15,
         buy_czk: block.buy_czk,
@@ -523,6 +524,7 @@ pub fn replay(rows: &[ReplayRow], opts: &ReplayOptions) -> Result<ReplayRun, Str
                     ));
                 }
                 horizon.push(PlanBlock {
+                    low_tariff_fill: false,
                     start: later.start,
                     duration_minutes: 15,
                     buy_czk: later_input.block.buy_czk,

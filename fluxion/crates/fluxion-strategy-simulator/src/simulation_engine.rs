@@ -267,6 +267,7 @@ impl SimulationEngine {
                     .unwrap_or(b.price_czk_per_kwh);
                 let effective = spot + b.grid_fee_czk_per_kwh;
                 TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: b.timestamp,
                     duration_minutes: 15,
                     price_czk_per_kwh: spot,
@@ -279,6 +280,7 @@ impl SimulationEngine {
 
         let effective_price = price + block.grid_fee_czk_per_kwh;
         let current_price_block = TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: block.timestamp,
             duration_minutes: 15,
             price_czk_per_kwh: price,

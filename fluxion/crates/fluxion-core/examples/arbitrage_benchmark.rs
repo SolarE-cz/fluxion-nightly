@@ -502,6 +502,7 @@ fn run_synthetic_closed_loop(
         hourly_cnt[utc_hour] += 1;
 
         all_prices.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             buy_price_czk_per_kwh: Some(buy),
             block_start,
             duration_minutes: 15,
@@ -668,6 +669,7 @@ fn run_synthetic_closed_loop(
         let (load, pv) = all_actuals[i];
 
         let su_block = PlanBlock {
+            low_tariff_fill: false,
             start: block_start,
             duration_minutes: 15,
             buy_czk: buy,

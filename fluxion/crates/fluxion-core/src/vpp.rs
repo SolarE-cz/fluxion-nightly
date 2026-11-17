@@ -3628,6 +3628,7 @@ mod ecs_tests {
         });
         world.spawn(SpotPriceData {
             time_block_prices: vec![TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: now - Duration::minutes(1),
                 duration_minutes: 15,

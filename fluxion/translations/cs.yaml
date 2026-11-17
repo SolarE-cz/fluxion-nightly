@@ -166,6 +166,11 @@ configuration:
     description: >-
       Winter Reserve s výběrem "daily_top_n": počet nejlépe placených hodin
       každého místního dne, ve kterých se smí exportovat (1-24). Výchozí 6.
+  low_tariff_fill_months:
+    name: Měsíce plnění v nízkém tarifu
+    description: >-
+      Měsíce (1–12), kdy se baterie v každém bloku nízkého tarifu HDO nabije na
+      maximum a drží. Prázdné = vypnuto.
   winter_adaptive:
     name: Zimní adaptivní strategie
     description: >-

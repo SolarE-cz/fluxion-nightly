@@ -158,6 +158,7 @@ fn prices_to_blocks(date: NaiveDate, prices: &[f32]) -> Vec<TimeBlockPrice> {
         .iter()
         .enumerate()
         .map(|(i, &price)| TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base_dt + chrono::Duration::minutes(i as i64 * 15),
             duration_minutes: 15,
             price_czk_per_kwh: price,
@@ -201,6 +202,7 @@ fn generate_usual_day_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
             let price = base_price * (1.0 + noise);
 
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_dt + chrono::Duration::minutes(i as i64 * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
@@ -237,6 +239,7 @@ fn generate_elevated_day_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
             let price = base_price * (1.0 + noise);
 
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_dt + chrono::Duration::minutes(i as i64 * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
@@ -303,6 +306,7 @@ fn generate_volatile_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
             let price = rng.gen_range(base_low..base_high.max(base_low + 0.1));
 
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_dt + chrono::Duration::minutes(i as i64 * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
@@ -343,6 +347,7 @@ fn generate_negative_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
             let price = base_price + (base_price.abs() * noise);
 
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_dt + chrono::Duration::minutes(i as i64 * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
@@ -390,6 +395,7 @@ fn generate_hdo_optimized_prices(date: NaiveDate) -> Vec<TimeBlockPrice> {
             let price = base_price * (1.0 + noise);
 
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_dt + chrono::Duration::minutes(i as i64 * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,

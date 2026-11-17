@@ -103,6 +103,7 @@ fn spot_data(values: &BTreeMap<DateTime<Utc>, f64>) -> SpotPriceData {
     let blocks = values
         .iter()
         .map(|(start, price)| TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: *start,
             duration_minutes: 15,
             price_czk_per_kwh: *price as f32,
@@ -248,6 +249,7 @@ fn reversed_block_is_skipped_not_expanded() {
     inject(&fb, market_2026_10_13());
     let mut data = spot_data(&entity_2026_10_13());
     data.time_block_prices.push(TimeBlockPrice {
+        hdo_low_tariff: None,
         block_start: prague("2026-10-14 00:00"),
         duration_minutes: u32::MAX - 14,
         price_czk_per_kwh: 1.0,
@@ -275,6 +277,7 @@ fn reversed_block_is_skipped_not_expanded() {
 #[test]
 fn drop_invalid_blocks_keeps_the_rest_in_order() {
     let block = |start: &str, minutes: u32| TimeBlockPrice {
+        hdo_low_tariff: None,
         block_start: prague(start),
         duration_minutes: minutes,
         price_czk_per_kwh: 1.0,

@@ -86,6 +86,10 @@ pub struct TimeBlockPrice {
     /// this block; the spot price is then the buy energy price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buy_price_czk_per_kwh: Option<f32>,
+
+    /// HDO tariff of the block: Some(true) low, Some(false) high, None unknown or no HDO sensor
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdo_low_tariff: Option<bool>,
 }
 
 impl TimeBlockPrice {

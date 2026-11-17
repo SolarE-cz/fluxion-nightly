@@ -185,6 +185,7 @@ mod tests {
         effective_price: f32,
     ) -> TimeBlockPrice {
         TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: Utc
                 .with_ymd_and_hms(year, month, day, hour, minute, 0)
                 .unwrap(),

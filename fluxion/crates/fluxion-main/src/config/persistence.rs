@@ -196,6 +196,7 @@ pub const ADDON_ONLY_OPTIONS: &[&[&str]] = &[
     &["control", "mode_control_enabled"],
     &["control", "hold_pv_to_battery"],
     &["strategies", "winter_reserve", "export_floor_until_cheap"],
+    &["strategies", "winter_reserve", "low_tariff_fill_months"],
     &[
         "strategies",
         "winter_reserve",
@@ -660,6 +661,44 @@ mod tests {
         assert!(config.inverters[0].battery_extra_capacities_kwh.is_empty());
         // A missing nested key leaves the saved value alone
         assert!(config.strategies.winter_reserve.export_floor_until_cheap);
+    }
+
+    /// The low-tariff fill months default to none, round-trip through the saved config and are
+    /// set by the add-on options over it
+    #[test]
+    fn low_tariff_fill_months_round_trip_and_follow_the_addon_options() {
+        let (persistence, dir) = create_test_persistence();
+        let mut saved = AppConfig::default();
+        saved.control.battery_capacity_kwh = 80.0;
+        assert!(
+            saved
+                .strategies
+                .winter_reserve
+                .low_tariff_fill_months
+                .is_empty()
+        );
+        saved.strategies.winter_reserve.low_tariff_fill_months = vec![1, 2, 12];
+        persistence.save(&saved, "web_ui").unwrap();
+        let mut config = persistence.load().unwrap().config;
+        assert_eq!(
+            config.strategies.winter_reserve.low_tariff_fill_months,
+            vec![1, 2, 12]
+        );
+
+        let options = dir.path().join("options.json");
+        fs::write(
+            &options,
+            serde_json::json!({
+                "strategies": {"winter_reserve": {"low_tariff_fill_months": [6]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        overlay_addon_options_file(&mut config, &options);
+        assert_eq!(
+            config.strategies.winter_reserve.low_tariff_fill_months,
+            vec![6]
+        );
     }
 
     /// PR #647 N5 / R3-4: on an install with a web-UI config, add-on options with invalid

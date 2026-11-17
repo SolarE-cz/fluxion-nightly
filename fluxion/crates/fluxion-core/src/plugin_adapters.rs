@@ -159,6 +159,7 @@ impl<S: EconomicStrategy + 'static> Plugin for StrategyPlugin<S> {
 /// Convert an EvaluationRequest to the types needed by strategies
 fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBlockPrice>) {
     let price_block = TimeBlockPrice {
+        hdo_low_tariff: request.block.hdo_low_tariff,
         buy_price_czk_per_kwh: None,
         block_start: request.block.block_start,
         duration_minutes: request.block.duration_minutes,
@@ -174,6 +175,7 @@ fn convert_request(request: &EvaluationRequest) -> (TimeBlockPrice, Vec<TimeBloc
 
 fn time_block_price(b: &fluxion_plugins::PriceBlock) -> TimeBlockPrice {
     TimeBlockPrice {
+        hdo_low_tariff: b.hdo_low_tariff,
         buy_price_czk_per_kwh: None,
         block_start: b.block_start,
         duration_minutes: b.duration_minutes,
@@ -464,6 +466,7 @@ pub fn init_plugin_manager(
         soc_resolution_pct: wr_core.soc_resolution_pct,
         export_floor_until_cheap: wr_core.export_floor_until_cheap,
         cautious_pv_fallback_months: wr_core.cautious_pv_fallback_months.clone(),
+        low_tariff_fill_months: wr_core.low_tariff_fill_months.clone(),
     };
     manager.register(Arc::new(StrategyPlugin::new(
         WinterReserveStrategy::new(wr_core.enabled, wr_params),

@@ -1701,6 +1701,7 @@ mod tests {
     #[test]
     fn chart_market_spot_price_is_the_spot_price_under_fixed_buy() {
         let block = |price: f32, sell: Option<f32>| fluxion_types::pricing::TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: "2026-11-05T10:00:00Z".parse().unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: price,

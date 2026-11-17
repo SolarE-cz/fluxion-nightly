@@ -384,6 +384,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|b| {
             let spot_price = get_price_czk(b.start_time, &prices);
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: b.start_time,
                 duration_minutes: 15,
                 price_czk_per_kwh: spot_price + buy_fee_czk, // Import price = Spot + Buy Fee

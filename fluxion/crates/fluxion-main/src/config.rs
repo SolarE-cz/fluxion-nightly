@@ -1136,6 +1136,7 @@ pub struct WinterReserveConfig {
     pub cautious_pv_mae_pct: f32,
     pub cautious_pv_off_pct: f32,
     pub cautious_pv_fallback_months: Vec<u32>,
+    pub low_tariff_fill_months: Vec<u32>,
 }
 
 impl Default for WinterReserveConfig {
@@ -1160,6 +1161,7 @@ impl Default for WinterReserveConfig {
             cautious_pv_mae_pct: core.cautious_pv_mae_pct,
             cautious_pv_off_pct: core.cautious_pv_off_pct,
             cautious_pv_fallback_months: core.cautious_pv_fallback_months,
+            low_tariff_fill_months: core.low_tariff_fill_months,
         }
     }
 }
@@ -2869,6 +2871,11 @@ impl From<AppConfig> for fluxion_core::SystemConfig {
                         .winter_reserve
                         .cautious_pv_fallback_months
                         .clone(),
+                    low_tariff_fill_months: app_config
+                        .strategies
+                        .winter_reserve
+                        .low_tariff_fill_months
+                        .clone(),
                 },
                 winter_adaptive_v10: fluxion_core::WinterAdaptiveV10ConfigCore {
                     enabled: app_config.strategies.winter_adaptive_v10.enabled,
@@ -4386,6 +4393,33 @@ mod winter_reserve_config_tests {
         assert!((wr.cautious_pv_mae_pct - 25.0).abs() < 1e-6);
         assert!((wr.cautious_pv_off_pct - 20.0).abs() < 1e-6);
         assert_eq!(wr.cautious_pv_fallback_months, vec![10, 11, 12, 1, 2, 3]);
+    }
+
+    /// Low-tariff fill months: off by default, parsed, reach the core config and the planner
+    #[test]
+    fn test_winter_reserve_low_tariff_fill_months() {
+        assert!(
+            WinterReserveConfig::default()
+                .low_tariff_fill_months
+                .is_empty()
+        );
+        let json = r#"{"winter_reserve": {"low_tariff_fill_months": [1, 12]}}"#;
+        let wr = serde_json::from_str::<StrategiesConfig>(json)
+            .unwrap()
+            .winter_reserve;
+        assert_eq!(wr.low_tariff_fill_months, vec![1, 12]);
+
+        let mut app = AppConfig::default();
+        app.strategies.winter_reserve.low_tariff_fill_months = vec![2];
+        let system: fluxion_core::SystemConfig = app.into();
+        let core = &system.strategies_config.winter_reserve;
+        assert_eq!(core.low_tariff_fill_months, vec![2]);
+        let params = fluxion_core::backtest::winter_reserve_params(core);
+        assert_eq!(params.low_tariff_fill_months, vec![2]);
+
+        let addon = include_str!("../../../fluxion/config.yaml");
+        assert!(addon.contains("      low_tariff_fill_months: []\n"));
+        assert!(addon.contains("      low_tariff_fill_months:\n        - int(1,12)?\n"));
     }
 
     /// Cautious PV options: defaults, explicit values, an empty month list, and the add-on schema

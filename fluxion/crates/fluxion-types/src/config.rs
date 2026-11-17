@@ -1166,6 +1166,10 @@ pub struct WinterReserveConfigCore {
     /// (default: [10, 11, 12, 1, 2, 3])
     #[serde(default = "default_wr_cautious_pv_fallback_months")]
     pub cautious_pv_fallback_months: Vec<u32>,
+    /// Local months (1-12) in which every HDO low-tariff block force-charges to max SOC and holds
+    /// there (winter sites with little PV). Empty = off (default: [])
+    #[serde(default)]
+    pub low_tariff_fill_months: Vec<u32>,
 }
 
 fn default_winter_reserve_priority() -> u8 {
@@ -1235,6 +1239,7 @@ impl Default for WinterReserveConfigCore {
             cautious_pv_mae_pct: default_wr_cautious_pv_mae_pct(),
             cautious_pv_off_pct: default_wr_cautious_pv_off_pct(),
             cautious_pv_fallback_months: default_wr_cautious_pv_fallback_months(),
+            low_tariff_fill_months: Vec::new(),
         }
     }
 }

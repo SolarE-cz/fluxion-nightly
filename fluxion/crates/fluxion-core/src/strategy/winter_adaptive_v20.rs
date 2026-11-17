@@ -1152,6 +1152,7 @@ mod tests {
                 };
 
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -1668,6 +1669,7 @@ mod tests {
             for quarter in 0..4 {
                 let effective_price = if hour == 3 { -0.5 } else { 3.0 };
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -1726,6 +1728,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks: Vec<TimeBlockPrice> = (0..96)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,

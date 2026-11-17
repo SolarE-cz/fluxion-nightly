@@ -167,6 +167,7 @@ fn parse_forecast_sensor(
         };
 
         time_block_prices.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start,
             duration_minutes,
             price_czk_per_kwh: price,
@@ -209,6 +210,7 @@ fn convert_to_15min_blocks(blocks: Vec<TimeBlockPrice>) -> Vec<TimeBlockPrice> {
             // Split hourly into 4x15-minute blocks
             for i in 0..4 {
                 result.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: block.block_start + chrono::Duration::minutes(i * 15),
                     duration_minutes: 15,
                     price_czk_per_kwh: block.price_czk_per_kwh,
@@ -310,6 +312,7 @@ fn parse_single_day_array(
         };
 
         time_block_prices.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start,
             duration_minutes: block_duration,
             price_czk_per_kwh: price,
@@ -464,6 +467,7 @@ fn parse_price_arrays(
         };
 
         time_block_prices.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start,
             duration_minutes: block_duration,
             price_czk_per_kwh: price,
@@ -520,6 +524,7 @@ fn parse_price_arrays(
         };
 
         time_block_prices.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start,
             duration_minutes: block_duration,
             price_czk_per_kwh: price,
@@ -614,6 +619,7 @@ fn parse_timestamp_keyed_attributes(
             // Parse the price value
             if let Some(price) = value.as_f64() {
                 time_block_prices.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: timestamp.with_timezone(&Utc),
                     duration_minutes: 0, // Will be calculated below
                     price_czk_per_kwh: price as f32,

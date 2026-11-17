@@ -91,6 +91,7 @@ fn test_config_update_flow() {
     let price_data = SpotPriceData {
         time_block_prices: vec![
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: chrono::Utc::now(),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.0,
@@ -99,6 +100,7 @@ fn test_config_update_flow() {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: chrono::Utc::now() + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.0,

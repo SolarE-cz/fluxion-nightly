@@ -196,6 +196,7 @@ fn simulate_winter_adaptive(
     let time_block_prices: Vec<TimeBlockPrice> = prices
         .iter()
         .map(|p| TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: p.timestamp,
             price_czk_per_kwh: p.price_czk_per_kwh,
             effective_price_czk_per_kwh: p.price_czk_per_kwh,
@@ -235,6 +236,7 @@ fn simulate_winter_adaptive(
         #[expect(clippy::integer_division)]
         let price_idx = (minute_of_day as usize * time_block_prices.len()) / total_minutes as usize;
         let fallback_price_block = TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: record.timestamp,
             price_czk_per_kwh: price,
             effective_price_czk_per_kwh: price,

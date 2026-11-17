@@ -556,6 +556,7 @@ mod tests {
     fn test_no_battery_imports_when_no_solar() {
         let strategy = NoBatteryBaseline;
         let price_block = TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
@@ -577,6 +578,7 @@ mod tests {
     fn test_no_battery_exports_when_solar_excess() {
         let strategy = NoBatteryBaseline;
         let price_block = TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
@@ -597,6 +599,7 @@ mod tests {
     fn test_naive_uses_battery_for_deficit() {
         let strategy = NaiveSelfUseStrategy;
         let price_block = TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: Utc.with_ymd_and_hms(2026, 1, 15, 18, 0, 0).unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: 4.0,
@@ -627,6 +630,7 @@ mod tests {
     fn test_naive_charges_from_solar_excess() {
         let strategy = NaiveSelfUseStrategy;
         let price_block = TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap(),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,

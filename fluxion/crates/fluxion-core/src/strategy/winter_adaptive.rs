@@ -1562,6 +1562,7 @@ mod tests {
         for i in 0..12 {
             // 3 hours = 12 blocks
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 4.5, // Expensive
@@ -1574,6 +1575,7 @@ mod tests {
         // 22:00-06:00: Cheap overnight charging (8 hours = 32 blocks)
         for i in 12..44 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.2, // Very cheap
@@ -1586,6 +1588,7 @@ mod tests {
         // Tomorrow 06:00-22:00: Very expensive (16 hours = 64 blocks)
         for i in 44..108 {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15 * i),
                 duration_minutes: 15,
                 price_czk_per_kwh: 6.0, // Even more expensive (>20% higher than today)
@@ -1682,6 +1685,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &price)| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15 * i as i64),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
