@@ -257,7 +257,8 @@ pub struct PlanBlock {
     /// Discharge window lever: Export is allowed in this block.
     #[serde(default = "export_allowed_default")]
     pub export_allowed: bool,
-    /// `low_tariff_fill_months`: the block is an HDO low-tariff block in a fill month, forced to Charge.
+    /// `low_tariff_fill_months`: the block is an HDO low-tariff block in a fill month. The plan charges
+    /// in the cheapest blocks of its run and holds in the others.
     #[serde(default)]
     pub low_tariff_fill: bool,
 }
@@ -508,6 +509,11 @@ fn candidate_modes(
     if block.force_charge {
         return vec![PlanMode::Charge];
     }
+    // Low-tariff fill (owner 2026-11-17): the planner picks the cheapest blocks of the run to charge
+    // in, the others hold (house from grid). Never SelfUse, Export or NoDischarge: no discharge.
+    if block.low_tariff_fill {
+        return vec![PlanMode::Hold, PlanMode::Charge];
+    }
     // The default is NoDischarge (first); Charge stays allowed below the median as usual.
     if block.no_discharge {
         let mut modes = vec![PlanMode::NoDischarge];
@@ -579,6 +585,32 @@ fn terminal_price(battery: &BatteryParams, cheap_ref: f32) -> f32 {
         .filter(|c| c.is_finite())
         .map_or(before_h33, |c| c.min(before_h33))
         .max(0.0)
+}
+
+/// Cost (CZK) of each kWh the energy at the end of a low-tariff fill run falls short of Emax - one
+/// SOC-grid step. A soft constraint (owner 2026-11-17): a run too short to fill still charges as
+/// much as it can. It steers the value tables only, never the reported cost.
+const FILL_SHORTFALL_CZK_PER_KWH: f32 = 100.0;
+
+/// Energy (kWh) a low-tariff fill run is filled to: Emax less the largest of one SOC-grid step, the
+/// charge guard margin and `min_charge_kwh`. That is the highest energy the planner can reach. The
+/// runtime guard stops charging at Emax less the margin, and a top-up smaller than `min_charge_kwh`
+/// is never planned, so a target at Emax itself would be chased and never reached.
+fn fill_target_kwh(battery: &BatteryParams, grid_step_kwh: f32) -> f32 {
+    let (_, emax) = battery.bounds_kwh();
+    let guard_margin_kwh = CHARGE_GUARD_MARGIN_PCT / 100.0 * battery.capacity_kwh;
+    emax - grid_step_kwh
+        .max(guard_margin_kwh)
+        .max(battery.min_charge_kwh)
+}
+
+/// Adds the fill shortfall penalty to the value tables of one index (`tables[slot][grid point]`).
+fn add_fill_shortfall(tables: &mut [Vec<f32>], grid: &[f32], target_kwh: f32) {
+    for table in tables {
+        for (value, &energy) in table.iter_mut().zip(grid) {
+            *value += FILL_SHORTFALL_CZK_PER_KWH * (target_kwh - energy).max(0.0);
+        }
+    }
 }
 
 /// Solar headroom per block (brief H33): the stored energy (kWh) a planned grid charge may reach.
@@ -895,6 +927,10 @@ fn plan_reason(
         ),
         PlanMode::Charge if block.low_tariff_fill => (
             "CHARGE (low tariff fill)".into(),
+            format!("buy {:.2}", block.buy_czk),
+        ),
+        PlanMode::Hold if block.low_tariff_fill => (
+            "HOLD (low tariff fill)".into(),
             format!("buy {:.2}", block.buy_czk),
         ),
         PlanMode::Charge if block.force_charge => (
@@ -1221,6 +1257,13 @@ impl Horizon<'_> {
 /// 1000 is the finest resolution the web settings allow (0.1 %) over the full 0..100 % span.
 const MAX_SOC_GRID_STEPS: usize = 1000;
 
+/// Lowest energy of the DP value grid. From Emin, or from the start energy when that is below Emin:
+/// interpolation clamps to the grid, so a start below the grid would be valued as if it were at
+/// Emin (a battery at 21 % would look as good as one at 30 %). At or above Emin it is Emin.
+fn dp_grid_min(emin: f32, start_energy_kwh: f32) -> f32 {
+    emin.min(start_energy_kwh).max(0.0)
+}
+
 /// Energy grid from Emin to Emax; the last point is exactly Emax. A resolution finer than
 /// `MAX_SOC_GRID_STEPS` is coarsened to the cap, so an input cannot size the grid.
 fn soc_grid(emin: f32, emax: f32, capacity: f32, resolution_pct: f32) -> Vec<f32> {
@@ -1298,7 +1341,14 @@ fn plan_with_rule(
 
     let caps = charge_caps(blocks, battery, tz);
 
-    let grid = soc_grid(emin, emax, capacity, params.soc_resolution_pct);
+    // The forward pass starts from the live SOC, clamped to Emax (below Emin it is kept as it is).
+    let start_energy_kwh = (soc_pct / 100.0 * capacity).clamp(0.0, emax);
+    let grid = soc_grid(
+        dp_grid_min(emin, start_energy_kwh),
+        emax,
+        capacity,
+        params.soc_resolution_pct,
+    );
 
     // Candidate modes per block (`values` below holds the value tables).
     let mut all_modes: Vec<Vec<PlanMode>> = blocks
@@ -1333,6 +1383,21 @@ fn plan_with_rule(
         terminal_price(battery, cheap_ref) * one_way_efficiency(battery.efficiency);
     let terminal: Vec<f32> = grid.iter().map(|&e| -e * terminal_price).collect();
     values[n] = vec![terminal; directions.len()];
+    // `fill_end[j]`: the energy at the start of block j is the energy at the end of a low-tariff fill
+    // run (block j-1 fills, block j does not, or j is the horizon end). Such energy is penalised
+    // below `fill_target` (see `fill_target_kwh`).
+    let fill_end: Vec<bool> = (0..=n)
+        .map(|j| {
+            j > 0
+                && blocks[j - 1].low_tariff_fill
+                && blocks.get(j).is_none_or(|b| !b.low_tariff_fill)
+        })
+        .collect();
+    let grid_step = grid.get(1).map_or(0.0, |&next| next - grid[0]);
+    let fill_target = fill_target_kwh(battery, grid_step);
+    if fill_end[n] {
+        add_fill_shortfall(&mut values[n], &grid, fill_target);
+    }
     for (k, block) in blocks.iter().enumerate().rev() {
         let (current, later) = values.split_at_mut(k + 1);
         let modes = &all_modes[k];
@@ -1381,11 +1446,14 @@ fn plan_with_rule(
             }
         }
         current[k] = tables;
+        if fill_end[k] {
+            add_fill_shortfall(&mut current[k], &grid, fill_target);
+        }
     }
 
     // Forward pass with the exact simulator, starting from the real live SOC. A SOC below Emin is
     // not raised to the floor: it can charge but not discharge (brief H19 item 4).
-    let mut energy = (soc_pct / 100.0 * capacity).clamp(0.0, emax);
+    let mut energy = start_energy_kwh;
     let mut planned = Vec::with_capacity(n);
     let mut expected_cost = 0.0;
     let horizon = Horizon {
@@ -1455,6 +1523,20 @@ fn plan_with_rule(
                     _ => chosen,
                 }
             }
+        };
+        // A full battery has nothing to charge: a fill block already at the target holds, so the
+        // plan never shows a Charge label at full SOC. A lever-forced block keeps its Charge. The
+        // value tables are unchanged, so this is the planned mode only.
+        let (mode, outcome) = if block.low_tariff_fill
+            && !block.force_charge
+            && mode == PlanMode::Charge
+            && energy >= fill_target
+        {
+            let held =
+                simulate_block_capped(PlanMode::Hold, energy, block, floors[k], battery, caps[k]);
+            (PlanMode::Hold, held)
+        } else {
+            (mode, outcome)
         };
         previous = Some(mode);
         direction = direction.after(mode);
@@ -2238,8 +2320,8 @@ impl WinterReserveStrategy {
             context.timezone,
             &self.params,
         );
-        // Low-tariff fill (owner 2026-11-17): after the levers, which overwrite force_charge. Block i
-        // is `all[i]` here. Unknown tariff (None) never matches.
+        // Low-tariff fill (owner 2026-11-17): after the levers, which set force_charge. Block i is
+        // `all[i]` here. A lever-forced block keeps force_charge. Unknown tariff (None) never matches.
         for (block, source) in blocks.iter_mut().zip(all.iter()) {
             if source.hdo_low_tariff == Some(true)
                 && self
@@ -2247,7 +2329,6 @@ impl WinterReserveStrategy {
                     .low_tariff_fill_months
                     .contains(&source.block_start.with_timezone(&tz).month())
             {
-                block.force_charge = true;
                 block.no_discharge = false;
                 block.low_tariff_fill = true;
             }
@@ -2417,18 +2498,42 @@ impl super::EconomicStrategy for WinterReserveStrategy {
             && mode == PlanMode::Charge
             && live_soc >= battery.max_soc_pct - CHARGE_GUARD_MARGIN_PCT
         {
-            mode = PlanMode::SelfUse;
-            reason = format!("WinterReserve SELF-USE | guard: charge held at SOC {live_soc:.0}%");
+            // A low-tariff fill block holds (house from grid) rather than self-uses: no discharge.
+            (mode, reason) = if head.low_tariff_fill {
+                (
+                    PlanMode::Hold,
+                    format!(
+                        "WinterReserve HOLD | guard: charge held at SOC {live_soc:.0}%, hold (low tariff fill)"
+                    ),
+                )
+            } else {
+                (
+                    PlanMode::SelfUse,
+                    format!("WinterReserve SELF-USE | guard: charge held at SOC {live_soc:.0}%"),
+                )
+            };
         } else if is_head
             && mode == PlanMode::Charge
             && !head.force_charge
             && live_kwh >= entry.charge_cap_kwh
         {
-            mode = PlanMode::SelfUse;
-            reason = format!(
-                "WinterReserve SELF-USE | guard: charge held at the solar headroom {:.1} kWh, SOC {live_soc:.0}%",
-                entry.charge_cap_kwh
-            );
+            (mode, reason) = if head.low_tariff_fill {
+                (
+                    PlanMode::Hold,
+                    format!(
+                        "WinterReserve HOLD | guard: charge held at the solar headroom {:.1} kWh, SOC {live_soc:.0}%, hold (low tariff fill)",
+                        entry.charge_cap_kwh
+                    ),
+                )
+            } else {
+                (
+                    PlanMode::SelfUse,
+                    format!(
+                        "WinterReserve SELF-USE | guard: charge held at the solar headroom {:.1} kWh, SOC {live_soc:.0}%",
+                        entry.charge_cap_kwh
+                    ),
+                )
+            };
         }
 
         let start_kwh = if is_head {
@@ -9194,6 +9299,7 @@ mod continuity_tests {
 #[cfg(test)]
 mod low_tariff_fill_tests {
     use super::*;
+    use crate::strategy::EconomicStrategy;
     use chrono::TimeZone;
     use fluxion_plugins::protocol::BlockForecast;
     use fluxion_types::pricing::TimeBlockPrice;
@@ -9228,6 +9334,39 @@ mod low_tariff_fill_tests {
     /// Low tariff before 06:00 local, high after
     fn low_before_six(hour: u32) -> Option<bool> {
         Some(hour < 6)
+    }
+
+    /// Blocks from 00:00 local on 15 Jan 2026 with the given buy prices; the HDO tariff is low in
+    /// the block indices `low` and high elsewhere.
+    fn priced(buys: &[f32], low: std::ops::Range<usize>) -> Vec<TimeBlockPrice> {
+        let start = PRAGUE
+            .with_ymd_and_hms(2026, 1, 15, 0, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        buys.iter()
+            .enumerate()
+            .map(|(i, &buy)| TimeBlockPrice {
+                hdo_low_tariff: Some(low.contains(&i)),
+                buy_price_czk_per_kwh: None,
+                block_start: start + Duration::minutes(15 * i as i64),
+                duration_minutes: 15,
+                price_czk_per_kwh: buy,
+                effective_price_czk_per_kwh: buy,
+                spot_sell_price_czk_per_kwh: Some(1.0),
+            })
+            .collect()
+    }
+
+    /// `battery()` with a 6 kW charge rate: a 10 kWh battery fills from 20 % in about 6 blocks.
+    fn fast_battery() -> BatteryParams {
+        BatteryParams {
+            max_charge_kw: 6.0,
+            ..battery()
+        }
+    }
+
+    fn is_charge_or_hold(mode: PlanMode) -> bool {
+        matches!(mode, PlanMode::Charge | PlanMode::Hold)
     }
 
     fn control() -> ControlConfig {
@@ -9325,38 +9464,207 @@ mod low_tariff_fill_tests {
     }
 
     #[test]
-    fn a_fill_month_charges_low_tariff_blocks_to_max_and_holds_them() {
-        let blocks = day(low_before_six);
+    fn a_fill_run_charges_its_cheap_blocks_and_holds_the_dear_ones() {
+        // 16-block low-tariff run: the first 8 blocks buy at 6.00, the last 8 at 4.00.
+        let buys = [vec![6.0; 8], vec![4.0; 8], vec![5.0; 16]].concat();
+        let blocks = priced(&buys, 0..16);
         let horizon = horizon_of(&blocks, fill(vec![1]), None);
         assert!(
-            horizon[..24]
+            horizon[..16]
                 .iter()
-                .all(|b| b.force_charge && b.low_tariff_fill && !b.no_discharge)
+                .all(|b| b.low_tariff_fill && !b.force_charge && !b.no_discharge)
         );
-        assert!(
-            horizon[24..]
-                .iter()
-                .all(|b| !b.force_charge && !b.low_tariff_fill)
-        );
+        assert!(horizon[16..].iter().all(|b| !b.low_tariff_fill));
 
-        let p = plan(&horizon, 20.0, PRAGUE, &battery(), &fill(vec![1]));
+        let p = plan(&horizon, 20.0, PRAGUE, &fast_battery(), &fill(vec![1]));
         assert!(
-            p.blocks[..24].iter().all(|b| b.mode == PlanMode::Charge),
+            p.blocks[..8].iter().all(|b| b.mode == PlanMode::Hold),
             "{:?}",
             modes(&p)
         );
         assert!(
-            p.blocks[..24]
+            p.blocks[..8]
                 .iter()
-                .all(|b| b.reason.contains("CHARGE (low tariff fill)")),
+                .all(|b| b.reason.contains("HOLD (low tariff fill)")),
             "{}",
             p.blocks[0].reason
         );
         assert!(
-            p.blocks[23].soc_end_pct >= 99.0,
-            "SOC {}",
-            p.blocks[23].soc_end_pct
+            p.blocks[8..16].iter().any(|b| b.mode == PlanMode::Charge),
+            "{:?}",
+            modes(&p)
         );
+        assert!(
+            p.blocks[..16].iter().all(|b| is_charge_or_hold(b.mode)),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks[15].soc_end_pct >= 99.0,
+            "SOC {}",
+            p.blocks[15].soc_end_pct
+        );
+    }
+
+    #[test]
+    fn a_fill_run_charges_first_when_its_cheap_part_comes_first() {
+        let buys = [vec![4.0; 8], vec![6.0; 8], vec![5.0; 16]].concat();
+        let blocks = priced(&buys, 0..16);
+        let horizon = horizon_of(&blocks, fill(vec![1]), None);
+        let p = plan(&horizon, 20.0, PRAGUE, &fast_battery(), &fill(vec![1]));
+        // Equal-price cheap blocks are interchangeable: Hold (the default) comes first, charging
+        // starts in the cheap part and is full by its end. Dear blocks hold once the battery is full.
+        assert!(
+            p.blocks[..8].iter().any(|b| b.mode == PlanMode::Charge),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks[7].soc_end_pct >= 99.0,
+            "SOC {}",
+            p.blocks[7].soc_end_pct
+        );
+        assert!(
+            p.blocks[8..16].iter().all(|b| b.mode == PlanMode::Hold),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks[..16].iter().all(|b| is_charge_or_hold(b.mode)),
+            "{:?}",
+            modes(&p)
+        );
+    }
+
+    #[test]
+    fn a_fill_run_too_short_to_fill_charges_in_every_block() {
+        // Four low-tariff blocks at 4.00 with a 3 kW charge rate cannot reach max SOC.
+        let blocks = priced(&[4.0; 8], 0..4);
+        let horizon = horizon_of(&blocks, fill(vec![1]), None);
+        let p = plan(&horizon, 20.0, PRAGUE, &battery(), &fill(vec![1]));
+        assert!(
+            p.blocks[..4].iter().all(|b| b.mode == PlanMode::Charge),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(p.blocks[3].soc_end_pct > p.blocks[0].soc_start_pct);
+        assert!(
+            p.blocks[3].soc_end_pct < 99.0,
+            "SOC {}",
+            p.blocks[3].soc_end_pct
+        );
+    }
+
+    #[test]
+    fn a_fill_run_at_the_horizon_end_ends_full() {
+        // The horizon ends inside the low-tariff run: the terminal value must not leave it short.
+        let buys = [vec![5.0; 32], vec![4.0; 16]].concat();
+        let blocks = priced(&buys, 32..48);
+        let horizon = horizon_of(&blocks, fill(vec![1]), None);
+        assert!(horizon[32..].iter().all(|b| b.low_tariff_fill));
+        let p = plan(&horizon, 20.0, PRAGUE, &fast_battery(), &fill(vec![1]));
+        assert!(
+            p.blocks[32..].iter().all(|b| is_charge_or_hold(b.mode)),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks.last().unwrap().soc_end_pct >= 99.0,
+            "SOC {}",
+            p.blocks.last().unwrap().soc_end_pct
+        );
+        // The penalty is a value, not a cost: the reported cost is the sum of the block costs.
+        let sum: f32 = p.blocks.iter().map(|b| b.cost_czk).sum();
+        assert!(
+            (p.expected_cost_czk - sum).abs() < 1e-3,
+            "{} vs {sum}",
+            p.expected_cost_czk
+        );
+    }
+
+    /// Production-like battery: 3 kW with `min_charge_kwh` 0.5 (the 300 s mode-change interval).
+    fn production_battery() -> BatteryParams {
+        BatteryParams {
+            min_charge_kwh: 0.5,
+            ..battery()
+        }
+    }
+
+    #[test]
+    fn fill_target_is_emax_less_the_largest_of_step_margin_and_min_charge() {
+        // Margin 1 % of 10 kWh = 0.1 kWh.
+        assert!((fill_target_kwh(&battery(), 0.05) - 9.9).abs() < 1e-4);
+        assert!((fill_target_kwh(&battery(), 0.5) - 9.5).abs() < 1e-4);
+        assert!((fill_target_kwh(&production_battery(), 0.05) - 9.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_fill_run_reaches_the_target_with_production_battery_and_its_head_charges() {
+        // 11 cheap low-tariff blocks at 2.00, then high tariff. From 20 % a 3 kW battery needs all
+        // 11 cheap blocks to reach the 9.5 kWh target, so the head must charge now.
+        let buys = [vec![2.0; 11], vec![4.3; 21]].concat();
+        let blocks = priced(&buys, 0..11);
+        let horizon = horizon_of(&blocks, fill(vec![1]), None);
+        let p = plan(
+            &horizon,
+            20.0,
+            PRAGUE,
+            &production_battery(),
+            &fill(vec![1]),
+        );
+        assert_eq!(p.blocks[0].mode, PlanMode::Charge, "{:?}", modes(&p));
+        assert!(
+            p.blocks[..11].iter().all(|b| is_charge_or_hold(b.mode)),
+            "{:?}",
+            modes(&p)
+        );
+        let end = p.blocks[10].soc_end_pct;
+        assert!(end >= 95.0 - 0.5, "SOC {end}");
+    }
+
+    #[test]
+    fn a_dear_fill_block_after_the_battery_is_full_holds() {
+        // Starts full: the dear low-tariff blocks hold, none shows Charge at full SOC.
+        let buys = [vec![6.0; 8], vec![5.0; 8]].concat();
+        let blocks = priced(&buys, 0..8);
+        let horizon = horizon_of(&blocks, fill(vec![1]), None);
+        let p = plan(
+            &horizon,
+            100.0,
+            PRAGUE,
+            &production_battery(),
+            &fill(vec![1]),
+        );
+        assert!(
+            p.blocks[..8].iter().all(|b| b.mode == PlanMode::Hold),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks[..8]
+                .iter()
+                .all(|b| b.reason.contains("HOLD (low tariff fill)")),
+            "{}",
+            p.blocks[0].reason
+        );
+    }
+
+    #[test]
+    fn a_fill_block_is_hold_or_charge_even_when_export_is_ahead() {
+        let blocks = priced(&[4.0; 8], 0..4);
+        let mut horizon = horizon_of(&blocks, fill(vec![1]), None);
+        // Export ahead at block 6 (sell 20 CZK) would make Hold the default of the blocks before it.
+        horizon[6].sell_czk = 20.0;
+        let params = fill(vec![1]);
+        let mut all: Vec<Vec<PlanMode>> = horizon
+            .iter()
+            .map(|b| candidate_modes(b, 1.0, 1.0, &battery(), &params))
+            .collect();
+        assert!(all[6].contains(&PlanMode::Export), "{:?}", all[6]);
+        house_from_grid_defaults(&horizon, &mut all);
+        for modes in &all[..4] {
+            assert_eq!(modes, &vec![PlanMode::Hold, PlanMode::Charge]);
+        }
     }
 
     #[test]
@@ -9388,10 +9696,9 @@ mod low_tariff_fill_tests {
     }
 
     #[test]
-    fn a_price_lever_charge_is_not_cleared_by_the_fill() {
-        // Cheap blocks before 06:00 are high tariff: lever 2.50 forces them, the fill does not.
-        // The 4.00 blocks after 06:00 are low tariff: filled, not lever-forced.
-        let blocks = day(|h| Some(h >= 6));
+    fn a_price_lever_charge_still_forces_a_fill_block() {
+        // Lever 2.50 forces the 2.00 low-tariff blocks: they are fill blocks and lever-forced.
+        let blocks = day(low_before_six);
         let levers = UserLevers {
             force_charge_at_or_below_czk: Some(2.5),
             ..UserLevers::default()
@@ -9400,24 +9707,305 @@ mod low_tariff_fill_tests {
         assert!(
             horizon[..24]
                 .iter()
-                .all(|b| b.force_charge && !b.low_tariff_fill)
+                .all(|b| b.force_charge && b.low_tariff_fill)
         );
         assert!(
             horizon[24..]
                 .iter()
-                .all(|b| b.force_charge && b.low_tariff_fill)
+                .all(|b| !b.force_charge && !b.low_tariff_fill)
         );
 
         let p = plan(&horizon, 20.0, PRAGUE, &battery(), &fill(vec![1]));
         assert!(
-            p.blocks[0].reason.contains("price lever"),
+            p.blocks[..24].iter().all(|b| b.mode == PlanMode::Charge),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks[0].reason.contains("CHARGE (low tariff fill)"),
             "{}",
             p.blocks[0].reason
         );
+    }
+
+    /// Same horizon with the house load of each block set to `load_kwh` (reserve flows too).
+    fn with_load(mut horizon: Vec<PlanBlock>, load_kwh: f32) -> Vec<PlanBlock> {
+        for b in &mut horizon {
+            b.load_kwh = load_kwh;
+            b.reserve_load_kwh = load_kwh;
+        }
+        horizon
+    }
+
+    #[test]
+    fn a_start_below_emin_charges_in_the_cheap_night_blocks() {
+        // 17.4 kWh, Emin 30 %, the battery at 20 %: the night buys at 4.00, the rest of the day at 8.00.
+        let bat = BatteryParams {
+            capacity_kwh: 17.4,
+            min_soc_pct: 30.0,
+            max_charge_kw: 9.0,
+            max_discharge_kw: 9.0,
+            max_export_kw: 9.0,
+            ..battery()
+        };
+        let buys = [vec![4.0; 20], vec![8.0; 76]].concat();
+        let blocks = priced(&buys, 0..0);
+        let horizon = with_load(
+            horizon_of(&blocks, WinterReserveParams::default(), None),
+            0.4,
+        );
+        let p = plan(
+            &horizon,
+            20.0,
+            PRAGUE,
+            &bat,
+            &WinterReserveParams::default(),
+        );
         assert!(
-            p.blocks[30].reason.contains("CHARGE (low tariff fill)"),
+            p.blocks[..20].iter().any(|b| b.mode == PlanMode::Charge),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks
+                .iter()
+                .zip(&horizon)
+                .all(|(b, h)| b.mode != PlanMode::Charge || h.buy_czk < 8.0),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(p.blocks[20].soc_start_pct > 30.0, "{:?}", modes(&p));
+    }
+
+    #[test]
+    fn below_emin_nothing_discharges_and_pv_only_raises_the_energy() {
+        let bat = BatteryParams {
+            capacity_kwh: 17.4,
+            min_soc_pct: 30.0,
+            ..battery()
+        };
+        let (emin, _) = bat.bounds_kwh();
+        let start = 0.2 * bat.capacity_kwh;
+        let mut block =
+            horizon_of(&priced(&[4.0], 0..0), WinterReserveParams::default(), None).remove(0);
+        block.load_kwh = 0.4;
+        block.reserve_load_kwh = 0.4;
+        block.pv_kwh = 0.0;
+        block.reserve_pv_kwh = 0.0;
+        for mode in [
+            PlanMode::SelfUse,
+            PlanMode::Hold,
+            PlanMode::Export,
+            PlanMode::NoDischarge,
+        ] {
+            let o = simulate_block(mode, start, &block, emin, &bat);
+            assert_eq!(o.battery_discharge_kwh, 0.0, "{mode:?}");
+            assert!(o.energy_end_kwh >= start, "{mode:?}: {}", o.energy_end_kwh);
+        }
+        block.pv_kwh = 1.0;
+        block.reserve_pv_kwh = 1.0;
+        let o = simulate_block(PlanMode::SelfUse, start, &block, emin, &bat);
+        assert!(o.energy_end_kwh > start, "{}", o.energy_end_kwh);
+    }
+
+    #[test]
+    fn the_dp_grid_starts_at_emin_unless_the_start_is_below_it() {
+        // At or above Emin the grid is unchanged (bit-identical to the Emin start).
+        assert_eq!(dp_grid_min(5.22, 5.22).to_bits(), 5.22_f32.to_bits());
+        assert_eq!(dp_grid_min(5.22, 9.0).to_bits(), 5.22_f32.to_bits());
+        assert_eq!(dp_grid_min(5.22, f32::NAN).to_bits(), 5.22_f32.to_bits());
+        // Below Emin the grid starts at the start energy.
+        assert_eq!(dp_grid_min(5.22, 3.48), 3.48);
+        assert_eq!(dp_grid_min(5.22, 0.0), 0.0);
+    }
+
+    fn head_clock() -> DateTime<Utc> {
+        PRAGUE
+            .with_ymd_and_hms(2026, 1, 15, 0, 5, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// Head evaluation at 00:05 local (block 0) with the live SOC `soc`. `s` keeps its plan cache.
+    fn head_eval(
+        s: &WinterReserveStrategy,
+        blocks: &[TimeBlockPrice],
+        soc: f32,
+    ) -> super::super::BlockEvaluation {
+        head_eval_sun(s, blocks, soc, 0.0)
+    }
+
+    /// `head_eval` with `solar_head_kwh` of PV forecast in block 0 (the other blocks have none).
+    fn head_eval_sun(
+        s: &WinterReserveStrategy,
+        blocks: &[TimeBlockPrice],
+        soc: f32,
+        solar_head_kwh: f32,
+    ) -> super::super::BlockEvaluation {
+        // 6 kW: one block lifts the battery by 13.5 % (the cached head reaches 99.5 %).
+        let ctl = ControlConfig {
+            max_battery_charge_rate_kw: 6.0,
+            ..control()
+        };
+        let forecasts: Vec<BlockForecast> = (0..blocks.len())
+            .map(|i| BlockForecast {
+                solar_kwh: if i == 0 { solar_head_kwh } else { 0.0 },
+                consumption_kwh: 0.3,
+            })
+            .collect();
+        let context = super::super::EvaluationContext {
+            price_block: &blocks[0],
+            control_config: &ctl,
+            current_battery_soc: soc,
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.0,
+            grid_export_price_czk_per_kwh: 0.5,
+            all_price_blocks: Some(blocks),
+            ranking_price_blocks: None,
+            backup_discharge_min_soc: 10.0,
+            grid_import_today_kwh: None,
+            consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
+            hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: Some(&forecasts),
+            timezone: Some(PRAGUE),
+            user_levers: None,
+            cautious_pv: None,
+        };
+        s.evaluate(&context)
+    }
+
+    #[test]
+    fn a_guarded_fill_charge_holds_and_a_non_fill_charge_self_uses() {
+        // One cheap block at 2.00, dear after: from 85 % (below the fill target) the head must charge
+        // now. The cached plan is then reused at 99.5 %, and the guard stops the charge.
+        let buys = [vec![2.0], vec![6.0; 23]].concat();
+        let fill_blocks = priced(&buys, 0..1);
+        let s = WinterReserveStrategy::new(true, fill(vec![1])).with_clock(head_clock);
+        let first = head_eval(&s, &fill_blocks, 85.0);
+        assert_eq!(
+            first.mode,
+            InverterOperationMode::ForceCharge,
             "{}",
-            p.blocks[30].reason
+            first.reason
+        );
+        let guarded = head_eval(&s, &fill_blocks, 99.5);
+        assert_eq!(
+            guarded.mode,
+            InverterOperationMode::NoChargeNoDischarge,
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            guarded
+                .reason
+                .contains("guard: charge held at SOC 100%, hold (low tariff fill)"),
+            "{}",
+            guarded.reason
+        );
+
+        // The same blocks without the fill option: the guard self-uses as before.
+        let plain_blocks = priced(&buys, 0..0);
+        let s =
+            WinterReserveStrategy::new(true, WinterReserveParams::default()).with_clock(head_clock);
+        let first = head_eval(&s, &plain_blocks, 85.0);
+        assert_eq!(
+            first.mode,
+            InverterOperationMode::ForceCharge,
+            "{}",
+            first.reason
+        );
+        let guarded = head_eval(&s, &plain_blocks, 99.5);
+        assert_eq!(
+            guarded.mode,
+            InverterOperationMode::SelfUse,
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            guarded.reason.contains("guard: charge held at SOC 100%"),
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            !guarded.reason.contains("low tariff fill"),
+            "{}",
+            guarded.reason
+        );
+    }
+
+    /// Solar headroom (`charge_caps`): a sunny head block with a surplus caps a grid charge below
+    /// Emax, so a cached head Charge at the cap is held by the guard, as a fill block.
+    #[test]
+    fn a_guarded_fill_charge_at_the_solar_headroom_holds() {
+        // One cheap low-tariff block at 2.00 with 1 kWh of forecast PV (0.7 kWh after the PV
+        // confidence) and 0.3 kWh of load: the surplus caps the charge at Emax less the stored surplus
+        // (about 96.2 %). From 85 % the head charges to the cap; at 97 % the cached head is held by the
+        // headroom guard.
+        let buys = [vec![2.0], vec![6.0; 23]].concat();
+        let fill_blocks = priced(&buys, 0..1);
+        let s = WinterReserveStrategy::new(true, fill(vec![1])).with_clock(head_clock);
+        let first = head_eval_sun(&s, &fill_blocks, 85.0, 1.0);
+        assert_eq!(
+            first.mode,
+            InverterOperationMode::ForceCharge,
+            "{}",
+            first.reason
+        );
+        let guarded = head_eval_sun(&s, &fill_blocks, 97.0, 1.0);
+        assert_eq!(
+            guarded.mode,
+            InverterOperationMode::NoChargeNoDischarge,
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            guarded
+                .reason
+                .contains("guard: charge held at the solar headroom"),
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            guarded.reason.contains("hold (low tariff fill)"),
+            "{}",
+            guarded.reason
+        );
+
+        // The same blocks without the fill option: SelfUse, with no fill wording.
+        let plain_blocks = priced(&buys, 0..0);
+        let s =
+            WinterReserveStrategy::new(true, WinterReserveParams::default()).with_clock(head_clock);
+        let first = head_eval_sun(&s, &plain_blocks, 85.0, 1.0);
+        assert_eq!(
+            first.mode,
+            InverterOperationMode::ForceCharge,
+            "{}",
+            first.reason
+        );
+        let guarded = head_eval_sun(&s, &plain_blocks, 97.0, 1.0);
+        assert_eq!(
+            guarded.mode,
+            InverterOperationMode::SelfUse,
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            guarded
+                .reason
+                .contains("guard: charge held at the solar headroom"),
+            "{}",
+            guarded.reason
+        );
+        assert!(
+            !guarded.reason.contains("low tariff fill"),
+            "{}",
+            guarded.reason
         );
     }
 }

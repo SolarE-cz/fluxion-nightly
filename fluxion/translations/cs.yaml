@@ -169,8 +169,9 @@ configuration:
   low_tariff_fill_months:
     name: Měsíce plnění v nízkém tarifu
     description: >-
-      Měsíce (1–12), kdy se baterie v každém bloku nízkého tarifu HDO nabije na
-      maximum a drží. Prázdné = vypnuto.
+      Měsíce (1–12), kdy se baterie do konce každého okna nízkého tarifu HDO
+      nabije na maximum v jeho nejlevnějších blocích a v ostatních drží (dům ze
+      sítě). Prázdné = vypnuto.
   winter_adaptive:
     name: Zimní adaptivní strategie
     description: >-

@@ -1597,7 +1597,8 @@ mod tests {
 
     /// Low tariff fill, end to end (owner 2026-11-17): the HDO tariff that
     /// `calculate_effective_prices` sets reaches the WinterReserve plugin through
-    /// `create_evaluation_request`, and the plugin force-charges the low-tariff block in a fill month
+    /// `create_evaluation_request`. In a fill month the plugin holds in the dear part of the low
+    /// tariff and charges in its cheap part
     #[test]
     fn test_low_tariff_fill_reaches_the_winter_reserve_plugin() {
         use crate::plugin_adapters::StrategyPlugin;
@@ -1609,7 +1610,7 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
             low_tariff_ranges: vec![HdoTimeRange {
                 start: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
-                end: NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
+                end: NaiveTime::from_hms_opt(4, 45, 0).unwrap(),
             }],
         }]);
         let pricing = PricingConfig {
@@ -1627,10 +1628,20 @@ mod tests {
             hdo_high_tariff_czk: 1.80,
         };
 
-        // 15 Jan 2026 from local midnight (Prague = UTC+1): 00:00-06:00 low tariff, then high
+        // 15 Jan 2026 from local midnight (Prague = UTC+1): 00:00-04:45 low tariff, then high.
+        // In the low tariff the first 2 h are dear (spot 3.0), the next 2.75 h cheap (spot 1.0).
+        // From 20 % to the 9.5 kWh fill target a 3 kW battery needs 11 quarter-hours, so the cheap
+        // part is exactly what fills the run and its head must charge.
         let start = Utc.with_ymd_and_hms(2026, 1, 14, 23, 0, 0).unwrap();
         let mut blocks: Vec<TimeBlockPrice> = (0..48)
-            .map(|i| spot_block(start + ChronoDuration::minutes(15 * i), 2.0))
+            .map(|i| {
+                let spot = match i {
+                    0..8 => 3.0,
+                    8..19 => 1.0,
+                    _ => 2.0,
+                };
+                spot_block(start + ChronoDuration::minutes(15 * i), spot)
+            })
             .collect();
         calculate_effective_prices(&mut blocks, Some(&cache), &pricing);
         assert_eq!(blocks[0].hdo_low_tariff, Some(true));
@@ -1675,14 +1686,56 @@ mod tests {
             low_tariff_fill_months: vec![1],
             ..WinterReserveParams::default()
         };
-        let plugin = StrategyPlugin::new(WinterReserveStrategy::new(true, params), 120, control);
-        let decision = plugin.evaluate(&request).unwrap();
-        assert_eq!(decision.mode, OperationMode::ForceCharge);
-        assert!(
-            decision.reason.contains("low tariff fill"),
+        // A fresh strategy per head: a WinterReserve instance caches its plan, and a cached plan
+        // projects block 8 as planned from head 0.
+        let evaluate = |head: usize| {
+            let plugin = StrategyPlugin::new(
+                WinterReserveStrategy::new(true, params.clone()),
+                120,
+                control.clone(),
+            );
+            let request = create_evaluation_request(
+                &blocks[head],
+                &blocks,
+                &[],
+                &control,
+                20.0,
+                0.0,
+                0.3,
+                0.5,
+                10.0,
+                None,
+                None,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+                Vec::new(),
+                Some("Europe/Prague"),
+                None,
+                None,
+                None,
+                None,
+            );
+            plugin.evaluate(&request).unwrap()
+        };
+
+        // Dear part first: the battery holds, the cheap part after it fills.
+        let dear = evaluate(0);
+        assert_eq!(
+            dear.mode,
+            OperationMode::NoChargeNoDischarge,
             "{}",
-            decision.reason
+            dear.reason
         );
+        assert!(dear.reason.contains("low tariff fill"), "{}", dear.reason);
+
+        // Cheap part: the battery charges.
+        let cheap = evaluate(8);
+        assert_eq!(cheap.mode, OperationMode::ForceCharge, "{}", cheap.reason);
+        assert!(cheap.reason.contains("low tariff fill"), "{}", cheap.reason);
     }
 
     #[test]
