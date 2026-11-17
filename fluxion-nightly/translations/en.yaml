@@ -166,6 +166,11 @@ configuration:
       Winter Reserve with export selection "daily_top_n": the number of
       best-selling hours of each local day in which export is allowed
       (1-24). Default 6.
+  low_tariff_fill_months:
+    name: Low-tariff fill months
+    description: >-
+      Months (1–12) in which every HDO low-tariff block charges the battery to
+      max SOC and holds it. Empty: off.
   winter_adaptive:
     name: Winter Adaptive Strategy
     description: >-

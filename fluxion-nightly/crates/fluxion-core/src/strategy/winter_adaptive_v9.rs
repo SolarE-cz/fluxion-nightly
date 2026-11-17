@@ -1373,6 +1373,7 @@ mod tests {
                 };
 
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -1647,6 +1648,7 @@ mod tests {
 
         for (i, &price) in prices.iter().enumerate() {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i as i64 * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
@@ -1898,6 +1900,7 @@ mod tests {
                 };
 
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -1977,6 +1980,7 @@ mod tests {
                 let grid_fee = if hour < 6 { hdo_low_fee } else { hdo_high_fee };
 
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -2058,6 +2062,7 @@ mod tests {
                 let grid_fee = if hour < 7 { hdo_low_fee } else { hdo_high_fee };
 
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),
@@ -2098,6 +2103,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks: Vec<TimeBlockPrice> = (0..20)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2123,6 +2129,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks: Vec<TimeBlockPrice> = (0..20)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2155,6 +2162,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks: Vec<TimeBlockPrice> = (0..5)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2195,6 +2203,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks: Vec<TimeBlockPrice> = (0..4)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2235,6 +2244,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks = vec![
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time,
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2243,6 +2253,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 10.0,
@@ -2251,6 +2262,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(30),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2285,6 +2297,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap();
         let blocks: Vec<TimeBlockPrice> = (0..6)
             .map(|i| TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(i * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.0,
@@ -2341,6 +2354,7 @@ mod tests {
                 let grid_fee = if hour < 6 { hdo_low_fee } else { hdo_high_fee };
 
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),

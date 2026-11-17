@@ -1134,6 +1134,7 @@ mod tests {
         vec![
             // Valley 1: 00:00-01:00 (cheap overnight)
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time,
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.00,
@@ -1142,6 +1143,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.10,
@@ -1150,6 +1152,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(30),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.05,
@@ -1158,6 +1161,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(45),
                 duration_minutes: 15,
                 price_czk_per_kwh: 1.15,
@@ -1167,6 +1171,7 @@ mod tests {
             },
             // Peak 1: 07:00-08:00 (morning peak)
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(7),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.50,
@@ -1175,6 +1180,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(7) + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.80,
@@ -1183,6 +1189,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(7) + chrono::Duration::minutes(30),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.60,
@@ -1192,6 +1199,7 @@ mod tests {
             },
             // Valley 2: 12:00-13:00 (midday solar dip)
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(12),
                 duration_minutes: 15,
                 price_czk_per_kwh: 0.80,
@@ -1200,6 +1208,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time
                     + chrono::Duration::hours(12)
                     + chrono::Duration::minutes(15),
@@ -1210,6 +1219,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time
                     + chrono::Duration::hours(12)
                     + chrono::Duration::minutes(30),
@@ -1221,6 +1231,7 @@ mod tests {
             },
             // Peak 2: 18:00-19:00 (evening peak)
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(18),
                 duration_minutes: 15,
                 price_czk_per_kwh: 6.50,
@@ -1229,6 +1240,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time
                     + chrono::Duration::hours(18)
                     + chrono::Duration::minutes(15),
@@ -1239,6 +1251,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time
                     + chrono::Duration::hours(18)
                     + chrono::Duration::minutes(30),
@@ -1260,6 +1273,7 @@ mod tests {
             .map(|hour| {
                 let price = 3.0 + (hour as f32 - 12.0).abs() * 0.1; // Slight variation
                 TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time + chrono::Duration::hours(hour),
                     duration_minutes: 15,
                     price_czk_per_kwh: price,
@@ -1362,6 +1376,7 @@ mod tests {
         let base_time = Utc.with_ymd_and_hms(2026, 1, 18, 12, 0, 0).unwrap();
         let blocks = vec![
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time,
                 duration_minutes: 15,
                 price_czk_per_kwh: -1.00,
@@ -1370,6 +1385,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: -2.00,
@@ -1378,6 +1394,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(6),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.00,
@@ -1386,6 +1403,7 @@ mod tests {
                 buy_price_czk_per_kwh: None,
             },
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::hours(6) + chrono::Duration::minutes(15),
                 duration_minutes: 15,
                 price_czk_per_kwh: 5.50,
@@ -1599,6 +1617,7 @@ mod tests {
                     4.0 // Expensive
                 };
                 TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time + chrono::Duration::hours(hour),
                     duration_minutes: 15,
                     price_czk_per_kwh: price,

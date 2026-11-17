@@ -332,6 +332,7 @@ fn planner_prices(
     cache.set_timezone(PRAGUE);
     cache.update(schedules.to_vec());
     let mut blocks = [TimeBlockPrice {
+        hdo_low_tariff: None,
         block_start: start,
         duration_minutes: 15,
         price_czk_per_kwh: spot,

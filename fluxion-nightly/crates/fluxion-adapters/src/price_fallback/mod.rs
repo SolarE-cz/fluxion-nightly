@@ -1105,6 +1105,7 @@ fn fill_missing(
         #[expect(clippy::cast_possible_truncation, reason = "prices are stored as f32")]
         let price = price as f32;
         data.time_block_prices.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: *start,
             duration_minutes: 15,
             price_czk_per_kwh: price,

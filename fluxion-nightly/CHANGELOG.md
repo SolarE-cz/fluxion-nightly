@@ -10,6 +10,15 @@ track what changes have been documented. Last edit: commit `1f2c17e` (2026-02-22
 
 ## [Unreleased]
 
+## [0.2.78] - 2026-11-17
+
+### Added
+
+- `strategies.winter_reserve.low_tariff_fill_months` (default `[]`, off): in the listed local months
+  every HDO low-tariff block charges the battery to max SOC and holds it there, so the house runs
+  from the grid (owner 2026-11-17, Přelouč site with little winter PV). Blocks with an unknown HDO
+  tariff are never filled. The plan reason shows `CHARGE (low tariff fill)`.
+
 ## [0.2.77] - 2026-11-11
 
 ### Fixed

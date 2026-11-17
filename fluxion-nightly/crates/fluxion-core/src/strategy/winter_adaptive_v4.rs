@@ -602,6 +602,7 @@ mod tests {
         vec![
             // 19:00 - expensive
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(60),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.73,
@@ -611,6 +612,7 @@ mod tests {
             },
             // 19:15 - expensive
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(75),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.55,
@@ -620,6 +622,7 @@ mod tests {
             },
             // 19:30 - expensive
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(90),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.30,
@@ -629,6 +632,7 @@ mod tests {
             },
             // 19:45 - medium
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(105),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.96,
@@ -638,6 +642,7 @@ mod tests {
             },
             // 20:00 - medium
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(120),
                 duration_minutes: 15,
                 price_czk_per_kwh: 3.17,
@@ -647,6 +652,7 @@ mod tests {
             },
             // 22:00 - cheap
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(240),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.59,
@@ -656,6 +662,7 @@ mod tests {
             },
             // 22:15 - cheapest!
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(255),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.31,
@@ -665,6 +672,7 @@ mod tests {
             },
             // 22:30 - cheap
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes(270),
                 duration_minutes: 15,
                 price_czk_per_kwh: 2.45,

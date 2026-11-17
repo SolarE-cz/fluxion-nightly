@@ -1678,6 +1678,7 @@ impl ConfigurablePriceDataSource {
         while block_start < end {
             let price = fixed_price_at(hourly, block_start, tz);
             time_block_prices.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start,
                 duration_minutes: 15,
                 price_czk_per_kwh: price,
@@ -1793,6 +1794,7 @@ fn fixed_buy_on_spot_timeline(
         .map(|spot| {
             let price = fixed_price_at(hourly, spot.block_start, tz);
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: spot.block_start,
                 duration_minutes: spot.duration_minutes,
                 price_czk_per_kwh: price,
@@ -4375,6 +4377,7 @@ mod buy_price_tests {
     fn buy_to_spot_ratio_is_median_over_covered_blocks() {
         fn block(secs: i64, spot: f32) -> TimeBlockPrice {
             TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
                 duration_minutes: 15,
                 price_czk_per_kwh: spot,
@@ -4719,6 +4722,7 @@ mod price_fallback_source_tests {
     fn fixed_buy_blocks_keep_the_fallback_marker_of_their_spot_sell_price() {
         let t0 = now();
         let blk = |i: i64, price: f32| TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: t0 + chrono::Duration::minutes(15 * i),
             duration_minutes: 15,
             price_czk_per_kwh: price,
@@ -4969,6 +4973,7 @@ mod fixed_buy_horizon_tests {
                     0.0
                 };
                 PlanBlock {
+                    low_tariff_fill: false,
                     start: b.block_start,
                     duration_minutes: b.duration_minutes,
                     buy_czk: b.effective_price_czk_per_kwh,

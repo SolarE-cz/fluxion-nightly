@@ -459,6 +459,7 @@ pub fn apply_planner_prices(
             None
         };
         let mut price = [TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: block.start,
             duration_minutes: 15,
             price_czk_per_kwh: spot,

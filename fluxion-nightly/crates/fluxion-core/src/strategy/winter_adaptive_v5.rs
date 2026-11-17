@@ -631,6 +631,7 @@ mod tests {
 
         for (i, &price) in prices.iter().enumerate() {
             blocks.push(TimeBlockPrice {
+                hdo_low_tariff: None,
                 block_start: base_time + chrono::Duration::minutes((i as i64) * 15),
                 duration_minutes: 15,
                 price_czk_per_kwh: price,

@@ -610,6 +610,16 @@ than 5 valid days, or the PV forecast correction off. An empty list turns the fa
 
 Default value: `[10, 11, 12, 1, 2, 3]`
 
+#### Option: `strategies.winter_reserve.low_tariff_fill_months`
+
+Local calendar months (1–12) in which every HDO low-tariff block charges the battery to max SOC and
+holds it there, so the house runs from the grid during the low tariff (winter sites with little PV).
+Only blocks whose HDO tariff is known are filled; without an HDO sensor the option does nothing. In a
+filled block the `Zákaz vybíjení` price lever does not apply. This option applies over a saved web UI
+configuration (`/data/config.json`). Not applied in the `/backtest` day replay.
+
+Default value: `[]` (off)
+
 ## How It Works
 
 FluxION operates on a 15-minute time block schedule, analyzing electricity spot prices to determine

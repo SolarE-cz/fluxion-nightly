@@ -1231,6 +1231,7 @@ mod tests {
                     _ => 2.0,
                 };
                 blocks.push(TimeBlockPrice {
+                    hdo_low_tariff: None,
                     block_start: base_time
                         + chrono::Duration::hours(hour)
                         + chrono::Duration::minutes(quarter * 15),

@@ -28,6 +28,7 @@ fn create_spike_then_cheaper_pattern() -> Vec<TimeBlockPrice> {
     // Overnight valley (00:00-08:00): 32 blocks @ 1.5 CZK
     for i in 0..32 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
@@ -40,6 +41,7 @@ fn create_spike_then_cheaper_pattern() -> Vec<TimeBlockPrice> {
     // Morning spike (08:00-09:00): 4 blocks @ 8.0 CZK (SPIKE!)
     for i in 32..36 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 8.0,
@@ -52,6 +54,7 @@ fn create_spike_then_cheaper_pattern() -> Vec<TimeBlockPrice> {
     // Post-spike DROP (09:00-14:00): 20 blocks @ 1.0 CZK (CHEAPER than overnight!)
     for i in 36..56 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.0,
@@ -64,6 +67,7 @@ fn create_spike_then_cheaper_pattern() -> Vec<TimeBlockPrice> {
     // Evening peak (14:00-22:00): 32 blocks @ 5.0 CZK
     for i in 56..88 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
@@ -76,6 +80,7 @@ fn create_spike_then_cheaper_pattern() -> Vec<TimeBlockPrice> {
     // Late evening (22:00-00:00): 8 blocks @ 2.0 CZK
     for i in 88..96 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,

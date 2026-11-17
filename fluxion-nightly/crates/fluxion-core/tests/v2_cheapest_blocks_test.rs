@@ -30,6 +30,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Early night (00:00-02:00): 8 blocks @ 2.0 CZK (NOT cheapest)
     for i in 0..8 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
@@ -42,6 +43,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Mid night (02:00-04:00): 8 blocks @ 1.5 CZK (cheaper, but still not cheapest)
     for i in 8..16 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.5,
@@ -54,6 +56,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Late night (04:00-06:00): 8 blocks @ 1.0 CZK (CHEAPEST!)
     for i in 16..24 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 1.0,
@@ -66,6 +69,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Morning ramp (06:00-08:00): 8 blocks @ 3.0 CZK
     for i in 24..32 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 3.0,
@@ -78,6 +82,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Morning peak (08:00-12:00): 16 blocks @ 5.0 CZK
     for i in 32..48 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 5.0,
@@ -90,6 +95,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Midday valley (12:00-16:00): 16 blocks @ 2.0 CZK
     for i in 48..64 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.0,
@@ -102,6 +108,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Evening peak (16:00-22:00): 24 blocks @ 6.0 CZK
     for i in 64..88 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 6.0,
@@ -114,6 +121,7 @@ fn create_decreasing_overnight_pattern() -> Vec<TimeBlockPrice> {
     // Late evening (22:00-00:00): 8 blocks @ 2.5 CZK
     for i in 88..96 {
         blocks.push(TimeBlockPrice {
+            hdo_low_tariff: None,
             block_start: base + chrono::Duration::minutes(i * 15),
             duration_minutes: 15,
             price_czk_per_kwh: 2.5,

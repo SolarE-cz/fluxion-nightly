@@ -225,6 +225,7 @@ options:
       export_window_continuity_pct: 5.0
       insane_price_multiplier: 3.0
       load_safety_factor: 1.1
+      low_tariff_fill_months: []
       min_arbitrage_profit_czk: 2.0
       min_mode_benefit_czk: 0.1
       mode_switch_min_benefit_czk: 1.0
@@ -500,6 +501,8 @@ schema:
       export_window_continuity_pct: float(0,100)?
       insane_price_multiplier: float(0,10)?
       load_safety_factor: float(0,10)?
+      low_tariff_fill_months:
+      - int(1,12)?
       min_arbitrage_profit_czk: float(0,)?
       min_mode_benefit_czk: float?
       mode_switch_min_benefit_czk: float(0,)?
@@ -515,4 +518,4 @@ schema:
 slug: fluxion-nightly
 startup: application
 url: https://github.com/SolarE-cz/fluxion-nightly
-version: 0.2.77
+version: 0.2.78

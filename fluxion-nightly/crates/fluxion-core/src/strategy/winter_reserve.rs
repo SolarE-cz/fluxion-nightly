@@ -111,6 +111,10 @@ pub struct WinterReserveParams {
     /// forecast error is unknown (no `CautiousPvSignal`); empty = never
     #[serde(default = "default_cautious_pv_fallback_months")]
     pub cautious_pv_fallback_months: Vec<u32>,
+    /// Months in which every HDO low-tariff block force-charges to max SOC and holds there (owner
+    /// 2026-11-17, winter sites with little PV). Empty: off.
+    #[serde(default)]
+    pub low_tariff_fill_months: Vec<u32>,
 }
 
 fn default_cautious_pv_fallback_months() -> Vec<u32> {
@@ -212,6 +216,7 @@ impl Default for WinterReserveParams {
             soc_resolution_pct: 0.5,
             export_floor_until_cheap: false,
             cautious_pv_fallback_months: default_cautious_pv_fallback_months(),
+            low_tariff_fill_months: Vec::new(),
         }
     }
 }
@@ -252,6 +257,9 @@ pub struct PlanBlock {
     /// Discharge window lever: Export is allowed in this block.
     #[serde(default = "export_allowed_default")]
     pub export_allowed: bool,
+    /// `low_tariff_fill_months`: the block is an HDO low-tariff block in a fill month, forced to Charge.
+    #[serde(default)]
+    pub low_tariff_fill: bool,
 }
 
 fn export_allowed_default() -> bool {
@@ -884,6 +892,10 @@ fn plan_reason(
         PlanMode::SelfUse => (
             "SELF-USE".into(),
             format!("buy {:.2} | sell {:.2}", block.buy_czk, block.sell_czk),
+        ),
+        PlanMode::Charge if block.low_tariff_fill => (
+            "CHARGE (low tariff fill)".into(),
+            format!("buy {:.2}", block.buy_czk),
         ),
         PlanMode::Charge if block.force_charge => (
             format!(
@@ -2048,6 +2060,7 @@ fn ranking_prefix(
         .iter()
         .filter(|b| b.block_start < first && b.block_start.with_timezone(&tz).date_naive() == day)
         .map(|b| PlanBlock {
+            low_tariff_fill: false,
             start: b.block_start,
             duration_minutes: b.duration_minutes,
             buy_czk: b.effective_price_czk_per_kwh,
@@ -2173,6 +2186,7 @@ impl WinterReserveStrategy {
                     tz,
                 );
                 PlanBlock {
+                    low_tariff_fill: false,
                     start: b.block_start,
                     duration_minutes: b.duration_minutes,
                     buy_czk: b.effective_price_czk_per_kwh,
@@ -2224,6 +2238,20 @@ impl WinterReserveStrategy {
             context.timezone,
             &self.params,
         );
+        // Low-tariff fill (owner 2026-11-17): after the levers, which overwrite force_charge. Block i
+        // is `all[i]` here. Unknown tariff (None) never matches.
+        for (block, source) in blocks.iter_mut().zip(all.iter()) {
+            if source.hdo_low_tariff == Some(true)
+                && self
+                    .params
+                    .low_tariff_fill_months
+                    .contains(&source.block_start.with_timezone(&tz).month())
+            {
+                block.force_charge = true;
+                block.no_discharge = false;
+                block.low_tariff_fill = true;
+            }
+        }
 
         blocks.split_off(start)
     }
@@ -2490,6 +2518,7 @@ mod tests {
     /// 15-minute block i after 18:00 local, with the given prices and forecasts.
     fn pblock(i: i64, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
         PlanBlock {
+            low_tariff_fill: false,
             start: base() + Duration::minutes(15 * i),
             duration_minutes: 15,
             buy_czk: buy,
@@ -3485,6 +3514,7 @@ mod tests {
                     (6.5, 5.5)
                 };
                 TimeBlockPrice {
+                    hdo_low_tariff: None,
                     buy_price_czk_per_kwh: None,
                     block_start: base() + Duration::minutes(15 * i),
                     duration_minutes: 15,
@@ -3765,6 +3795,7 @@ mod tests {
                 let h = solar_day_hour(i);
                 let actual_pv = solar_bell(h) / day_weight[day_of(i)] * day_kwh[day_of(i)];
                 PlanBlock {
+                    low_tariff_fill: false,
                     start: start + Duration::minutes(15 * i as i64),
                     duration_minutes: 15,
                     buy_czk: solar_day_buy(h),
@@ -3953,6 +3984,7 @@ mod tests {
         let prices: Vec<TimeBlockPrice> = slots
             .iter()
             .map(|s| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: s.start,
                 duration_minutes: 15,
@@ -4070,6 +4102,7 @@ mod tests {
             let pv_real = s.pv_actual_kwh.unwrap_or(s.pv_forecast_kwh * 1.44);
             let load_real = mean[s.start.hour() as usize] * 0.25;
             let real = PlanBlock {
+                low_tariff_fill: false,
                 start: s.start,
                 duration_minutes: 15,
                 buy_czk: s.buy,
@@ -4933,6 +4966,7 @@ mod tests {
     fn prices_rising_evening() -> Vec<TimeBlockPrice> {
         (0..60)
             .map(|i: i64| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: base() + Duration::minutes(15 * i),
                 duration_minutes: 15,
@@ -4977,6 +5011,7 @@ mod tests {
         // Block 23 has the highest sell but is forced to charge (buy 0.5 <= 1.0); others buy at 2.0.
         let blocks: Vec<TimeBlockPrice> = (0..60)
             .map(|i: i64| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: base() + Duration::minutes(15 * i),
                 duration_minutes: 15,
@@ -5060,6 +5095,7 @@ mod force_discharge_gate_tests {
     /// A block where exporting is clearly profitable (sell 10, cheap reference 1).
     fn profitable_block() -> PlanBlock {
         PlanBlock {
+            low_tariff_fill: false,
             start: Utc.with_ymd_and_hms(2026, 10, 13, 17, 0, 0).unwrap(),
             duration_minutes: 15,
             buy_czk: 1.0,
@@ -5124,6 +5160,7 @@ mod keep_rule_tests {
 
     fn blk(i: usize, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
         PlanBlock {
+            low_tariff_fill: false,
             start: start() + Duration::minutes(15 * i as i64),
             duration_minutes: 15,
             buy_czk: buy,
@@ -5658,6 +5695,7 @@ mod h30_tests {
                 };
                 let load = 0.35;
                 PlanBlock {
+                    low_tariff_fill: false,
                     start: t,
                     duration_minutes: 15,
                     buy_czk: buy,
@@ -5856,6 +5894,7 @@ mod h33_tests {
             .with_timezone(&Utc)
             + Duration::minutes(15 * i);
         PlanBlock {
+            low_tariff_fill: false,
             start,
             duration_minutes: 15,
             buy_czk: buy,
@@ -6348,6 +6387,7 @@ mod owner_fixed_buy_tests {
                 let (buy, sell) = price(hour);
                 let pv = if (10..14).contains(&hour) { 0.4 } else { 0.0 };
                 PlanBlock {
+                    low_tariff_fill: false,
                     start,
                     duration_minutes: 15,
                     buy_czk: buy,
@@ -6711,6 +6751,7 @@ mod cautious_pv_tests {
         starts
             .iter()
             .map(|&s| TimeBlockPrice {
+                hdo_low_tariff: None,
                 buy_price_czk_per_kwh: None,
                 block_start: s,
                 duration_minutes: 15,
@@ -7039,6 +7080,7 @@ mod soc_bounds_tests {
         let start = Utc.with_ymd_and_hms(2026, 10, 20, 10, 0, 0).unwrap();
         (0..4)
             .map(|i| PlanBlock {
+                low_tariff_fill: false,
                 start: start + Duration::minutes(15 * i),
                 duration_minutes: 15,
                 buy_czk: 2.0,
@@ -7131,6 +7173,7 @@ mod reversal_tests {
 
     fn block_at(start: DateTime<Utc>, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
         PlanBlock {
+            low_tariff_fill: false,
             start,
             duration_minutes: 15,
             buy_czk: buy,
@@ -7684,6 +7727,7 @@ mod continuity_tests {
 
     fn block_at(start: DateTime<Utc>, buy: f32, sell: f32, load: f32, pv: f32) -> PlanBlock {
         PlanBlock {
+            low_tariff_fill: false,
             start,
             duration_minutes: 15,
             buy_czk: buy,
@@ -7740,6 +7784,7 @@ mod continuity_tests {
     /// The owner's add-on options (0.2.74) with `continuity_pct` and `reversal_czk`
     fn owner_params(continuity_pct: f32, reversal_czk: f32) -> WinterReserveParams {
         WinterReserveParams {
+            low_tariff_fill_months: Vec::new(),
             min_arbitrage_profit_czk: 1.5,
             insane_price_multiplier: 3.0,
             cheap_percentile: 0.2,
@@ -8286,6 +8331,7 @@ mod continuity_tests {
 
     fn price_of(b: &OwnerDayBlock) -> TimeBlockPrice {
         TimeBlockPrice {
+            hdo_low_tariff: None,
             buy_price_czk_per_kwh: None,
             block_start: b.start,
             duration_minutes: 15,
@@ -8657,6 +8703,7 @@ mod continuity_tests {
             let prices: Vec<TimeBlockPrice> = blocks
                 .iter()
                 .map(|b| TimeBlockPrice {
+                    hdo_low_tariff: None,
                     buy_price_czk_per_kwh: None,
                     block_start: b.start,
                     duration_minutes: b.duration_minutes,
@@ -9139,5 +9186,238 @@ mod continuity_tests {
                 assert_eq!(allowed, 32, "{date:?}");
             }
         }
+    }
+}
+
+/// Low-tariff fill (owner 2026-11-17): in a fill month every HDO low-tariff block charges to max SOC
+/// and holds there. Unknown tariffs and other months plan as before; price levers still apply.
+#[cfg(test)]
+mod low_tariff_fill_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use fluxion_plugins::protocol::BlockForecast;
+    use fluxion_types::pricing::TimeBlockPrice;
+
+    const PRAGUE: Tz = chrono_tz::Europe::Prague;
+
+    /// 48 quarter-hour blocks from 00:00 local on 15 Jan 2026: buy 2.00 before 06:00, 4.00 after;
+    /// the HDO tariff of each block comes from `hdo(local hour)`
+    fn day(hdo: impl Fn(u32) -> Option<bool>) -> Vec<TimeBlockPrice> {
+        let start = PRAGUE
+            .with_ymd_and_hms(2026, 1, 15, 0, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc);
+        (0..48)
+            .map(|i| {
+                let block_start = start + Duration::minutes(15 * i);
+                let hour = block_start.with_timezone(&PRAGUE).hour();
+                let buy = if hour < 6 { 2.0 } else { 4.0 };
+                TimeBlockPrice {
+                    hdo_low_tariff: hdo(hour),
+                    buy_price_czk_per_kwh: None,
+                    block_start,
+                    duration_minutes: 15,
+                    price_czk_per_kwh: buy,
+                    effective_price_czk_per_kwh: buy,
+                    spot_sell_price_czk_per_kwh: Some(1.0),
+                }
+            })
+            .collect()
+    }
+
+    /// Low tariff before 06:00 local, high after
+    fn low_before_six(hour: u32) -> Option<bool> {
+        Some(hour < 6)
+    }
+
+    fn control() -> ControlConfig {
+        ControlConfig {
+            force_discharge_enabled: true,
+            battery_capacity_kwh: 10.0,
+            min_battery_soc: 10.0,
+            max_battery_soc: 100.0,
+            max_battery_charge_rate_kw: 3.0,
+            battery_efficiency: 0.9,
+            battery_wear_cost_czk_per_kwh: 0.1,
+            maximum_export_power_w: 3_000,
+            grid_export_fee_czk_per_kwh: 0.5,
+            average_household_load_kw: 1.2,
+            ..ControlConfig::default()
+        }
+    }
+
+    fn battery() -> BatteryParams {
+        BatteryParams {
+            capacity_kwh: 10.0,
+            min_soc_pct: 10.0,
+            max_soc_pct: 100.0,
+            max_charge_kw: 3.0,
+            max_discharge_kw: 3.0,
+            efficiency: 0.9,
+            wear_cost_czk_per_kwh: 0.1,
+            max_export_kw: 3.0,
+            export_guard_margin_kwh: 0.0,
+            force_discharge_enabled: true,
+            hold_pv_to_battery: false,
+            min_charge_kwh: 0.0,
+            charge_cost_czk_per_kwh: None,
+        }
+    }
+
+    fn fill(months: Vec<u32>) -> WinterReserveParams {
+        WinterReserveParams {
+            low_tariff_fill_months: months,
+            ..WinterReserveParams::default()
+        }
+    }
+
+    fn horizon_of(
+        blocks: &[TimeBlockPrice],
+        params: WinterReserveParams,
+        levers: Option<&UserLevers>,
+    ) -> Vec<PlanBlock> {
+        let ctl = control();
+        let forecasts: Vec<BlockForecast> = blocks
+            .iter()
+            .map(|_| BlockForecast {
+                solar_kwh: 0.0,
+                consumption_kwh: 0.3,
+            })
+            .collect();
+        let context = super::super::EvaluationContext {
+            price_block: &blocks[0],
+            control_config: &ctl,
+            current_battery_soc: 20.0,
+            solar_forecast_kwh: 0.0,
+            consumption_forecast_kwh: 0.0,
+            grid_export_price_czk_per_kwh: 0.5,
+            all_price_blocks: Some(blocks),
+            ranking_price_blocks: None,
+            backup_discharge_min_soc: 10.0,
+            grid_import_today_kwh: None,
+            consumption_today_kwh: None,
+            solar_forecast_total_today_kwh: 0.0,
+            solar_forecast_remaining_today_kwh: 0.0,
+            solar_forecast_tomorrow_kwh: 0.0,
+            battery_avg_charge_price_czk_per_kwh: 0.0,
+            battery_charge_cost_czk_per_kwh: None,
+            hourly_consumption_profile: None,
+            hourly_consumption_p75: None,
+            block_forecasts: Some(&forecasts),
+            timezone: Some(PRAGUE),
+            user_levers: levers,
+            cautious_pv: None,
+        };
+        WinterReserveStrategy::new(true, params).horizon_blocks(&context)
+    }
+
+    fn modes(p: &Plan) -> Vec<PlanMode> {
+        p.blocks.iter().map(|b| b.mode).collect()
+    }
+
+    #[test]
+    fn the_option_is_off_by_default() {
+        assert!(
+            WinterReserveParams::default()
+                .low_tariff_fill_months
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_fill_month_charges_low_tariff_blocks_to_max_and_holds_them() {
+        let blocks = day(low_before_six);
+        let horizon = horizon_of(&blocks, fill(vec![1]), None);
+        assert!(
+            horizon[..24]
+                .iter()
+                .all(|b| b.force_charge && b.low_tariff_fill && !b.no_discharge)
+        );
+        assert!(
+            horizon[24..]
+                .iter()
+                .all(|b| !b.force_charge && !b.low_tariff_fill)
+        );
+
+        let p = plan(&horizon, 20.0, PRAGUE, &battery(), &fill(vec![1]));
+        assert!(
+            p.blocks[..24].iter().all(|b| b.mode == PlanMode::Charge),
+            "{:?}",
+            modes(&p)
+        );
+        assert!(
+            p.blocks[..24]
+                .iter()
+                .all(|b| b.reason.contains("CHARGE (low tariff fill)")),
+            "{}",
+            p.blocks[0].reason
+        );
+        assert!(
+            p.blocks[23].soc_end_pct >= 99.0,
+            "SOC {}",
+            p.blocks[23].soc_end_pct
+        );
+    }
+
+    #[test]
+    fn a_month_outside_the_list_plans_as_with_the_option_off() {
+        let blocks = day(low_before_six);
+        let off = plan(
+            &horizon_of(&blocks, fill(vec![]), None),
+            20.0,
+            PRAGUE,
+            &battery(),
+            &fill(vec![]),
+        );
+        let other = horizon_of(&blocks, fill(vec![6]), None);
+        assert!(other.iter().all(|b| !b.force_charge && !b.low_tariff_fill));
+        let other = plan(&other, 20.0, PRAGUE, &battery(), &fill(vec![6]));
+        assert_eq!(modes(&other), modes(&off));
+    }
+
+    #[test]
+    fn an_unknown_tariff_is_never_filled() {
+        let blocks = day(|_| None);
+        let with_fill = horizon_of(&blocks, fill(vec![1]), None);
+        assert!(
+            with_fill
+                .iter()
+                .all(|b| !b.force_charge && !b.low_tariff_fill)
+        );
+        assert_eq!(with_fill, horizon_of(&blocks, fill(vec![]), None));
+    }
+
+    #[test]
+    fn a_price_lever_charge_is_not_cleared_by_the_fill() {
+        // Cheap blocks before 06:00 are high tariff: lever 2.50 forces them, the fill does not.
+        // The 4.00 blocks after 06:00 are low tariff: filled, not lever-forced.
+        let blocks = day(|h| Some(h >= 6));
+        let levers = UserLevers {
+            force_charge_at_or_below_czk: Some(2.5),
+            ..UserLevers::default()
+        };
+        let horizon = horizon_of(&blocks, fill(vec![1]), Some(&levers));
+        assert!(
+            horizon[..24]
+                .iter()
+                .all(|b| b.force_charge && !b.low_tariff_fill)
+        );
+        assert!(
+            horizon[24..]
+                .iter()
+                .all(|b| b.force_charge && b.low_tariff_fill)
+        );
+
+        let p = plan(&horizon, 20.0, PRAGUE, &battery(), &fill(vec![1]));
+        assert!(
+            p.blocks[0].reason.contains("price lever"),
+            "{}",
+            p.blocks[0].reason
+        );
+        assert!(
+            p.blocks[30].reason.contains("CHARGE (low tariff fill)"),
+            "{}",
+            p.blocks[30].reason
+        );
     }
 }
